@@ -475,8 +475,12 @@ void Effect11::OverrideWeather(RE::Sky* a_sky)
 
 	{
 		static auto& volumetricLighting = (*(RE::BSVolumetricLightingRenderData*)(REL::RelocationID(527719, 414629).address() - offsetof(RE::BSVolumetricLightingRenderData, red)));
-		volumetricLighting.intensity *= settingManager.GetInterpolatedTimeOfDayValue("Intensity", "GAMEVOLUMETRICRAYS");
-		volumetricLighting.samplingRepartition.rangeFactor *= settingManager.GetInterpolatedTimeOfDayValue("RangeFactor", "GAMEVOLUMETRICRAYS");
+		if (EffectManager::GetSingleton().IsDX9Mode()) {
+			volumetricLighting.intensity = 0.0f;
+		} else {
+			volumetricLighting.intensity *= settingManager.GetInterpolatedTimeOfDayValue("Intensity", "GAMEVOLUMETRICRAYS");
+			volumetricLighting.samplingRepartition.rangeFactor *= settingManager.GetInterpolatedTimeOfDayValue("RangeFactor", "GAMEVOLUMETRICRAYS");
+		}
 	}
 }
 
@@ -518,19 +522,41 @@ void Effect11::OverrideAmbientLighting(DirectionalAmbientColors& DirectionalAmbi
 {
 	auto& settingManager = SettingManager::GetSingleton();
 
+	float intensity = settingManager.GetInterpolatedTimeOfDayValue("AmbientLightingIntensity", "ENVIRONMENT");
+	float curve = settingManager.GetInterpolatedTimeOfDayValue("AmbientLightingCurve", "ENVIRONMENT");
+	float desaturation = settingManager.GetInterpolatedTimeOfDayValue("AmbientLightingDesaturation", "ENVIRONMENT");
+	float filterAmount = settingManager.GetInterpolatedTimeOfDayValue("AmbientColorFilterAmount", "ENVIRONMENT");
+	float3 filterTop = settingManager.GetInterpolatedColorTimeOfDayValue("AmbientColorFilterTop", "ENVIRONMENT");
+	float3 filterMiddle = settingManager.GetInterpolatedColorTimeOfDayValue("AmbientColorFilterMiddle", "ENVIRONMENT");
+	float3 filterBottom = settingManager.GetInterpolatedColorTimeOfDayValue("AmbientColorFilterBottom", "ENVIRONMENT");
+
+	// [0] = X axis, [1] = Y axis, [2] = Z axis
+	// [x][0] = positive, [x][1] = negative
+	// Z+ = top (up), Z- = bottom (down), X/Y = middle
 	for (int i = 0; i < 3; i++) {
 		for (int j = 0; j < 2; j++) {
 			auto& ambientLightingColor = DirectionalAmbientColors.directionalAmbientColors[i][j];
+			float3 color = NiToF3(ambientLightingColor);
 
-			float3 ambientLightingColorF3 = NiToF3(ambientLightingColor);
+			if (curve != 1.0f)
+				color = { std::pow(std::abs(color.x), curve), std::pow(std::abs(color.y), curve), std::pow(std::abs(color.z), curve) };
 
-			int currentSide = i * 2 + j;
-			if (currentSide == 3)
-				ambientLightingColorF3 = Desaturation(ambientLightingColorF3, settingManager.GetInterpolatedTimeOfDayValue("AmbientLightingDesaturation", "ENVIRONMENT"));
+			if (i == 2 && j == 0)
+				color = Desaturation(color, desaturation);
 
-			ambientLightingColorF3 = Intensity(ambientLightingColorF3, settingManager.GetInterpolatedTimeOfDayValue("AmbientLightingIntensity", "ENVIRONMENT"));
+			float3 filter;
+			if (i == 2 && j == 0)
+				filter = filterTop;
+			else if (i == 2 && j == 1)
+				filter = filterBottom;
+			else
+				filter = filterMiddle;
 
-			ambientLightingColor = F3ToNi(ambientLightingColorF3);
+			color = { std::lerp(color.x, color.x * filter.x, filterAmount) * intensity,
+				std::lerp(color.y, color.y * filter.y, filterAmount) * intensity,
+				std::lerp(color.z, color.z * filter.z, filterAmount) * intensity };
+
+			ambientLightingColor = F3ToNi(color);
 		}
 	}
 }

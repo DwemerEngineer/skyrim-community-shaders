@@ -125,6 +125,8 @@ public:
 	const CommonVariableData& GetCommonData() const { return commonData; }
 
 	bool IsInitialized() const { return initialized; }
+	bool IsDX9Mode() const { return isDX9Mode; }
+	void SetDX9Mode(bool mode) { isDX9Mode = mode; }
 
 	bool performanceMode = false;
 
@@ -145,4 +147,5 @@ public:
 
 private:
 	bool initialized = false;
+	bool isDX9Mode = false;
 };

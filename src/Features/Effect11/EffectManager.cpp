@@ -99,6 +99,14 @@ void EffectManager::Apply()
 	enbEffect.Apply();
 	enbEffectPostPass.Apply();
 
+	isDX9Mode = enbBloom.isDX9Effect || enbLens.isDX9Effect ||
+	            enbAdaptation.isDX9Effect || enbEffect.isDX9Effect || enbEffectPostPass.isDX9Effect;
+
+	if (isDX9Mode) {
+		auto& settingManager = SettingManager::GetSingleton();
+		settingManager.SetCategoryHidden("GAMEVOLUMETRICRAYS", true);
+	}
+
 #ifdef ENABLE_ENB_EXTENDER
 	EffectBase* allEffects[] = { &enbBloom, &enbLens, &enbAdaptation, &enbEffect, &enbEffectPostPass };
 	for (auto* effect : allEffects) {
@@ -179,7 +187,12 @@ void EffectManager::RegisterSettings()
 	settingManager.RegisterTimeOfDaySetting("DirectLightingCurve", "ENVIRONMENT", 1.0f, 0.1f, 8.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("DirectLightingDesaturation", "ENVIRONMENT", 0.0f, -1.0f, 1.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("AmbientLightingIntensity", "ENVIRONMENT", 1.0f, 0.0f, 30000.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("AmbientLightingCurve", "ENVIRONMENT", 1.0f, 0.1f, 8.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("AmbientLightingDesaturation", "ENVIRONMENT", 0.0f, -1.0f, 1.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("AmbientColorFilterAmount", "ENVIRONMENT", 0.0f, 0.0f, 1.0f, 0.01f, true);
+	settingManager.RegisterColorTimeOfDaySetting("AmbientColorFilterTop", "ENVIRONMENT", { 1.0f, 1.0f, 1.0f }, true);
+	settingManager.RegisterColorTimeOfDaySetting("AmbientColorFilterMiddle", "ENVIRONMENT", { 0.0f, 0.0f, 0.0f }, true);
+	settingManager.RegisterColorTimeOfDaySetting("AmbientColorFilterBottom", "ENVIRONMENT", { 1.0f, 1.0f, 1.0f }, true);
 	settingManager.RegisterTimeOfDaySetting("PointLightingIntensity", "ENVIRONMENT", 1.0f, 0.0f, 30000.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("PointLightingCurve", "ENVIRONMENT", 1.0f, 0.1f, 4.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("PointLightingDesaturation", "ENVIRONMENT", 0.0f, -1.0f, 1.0f, 0.01f, true);

@@ -159,6 +159,8 @@ public:
 	bool CategoryHasWeatherSupport(const std::string& category) const;
 	void SetCategoryExteriorOnly(const std::string& category, bool exteriorOnly);
 	bool IsCategoryExteriorOnly(const std::string& category) const;
+	void SetCategoryHidden(const std::string& category, bool hidden);
+	bool IsCategoryHidden(const std::string& category) const;
 
 	void SetCategoryTab(const std::string& category, const std::string& tab);
 	std::string GetCategoryTab(const std::string& category) const;
@@ -200,6 +202,7 @@ private:
 		bool lastSavedIgnoreWeatherSystem = false;
 		bool lastSavedIgnoreWeatherSystemInterior = true;
 		bool exteriorOnly = false;
+		bool hidden = false;
 	};
 
 	std::vector<Setting> allSettings;

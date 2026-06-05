@@ -615,6 +615,7 @@ namespace DX9Compat
 	{
 		static const std::vector<std::string> dx9States = {
 			"SRGBWRITEENABLE", "SRGBWriteEnable",
+			"SRGBTexture",
 			"AlphaTestEnable",
 			"AlphaBlendEnable",
 			"ZEnable",
@@ -630,6 +631,9 @@ namespace DX9Compat
 			"StencilPass",
 			"StencilFail",
 			"SEPARATEALPHABLENDENABLE",
+			"DitherEnable",
+			"MaxMipLevel",
+			"MipMapLodBias",
 		};
 
 		std::string result;
@@ -658,6 +662,28 @@ namespace DX9Compat
 			}
 		}
 		source = std::move(result);
+
+		// Also strip inline occurrences (e.g. "SRGBTexture=FALSE;" within single-line sampler_state blocks or macros)
+		static const std::vector<std::string> inlineStrip = {
+			"SRGBTexture", "MaxMipLevel", "MipMapLodBias", "DitherEnable"
+		};
+		for (auto& prop : inlineStrip) {
+			size_t pos = 0;
+			while ((pos = FindWord(source, prop, pos)) != std::string::npos) {
+				size_t eqPos = source.find_first_not_of(" \t", pos + prop.size());
+				if (eqPos != std::string::npos && source[eqPos] == '=') {
+					size_t semiPos = source.find(';', eqPos);
+					if (semiPos != std::string::npos) {
+						size_t end = semiPos + 1;
+						while (end < source.size() && (source[end] == ' ' || source[end] == '\t'))
+							++end;
+						source.erase(pos, end - pos);
+						continue;
+					}
+				}
+				pos += prop.size();
+			}
+		}
 	}
 
 	static void ApplyTextureNameMappings(std::string& source, const std::string& effectName)

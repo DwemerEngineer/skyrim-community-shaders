@@ -418,6 +418,23 @@ bool SettingManager::IsCategoryExteriorOnly(const std::string& category) const
 	return it->second.exteriorOnly;
 }
 
+void SettingManager::SetCategoryHidden(const std::string& category, bool hidden)
+{
+	std::unique_lock lock(mutex);
+	auto it = categories.find(category);
+	if (it != categories.end())
+		it->second.hidden = hidden;
+}
+
+bool SettingManager::IsCategoryHidden(const std::string& category) const
+{
+	std::shared_lock lock(mutex);
+	auto it = categories.find(category);
+	if (it == categories.end())
+		return false;
+	return it->second.hidden;
+}
+
 void SettingManager::SetCategoryTab(const std::string& category, const std::string& tab)
 {
 	std::unique_lock lock(mutex);

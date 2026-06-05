@@ -273,6 +273,9 @@ void MenuManager::RenderAllSettings()
 				}
 
 				for (const auto& category : categories) {
+					if (settingManager.IsCategoryHidden(category))
+						continue;
+
 					ImGuiTreeNodeFlags flags = (tabName == "Weather") ? ImGuiTreeNodeFlags_None : ImGuiTreeNodeFlags_DefaultOpen;
 
 					if (ImGui::TreeNodeEx(category.c_str(), flags)) {
