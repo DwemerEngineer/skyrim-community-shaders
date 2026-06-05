@@ -44,6 +44,8 @@ namespace ENBExtender
 		HRESULT __stdcall Close(LPCVOID pData) override;
 
 		const std::vector<std::string>& GetStringifyMacros() const { return stringifyMacros; }
+		void AddIncludeDir(const std::filesystem::path& dir) { includeDirs.push_back(dir); }
+		void SetDX9Compat(bool enable) { dx9Compat = enable; }
 
 	private:
 		std::filesystem::path basePath;
@@ -52,6 +54,7 @@ namespace ENBExtender
 		std::string iniSection;
 		std::vector<std::filesystem::path> includeDirs;
 		std::vector<std::string> stringifyMacros;
+		bool dx9Compat = false;
 	};
 
 	// UI variable processing

@@ -99,4 +99,10 @@ void ENBEffect::UpdateEffectVariables()
 
 	const char* adaptationTexName = (textureManager.GetTextureSwap() & 1) ? "TextureAdaptation" : "TextureAdaptationSwap";
 	bindTextureIfEnabled(idEnableAdaptation, "TextureAdaptation", adaptationTexName);
+
+	if (settingManager.HasSetting("UsePaletteTexture", "COLORCORRECTION") &&
+		settingManager.GetValue<bool>("UsePaletteTexture", "COLORCORRECTION")) {
+		if (auto srv = LoadTextureFromFile("enbpalette.bmp"))
+			SetShaderResourceVariable("TexturePalette", srv);
+	}
 }

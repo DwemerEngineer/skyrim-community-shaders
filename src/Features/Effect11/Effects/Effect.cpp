@@ -5,8 +5,10 @@
 
 #include <DirectXTex.h>
 
+#include "../DX9Compat.h"
 #include "../ENBExtender.h"
 #include "../PresetManager.h"
+#include "../SettingManager.h"
 #include "../TextureManager.h"
 #include "Globals.h"
 #include "State.h"
@@ -251,11 +253,23 @@ void Effect::Unload()
 
 bool Effect::LoadFXFile()
 {
-	auto filePath = PresetManager::GetSingleton().GetENBSeriesPath() / GetName();
+	auto enbseriesPath = PresetManager::GetSingleton().GetENBSeriesPath();
+	auto filePath = enbseriesPath / GetName();
+	bool isDX9Source = false;
 
 	if (!std::filesystem::exists(filePath)) {
-		filePresent = false;
-		return false;
+		auto parentPath = enbseriesPath.parent_path() / GetName();
+		if (std::filesystem::exists(parentPath)) {
+			filePath = parentPath;
+		} else {
+			auto bundledPath = std::filesystem::path("Data\\Shaders\\Effect11") / GetBundledFallbackName();
+			if (!GetBundledFallbackName().empty() && std::filesystem::exists(bundledPath)) {
+				filePath = bundledPath;
+			} else {
+				filePresent = false;
+				return false;
+			}
+		}
 	}
 	filePresent = true;
 
@@ -280,7 +294,6 @@ bool Effect::LoadFXFile()
 
 	sourceCode = ENBExtender::DecodeKIEFX(sourceCode);
 
-	auto enbseriesPath = filePath.parent_path();
 	auto iniFilePath = enbseriesPath / (GetName() + ".ini");
 	std::string iniPathStr = iniFilePath.string();
 	std::string iniSection = GetName();
@@ -288,6 +301,23 @@ bool Effect::LoadFXFile()
 
 	uiDefines.clear();
 	Util::ShaderPatches::Apply(GetName().c_str(), sourceCode);
+
+	isDX9Source = DX9Compat::IsDX9Source(sourceCode);
+	isDX9Effect = isDX9Source;
+	if (isDX9Source)
+		sourceCode = DX9Compat::Transform(sourceCode, GetName());
+
+	{
+		auto& sm = SettingManager::GetSingleton();
+		std::string defines;
+		if (sm.HasSetting("UsePaletteTexture", "COLORCORRECTION") && sm.GetValue<bool>("UsePaletteTexture", "COLORCORRECTION"))
+			defines += "#define E_CC_PALETTE 1\n";
+		if (sm.HasSetting("UseProceduralCorrection", "COLORCORRECTION") && sm.GetValue<bool>("UseProceduralCorrection", "COLORCORRECTION"))
+			defines += "#define E_CC_PROCEDURAL 1\n";
+		if (!defines.empty())
+			sourceCode = defines + sourceCode;
+	}
+
 	ENBExtender::ConvertExtenderSyntax(sourceCode, enbseriesPath, uiDefines, iniPathStr, iniSection);
 
 	std::vector<std::string> stringifyMacros;
@@ -341,6 +371,9 @@ bool Effect::LoadFXFile()
 
 	{
 		ENBExtender::PresetInclude ppInclude(enbseriesPath, uiDefines, iniPathStr, iniSection);
+		ppInclude.AddIncludeDir(enbseriesPath.parent_path());
+		if (isDX9Source)
+			ppInclude.SetDX9Compat(true);
 		auto pp = preprocess(sourceCode, &ppInclude);
 		if (!pp.empty()) {
 			auto allMacros = stringifyMacros;
@@ -355,7 +388,7 @@ bool Effect::LoadFXFile()
 	}
 
 	if (!compiled) {
-		std::vector<std::filesystem::path> dirs = { enbseriesPath };
+		std::vector<std::filesystem::path> dirs = { enbseriesPath, enbseriesPath.parent_path() };
 		std::unordered_set<std::string> visited;
 		auto inlined = ENBExtender::InlineIncludes(sourceCode, enbseriesPath, iniPathStr, iniSection, dirs, visited, uiDefines);
 		ENBExtender::ExpandStringificationMacros(inlined);
@@ -364,6 +397,9 @@ bool Effect::LoadFXFile()
 
 	if (!compiled) {
 		ENBExtender::PresetInclude includeHandler(enbseriesPath, uiDefines, iniPathStr, iniSection);
+		includeHandler.AddIncludeDir(enbseriesPath.parent_path());
+		if (isDX9Source)
+			includeHandler.SetDX9Compat(true);
 		winrt::com_ptr<ID3DBlob> compiledShader, errorBlob;
 		HRESULT hr = D3DCompile(sourceCode.c_str(), sourceCode.size(), filePathStr.c_str(),
 			nullptr, &includeHandler, nullptr, "fx_5_0", 0, 0, compiledShader.put(), errorBlob.put());
@@ -477,8 +513,10 @@ void Effect::ExecuteTechnique(const std::string& techniqueName, TextureManager::
 		return;
 
 	auto technique = effect->GetTechniqueByName(techniqueName.c_str());
-	if (!technique || !technique->IsValid())
+	if (!technique || !technique->IsValid()) {
+		logger::debug("[EFFECT11] ExecuteTechnique: '{}' not found or invalid in '{}'", techniqueName, GetName());
 		return;
+	}
 
 	RenderPasses(technique, output.rtv.get());
 }
@@ -507,7 +545,10 @@ ID3D11ShaderResourceView* Effect::LoadTextureFromFile(const std::string& filenam
 	if (cacheIt != customTextureCache.end())
 		return cacheIt->second.get();
 
-	std::filesystem::path filepath = PresetManager::GetSingleton().GetENBSeriesPath() / filename;
+	auto enbPath = PresetManager::GetSingleton().GetENBSeriesPath();
+	std::filesystem::path filepath = enbPath / filename;
+	if (!std::filesystem::exists(filepath))
+		filepath = enbPath.parent_path() / filename;
 
 	winrt::com_ptr<ID3D11ShaderResourceView> srv;
 

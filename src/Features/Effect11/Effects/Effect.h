@@ -48,6 +48,7 @@ public:
 
 	// Pure virtual methods for derived classes to implement
 	virtual std::string GetName() const = 0;
+	virtual std::string GetBundledFallbackName() const { return {}; }
 	virtual bool IsRequired() const { return false; }
 
 	struct TechniqueBinding
@@ -178,6 +179,7 @@ public:
 
 	// Error tracking
 	bool filePresent = false;
+	bool isDX9Effect = false;
 	std::vector<std::string> errors;
 
 	// Source-parsed group map and declaration order (compiled effect reorders variable types)
@@ -272,6 +274,7 @@ public:
 protected:
 	static bool IsPerComponentVector(const UIVariable& uiVar);
 	std::string GetVariableIniKey(const UIVariable& uiVar);
+	ID3D11ShaderResourceView* LoadTextureFromFile(const std::string& filename);
 
 private:
 	bool LoadFXFile();
@@ -283,7 +286,6 @@ private:
 	void EnumerateAllVariables();
 
 	void SetupCustomTextures();
-	ID3D11ShaderResourceView* LoadTextureFromFile(const std::string& filename);
 
 	void LoadTechniques();
 	void LoadUITechniques();

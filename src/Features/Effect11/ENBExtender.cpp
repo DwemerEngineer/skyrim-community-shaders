@@ -5,6 +5,7 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "DX9Compat.h"
 #include "Utils/ShaderPatches.h"
 
 namespace ENBExtender
@@ -1183,6 +1184,8 @@ namespace ENBExtender
 
 		content = DecodeKIEFX(content);
 		Util::ShaderPatches::Apply(pFileName, content);
+		if (dx9Compat && DX9Compat::IsDX9Source(content))
+			content = DX9Compat::Transform(content, pFileName);
 		ConvertExtenderSyntax(content, basePath, uiDefines, iniPath, iniSection);
 		StripStringifyDefines(content, stringifyMacros);
 

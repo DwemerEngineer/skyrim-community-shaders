@@ -33,9 +33,19 @@ void ENBLens::UpdateEffectVariables()
 	if (!effect)
 		return;
 
-	// Set dowsampled texture, typically the one used (use 1024x1024 mip)
 	SetShaderResourceVariable("TextureDownsampled", TextureManager::GetSingleton().GetDownsampleTexture());
-
-	// Set original texture, not typically used due to aliasing
 	SetShaderResourceVariable("TextureOriginal", globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].SRV);
+
+	auto maskSRV = LoadTextureFromFile("enblensmask.png");
+	if (!maskSRV)
+		maskSRV = LoadTextureFromFile("enblensmask.bmp");
+	if (maskSRV)
+		SetShaderResourceVariable("TextureMask", maskSRV);
+
+	// DX9 compat: bind bloom textures for lens passes
+	if (isDX9Effect) {
+		auto downsampledSRV = TextureManager::GetSingleton().GetDownsampleTexture();
+		for (int i = 1; i <= 8; ++i)
+			SetShaderResourceVariable("texBloom" + std::to_string(i), downsampledSRV);
+	}
 }

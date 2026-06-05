@@ -146,6 +146,8 @@ void EffectManager::RegisterSettings()
 
 	settingManager.RegisterFloatSetting("Brightness", "COLORCORRECTION", 1.0f, 0.0f, 10000.0f, 0.01f, false);
 	settingManager.RegisterFloatSetting("GammaCurve", "COLORCORRECTION", 1.0f, 1.0f, 2.2f, 0.01f, false);
+	settingManager.RegisterBoolSetting("UsePaletteTexture", "COLORCORRECTION", false, false);
+	settingManager.RegisterBoolSetting("UseProceduralCorrection", "COLORCORRECTION", false, false);
 
 	settingManager.RegisterBoolSetting("EnableMultipleWeathers", "WEATHER", false, false);
 	settingManager.RegisterBoolSetting("EnableLocationWeather", "WEATHER", false, false);
@@ -164,8 +166,14 @@ void EffectManager::RegisterSettings()
 	settingManager.RegisterFloatSetting("AdaptationMax", "ADAPTATION", 10.0f, 0.0f, 65536.0f, 0.01f, false);
 
 	settingManager.RegisterTimeOfDaySetting("Amount", "BLOOM", 0.1f, 0.0f, 10.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("BlueShiftAmount", "BLOOM", 0.0f, 0.0f, 10.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("Contrast", "BLOOM", 1.0f, 0.0f, 10.0f, 0.01f, true);
 
 	settingManager.RegisterTimeOfDaySetting("Amount", "LENS", 1.0f, 0.0f, 10.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("ReflectionIntensity", "LENS", 0.0f, 0.0f, 100.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("ReflectionPower", "LENS", 2.0f, 0.0f, 10.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("DirtIntensity", "LENS", 0.0f, 0.0f, 100.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("DirtPower", "LENS", 2.0f, 0.0f, 10.0f, 0.01f, true);
 
 	settingManager.RegisterTimeOfDaySetting("DirectLightingIntensity", "ENVIRONMENT", 1.0f, 0.0f, 30000.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("DirectLightingCurve", "ENVIRONMENT", 1.0f, 0.1f, 8.0f, 0.01f, true);
@@ -808,6 +816,32 @@ void EffectManager::UpdateCommonVariablesForEffect(Effect& effect)
 	effect.SetVectorVariable("TimeOfDay2", commonData.timeOfDay2, sizeof(commonData.timeOfDay2));
 	effect.SetVectorVariable("ENightDayFactor", &commonData.eNightDayFactor, sizeof(commonData.eNightDayFactor));
 	effect.SetVectorVariable("EInteriorFactor", &commonData.eInteriorFactor, sizeof(commonData.eInteriorFactor));
+
+	if (effect.isDX9Effect) {
+		auto& settingManager = SettingManager::GetSingleton();
+
+		float bloomAmount = settingManager.GetInterpolatedTimeOfDayValue("Amount", "BLOOM");
+		effect.SetVectorVariable("EBloomAmount", &bloomAmount, sizeof(bloomAmount));
+
+		float4 bloomParameters = {
+			4.0f,
+			4.0f,
+			settingManager.GetInterpolatedTimeOfDayValue("BlueShiftAmount", "BLOOM"),
+			settingManager.GetInterpolatedTimeOfDayValue("Contrast", "BLOOM")
+		};
+		effect.SetVectorVariable("BloomParameters", &bloomParameters, sizeof(bloomParameters));
+
+		float4 lensParameters = {
+			settingManager.GetInterpolatedTimeOfDayValue("ReflectionIntensity", "LENS"),
+			settingManager.GetInterpolatedTimeOfDayValue("ReflectionPower", "LENS"),
+			settingManager.GetInterpolatedTimeOfDayValue("DirtIntensity", "LENS"),
+			settingManager.GetInterpolatedTimeOfDayValue("DirtPower", "LENS")
+		};
+		effect.SetVectorVariable("LensParameters", &lensParameters, sizeof(lensParameters));
+
+		float4 tempParameters = { 0.0f, 0.0f, 0.0f, 1.0f };
+		effect.SetVectorVariable("TempParameters", &tempParameters, sizeof(tempParameters));
+	}
 }
 
 void EffectManager::CopyTexture(ID3D11ShaderResourceView* a_source, ID3D11RenderTargetView* a_dest)

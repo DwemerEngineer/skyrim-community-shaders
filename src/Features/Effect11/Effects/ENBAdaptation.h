@@ -6,6 +6,7 @@ class ENBAdaptation : public EffectBase
 {
 public:
 	virtual std::string GetName() const override { return "enbadaptation.fx"; }
+	virtual std::string GetBundledFallbackName() const override { return "DX9Adaptation.fx"; }
 
 	virtual void Execute() override;
 	virtual void UpdateEffectVariables() override;
