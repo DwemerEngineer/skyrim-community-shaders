@@ -92,6 +92,10 @@ cbuffer PerGeometry : register(
 #		include "GrassCollision\\GrassCollision.hlsli"
 #	endif  // GRASS_COLLISION
 
+#	ifdef GRASS_OPTIMIZATIONS
+	StructuredBuffer<float> GroupFadeAlphas : register(t2);
+	StructuredBuffer<uint>  InstanceGroupMap    : register(t3);
+#	else
 cbuffer cb7 : register(b7)
 {
 	float4 cb7[1];
@@ -101,6 +105,7 @@ cbuffer cb8 : register(b8)
 {
 	float4 cb8[240];
 }
+#	endif
 
 // Calculate wind displacement for a grass vertex
 float3 CalculateWindDisplacement(VS_INPUT input, float windTimer)
@@ -146,13 +151,14 @@ float4 GetMSPosition(VS_INPUT input)
 }
 
 #	ifdef GRASS_LIGHTING
-VS_OUTPUT main(VS_INPUT input)
+VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 {
 	VS_OUTPUT vsout;
 
 	float3x3 world3x3 = float3x3(input.InstanceData2.xyz, input.InstanceData3.xyz, float3(input.InstanceData4.x, input.InstanceData2.w, input.InstanceData3.w));
 
 	float4 msPosition = GetMSPosition(input, world3x3);
+    float4 previousMsPosition = msPosition; 
 
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
 	float3 previousWindDisplacement = CalculateWindDisplacement(input, PreviousWindTimer);
@@ -161,9 +167,13 @@ VS_OUTPUT main(VS_INPUT input)
 	float3 displacement, previousDisplacement;
 	GrassCollision::GetDisplacedPosition(input, msPosition.xyz, displacement, previousDisplacement);
 	msPosition.xyz += displacement;
+    previousMsPosition.xyz += previousDisplacement;
 #		endif  // GRASS_COLLISION
 
 	msPosition.xyz += windDisplacement;
+	previousMsPosition.xyz += previousWindDisplacement;
+
+	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
 
 	float4 projSpacePosition = mul(WorldViewProj, msPosition);
 	vsout.HPosition = projSpacePosition;
@@ -172,9 +182,14 @@ VS_OUTPUT main(VS_INPUT input)
 	vsout.Depth = projSpacePosition.zw;
 #		endif  // RENDER_DEPTH
 
+#	ifdef GRASS_OPTIMIZATIONS
+	uint groupIndex       = InstanceGroupMap[instanceID];
+	float perInstanceFade = GroupFadeAlphas[groupIndex];
+#		else
 	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
+#		endif
 
-	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
+    float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
 
 	// Note: input.Color.w is used for wind speed
 	vsout.Color.xyz = input.Color.xyz;
@@ -187,16 +202,6 @@ VS_OUTPUT main(VS_INPUT input)
 	vsout.ViewSpacePosition = mul(WorldView, msPosition).xyz;
 	vsout.WorldPosition = mul(World, msPosition);
 
-	float4 previousMsPosition = GetMSPosition(input, world3x3);
-
-#		ifdef GRASS_COLLISION
-	previousMsPosition.xyz += previousDisplacement;
-#		endif  // GRASS_COLLISION
-
-	previousMsPosition.xyz += previousWindDisplacement;
-
-	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
-
 	// Vertex normal needs to be transformed to world-space for lighting calculations.
 	vsout.VertexNormal.xyz = mul(world3x3, input.Normal.xyz * 2.0 - 1.0);
 	vsout.VertexNormal.w = input.Color.w;
@@ -204,11 +209,12 @@ VS_OUTPUT main(VS_INPUT input)
 	return vsout;
 }
 #	else
-VS_OUTPUT main(VS_INPUT input)
+VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 {
 	VS_OUTPUT vsout;
 
 	float4 msPosition = GetMSPosition(input);
+    float4 previousMsPosition = GetMSPosition(input);
 
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
 	float3 previousWindDisplacement = CalculateWindDisplacement(input, PreviousWindTimer);
@@ -217,9 +223,11 @@ VS_OUTPUT main(VS_INPUT input)
 	float3 displacement, previousDisplacement;
 	GrassCollision::GetDisplacedPosition(input, msPosition.xyz, displacement, previousDisplacement);
 	msPosition.xyz += displacement;
+	previousMsPosition.xyz += previousDisplacement;
 #		endif  // GRASS_COLLISION
 
 	msPosition.xyz += windDisplacement;
+    previousMsPosition.xyz += previousWindDisplacement;
 
 	float4 projSpacePosition = mul(WorldViewProj, msPosition);
 	vsout.HPosition = projSpacePosition;
@@ -232,7 +240,12 @@ VS_OUTPUT main(VS_INPUT input)
 	float dirLightAngle = dot(DirLightDirection.xyz, instanceNormal);
 	float3 diffuseMultiplier = input.InstanceData1.www * input.Color.xyz;
 
+	#	ifdef GRASS_OPTIMIZATIONS
+	uint groupIndex       = InstanceGroupMap[instanceID];
+	float perInstanceFade = GroupFadeAlphas[groupIndex];
+#		else
 	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
+#		endif
 
 	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
 
@@ -248,14 +261,6 @@ VS_OUTPUT main(VS_INPUT input)
 
 	vsout.ViewSpacePosition = mul(WorldView, msPosition).xyz;
 	vsout.WorldPosition = mul(World, msPosition);
-
-	float4 previousMsPosition = GetMSPosition(input);
-
-#		ifdef GRASS_COLLISION
-	previousMsPosition.xyz += previousDisplacement;
-#		endif  // GRASS_COLLISION
-
-	previousMsPosition.xyz += previousWindDisplacement;
 
 	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
 
