@@ -93,8 +93,14 @@ cbuffer PerGeometry : register(
 #	endif  // GRASS_COLLISION
 
 #	ifdef GRASS_OPTIMIZATIONS
-	StructuredBuffer<float> GroupFadeAlphas : register(t2);
-	StructuredBuffer<uint>  InstanceGroupMap    : register(t3);
+StructuredBuffer<float> InstanceFadeStart : register(t2);
+cbuffer PerRun : register(b7)
+{
+	uint BaseInstance;
+	float FadeNow;
+	float FadeInTimeRcp;
+	uint _padPerRun;
+}
 #	else
 cbuffer cb7 : register(b7)
 {
@@ -183,8 +189,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 #		endif  // RENDER_DEPTH
 
 #	ifdef GRASS_OPTIMIZATIONS
-	uint groupIndex       = InstanceGroupMap[instanceID];
-	float perInstanceFade = GroupFadeAlphas[groupIndex];
+	float perInstanceFade = saturate((FadeNow - InstanceFadeStart[BaseInstance + instanceID]) * FadeInTimeRcp);
 #		else
 	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
 #		endif
@@ -241,8 +246,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	float3 diffuseMultiplier = input.InstanceData1.www * input.Color.xyz;
 
 	#	ifdef GRASS_OPTIMIZATIONS
-	uint groupIndex       = InstanceGroupMap[instanceID];
-	float perInstanceFade = GroupFadeAlphas[groupIndex];
+	float perInstanceFade = saturate((FadeNow - InstanceFadeStart[BaseInstance + instanceID]) * FadeInTimeRcp);
 #		else
 	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
 #		endif
