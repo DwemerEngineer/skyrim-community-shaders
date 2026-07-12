@@ -12,6 +12,7 @@ struct BucketSlice
 	RE::NiPoint3 aabbMin;
 	RE::NiPoint3 aabbMax;
 	RE::NiPoint3 origin;
+	uint32_t bufferOffset = UINT32_MAX;
 };
 
 struct VisibleRun
@@ -40,6 +41,7 @@ struct GrassBucket
 	std::vector<VisibleRun> visibleRuns;
 	uint32_t registeredFrame = UINT32_MAX;
 	const void* registeredProc = nullptr;
+	uint32_t slotBase = UINT32_MAX; 
 
 	void ReleaseResources()
 	{
@@ -77,14 +79,16 @@ struct PendingCapture
 	RE::NiPoint3 origin;
 };
 
-struct RunSlot
+struct RunSlot  // must match HLSL PerRun (c0–c2)
 {
 	uint32_t base;        // c0.x
 	float fadeNow;        // c0.y
 	float fadeInTimeRcp;  // c0.z
-	uint32_t pad0;        // c0.w
-	float origin[3];      // c1.xyz � absolute world origin of this run's slices
+	uint32_t debugFlags;  // c0.w
+	float origin[3];      // c1.xyz
 	float pad1;           // c1.w
+	uint32_t slotIndex;   // c2.x — debug: global slot id for run coloring
+	uint32_t pad2[3];     // c2.yzw
 };
 
 struct GrassOptimizations : Feature
@@ -105,6 +109,13 @@ public:
 			T("feature.grass_optimizations.description", "Improves grass rendering performance."), { T("feature.grass_optimizations.key_feature_1", "Improves vanilla grass instancing improving performance") }
 		};
 	};
+
+	struct Settings
+	{
+		bool ShowDebugVisualization = false;
+	};
+
+	Settings settings;
 
 	std::unordered_map<RE::NiSourceTexture*, GrassBucket> buckets;
 	std::mutex bucketMutex;
@@ -166,6 +177,14 @@ public:
 	bool EnsureRunBaseCapacity(uint32_t slots, ID3D11Device* device);
 
 	bool EnsureTriggerCB(ID3D11Device* device);
+
+	/** @brief Draws the ImGui settings panel for grass optimizations configuration. */
+	virtual void DrawSettings() override;
+
+	virtual void LoadSettings(json& o_json) override;
+	virtual void SaveSettings(json& o_json) override;
+
+	virtual void RestoreDefaultSettings() override;
 
 	/** @brief Installs the hooks after all plugins have loaded. */
 	virtual void PostPostLoad() override;
@@ -280,7 +299,7 @@ public:
 
 			stl::write_vfunc<0x0, BSMultiStreamInstanceTriShape_dtor>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 			//stl::write_vfunc<0x34, BSMultiStreamInstanceTriShape_OnVisible>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
-			//stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
+			stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 
 			stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
 			//stl::write_vfunc<0x29, BSMultiBoundAABB_WithinFrustum>(RE::VTABLE_BSMultiBoundAABB[0]);
