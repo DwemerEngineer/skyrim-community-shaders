@@ -96,10 +96,17 @@ cbuffer PerGeometry : register(
 StructuredBuffer<float> InstanceFadeStart : register(t2);
 cbuffer PerRun : register(b7)
 {
-	uint BaseInstance;
-	float FadeNow;
-	float FadeInTimeRcp;
-	uint _padPerRun;
+	uint BaseInstance;      // c0.x
+	float FadeNow;          // c0.y
+	float FadeInTimeRcp;    // c0.z
+	uint _padPerRun;        // c0.w
+	float3 RunOrigin;       // c1.xyz — absolute world origin of this run's source shape
+	float _padPerRun2;      // c1.w
+}
+cbuffer PerTrigger : register(b8)
+{
+	float3 TriggerOrigin;   // absolute world origin of the shape whose b2 is bound
+	float _padPerTrigger;
 }
 #	else
 cbuffer cb7 : register(b7)
@@ -164,6 +171,10 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	float3x3 world3x3 = float3x3(input.InstanceData2.xyz, input.InstanceData3.xyz, float3(input.InstanceData4.x, input.InstanceData2.w, input.InstanceData3.w));
 
 	float4 msPosition = GetMSPosition(input, world3x3);
+#	ifdef GRASS_OPTIMIZATIONS
+	float3 originCorrection = RunOrigin - TriggerOrigin;
+	msPosition.xyz += originCorrection;
+#	endif
     float4 previousMsPosition = msPosition; 
 
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
@@ -219,7 +230,11 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	VS_OUTPUT vsout;
 
 	float4 msPosition = GetMSPosition(input);
-    float4 previousMsPosition = GetMSPosition(input);
+#	ifdef GRASS_OPTIMIZATIONS
+	float3 originCorrection = RunOrigin - TriggerOrigin;
+	msPosition.xyz += originCorrection;
+#	endif
+    float4 previousMsPosition = msPosition;
 
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
 	float3 previousWindDisplacement = CalculateWindDisplacement(input, PreviousWindTimer);
