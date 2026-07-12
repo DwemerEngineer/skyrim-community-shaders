@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Buffer.h"
 #include "Upscaling.h"
@@ -11,14 +11,16 @@ struct BucketSlice
 	float fadeStart;
 	RE::NiPoint3 aabbMin;
 	RE::NiPoint3 aabbMax;
+	RE::NiPoint3 origin;
 };
 
 struct VisibleRun
 {
-	uint32_t base;          // StartInstanceLocation / alpha-SRV base
-	uint32_t count;         // instance count
-	uint32_t cbFirstConst = UINT32_MAX;  // offset into baseCB, in 16-byte constants (multiple of 16)
+	uint32_t base; 
+	uint32_t count; 
+	uint32_t cbFirstConst = UINT32_MAX;
 	float sortKeySq = 0.0f;
+	RE::NiPoint3 origin;
 };
 
 struct GrassBucket
@@ -53,7 +55,7 @@ struct GrassBucket
 		capacityInstances = 0;
 	}
 
-	void Release()  
+	void Release()
 	{
 		ReleaseResources();
 		totalInstances = 0;
@@ -72,16 +74,18 @@ struct PendingCapture
 	uint64_t descVal = 0;
 	RE::NiPoint3 aabbMin;
 	RE::NiPoint3 aabbMax;
+	RE::NiPoint3 origin;
 };
 
 struct RunSlot
 {
-	uint32_t base;
-	float fadeNow;
-	float fadeInTimeRcp;
-	uint32_t pad;
+	uint32_t base;        // c0.x
+	float fadeNow;        // c0.y
+	float fadeInTimeRcp;  // c0.z
+	uint32_t pad0;        // c0.w
+	float origin[3];      // c1.xyz � absolute world origin of this run's slices
+	float pad1;           // c1.w
 };
-
 
 struct GrassOptimizations : Feature
 {
@@ -132,11 +136,13 @@ public:
 	uint32_t runBaseCBCapacity = 0;
 	ID3D11Buffer* runBaseCBRetired = nullptr;
 	uint32_t retireFrame = UINT32_MAX;
-	ID3D11DeviceContext1* ctx1 = nullptr;   
+	ID3D11DeviceContext1* ctx1 = nullptr;
 	bool triedCtx1Init = false;
 
 	float timeAccum = 0.0f;
 	float fadeInTimeRcp = 0.0f;
+
+	ID3D11Buffer* triggerCB = nullptr;
 
 	void UpdateGrass();
 	void ApplyRemovals(const std::vector<RE::BSMultiStreamInstanceTriShape*>& removes);
@@ -158,6 +164,8 @@ public:
 	void InitRunBaseCB();                           // call once at feature init
 	void UploadRunBases(ID3D11DeviceContext* ctx);  // per frame, after BuildVisibleRuns
 	bool EnsureRunBaseCapacity(uint32_t slots, ID3D11Device* device);
+
+	bool EnsureTriggerCB(ID3D11Device* device);
 
 	/** @brief Installs the hooks after all plugins have loaded. */
 	virtual void PostPostLoad() override;
@@ -272,7 +280,7 @@ public:
 
 			stl::write_vfunc<0x0, BSMultiStreamInstanceTriShape_dtor>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 			//stl::write_vfunc<0x34, BSMultiStreamInstanceTriShape_OnVisible>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
-			stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
+			//stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 
 			stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
 			//stl::write_vfunc<0x29, BSMultiBoundAABB_WithinFrustum>(RE::VTABLE_BSMultiBoundAABB[0]);
@@ -298,7 +306,7 @@ public:
 
 			//stl::write_thunk_call<ExecuteCullingPass>(REL::RelocationID(100416, 107134).address() + REL::Relocate(0xFE, 0));
 			//stl::write_thunk_call<RegisterObject>(REL::RelocationID(74809, 0).address() + REL::Relocate(0x73, 0));
-			
+
 			//stl::write_thunk_call<RegisterObject>(REL::RelocationID(74809, 0).address() + REL::Relocate(0x159, 0));
 			//stl::write_thunk_call<RegisterObject>(REL::RelocationID(101601, 0).address() + REL::Relocate(0x70, 0));
 			//stl::write_thunk_call<RegisterObject>(REL::RelocationID(99974, 0).address() + REL::Relocate(0xE4, 0));

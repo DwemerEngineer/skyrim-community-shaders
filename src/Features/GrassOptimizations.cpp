@@ -101,6 +101,7 @@ void GrassOptimizations::ApplyCaptures(std::vector<PendingCapture>& captures)
 		s.shape = pc.shape;
 		s.count = pc.count;
 		s.fadeStart = timeAccum;
+		s.origin = pc.origin;
 		s.data = std::move(pc.bytes);
 		s.aabbMin = pc.aabbMin;
 		s.aabbMax = pc.aabbMax;
@@ -383,6 +384,7 @@ void GrassOptimizations::CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shap
 	pc.diffuseTexture = tex;
 	pc.instanceStride = stride;
 	pc.count = count;
+	pc.origin = shape->world.translate;
 	pc.bytes.resize(static_cast<size_t>(count) * stride);
 	std::memcpy(pc.bytes.data(), instanceData, pc.bytes.size());
 
@@ -465,8 +467,6 @@ bool GrassOptimizations::IsBucketKey(RE::NiSourceTexture* tex) const
 
 void GrassOptimizations::Hooks::BSMultiStreamInstanceTriShape_dtor::thunk(RE::BSMultiStreamInstanceTriShape* shape)
 {
-	logger::info("dtor: shape={:p}", (void*)shape);
-
 	auto& self = globals::features::grassOptimizations;
 	{
 		std::scoped_lock lk(self.pendingMutex);
@@ -603,7 +603,11 @@ void GrassOptimizations::UploadRunBases(ID3D11DeviceContext* ctx)
 			rs->base = r.base;
 			rs->fadeNow = timeAccum;
 			rs->fadeInTimeRcp = fadeInTimeRcp;
-			rs->pad = 0;
+			rs->pad0 = 0;
+			rs->origin[0] = r.origin.x;
+			rs->origin[1] = r.origin.y;
+			rs->origin[2] = r.origin.z;
+			rs->pad1 = 0.0f;
 			r.cbFirstConst = slot * 16;
 			++slot;
 		}
@@ -621,6 +625,24 @@ static bool IsGrassWorthyPass(RE::NiCullingProcess* proc)
 	if (auto* cam = proc->camera; cam && cam->GetRTTI() == self.BSCubeMapCamera_Ni_RTTI.get())
 		return false;
 
+	return true;
+}
+
+bool GrassOptimizations::EnsureTriggerCB(ID3D11Device* device)
+{
+	if (triggerCB)
+		return true;
+	D3D11_BUFFER_DESC bd{};
+	bd.ByteWidth = 16;
+	bd.Usage = D3D11_USAGE_DYNAMIC;
+	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	const HRESULT hr = device->CreateBuffer(&bd, nullptr, &triggerCB);
+	if (FAILED(hr) || !triggerCB) {
+		logger::error("[GRASS OPTIMIZATIONS] trigger CB create failed hr={:08X}", (unsigned)hr);
+		return false;
+	}
+	Util::SetResourceName(triggerCB, "GrassOptimizations::TriggerCB");
 	return true;
 }
 
@@ -687,6 +709,15 @@ void GrassOptimizations::Hooks::DoneAddingInstances::thunk(RE::BSMultiStreamInst
 	const uint32_t count = shape->GetMultiStreamTrishapeRuntimeData().instanceCount;
 	const uint32_t stride = 2u * shape->GetMultiStreamTrishapeRuntimeData().instanceSize;
 
+	static std::mutex mx;
+	static std::set<std::tuple<float, float, float>> os;
+	{
+		std::scoped_lock lk(mx);
+		auto& t = shape->world.translate;
+		if (os.emplace(t.x, t.y, t.z).second)
+			logger::info("[GO] origin ({},{},{}) count={}", t.x, t.y, t.z, os.size());
+	}
+
 	if (groupAlloc && count && stride) {
 		PendingCapture pc;
 		pc.shape = shape;
@@ -694,6 +725,7 @@ void GrassOptimizations::Hooks::DoneAddingInstances::thunk(RE::BSMultiStreamInst
 		pc.diffuseTexture = shape->GetGeometryRuntimeData().shaderProperty->GetBaseTexture();
 		pc.instanceStride = stride;
 		pc.count = count;
+		pc.origin = shape->world.translate;
 		pc.bytes.resize(static_cast<size_t>(count) * stride);
 		std::memcpy(pc.bytes.data(), groupAlloc, pc.bytes.size());
 		auto& self = globals::features::grassOptimizations;
@@ -962,6 +994,23 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass*, R
 	ctx->IASetVertexBuffers(0, 2, buffers, strides, offsets);
 
 	ctx->VSSetShaderResources(2, 1, &b->fadeSRV);
+
+	if (!self.EnsureTriggerCB(globals::d3d::device))
+		return;
+
+	{
+		D3D11_MAPPED_SUBRESOURCE tm{};
+		if (FAILED(ctx->Map(self.triggerCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &tm)))
+			return;
+		float* t = static_cast<float*>(tm.pData);
+		const auto& wt = geometry->world.translate;  
+		t[0] = wt.x;
+		t[1] = wt.y;
+		t[2] = wt.z;
+		t[3] = 0.0f;
+		ctx->Unmap(self.triggerCB, 0);
+	}
+	ctx->VSSetConstantBuffers(8, 1, &self.triggerCB);
 
 	if (!self.ctx1 || !self.runBaseCB) {
 		VanillaDrawInstanceTriShape(geometry);
