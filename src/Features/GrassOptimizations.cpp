@@ -4,6 +4,38 @@
 
 #include "Utils/D3D.h"
 
+#define I18N_KEY_PREFIX "feature.grass_optimizations."
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	GrassOptimizations::Settings,
+	ShowDebugVisualization)
+
+void GrassOptimizations::LoadSettings(json& o_json)
+{
+	settings = o_json;
+}
+
+void GrassOptimizations::SaveSettings(json& o_json)
+{
+	o_json = settings;
+}
+
+void GrassOptimizations::RestoreDefaultSettings()
+{
+	settings = {};
+}
+
+void GrassOptimizations::DrawSettings()
+{
+	ImGui::SeparatorText(T(TKEY("debug"), "Debug"));
+
+	ImGui::Checkbox(T(TKEY("show_bucket_debug_visualization"), "Show Bucket Debug Visualization"), &settings.ShowDebugVisualization);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T(TKEY("show_bucket_debug_visualization_tooltip"),
+							  "Colors grass instances by bucket"));
+	}
+}
+
 void GrassOptimizations::PostPostLoad()
 {
 	Hooks::Install();
@@ -150,9 +182,12 @@ void GrassOptimizations::RebuildBucket(GrassBucket& bucket, uint32_t instanceStr
 	fades.clear();
 	concat.reserve((size_t)bucket.totalInstances * instanceStride);
 	fades.reserve(bucket.totalInstances);
+	uint32_t off = 0;
 	for (auto& s : bucket.slices) {
+		s.bufferOffset = off;
 		concat.insert(concat.end(), s.data.begin(), s.data.end());
 		fades.insert(fades.end(), s.count, s.fadeStart);
+		off += s.count;
 	}
 
 	const D3D11_BOX box{ 0, 0, 0, (UINT)concat.size(), 1, 1 };
@@ -164,17 +199,36 @@ void GrassOptimizations::RebuildBucket(GrassBucket& bucket, uint32_t instanceStr
 
 void GrassOptimizations::AppendNewSlices(GrassBucket& bucket, uint32_t instanceStride, ID3D11DeviceContext* ctx)
 {
+	// Append position = end of what's actually in the buffer: last uploaded
+	// slice's offset + count. NOT a recomputed prefix sum over current slices —
+	// stored offsets are the single source of truth for buffer layout.
 	uint32_t prefix = 0;
-	for (uint32_t i = 0; i < bucket.firstNewSlice; ++i)
-		prefix += bucket.slices[i].count;
+	for (uint32_t i = 0; i < bucket.firstNewSlice; ++i) {
+		const auto& s = bucket.slices[i];
+		if (s.bufferOffset == UINT32_MAX || s.bufferOffset != prefix) {
+			// Leading region isn't the contiguous layout we'd append to —
+			// stale/divergent bookkeeping. Never guess: full rebuild instead.
+			logger::warn("[GRASS OPTIMIZATIONS] append prefix mismatch slice={} stored={} expected={} — rebuilding",
+				i, s.bufferOffset, prefix);
+			bucket.dirty = true;
+			RebuildBucket(bucket, instanceStride, globals::d3d::device, ctx);
+			return;
+		}
+		prefix += s.count;
+	}
 
 	static thread_local std::vector<uint8_t> tail;
 	static thread_local std::vector<float> fadeTail;
 	tail.clear();
 	fadeTail.clear();
+
+	uint32_t tailOff = 0;
 	for (uint32_t i = bucket.firstNewSlice; i < (uint32_t)bucket.slices.size(); ++i) {
-		tail.insert(tail.end(), bucket.slices[i].data.begin(), bucket.slices[i].data.end());
-		fadeTail.insert(fadeTail.end(), bucket.slices[i].count, bucket.slices[i].fadeStart);
+		auto& s = bucket.slices[i];
+		s.bufferOffset = prefix + tailOff;  // the running tail offset
+		tail.insert(tail.end(), s.data.begin(), s.data.end());
+		fadeTail.insert(fadeTail.end(), s.count, s.fadeStart);
+		tailOff += s.count;
 	}
 
 	if (!tail.empty()) {
@@ -183,11 +237,15 @@ void GrassOptimizations::AppendNewSlices(GrassBucket& bucket, uint32_t instanceS
 		ctx->UpdateSubresource(bucket.instanceBuf, 0, &box, tail.data(), 0, 0);
 
 		const D3D11_BOX fbox{ prefix * (UINT)sizeof(float), 0, 0,
-			(prefix + (UINT)fadeTail.size()) * (UINT)sizeof(float), 1, 1 };
+			(prefix + tailOff) * (UINT)sizeof(float), 1, 1 };
 		ctx->UpdateSubresource(bucket.fadeBuf, 0, &fbox, fadeTail.data(), 0, 0);
 	}
 	bucket.firstNewSlice = UINT32_MAX;
 }
+
+
+
+
 
 void GrassOptimizations::BuildVisibleRuns()
 {
@@ -213,18 +271,32 @@ void GrassOptimizations::BuildVisibleRuns()
 	}
 
 	// lane order x,y,z to match the min/max vectors below
-	const __m128 cam = _mm_set_ps(0.0f, camPos.z, camPos.y, camPos.x);
+	const __m128 cam4 = _mm_set_ps(0.0f, camPos.z, camPos.y, camPos.x);
 
 	for (auto& [key, b] : buckets) {
 		b.visibleRuns.clear();
 		b.visibleRuns.reserve((b.slices.size() >> 3) + 8);
 
-		uint32_t off = 0;
 		uint32_t runStart = 0;
 		uint32_t runLen = 0;
-		float runSortKeySq = FLT_MAX;  // sort key only — never used as a cull threshold
+		float runSortKeySq = FLT_MAX;  // sort key only — never a cull threshold
+		RE::NiPoint3 runOrigin{};
+
+		auto flush = [&] {
+			if (runLen > 0) {
+				b.visibleRuns.push_back({ runStart, runLen, UINT32_MAX, runSortKeySq, runOrigin });
+				runLen = 0;
+			}
+		};
 
 		for (const auto& s : b.slices) {
+			// Not in the GPU buffer (failed/pending upload): undrawable regardless
+			// of visibility — and must not be merged into any window.
+			if (s.bufferOffset == UINT32_MAX) {
+				flush();
+				continue;
+			}
+
 			bool vis = true;
 			float distSq = 0.0f;
 
@@ -233,8 +305,8 @@ void GrassOptimizations::BuildVisibleRuns()
 				const __m128 maxV = _mm_set_ps(0.0f, s.aabbMax.z, s.aabbMax.y, s.aabbMax.x);
 
 				// squared distance from camera to nearest point of the AABB
-				const __m128 clamped = _mm_max_ps(minV, _mm_min_ps(cam, maxV));
-				const __m128 diff = _mm_sub_ps(clamped, cam);
+				const __m128 clamped = _mm_max_ps(minV, _mm_min_ps(cam4, maxV));
+				const __m128 diff = _mm_sub_ps(clamped, cam4);
 				const __m128 sq = _mm_mul_ps(diff, diff);
 
 				__m128 sum = _mm_add_ps(sq, _mm_movehl_ps(sq, sq));
@@ -246,21 +318,27 @@ void GrassOptimizations::BuildVisibleRuns()
 			}
 
 			if (vis) {
+				// Merge ONLY on actual GPU adjacency AND matching origin; any
+				// bookkeeping divergence costs extra draws, never wrong data.
+				const bool adjacent = runLen > 0 && s.bufferOffset == runStart + runLen;
+				const bool sameOrigin = runLen > 0 &&
+				                        s.origin.x == runOrigin.x &&
+				                        s.origin.y == runOrigin.y &&
+				                        s.origin.z == runOrigin.z;  // exact compare: origins are copied, never recomputed
+				if (runLen > 0 && !(adjacent && sameOrigin))
+					flush();
 				if (runLen == 0) {
-					runStart = off;
+					runStart = s.bufferOffset;
 					runSortKeySq = FLT_MAX;
+					runOrigin = s.origin;
 				}
 				runLen += s.count;
 				runSortKeySq = std::min(runSortKeySq, distSq);
-			} else if (runLen > 0) {
-				b.visibleRuns.push_back({ runStart, runLen, UINT32_MAX, runSortKeySq });
-				runLen = 0;
+			} else {
+				flush();
 			}
-			off += s.count;
 		}
-
-		if (runLen > 0)
-			b.visibleRuns.push_back({ runStart, runLen, UINT32_MAX, runSortKeySq });
+		flush();
 
 		std::ranges::sort(b.visibleRuns,
 			[](const VisibleRun& a, const VisibleRun& r) { return a.sortKeySq < r.sortKeySq; });
@@ -598,16 +676,19 @@ void GrassOptimizations::UploadRunBases(ID3D11DeviceContext* ctx)
 	auto* bytes = static_cast<uint8_t*>(m.pData);
 	uint32_t slot = 0;
 	for (auto& [key, b] : buckets) {
+		b.slotBase = slot;
 		for (auto& r : b.visibleRuns) {
 			auto* rs = reinterpret_cast<RunSlot*>(bytes + (size_t)slot * 256);
 			rs->base = r.base;
 			rs->fadeNow = timeAccum;
 			rs->fadeInTimeRcp = fadeInTimeRcp;
-			rs->pad0 = 0;
+			rs->debugFlags = settings.ShowDebugVisualization;
 			rs->origin[0] = r.origin.x;
 			rs->origin[1] = r.origin.y;
 			rs->origin[2] = r.origin.z;
 			rs->pad1 = 0.0f;
+			rs->slotIndex = slot;
+			rs->pad2[0] = rs->pad2[1] = rs->pad2[2] = 0;
 			r.cbFirstConst = slot * 16;
 			++slot;
 		}
@@ -1017,11 +1098,25 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass*, R
 		return;
 	}
 
+	if (b->slotBase == UINT32_MAX)
+		return;  // upload failed this frame
+
 	ID3D11Buffer* cbs[1] = { self.runBaseCB };
+	uint32_t runIndex = 0;
 	for (const auto& r : b->visibleRuns) {
+		const UINT derived = (b->slotBase + runIndex) * 16;
+		++runIndex;
+
 		if (r.cbFirstConst == UINT32_MAX)
 			continue;
-		UINT first = r.cbFirstConst;
+		if (r.cbFirstConst != derived) {
+			// pairing violated: run list or slot assignment mutated between upload and draw
+			logger::error("[GRASS OPTIMIZATIONS] slot pairing mismatch: stored={} derived={} bucketBase={} run={}",
+				r.cbFirstConst, derived, b->slotBase, runIndex - 1);
+			continue;  // skip rather than draw with a wrong origin
+		}
+
+		UINT first = derived;
 		UINT num = 16;
 		self.ctx1->VSSetConstantBuffers1(7, 1, cbs, &first, &num);
 		ctx->DrawIndexedInstanced(indexCount, r.count, 0, 0, r.base);

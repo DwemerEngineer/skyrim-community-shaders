@@ -43,6 +43,9 @@ struct VS_OUTPUT
 	float4 WorldPosition: POSITION1;
 	float4 PreviousWorldPosition: POSITION2;
 	float4 VertexNormal: POSITION4;
+#	if defined(GRASS_OPTIMIZATIONS)
+	float DebugRunId: TEXCOORD5;
+#	endif // GRASS_OPTIMIZATIONS
 };
 #else
 struct VS_OUTPUT
@@ -58,6 +61,9 @@ struct VS_OUTPUT
 #	endif  // RENDER_DEPTH
 	float4 WorldPosition: POSITION1;
 	float4 PreviousWorldPosition: POSITION2;
+#	if defined(GRASS_OPTIMIZATIONS)
+	float DebugRunId: TEXCOORD5;
+#	endif // GRASS_OPTIMIZATIONS
 };
 #endif
 
@@ -99,13 +105,15 @@ cbuffer PerRun : register(b7)
 	uint BaseInstance;      // c0.x
 	float FadeNow;          // c0.y
 	float FadeInTimeRcp;    // c0.z
-	uint _padPerRun;        // c0.w
-	float3 RunOrigin;       // c1.xyz — absolute world origin of this run's source shape
+	uint DebugFlags;        // c0.w
+	float3 RunOrigin;       // c1.xyz
 	float _padPerRun2;      // c1.w
+	uint RunSlotIndex;      // c2.x
+	uint3 _padPerRun3;      // c2.yzw
 }
 cbuffer PerTrigger : register(b8)
 {
-	float3 TriggerOrigin;   // absolute world origin of the shape whose b2 is bound
+	float3 TriggerOrigin;
 	float _padPerTrigger;
 }
 #	else
@@ -213,7 +221,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.VertexMult = input.InstanceData1.w;
 
 	vsout.TexCoord.xy = input.TexCoord.xy;
-	vsout.TexCoord.z = FogNearColor.w;
+    vsout.TexCoord.z = FogNearColor.w;
 
 	vsout.ViewSpacePosition = mul(WorldView, msPosition).xyz;
 	vsout.WorldPosition = mul(World, msPosition);
@@ -221,6 +229,10 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	// Vertex normal needs to be transformed to world-space for lighting calculations.
 	vsout.VertexNormal.xyz = mul(world3x3, input.Normal.xyz * 2.0 - 1.0);
 	vsout.VertexNormal.w = input.Color.w;
+
+#	ifdef GRASS_OPTIMIZATIONS
+	vsout.DebugRunId = (DebugFlags & 1u) ? (float)RunSlotIndex : -1.0;
+#	endif
 
 	return vsout;
 }
@@ -282,6 +294,10 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.WorldPosition = mul(World, msPosition);
 
 	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
+
+#	ifdef GRASS_OPTIMIZATIONS
+	vsout.DebugRunId = (DebugFlags & 1u) ? (float)RunSlotIndex : -1.0;
+#	endif
 
 	return vsout;
 }
@@ -636,6 +652,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	psout.Masks = float4(0, 0, Color::RGBToYCoCg(directionalAmbientColor).x, 0);
 	psout.Masks2 = float4(1.0 - vertexAO, 0, 0, 0);
 #		endif
+
+#if defined(GRASS_OPTIMIZATIONS) && !defined(RENDER_DEPTH)
+	[branch] if (input.DebugRunId >= 0.0) {
+		uint slotId = (uint)(input.DebugRunId + 0.5);
+		float3 runColor = frac(float3(slotId * 0.6180339887, slotId * 0.7548776662, slotId * 0.5698402909));
+		psout.Diffuse.xyz = runColor;
+	}
+#endif
+
 	return psout;
 }
 #	else
@@ -785,6 +810,14 @@ PS_OUTPUT main(PS_INPUT input)
 	psout.Masks = float4(0, 0, Color::RGBToYCoCg(directionalAmbientColor).x, 0);
 	psout.Masks2 = float4(1.0 - vertexAO, 0, 0, 0);
 #		endif
+
+#if defined(GRASS_OPTIMIZATIONS) && !defined(RENDER_DEPTH)
+	[branch] if (input.DebugRunId >= 0.0) {
+		uint slotId = (uint)(input.DebugRunId + 0.5);
+		float3 runColor = frac(float3(slotId * 0.6180339887, slotId * 0.7548776662, slotId * 0.5698402909));
+		psout.Diffuse.xyz = runColor;
+	}
+#endif
 
 	return psout;
 }
