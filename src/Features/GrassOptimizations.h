@@ -22,6 +22,7 @@ struct VisibleRun
 	uint32_t cbFirstConst = UINT32_MAX;
 	float sortKeySq = 0.0f;
 	RE::NiPoint3 origin;
+	uint32_t drawCount;
 };
 
 struct GrassBucket
@@ -34,7 +35,7 @@ struct GrassBucket
 	std::vector<BucketSlice> slices;
 	bool dirty = false;
 	uint32_t drawnFrame = UINT32_MAX;
-	uint32_t drawnTechnique = UINT32_MAX;
+	RE::BSRenderPass* drawnPass = nullptr;
 	uint64_t descVal = 0;
 	void* drawnVS = nullptr;
 	uint32_t firstNewSlice = UINT32_MAX;
@@ -79,16 +80,17 @@ struct PendingCapture
 	RE::NiPoint3 origin;
 };
 
-struct RunSlot  // must match HLSL PerRun (c0–c2)
+struct RunSlot
 {
-	uint32_t base;        // c0.x
-	float fadeNow;        // c0.y
-	float fadeInTimeRcp;  // c0.z
-	uint32_t debugFlags;  // c0.w
-	float origin[3];      // c1.xyz
-	float pad1;           // c1.w
-	uint32_t slotIndex;   // c2.x — debug: global slot id for run coloring
-	uint32_t pad2[3];     // c2.yzw
+	uint32_t base;
+	float fadeNow;
+	float fadeInTimeRcp;
+	uint32_t debugFlags;
+	float origin[3];
+	float pad1;
+	uint32_t slotIndex;
+	uint32_t isFar; 
+	uint32_t pad2[2]; 
 };
 
 struct GrassOptimizations : Feature
@@ -113,11 +115,31 @@ public:
 	struct Settings
 	{
 		bool ShowDebugVisualization = false;
+		float BeginThinningDistance = 8000.0f;
+		float ThinningDistance = 6000.0f;
+		float MinDistantAmmount = 0.25f;
+		float shadowGrassDistance = 8000.0f;
+		float farGrassDistance = 8000.0f;
 	};
 
 	Settings settings;
 
-	std::unordered_map<RE::NiSourceTexture*, GrassBucket> buckets;
+	struct BucketKey
+	{
+		RE::NiSourceTexture* tex;
+		uint64_t descVal;
+		bool operator==(const BucketKey&) const = default;
+	};
+
+	struct BucketKeyHash
+	{
+		size_t operator()(const BucketKey& k) const
+		{
+			return std::hash<void*>{}(k.tex) ^ (std::hash<uint64_t>{}(k.descVal) << 1);
+		}
+	};
+
+	std::unordered_map<BucketKey, GrassBucket, BucketKeyHash> buckets;
 	std::mutex bucketMutex;
 
 	std::vector<PendingCapture> pendingCaptures;
@@ -154,6 +176,10 @@ public:
 	float fadeInTimeRcp = 0.0f;
 
 	ID3D11Buffer* triggerCB = nullptr;
+	RE::NiPoint3 lastTriggerOrigin{ FLT_MAX, FLT_MAX, FLT_MAX };
+
+	float shadowGrassDistance = 0.0f;
+	float shadowGrassDistSq = 0.0f;
 
 	void UpdateGrass();
 	void ApplyRemovals(const std::vector<RE::BSMultiStreamInstanceTriShape*>& removes);
@@ -165,12 +191,7 @@ public:
 	bool EnsureBucketCapacity(GrassBucket& b, uint32_t neededInstances, uint32_t instanceStride, ID3D11Device* device);
 	bool AabbVisible(const RE::NiFrustumPlanes& f, const RE::NiPoint3& mn, const RE::NiPoint3& mx);
 	void CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape, RE::BSMultiStreamInstanceTriShape::GroupHeader* header, const uint16_t* instanceData);
-	void ComputeCaptureAabb(PendingCapture& pc, const RE::NiPoint3& shapeTranslate);
-	bool IsBucketRegistered(RE::BSMultiStreamInstanceTriShape* shape, uint32_t frame, const RE::NiCullingProcess* process);
-	void MarkBucketRegistered(RE::BSMultiStreamInstanceTriShape* shape, uint32_t frame, const RE::NiCullingProcess* process);
-
-	bool IsBucketKey(RE::NiSourceTexture* tex) const;
-	RE::NiSourceTexture* GetGrassBucketKey(RE::NiAVObject* obj) const;
+	void BuildSubCellSlices(GrassBucket& bucket, RE::BSMultiStreamInstanceTriShape* shape, const uint8_t* src, uint32_t count, uint32_t stride, const RE::NiPoint3& wt, float fadeStart);
 
 	void InitRunBaseCB();                           // call once at feature init
 	void UploadRunBases(ID3D11DeviceContext* ctx);  // per frame, after BuildVisibleRuns
@@ -263,46 +284,16 @@ public:
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
 
-		struct ExecuteCullingPass
-		{
-			static void thunk(void* a_cullParam, int a2, int a3);
-			static inline REL::Relocation<decltype(thunk)> func;
-		};
-
-		struct BSCullingProcess_Process
-		{
-			static void thunk(RE::BSCullingProcess* process, RE::BSTArray<RE::NiPointer<RE::NiAVObject>>* objArray, bool processCullingProcess, bool queueCullingJob);
-			static inline REL::Relocation<decltype(thunk)> func;
-		};
-
-		struct RegisterObject
-		{
-			static void thunk(RE::BSShaderAccumulator*, RE::NiAVObject*, RE::BSBatchRenderer::GeometryGroup*);
-			static inline REL::Relocation<decltype(thunk)> func;
-		};
-
-		struct ProcessAlphaGroups
-		{
-			static void thunk(RE::BSGeometryListCullingProcess*, RE::BSShaderAccumulator*);
-			static inline REL::Relocation<decltype(thunk)> func;
-		};
-
-		struct WithinFrustum
-		{
-			static bool thunk(RE::BSMultiBoundAABB* a_this, RE::NiFrustumPlanes* a_planes);
-			static inline REL::Relocation<decltype(thunk)> func;
-		};
-
 		static void Install()
 		{
 			auto& trampoline = SKSE::GetTrampoline();
 
 			stl::write_vfunc<0x0, BSMultiStreamInstanceTriShape_dtor>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
-			//stl::write_vfunc<0x34, BSMultiStreamInstanceTriShape_OnVisible>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
+			stl::write_vfunc<0x34, BSMultiStreamInstanceTriShape_OnVisible>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 			stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 
 			stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
-			//stl::write_vfunc<0x29, BSMultiBoundAABB_WithinFrustum>(RE::VTABLE_BSMultiBoundAABB[0]);
+			stl::write_vfunc<0x29, BSMultiBoundAABB_WithinFrustum>(RE::VTABLE_BSMultiBoundAABB[0]);
 
 			stl::write_thunk_call<AddQueuedGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x7FF, 0));
 			stl::write_thunk_call<AddGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x806, 0x75D));
@@ -322,17 +313,6 @@ public:
 			} else {
 				REL::safe_write(REL::RelocationID(99996, 106685).address() + REL::Relocate(0x54D, 0x595), REL::NOP5);
 			}
-
-			//stl::write_thunk_call<ExecuteCullingPass>(REL::RelocationID(100416, 107134).address() + REL::Relocate(0xFE, 0));
-			//stl::write_thunk_call<RegisterObject>(REL::RelocationID(74809, 0).address() + REL::Relocate(0x73, 0));
-
-			//stl::write_thunk_call<RegisterObject>(REL::RelocationID(74809, 0).address() + REL::Relocate(0x159, 0));
-			//stl::write_thunk_call<RegisterObject>(REL::RelocationID(101601, 0).address() + REL::Relocate(0x70, 0));
-			//stl::write_thunk_call<RegisterObject>(REL::RelocationID(99974, 0).address() + REL::Relocate(0xE4, 0));
-
-			//stl::write_thunk_call<ProcessAlphaGroups>(REL::RelocationID(100219, 0).address() + REL::Relocate(0x4E, 0));
-
-			//stl::write_thunk_call<WithinFrustum, 6>(REL::RelocationID(74602, 0).address() + REL::Relocate(0x19C, 0));
 
 			logger::info("[GRASS OPTIMIZATIONS] Installed hooks");
 		}
