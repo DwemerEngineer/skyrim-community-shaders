@@ -45,6 +45,7 @@ struct VS_OUTPUT
 	float4 VertexNormal: POSITION4;
 #	if defined(GRASS_OPTIMIZATIONS)
 	float DebugRunId: TEXCOORD5;
+	uint IsFarInterp : TEXCOORD6;
 #	endif // GRASS_OPTIMIZATIONS
 };
 #else
@@ -63,7 +64,8 @@ struct VS_OUTPUT
 	float4 PreviousWorldPosition: POSITION2;
 #	if defined(GRASS_OPTIMIZATIONS)
 	float DebugRunId: TEXCOORD5;
-#	endif // GRASS_OPTIMIZATIONS
+ uint IsFarInterp : TEXCOORD6;
+#endif // GRASS_OPTIMIZATIONS
 };
 #endif
 
@@ -102,14 +104,15 @@ cbuffer PerGeometry : register(
 StructuredBuffer<float> InstanceFadeStart : register(t2);
 cbuffer PerRun : register(b7)
 {
-	uint BaseInstance;      // c0.x
-	float FadeNow;          // c0.y
-	float FadeInTimeRcp;    // c0.z
-	uint DebugFlags;        // c0.w
-	float3 RunOrigin;       // c1.xyz
-	float _padPerRun2;      // c1.w
-	uint RunSlotIndex;      // c2.x
-	uint3 _padPerRun3;      // c2.yzw
+	uint BaseInstance;
+	float FadeNow;
+	float FadeInTimeRcp;
+	uint DebugFlags; 
+	float3 RunOrigin;
+	float _padPerRun2; 
+	uint RunSlotIndex;
+	uint IsFar;
+	uint2 _padPerRun3;
 }
 cbuffer PerTrigger : register(b8)
 {
@@ -186,7 +189,6 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
     float4 previousMsPosition = msPosition; 
 
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
-	float3 previousWindDisplacement = CalculateWindDisplacement(input, PreviousWindTimer);
 
 #		ifdef GRASS_COLLISION
 	float3 displacement, previousDisplacement;
@@ -196,7 +198,16 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 #		endif  // GRASS_COLLISION
 
 	msPosition.xyz += windDisplacement;
-	previousMsPosition.xyz += previousWindDisplacement;
+
+	#	ifdef GRASS_OPTIMIZATIONS
+	[branch] if (IsFar) {
+		previousMsPosition = msPosition;
+	} else
+#	endif
+	{
+		float3 previousWindDisplacement = CalculateWindDisplacement(input, PreviousWindTimer);
+		previousMsPosition.xyz += previousWindDisplacement;
+	}
 
 	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
 
@@ -232,6 +243,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 
 #	ifdef GRASS_OPTIMIZATIONS
 	vsout.DebugRunId = (DebugFlags & 1u) ? (float)RunSlotIndex : -1.0;
+	vsout.IsFarInterp = IsFar;
 #	endif
 
 	return vsout;
@@ -249,7 +261,6 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
     float4 previousMsPosition = msPosition;
 
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
-	float3 previousWindDisplacement = CalculateWindDisplacement(input, PreviousWindTimer);
 
 #		ifdef GRASS_COLLISION
 	float3 displacement, previousDisplacement;
@@ -259,7 +270,16 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 #		endif  // GRASS_COLLISION
 
 	msPosition.xyz += windDisplacement;
-    previousMsPosition.xyz += previousWindDisplacement;
+
+  #	ifdef GRASS_OPTIMIZATIONS
+	[branch] if (IsFar) {
+		previousMsPosition = msPosition;
+	} else
+#	endif
+	{
+		float3 previousWindDisplacement = CalculateWindDisplacement(input, PreviousWindTimer);
+		previousMsPosition.xyz += previousWindDisplacement;
+	}
 
 	float4 projSpacePosition = mul(WorldViewProj, msPosition);
 	vsout.HPosition = projSpacePosition;
@@ -297,6 +317,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 
 #	ifdef GRASS_OPTIMIZATIONS
 	vsout.DebugRunId = (DebugFlags & 1u) ? (float)RunSlotIndex : -1.0;
+	vsout.IsFarInterp = IsFar;
 #	endif
 
 	return vsout;
