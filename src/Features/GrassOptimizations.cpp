@@ -168,12 +168,6 @@ void GrassOptimizations::UpdateGrass()
 
 	const auto [screenW, screenH] = globals::game::renderer->GetScreenSize();
 
-	const bool hiZReady =
-		EnsureHiZResources((uint32_t)screenW, (uint32_t)screenH, device) && hiZCopyCS && hiZBuildCS;
-	if (hiZReady)
-		BuildHiZ(ctx);
-
-
 	{
 		D3D11_MAPPED_SUBRESOURCE m{};
 		if (SUCCEEDED(ctx->Map(cullParamsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -192,6 +186,7 @@ void GrassOptimizations::UpdateGrass()
 			cp->lodNearDistSq = 8000.0f * 8000.0f;
 			cp->lodFarDistSq = 16000.0f * 16000.0f;
 			cp->lodMinKeep = 0.15f;
+			cp->clumpRadius = 128.0f;
 			cp->projScale = screenH / (2.0f * tanf(0.5f * Util::GetVerticalFOVRad()));
 			cp->minPixelSize = 2.0f;
 			const float d = maxGrassDistance;
@@ -199,13 +194,6 @@ void GrassOptimizations::UpdateGrass()
 			cp->bandDistSq[1] = (d * 0.35f) * (d * 0.35f);
 			cp->bandDistSq[2] = (d * 0.65f) * (d * 0.65f);
 			cp->pad2 = 0.0f;
-
-			const auto& vp = globals::game::frameBufferCached.GetCameraViewProj();
-			std::memcpy(cp->viewProj, &vp, sizeof(cp->viewProj));
-			cp->hiZDims[0] = (float)hiZWidth;
-			cp->hiZDims[1] = (float)hiZHeight;
-			cp->maxHiZMip = hiZMips ? hiZMips - 1 : 0;
-			cp->hiZValid = hiZReady ? 1u : 0u;
 			ctx->Unmap(cullParamsCB, 0);
 		}
 	}
@@ -796,48 +784,14 @@ void GrassOptimizations::InitCullResources()
 	if (!detectCS) {
 		logger::error("[GRASS OPTIMIZATIONS] detect CS load failed — complex detection disabled");
 	}
-
-	if (!makeDynamicCB(&hiZParamsCB, sizeof(HiZParamsCB), "GrassOptimizations::HiZParamsCB"))
-		return;
-
-	{
-		D3D11_SAMPLER_DESC sd{};
-		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-		sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-		sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-		sd.MaxLOD = D3D11_FLOAT32_MAX;
-		if (FAILED(device->CreateSamplerState(&sd, &pointClamp)) || !pointClamp) {
-			logger::error("[GRASS OPTIMIZATIONS] point sampler create failed");
-			return;
-		}
-	}
-
-	hiZCopyCS = static_cast<ID3D11ComputeShader*>(
-		Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\HiZCopyCS.hlsl", {}, "cs_5_0"));
-	hiZBuildCS = static_cast<ID3D11ComputeShader*>(
-		Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\BuildHiZCS.hlsl", {}, "cs_5_0"));
-	if (!hiZCopyCS || !hiZBuildCS)
-		logger::error("[GRASS OPTIMIZATIONS] HiZ shaders failed to compile — occlusion culling disabled");
 }
 
 void GrassOptimizations::CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
 {
 	float wavePeriod = 1.0f;
-	float boundCenter[3] = { 0.0f, 0.0f, 0.0f };
-	float clumpRadius = 128.0f;
-
 	if (!b.slices.empty() && b.slices[0].shape) {
-		auto* shape = b.slices[0].shape;
-
-		if (auto* prop = static_cast<RE::BSGrassShaderProperty*>(
-				shape->GetGeometryRuntimeData().shaderProperty.get()))
+		if (auto* prop = static_cast<RE::BSGrassShaderProperty*>(b.slices[0].shape->GetGeometryRuntimeData().shaderProperty.get()))
 			wavePeriod = prop->wavePeriod;
-
-		const auto& bound = shape->GetModelData().modelBound;
-		boundCenter[0] = bound.center.x;
-		boundCenter[1] = bound.center.y;
-		boundCenter[2] = bound.center.z;
-		clumpRadius = bound.radius;
 	}
 
 	{
@@ -849,10 +803,6 @@ void GrassOptimizations::CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
 		cb->wavePeriod = wavePeriod;
 		cb->timeBase = timeBase;
 		cb->prevTimeBase = prevTimeBase;
-		cb->boundCenter[0] = boundCenter[0];
-		cb->boundCenter[1] = boundCenter[1];
-		cb->boundCenter[2] = boundCenter[2];
-		cb->clumpRadius = clumpRadius;
 		ctx->Unmap(cullBucketCB, 0);
 	}
 
@@ -865,16 +815,15 @@ void GrassOptimizations::CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
 	ctx->CSSetShader(cullCS, nullptr, 0);
 	ID3D11Buffer* cbs[2] = { cullParamsCB, cullBucketCB };
 	ctx->CSSetConstantBuffers(0, 2, cbs);
-	ID3D11ShaderResourceView* srvs[3] = { b.instanceSRV, b.originSRV, hiZSRV };
-	ctx->CSSetShaderResources(0, 3, srvs);
-	ctx->CSSetSamplers(0, 1, &pointClamp);
+	ID3D11ShaderResourceView* srvs[2] = { b.instanceSRV, b.originSRV };
+	ctx->CSSetShaderResources(0, 2, srvs);
 
 	ctx->Dispatch((b.totalInstances + 63) / 64, 1, 1);
 
 	ID3D11UnorderedAccessView* nullUAVs[GrassBucket::kBands + 1] = {};
 	ctx->CSSetUnorderedAccessViews(0, GrassBucket::kBands + 1, nullUAVs, nullptr);
-	ID3D11ShaderResourceView* nullSRVs[3] = {};
-	ctx->CSSetShaderResources(0, 3, nullSRVs);
+	ID3D11ShaderResourceView* nullSRVs[2] = {};
+	ctx->CSSetShaderResources(0, 2, nullSRVs);
 
 	for (uint32_t band = 0; band < GrassBucket::kBands; ++band)
 		ctx->CopyStructureCount(b.argsBuf[band], sizeof(uint32_t), b.visibleUAV[band]);
@@ -1263,159 +1212,5 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 		vsSRVs[3] = b->visibleSRV[band];
 		ctx->VSSetShaderResources(2, 5, vsSRVs);
 		ctx->DrawIndexedInstancedIndirect(b->argsBuf[band], 0);
-	}
-}
-
-bool GrassOptimizations::EnsureHiZResources(uint32_t w, uint32_t h, ID3D11Device* device)
-{
-	if (hiZTex && hiZWidth == w && hiZHeight == h)
-		return true;
-
-	ReleaseHiZResources();
-	if (!w || !h)
-		return false;
-
-	uint32_t mips = 1;
-	while ((w >> mips) > 0 || (h >> mips) > 0)
-		++mips;
-
-	D3D11_TEXTURE2D_DESC td{};
-	td.Width = w;
-	td.Height = h;
-	td.MipLevels = mips;
-	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R32_FLOAT;
-	td.SampleDesc.Count = 1;
-	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-	if (FAILED(device->CreateTexture2D(&td, nullptr, &hiZTex)) || !hiZTex) {
-		logger::error("[GRASS OPTIMIZATIONS] HiZ texture create failed {}x{} mips={}", w, h, mips);
-		return false;
-	}
-	Util::SetResourceName(hiZTex, "GrassOptimizations::HiZTex");
-
-	{
-		D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-		sv.Format = DXGI_FORMAT_R32_FLOAT;
-		sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		sv.Texture2D.MostDetailedMip = 0;
-		sv.Texture2D.MipLevels = mips;
-		if (FAILED(device->CreateShaderResourceView(hiZTex, &sv, &hiZSRV)) || !hiZSRV) {
-			logger::error("[GRASS OPTIMIZATIONS] HiZ SRV create failed");
-			ReleaseHiZResources();
-			return false;
-		}
-		Util::SetResourceName(hiZSRV, "GrassOptimizations::HiZTex SRV");
-	}
-
-	hiZMipUAV.resize(mips, nullptr);
-	hiZMipSRV.resize(mips, nullptr);
-	for (uint32_t m = 0; m < mips; ++m) {
-		D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
-		uav.Format = DXGI_FORMAT_R32_FLOAT;
-		uav.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-		uav.Texture2D.MipSlice = m;
-		if (FAILED(device->CreateUnorderedAccessView(hiZTex, &uav, &hiZMipUAV[m])) || !hiZMipUAV[m]) {
-			logger::error("[GRASS OPTIMIZATIONS] HiZ mip {} UAV create failed", m);
-			ReleaseHiZResources();
-			return false;
-		}
-		Util::SetResourceName(hiZMipUAV[m], "GrassOptimizations::HiZ mip UAV");
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-		sv.Format = DXGI_FORMAT_R32_FLOAT;
-		sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		sv.Texture2D.MostDetailedMip = m;
-		sv.Texture2D.MipLevels = 1;
-		if (FAILED(device->CreateShaderResourceView(hiZTex, &sv, &hiZMipSRV[m])) || !hiZMipSRV[m]) {
-			logger::error("[GRASS OPTIMIZATIONS] HiZ mip {} SRV create failed", m);
-			ReleaseHiZResources();
-			return false;
-		}
-		Util::SetResourceName(hiZMipSRV[m], "GrassOptimizations::HiZ mip SRV");
-	}
-
-	hiZWidth = w;
-	hiZHeight = h;
-	hiZMips = mips;
-	return true;
-}
-
-void GrassOptimizations::ReleaseHiZResources()
-{
-	for (auto*& v : hiZMipUAV)
-		if (v) {
-			v->Release();
-			v = nullptr;
-		}
-	for (auto*& v : hiZMipSRV)
-		if (v) {
-			v->Release();
-			v = nullptr;
-		}
-	hiZMipUAV.clear();
-	hiZMipSRV.clear();
-	if (hiZSRV) {
-		hiZSRV->Release();
-		hiZSRV = nullptr;
-	}
-	if (hiZTex) {
-		hiZTex->Release();
-		hiZTex = nullptr;
-	}
-	hiZWidth = hiZHeight = hiZMips = 0;
-}
-
-void GrassOptimizations::BuildHiZ(ID3D11DeviceContext* ctx)
-{
-	if (!hiZCopyCS || !hiZBuildCS || !hiZTex)
-		return;
-
-	// VERIFY: the main depth SRV, populated with opaque geometry by cull time.
-	ID3D11ShaderResourceView* depthSRV = Util::GetCurrentSceneDepthSRV();
-	if (!depthSRV)
-		return;
-
-	auto writeParams = [&](uint32_t dw, uint32_t dh, uint32_t sw, uint32_t sh) {
-		D3D11_MAPPED_SUBRESOURCE m{};
-		if (SUCCEEDED(ctx->Map(hiZParamsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-			auto* p = static_cast<HiZParamsCB*>(m.pData);
-			p->dstDims[0] = dw;
-			p->dstDims[1] = dh;
-			p->srcDims[0] = sw;
-			p->srcDims[1] = sh;
-			ctx->Unmap(hiZParamsCB, 0);
-		}
-	};
-
-	ID3D11ShaderResourceView* nullSRV = nullptr;
-	ID3D11UnorderedAccessView* nullUAV = nullptr;
-
-	ctx->CSSetConstantBuffers(0, 1, &hiZParamsCB);
-
-	// mip 0 = depth
-	writeParams(hiZWidth, hiZHeight, hiZWidth, hiZHeight);
-	ctx->CSSetShader(hiZCopyCS, nullptr, 0);
-	ctx->CSSetShaderResources(0, 1, &depthSRV);
-	ctx->CSSetUnorderedAccessViews(0, 1, &hiZMipUAV[0], nullptr);
-	ctx->Dispatch((hiZWidth + 7) / 8, (hiZHeight + 7) / 8, 1);
-	ctx->CSSetShaderResources(0, 1, &nullSRV);
-	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-
-	// mips 1..N-1, each a min-reduction of the one above
-	ctx->CSSetShader(hiZBuildCS, nullptr, 0);
-	for (uint32_t mip = 1; mip < hiZMips; ++mip) {
-		const uint32_t sw = std::max(1u, hiZWidth >> (mip - 1));
-		const uint32_t sh = std::max(1u, hiZHeight >> (mip - 1));
-		const uint32_t dw = std::max(1u, hiZWidth >> mip);
-		const uint32_t dh = std::max(1u, hiZHeight >> mip);
-
-		writeParams(dw, dh, sw, sh);
-		ctx->CSSetShaderResources(0, 1, &hiZMipSRV[mip - 1]);
-		ctx->CSSetUnorderedAccessViews(0, 1, &hiZMipUAV[mip], nullptr);
-		ctx->Dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
-		// must unbind: next iteration reads this mip as SRV
-		ctx->CSSetShaderResources(0, 1, &nullSRV);
-		ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
 	}
 }
