@@ -209,10 +209,8 @@ public:
 		float wavePeriod;
 		float timeBase;
 		float prevTimeBase;
-		float boundCenter[3];  // local offset from the instance origin to the bound center
-		float clumpRadius;     // bound radius
 	};
-	static_assert(sizeof(CullBucketCB) == 32);
+	static_assert(sizeof(CullBucketCB) == 16);
 
 	ID3D11ComputeShader* cullCS = nullptr;
 	ID3D11Buffer* cullParamsCB = nullptr;  // per-frame frustum + params
@@ -220,25 +218,21 @@ public:
 	bool cullInit = false;
 	struct CullParamsCB
 	{
-		float frustumPlanes[6][4];  // 96
-		float cameraPos[3];         // 108
-		uint32_t pad0;              // 112
+		float frustumPlanes[6][4];
+		float cameraPos[3];
+		uint32_t pad0;
 		float maxDistSq;
 		float pad1;
 		float lodNearDistSq;
-		float lodFarDistSq;  // 128
+		float lodFarDistSq;
 		float lodMinKeep;
+		float clumpRadius;
 		float projScale;
 		float minPixelSize;
-		float edgeOnCos;  // 144
-		float bandDistSq[3];
-		float pad2;            // 160
-		float viewProj[4][4];  // 224 — row-major, same matrix the VS projects with
-		float hiZDims[2];      // mip 0 dimensions
-		uint32_t maxHiZMip;
-		uint32_t hiZValid;  // 0 → skip the occlusion test entirely
-	};  // 240
-	static_assert(sizeof(CullParamsCB) % 16 == 0);
+		float bandDistSq[3];  // NEW — 3 boundaries → 4 bands
+		float pad2;           // NEW
+	};
+	static_assert(sizeof(CullParamsCB) % 16 == 0);  // 160
 	ID3D11Buffer* grassFrameCB = nullptr; 
 
 	ID3D11ComputeShader* detectCS = nullptr;
@@ -252,28 +246,6 @@ public:
 	float prevTimeBase = 0.0f;
 
 	float cachedComplexThreshold = -1.0f; 
-
-	// Hi-Z occlusion
-	ID3D11Texture2D* hiZTex = nullptr;
-	ID3D11ShaderResourceView* hiZSRV = nullptr;         // full chain — cull CS
-	std::vector<ID3D11UnorderedAccessView*> hiZMipUAV;  // per-mip write
-	std::vector<ID3D11ShaderResourceView*> hiZMipSRV;   // per-mip read
-	ID3D11ComputeShader* hiZCopyCS = nullptr;
-	ID3D11ComputeShader* hiZBuildCS = nullptr;
-	ID3D11Buffer* hiZParamsCB = nullptr;
-	ID3D11SamplerState* pointClamp = nullptr;
-	uint32_t hiZWidth = 0, hiZHeight = 0, hiZMips = 0;
-
-	struct HiZParamsCB
-	{
-		uint32_t dstDims[2];
-		uint32_t srcDims[2];
-	};
-	static_assert(sizeof(HiZParamsCB) == 16);
-
-	bool EnsureHiZResources(uint32_t w, uint32_t h, ID3D11Device* device);
-	void ReleaseHiZResources();
-	void BuildHiZ(ID3D11DeviceContext* ctx);
 
 	void InitCullResources();                                   // once
 	void CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx);  // per bucket per frame
