@@ -9,8 +9,6 @@ struct BucketSlice
 	std::vector<uint8_t> data;
 	uint32_t count;
 	float fadeStart;
-	RE::NiPoint3 aabbMin;
-	RE::NiPoint3 aabbMax;
 	RE::NiPoint3 origin;
 	uint32_t bufferOffset = UINT32_MAX;
 };
@@ -27,34 +25,60 @@ struct VisibleRun
 
 struct GrassBucket
 {
-	ID3D11Buffer* instanceBuf = nullptr;
-	ID3D11Buffer* fadeBuf = nullptr;
+	static constexpr uint32_t kBands = 4;
+
+	// Static GPU state (rebuilt on capture/removal)
+	ID3D11Buffer* instanceBuf = nullptr;  // ByteAddressBuffer: raw half-packed records
+	ID3D11ShaderResourceView* instanceSRV = nullptr;
+	ID3D11Buffer* originBuf = nullptr;  // StructuredBuffer<float3> per-instance origin
+	ID3D11ShaderResourceView* originSRV = nullptr;
+	ID3D11Buffer* fadeBuf = nullptr;  // StructuredBuffer<float> per-instance fade start
 	ID3D11ShaderResourceView* fadeSRV = nullptr;
+
+	ID3D11Buffer* visibleBuf[kBands] = {};
+	ID3D11UnorderedAccessView* visibleUAV[kBands] = {};
+	ID3D11ShaderResourceView* visibleSRV[kBands] = {};
+	ID3D11Buffer* argsBuf[kBands] = {};
+
+	ID3D11Buffer* windBuf = nullptr;  // float2 per instance {cur, prev}
+	ID3D11UnorderedAccessView* windUAV = nullptr;
+	ID3D11ShaderResourceView* windSRV = nullptr;
+
 	uint32_t capacityInstances = 0;
 	uint32_t totalInstances = 0;
 	std::vector<BucketSlice> slices;
 	bool dirty = false;
+	uint64_t descVal = 0;
+	uint32_t firstNewSlice = UINT32_MAX;
+
 	uint32_t drawnFrame = UINT32_MAX;
 	RE::BSRenderPass* drawnPass = nullptr;
-	uint64_t descVal = 0;
-	void* drawnVS = nullptr;
-	uint32_t firstNewSlice = UINT32_MAX;
-	std::vector<VisibleRun> visibleRuns;
-	uint32_t registeredFrame = UINT32_MAX;
-	const void* registeredProc = nullptr;
-	uint32_t slotBase = UINT32_MAX; 
+
+	RE::NiPoint3 coarseMin{};
+	RE::NiPoint3 coarseMax{};
+	bool coarseValid = false;
+	bool cullVisible = false;
+
+	bool isComplex = false;
 
 	void ReleaseResources()
 	{
-		if (instanceBuf)
-			instanceBuf->Release();
-		if (fadeBuf)
-			fadeBuf->Release();
-		if (fadeSRV)
-			fadeSRV->Release();
-
-		instanceBuf = fadeBuf = nullptr;
-		fadeSRV = nullptr;
+		auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
+		rel(instanceSRV);
+		rel(instanceBuf);
+		rel(originSRV);
+		rel(originBuf);
+		rel(fadeSRV);
+		rel(fadeBuf);
+		for (uint32_t i = 0; i < kBands; ++i) {
+			rel(visibleSRV[i]);
+			rel(visibleUAV[i]);
+			rel(visibleBuf[i]);
+			rel(argsBuf[i]);
+		}
+		rel(windSRV);
+		rel(windUAV);
+		rel(windBuf);
 		capacityInstances = 0;
 	}
 
@@ -63,9 +87,10 @@ struct GrassBucket
 		ReleaseResources();
 		totalInstances = 0;
 		slices.clear();
-		visibleRuns.clear();
 	}
+	// cull buffers (visibleBuf/argsBuf + UAVs) added in piece 2
 };
+
 
 struct PendingCapture
 {
@@ -116,8 +141,8 @@ public:
 	{
 		bool ShowDebugVisualization = false;
 		float BeginThinningDistance = 8000.0f;
-		float ThinningDistance = 6000.0f;
-		float MinDistantAmmount = 0.25f;
+		float ThinningDistance = 8000.0f;
+		float MinDistantAmmount = 0.15f;
 		float shadowGrassDistance = 8000.0f;
 		float farGrassDistance = 8000.0f;
 	};
@@ -165,9 +190,6 @@ public:
 	uint32_t lastRegisteredFrame12 = UINT32_MAX;
 	uint32_t lastRegisteredFrame0 = UINT32_MAX;
 
-	ID3D11Buffer* runBaseCB = nullptr;
-	uint32_t runBaseCBCapacity = 0;
-	ID3D11Buffer* runBaseCBRetired = nullptr;
 	uint32_t retireFrame = UINT32_MAX;
 	ID3D11DeviceContext1* ctx1 = nullptr;
 	bool triedCtx1Init = false;
@@ -178,8 +200,57 @@ public:
 	ID3D11Buffer* triggerCB = nullptr;
 	RE::NiPoint3 lastTriggerOrigin{ FLT_MAX, FLT_MAX, FLT_MAX };
 
-	float shadowGrassDistance = 0.0f;
-	float shadowGrassDistSq = 0.0f;
+	float windTimer = 0.0f;
+	float prevWindTimer = 0.0f;
+
+	struct CullBucketCB
+	{
+		uint32_t instanceCount;
+		float wavePeriod;
+		float timeBase;
+		float prevTimeBase;
+	};
+	static_assert(sizeof(CullBucketCB) == 16);
+
+	ID3D11ComputeShader* cullCS = nullptr;
+	ID3D11Buffer* cullParamsCB = nullptr;  // per-frame frustum + params
+	ID3D11Buffer* cullBucketCB = nullptr;
+	bool cullInit = false;
+	struct CullParamsCB
+	{
+		float frustumPlanes[6][4];
+		float cameraPos[3];
+		uint32_t pad0;
+		float maxDistSq;
+		float pad1;
+		float lodNearDistSq;
+		float lodFarDistSq;
+		float lodMinKeep;
+		float clumpRadius;
+		float projScale;
+		float minPixelSize;
+		float bandDistSq[3];  // NEW — 3 boundaries → 4 bands
+		float pad2;           // NEW
+	};
+	static_assert(sizeof(CullParamsCB) % 16 == 0);  // 160
+	ID3D11Buffer* grassFrameCB = nullptr; 
+
+	ID3D11ComputeShader* detectCS = nullptr;
+	ID3D11Buffer* detectResultBuf = nullptr;
+	ID3D11UnorderedAccessView* detectResultUAV = nullptr;
+	ID3D11Buffer* detectStaging = nullptr;
+	ID3D11Buffer* detectParamsCB = nullptr; 
+	std::unordered_map<RE::NiSourceTexture*, bool> complexCache;
+
+	float timeBase = 0.0f;
+	float prevTimeBase = 0.0f;
+
+	float cachedComplexThreshold = -1.0f; 
+
+	void InitCullResources();                                   // once
+	void CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx);  // per bucket per frame
+
+	void ComputeFrustumPlanes(RE::NiFrustumPlanes& out, const RE::NiFrustum& viewFrustum, const RE::NiTransform& transform);
 
 	void UpdateGrass();
 	void ApplyRemovals(const std::vector<RE::BSMultiStreamInstanceTriShape*>& removes);
@@ -187,17 +258,12 @@ public:
 	void UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceContext* ctx);
 	void RebuildBucket(GrassBucket& bucket, uint32_t instanceStride, ID3D11Device* device, ID3D11DeviceContext* ctx);
 	void AppendNewSlices(GrassBucket& bucket, uint32_t instanceStride, ID3D11DeviceContext* ctx);
-	void BuildVisibleRuns();
 	bool EnsureBucketCapacity(GrassBucket& b, uint32_t neededInstances, uint32_t instanceStride, ID3D11Device* device);
 	bool AabbVisible(const RE::NiFrustumPlanes& f, const RE::NiPoint3& mn, const RE::NiPoint3& mx);
 	void CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape, RE::BSMultiStreamInstanceTriShape::GroupHeader* header, const uint16_t* instanceData);
-	void BuildSubCellSlices(GrassBucket& bucket, RE::BSMultiStreamInstanceTriShape* shape, const uint8_t* src, uint32_t count, uint32_t stride, const RE::NiPoint3& wt, float fadeStart);
+	void UpdateCoarseBounds(GrassBucket& b);
 
-	void InitRunBaseCB();                           // call once at feature init
-	void UploadRunBases(ID3D11DeviceContext* ctx);  // per frame, after BuildVisibleRuns
-	bool EnsureRunBaseCapacity(uint32_t slots, ID3D11Device* device);
-
-	bool EnsureTriggerCB(ID3D11Device* device);
+	bool DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11Device* device, ID3D11DeviceContext* ctx);
 
 	/** @brief Draws the ImGui settings panel for grass optimizations configuration. */
 	virtual void DrawSettings() override;
@@ -289,7 +355,7 @@ public:
 			auto& trampoline = SKSE::GetTrampoline();
 
 			stl::write_vfunc<0x0, BSMultiStreamInstanceTriShape_dtor>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
-			stl::write_vfunc<0x34, BSMultiStreamInstanceTriShape_OnVisible>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
+			//stl::write_vfunc<0x34, BSMultiStreamInstanceTriShape_OnVisible>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 			stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 
 			stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
