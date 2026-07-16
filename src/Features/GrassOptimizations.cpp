@@ -1,3 +1,4 @@
+#include "GrassLighting.h"
 #include "GrassOptimizations.h"
 
 #include <DirectXPackedVector.h>
@@ -51,6 +52,61 @@ bool GrassOptimizations::HasShaderDefine(RE::BSShader::Type shaderType)
 	}
 }
 
+void GrassOptimizations::ComputeFrustumPlanes(RE::NiFrustumPlanes& out, const RE::NiFrustum& viewFrustum, const RE::NiTransform& transform)
+{
+	const __m128 fwd = _mm_set_ps(0.0f, transform.rotate.entry[2][0], transform.rotate.entry[1][0], transform.rotate.entry[0][0]);
+	const __m128 col1 = _mm_set_ps(0.0f, transform.rotate.entry[2][1], transform.rotate.entry[1][1], transform.rotate.entry[0][1]);
+	const __m128 col2 = _mm_set_ps(0.0f, transform.rotate.entry[2][2], transform.rotate.entry[1][2], transform.rotate.entry[0][2]);
+	const __m128 trans = _mm_set_ps(0.0f, transform.translate.z, transform.translate.y, transform.translate.x);
+
+	const __m128 nearPt = _mm_add_ps(trans, _mm_mul_ps(fwd, _mm_set1_ps(viewFrustum.fNear)));
+	const __m128 farPt = _mm_add_ps(trans, _mm_mul_ps(fwd, _mm_set1_ps(viewFrustum.fFar)));
+
+	auto MakePlane = [&](int idx, __m128 normal, __m128 point) {
+		alignas(16) float n[4];
+		_mm_store_ps(n, normal);
+		out.cullingPlanes[idx].normal = { n[0], n[1], n[2] };
+		out.cullingPlanes[idx].constant = _mm_cvtss_f32(_mm_dp_ps(normal, point, 0x71));
+	};
+
+	MakePlane(0, fwd, nearPt);
+	const __m128 negFwd = _mm_xor_ps(fwd, _mm_set1_ps(-0.0f));
+	MakePlane(1, negFwd, farPt);
+
+	if (viewFrustum.bOrtho) {
+		__m128 leftVec = col2;
+		MakePlane(2, leftVec, _mm_add_ps(trans, _mm_mul_ps(leftVec, _mm_set1_ps(viewFrustum.fLeft))));
+		__m128 rightVec = _mm_xor_ps(col2, _mm_set1_ps(-0.0f));
+		MakePlane(3, rightVec, _mm_add_ps(trans, _mm_mul_ps(rightVec, _mm_set1_ps(viewFrustum.fRight))));
+		__m128 upVec = col1;
+		MakePlane(4, upVec, _mm_add_ps(trans, _mm_mul_ps(upVec, _mm_set1_ps(viewFrustum.fTop))));
+		__m128 botVec = _mm_xor_ps(col1, _mm_set1_ps(-0.0f));
+		MakePlane(5, botVec, _mm_add_ps(trans, _mm_mul_ps(botVec, _mm_set1_ps(viewFrustum.fBottom))));
+	} else {
+		// Set: s = 1/sqrt(slope²+1); n = fwd*(±slope*s) + axis*(±s)
+		auto sidePlane = [&](int idx, __m128 axis, float slope, float fwdSign, float axisSign) {
+			const float s = 1.0f / std::sqrt(slope * slope + 1.0f);
+			__m128 n = _mm_add_ps(
+				_mm_mul_ps(fwd, _mm_set1_ps(fwdSign * slope * s)),
+				_mm_mul_ps(axis, _mm_set1_ps(axisSign * s)));
+			MakePlane(idx, n, trans);
+		};
+
+		sidePlane(2, col2, viewFrustum.fLeft, -1.0f, +1.0f); 
+		sidePlane(3, col2, viewFrustum.fRight, +1.0f, -1.0f);
+		sidePlane(4, col1, viewFrustum.fTop, +1.0f, -1.0f); 
+		sidePlane(5, col1, viewFrustum.fBottom, -1.0f, +1.0f);
+	}
+
+	out.activePlanes = RE::NiFrustumPlanes::ActivePlane(0x3F);
+
+	constexpr float kGuard = 128.0f;
+	out.cullingPlanes[2].constant -= kGuard;
+	out.cullingPlanes[3].constant -= kGuard;
+	out.cullingPlanes[4].constant -= kGuard;
+	out.cullingPlanes[5].constant -= kGuard;
+}
+
 void GrassOptimizations::UpdateGrass()
 {
 	std::vector<PendingCapture> caps;
@@ -65,34 +121,117 @@ void GrassOptimizations::UpdateGrass()
 	auto* device = globals::d3d::device;
 	auto* ctx = globals::d3d::context;
 
-	if (!ctx1 && !triedCtx1Init) {
-		triedCtx1Init = true;
-		InitRunBaseCB();
+	if (!cullInit) {
+		cullInit = true;
+		InitCullResources();
 	}
-
-	const uint32_t frame = globals::game::graphicsState->frameCount;
-	if (runBaseCBRetired && retireFrame != frame) {
-		runBaseCBRetired->Release();
-		runBaseCBRetired = nullptr;
-	}
+	if (!cullCS)
+		return;
 
 	timeAccum += globals::game::smState->timerValues[1];
+	prevTimeBase = timeBase;
+	timeBase = globals::game::smState->timerValues[4] * 0.0016666667f * 6.2831802f;
 
 	if (fadeInTimeRcp == 0.0f) {
 		const float t = RE::GetINISetting("fGrassFadeInTime:Grass")->GetFloat();
-		fadeInTimeRcp = t > 0.0f ? 1.0f / t : 1e6f;  // zero fade time → instant
+		fadeInTimeRcp = t > 0.0f ? 1.0f / t : 1e6f;
+	}
+	if (maxDistSq == 0.0f) {
+		maxGrassDistance = RE::GetINISetting("fGrassStartFadeDistance:Grass")->GetFloat() +
+		                   RE::GetINISetting("fGrassFadeRange:Grass")->GetFloat();
+		maxDistSq = maxGrassDistance * maxGrassDistance;
 	}
 
-	if (shadowGrassDistance != settings.shadowGrassDistance) {
-		shadowGrassDistance = settings.shadowGrassDistance;
-		shadowGrassDistSq = shadowGrassDistance * shadowGrassDistance;
+	{
+		const float threshold = globals::features::grassLighting.settings.ComplexGrassThreshold;
+		if (threshold != cachedComplexThreshold) {
+			cachedComplexThreshold = threshold;
+			complexCache.clear();
+			for (auto& [key, b] : buckets) {
+				b.isComplex = DetectComplexGrass(key.tex, device, ctx);
+				b.dirty = true;
+			}
+		}
 	}
 
 	ApplyRemovals(rems);
 	ApplyCaptures(caps);
 	UploadDirtyBuckets(device, ctx);
-	BuildVisibleRuns();
-	UploadRunBases(ctx);
+
+	RE::NiCamera* cam = RE::Main::WorldRootCamera();
+	if (!cam)
+		return;
+
+	RE::NiFrustumPlanes frustum{};
+	ComputeFrustumPlanes(frustum, cam->GetRuntimeData2().viewFrustum, cam->world);
+	const RE::NiPoint3 camPos = cam->world.translate;
+
+	const auto [screenW, screenH] = globals::game::renderer->GetScreenSize();
+
+	{
+		D3D11_MAPPED_SUBRESOURCE m{};
+		if (SUCCEEDED(ctx->Map(cullParamsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			auto* cp = static_cast<CullParamsCB*>(m.pData);
+			for (int i = 0; i < 6; ++i) {
+				cp->frustumPlanes[i][0] = frustum.cullingPlanes[i].normal.x;
+				cp->frustumPlanes[i][1] = frustum.cullingPlanes[i].normal.y;
+				cp->frustumPlanes[i][2] = frustum.cullingPlanes[i].normal.z;
+				cp->frustumPlanes[i][3] = frustum.cullingPlanes[i].constant;
+			}
+			cp->cameraPos[0] = camPos.x;
+			cp->cameraPos[1] = camPos.y;
+			cp->cameraPos[2] = camPos.z;
+			cp->maxDistSq = maxDistSq;
+			cp->pad1 = 0.0f;
+			cp->lodNearDistSq = 8000.0f * 8000.0f;
+			cp->lodFarDistSq = 16000.0f * 16000.0f;
+			cp->lodMinKeep = 0.15f;
+			cp->clumpRadius = 128.0f;
+			cp->projScale = screenH / (2.0f * tanf(0.5f * Util::GetVerticalFOVRad()));
+			cp->minPixelSize = 2.0f;
+			const float d = maxGrassDistance;
+			cp->bandDistSq[0] = (d * 0.15f) * (d * 0.15f);
+			cp->bandDistSq[1] = (d * 0.35f) * (d * 0.35f);
+			cp->bandDistSq[2] = (d * 0.65f) * (d * 0.65f);
+			cp->pad2 = 0.0f;
+			ctx->Unmap(cullParamsCB, 0);
+		}
+	}
+
+	for (auto& [key, b] : buckets) {
+		if (!b.totalInstances || !b.instanceSRV) {
+			b.cullVisible = false;
+			continue;
+		}
+		if (!b.coarseValid)
+			UpdateCoarseBounds(b);
+		b.cullVisible = AabbVisible(frustum, b.coarseMin, b.coarseMax);
+	}
+
+	// dispatch only visible buckets
+	for (auto& [key, b] : buckets) {
+		if (b.cullVisible)
+			CullBucket(b, ctx);
+	}
+
+	{
+		D3D11_MAPPED_SUBRESOURCE m{};
+		if (SUCCEEDED(ctx->Map(grassFrameCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			struct GrassFrame
+			{
+				float fadeNow;
+				float fadeInTimeRcp;
+				uint32_t debugFlags;
+				uint32_t instanceStride;
+			};
+			auto* g = static_cast<GrassFrame*>(m.pData);
+			g->fadeNow = timeAccum;
+			g->fadeInTimeRcp = fadeInTimeRcp;
+			g->debugFlags = settings.ShowDebugVisualization ? 1u : 0u;
+			g->instanceStride = 32; 
+			ctx->Unmap(grassFrameCB, 0);
+		}
+	}
 }
 
 void GrassOptimizations::ApplyRemovals(const std::vector<RE::BSMultiStreamInstanceTriShape*>& removes)
@@ -137,6 +276,9 @@ void GrassOptimizations::ApplyCaptures(std::vector<PendingCapture>& captures)
 		const BucketKey bk{ pc.diffuseTexture, pc.descVal };
 		auto& b = buckets[bk];
 
+		if (b.slices.empty() && b.totalInstances == 0)
+			b.isComplex = DetectComplexGrass(pc.diffuseTexture, globals::d3d::device, globals::d3d::context);
+
 		if (b.firstNewSlice == UINT32_MAX)
 			b.firstNewSlice = (uint32_t)b.slices.size();
 
@@ -144,10 +286,15 @@ void GrassOptimizations::ApplyCaptures(std::vector<PendingCapture>& captures)
 			std::unique_lock lk(bucketKeysMutex);
 			bucketKeys.insert(pc.diffuseTexture);
 		}
-
 		b.descVal = pc.descVal;
 
-		BuildSubCellSlices(b, pc.shape, pc.bytes.data(), pc.count, pc.instanceStride, pc.origin, timeAccum);
+		BucketSlice s;
+		s.shape = pc.shape;
+		s.count = pc.count;
+		s.fadeStart = timeAccum;
+		s.origin = pc.origin;
+		s.data = std::move(pc.bytes);
+		b.slices.push_back(std::move(s));
 	}
 }
 
@@ -172,6 +319,17 @@ void GrassOptimizations::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceCo
 	}
 }
 
+static inline void ExpandInstanceRecord(const uint8_t* src, float* dst)
+{
+	// 16 halfs = two 128-bit loads of 8 halfs each
+	const __m128i h0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));       // halfs 0..7
+	const __m128i h1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16));  // halfs 8..15
+	_mm_storeu_ps(dst + 0, _mm_cvtph_ps(h0));                                        // floats 0..3
+	_mm_storeu_ps(dst + 4, _mm_cvtph_ps(_mm_unpackhi_epi64(h0, h0)));                // floats 4..7
+	_mm_storeu_ps(dst + 8, _mm_cvtph_ps(h1));                                        // floats 8..11
+	_mm_storeu_ps(dst + 12, _mm_cvtph_ps(_mm_unpackhi_epi64(h1, h1)));               // floats 12..15
+}
+
 void GrassOptimizations::RebuildBucket(GrassBucket& bucket, uint32_t instanceStride, ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
 	bucket.dirty = false;
@@ -185,22 +343,39 @@ void GrassOptimizations::RebuildBucket(GrassBucket& bucket, uint32_t instanceStr
 		return;
 	}
 
-	static thread_local std::vector<uint8_t> concat;
+	static thread_local std::vector<float> expanded;  // 16 floats per instance
 	static thread_local std::vector<float> fades;
-	concat.clear();
+	static thread_local std::vector<float> origins;
+	expanded.clear();
 	fades.clear();
-	concat.reserve((size_t)bucket.totalInstances * instanceStride);
+	origins.clear();
+	expanded.reserve((size_t)bucket.totalInstances * 16);
 	fades.reserve(bucket.totalInstances);
+	origins.reserve((size_t)bucket.totalInstances * 4);
+
 	uint32_t off = 0;
 	for (auto& s : bucket.slices) {
 		s.bufferOffset = off;
-		concat.insert(concat.end(), s.data.begin(), s.data.end());
-		fades.insert(fades.end(), s.count, s.fadeStart);
+		const uint8_t* rec = s.data.data();
+		const float complexFlag = bucket.isComplex ? 1.0f : 0.0f;
+		for (uint32_t i = 0; i < s.count; ++i, rec += instanceStride) {
+			float tmp[16];
+			ExpandInstanceRecord(rec, tmp);
+			expanded.insert(expanded.end(), tmp, tmp + 16);
+			fades.push_back(s.fadeStart);
+			origins.push_back(s.origin.x);
+			origins.push_back(s.origin.y);
+			origins.push_back(s.origin.z);
+			origins.push_back(complexFlag);
+		}
 		off += s.count;
 	}
 
-	const D3D11_BOX box{ 0, 0, 0, (UINT)concat.size(), 1, 1 };
-	ctx->UpdateSubresource(bucket.instanceBuf, 0, &box, concat.data(), 0, 0);
+	const D3D11_BOX ibox{ 0, 0, 0, (UINT)(expanded.size() * sizeof(float)), 1, 1 };
+	ctx->UpdateSubresource(bucket.instanceBuf, 0, &ibox, expanded.data(), 0, 0);
+
+	const D3D11_BOX obox{ 0, 0, 0, (UINT)(origins.size() * sizeof(float)), 1, 1 };
+	ctx->UpdateSubresource(bucket.originBuf, 0, &obox, origins.data(), 0, 0);
 
 	const D3D11_BOX fbox{ 0, 0, 0, (UINT)(fades.size() * sizeof(float)), 1, 1 };
 	ctx->UpdateSubresource(bucket.fadeBuf, 0, &fbox, fades.data(), 0, 0);
@@ -208,7 +383,6 @@ void GrassOptimizations::RebuildBucket(GrassBucket& bucket, uint32_t instanceStr
 
 void GrassOptimizations::AppendNewSlices(GrassBucket& bucket, uint32_t instanceStride, ID3D11DeviceContext* ctx)
 {
-
 	uint32_t prefix = 0;
 	for (uint32_t i = 0; i < bucket.firstNewSlice; ++i) {
 		const auto& s = bucket.slices[i];
@@ -222,24 +396,36 @@ void GrassOptimizations::AppendNewSlices(GrassBucket& bucket, uint32_t instanceS
 		prefix += s.count;
 	}
 
-	static thread_local std::vector<uint8_t> tail;
-	static thread_local std::vector<float> fadeTail;
-	tail.clear();
+	static thread_local std::vector<float> expTail, fadeTail, originTail;
+	expTail.clear();
 	fadeTail.clear();
+	originTail.clear();
 
 	uint32_t tailOff = 0;
 	for (uint32_t i = bucket.firstNewSlice; i < (uint32_t)bucket.slices.size(); ++i) {
 		auto& s = bucket.slices[i];
-		s.bufferOffset = prefix + tailOff;  // the running tail offset
-		tail.insert(tail.end(), s.data.begin(), s.data.end());
-		fadeTail.insert(fadeTail.end(), s.count, s.fadeStart);
+		s.bufferOffset = prefix + tailOff;
+		const uint8_t* rec = s.data.data();
+		for (uint32_t j = 0; j < s.count; ++j, rec += instanceStride) {
+			float tmp[16];
+			ExpandInstanceRecord(rec, tmp);
+			expTail.insert(expTail.end(), tmp, tmp + 16);
+			fadeTail.push_back(s.fadeStart);
+			originTail.push_back(s.origin.x);
+			originTail.push_back(s.origin.y);
+			originTail.push_back(s.origin.z);
+			originTail.push_back(0.0f);
+		}
 		tailOff += s.count;
 	}
 
-	if (!tail.empty()) {
-		const D3D11_BOX box{ prefix * instanceStride, 0, 0,
-			prefix * instanceStride + (UINT)tail.size(), 1, 1 };
-		ctx->UpdateSubresource(bucket.instanceBuf, 0, &box, tail.data(), 0, 0);
+	if (!expTail.empty()) {
+		const D3D11_BOX ibox{ prefix * 64, 0, 0, (prefix + tailOff) * 64, 1, 1 };
+		ctx->UpdateSubresource(bucket.instanceBuf, 0, &ibox, expTail.data(), 0, 0);
+
+		const D3D11_BOX obox{ prefix * 4 * (UINT)sizeof(float), 0, 0,
+			(prefix + tailOff) * 4 * (UINT)sizeof(float), 1, 1 };
+		ctx->UpdateSubresource(bucket.originBuf, 0, &obox, originTail.data(), 0, 0);
 
 		const D3D11_BOX fbox{ prefix * (UINT)sizeof(float), 0, 0,
 			(prefix + tailOff) * (UINT)sizeof(float), 1, 1 };
@@ -248,113 +434,7 @@ void GrassOptimizations::AppendNewSlices(GrassBucket& bucket, uint32_t instanceS
 	bucket.firstNewSlice = UINT32_MAX;
 }
 
-
-
-
-
-void GrassOptimizations::BuildVisibleRuns()
-{
-	const uint32_t frame = globals::game::graphicsState->frameCount;
-
-	RE::NiFrustumPlanes frustum{};
-	RE::NiPoint3 camPos{};
-	bool haveFrustum = false;
-
-	{
-		std::scoped_lock lk(planesMutex);
-		if (planesFrame == frame || planesFrame + 1 == frame) {
-			frustum = capturedPlanes;
-			camPos = capturedCamPos;
-			haveFrustum = true;
-		}
-	}
-
-	if (maxGrassDistance == 0.0f) {
-		maxGrassDistance = RE::GetINISetting("fGrassStartFadeDistance:Grass")->GetFloat() +
-		                   RE::GetINISetting("fGrassFadeRange:Grass")->GetFloat();
-		maxDistSq = maxGrassDistance * maxGrassDistance;
-	}
-
-	// lane order x,y,z to match the min/max vectors below
-	const __m128 cam4 = _mm_set_ps(0.0f, camPos.z, camPos.y, camPos.x);
-
-	for (auto& [key, b] : buckets) {
-		b.visibleRuns.clear();
-		b.visibleRuns.reserve((b.slices.size() >> 3) + 8);
-
-		uint32_t runStart = 0;
-		uint32_t runLen = 0;
-		float runSortKeySq = FLT_MAX;  // sort key only — never a cull threshold
-		RE::NiPoint3 runOrigin{};
-
-		auto flush = [&] {
-			if (runLen > 0) {
-				uint32_t draw = runLen;
-				const float d2 = runSortKeySq;
-				// begin thinning past ~2000 units, floor at 15% by ~8000
-				if (d2 > settings.BeginThinningDistance * settings.BeginThinningDistance) {
-					const float d = sqrtf(d2);
-					const float t = std::clamp((d - settings.BeginThinningDistance) / settings.ThinningDistance, 0.0f, 1.0f);
-					const float keep = 1.0f - (1.0f - settings.MinDistantAmmount) * t;
-					draw = std::max(1u, (uint32_t)(runLen * keep));
-				}
-				b.visibleRuns.push_back({ runStart, runLen, UINT32_MAX, runSortKeySq, runOrigin, draw });
-				runLen = 0;
-			}
-		};
-
-		for (const auto& s : b.slices) {
-			// Not in the GPU buffer (failed/pending upload): undrawable regardless
-			// of visibility — and must not be merged into any window.
-			if (s.bufferOffset == UINT32_MAX) {
-				flush();
-				continue;
-			}
-
-			bool vis = true;
-			float distSq = 0.0f;
-
-			if (haveFrustum) {
-				const __m128 minV = _mm_set_ps(0.0f, s.aabbMin.z, s.aabbMin.y, s.aabbMin.x);
-				const __m128 maxV = _mm_set_ps(0.0f, s.aabbMax.z, s.aabbMax.y, s.aabbMax.x);
-
-				// squared distance from camera to nearest point of the AABB
-				const __m128 clamped = _mm_max_ps(minV, _mm_min_ps(cam4, maxV));
-				const __m128 diff = _mm_sub_ps(clamped, cam4);
-				const __m128 sq = _mm_mul_ps(diff, diff);
-
-				__m128 sum = _mm_add_ps(sq, _mm_movehl_ps(sq, sq));
-				sum = _mm_add_ss(sum, _mm_shuffle_ps(sum, sum, 1));
-				distSq = _mm_cvtss_f32(sum);
-
-				// threshold is the constant max grass distance — per slice, no state
-				vis = (distSq <= maxDistSq) && AabbVisible(frustum, s.aabbMin, s.aabbMax);
-			}
-
-			if (vis) {
-				const bool adjacent = runLen > 0 && s.bufferOffset == runStart + runLen;
-				const bool sameOrigin = runLen > 0 && fabsf(s.origin.x - runOrigin.x) < 0.1f && fabsf(s.origin.y - runOrigin.y) < 0.1f && fabsf(s.origin.z - runOrigin.z) < 0.1f;
-				if (runLen > 0 && !(adjacent && sameOrigin))
-					flush();
-				if (runLen == 0) {
-					runStart = s.bufferOffset;
-					runSortKeySq = FLT_MAX;
-					runOrigin = s.origin;
-				}
-				runLen += s.count;
-				runSortKeySq = std::min(runSortKeySq, distSq);
-			} else {
-				flush();
-			}
-		}
-		flush();
-
-		std::ranges::sort(b.visibleRuns,
-			[](const VisibleRun& a, const VisibleRun& r) { return a.sortKeySq < r.sortKeySq; });
-	}
-}
-
-bool GrassOptimizations::EnsureBucketCapacity(GrassBucket& b, uint32_t neededInstances, uint32_t instanceStride, ID3D11Device* device)
+bool GrassOptimizations::EnsureBucketCapacity(GrassBucket& b, uint32_t neededInstances, uint32_t, ID3D11Device* device)
 {
 	if (b.instanceBuf && b.capacityInstances >= neededInstances)
 		return true;
@@ -365,44 +445,193 @@ bool GrassOptimizations::EnsureBucketCapacity(GrassBucket& b, uint32_t neededIns
 
 	b.ReleaseResources();
 
-	D3D11_BUFFER_DESC ib{};
-	ib.ByteWidth = cap * instanceStride;
-	ib.Usage = D3D11_USAGE_DEFAULT;
-	ib.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-	HRESULT hr = device->CreateBuffer(&ib, nullptr, &b.instanceBuf);
-	if (FAILED(hr) || !b.instanceBuf) {
-		logger::error("[GRASS OPTIMIZATIONS] instance VB create failed hr={:08X} bytes={} instances={}", (unsigned)hr, ib.ByteWidth, cap);
-		b.capacityInstances = 0;
-		return false;
-	}
-	Util::SetResourceName(b.instanceBuf, "GrassOptimizations::BucketInstanceVB");
+	{
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = cap * 64;
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = 16;
+		HRESULT hr = device->CreateBuffer(&bd, nullptr, &b.instanceBuf);
+		if (FAILED(hr) || !b.instanceBuf) {
+			logger::error("[GRASS OPTIMIZATIONS] instance buffer create failed hr={:08X} bytes={}", (unsigned)hr, bd.ByteWidth);
+			b.capacityInstances = 0;
+			return false;
+		}
+		Util::SetResourceName(b.instanceBuf, "GrassOptimizations::InstanceBuf");
 
-	D3D11_BUFFER_DESC ab{};
-	ab.ByteWidth = cap * sizeof(float);
-	ab.Usage = D3D11_USAGE_DEFAULT;
-	ab.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-	ab.CPUAccessFlags = 0;
-	ab.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-	ab.StructureByteStride = sizeof(float);
-	hr = device->CreateBuffer(&ab, nullptr, &b.fadeBuf);
-	if (FAILED(hr) || !b.fadeBuf) {
-		logger::error("[GRASS OPTIMIZATIONS] fade buffer create failed hr={:08X} bytes={}", (unsigned)hr, ab.ByteWidth);
-		b.ReleaseResources();
-		return false;
+		D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+		sv.Format = DXGI_FORMAT_UNKNOWN;
+		sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+		sv.Buffer.FirstElement = 0;
+		sv.Buffer.NumElements = cap * 4;
+		hr = device->CreateShaderResourceView(b.instanceBuf, &sv, &b.instanceSRV);
+		if (FAILED(hr) || !b.instanceSRV) {
+			logger::error("[GRASS OPTIMIZATIONS] instance SRV create failed hr={:08X}", (unsigned)hr);
+			b.ReleaseResources();
+			return false;
+		}
+		Util::SetResourceName(b.instanceSRV, "GrassOptimizations::InstanceBuf SRV");
 	}
-	Util::SetResourceName(b.fadeBuf, "GrassOptimizations::BucketFadeBuf");
 
-	D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-	sv.Format = DXGI_FORMAT_UNKNOWN;
-	sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-	sv.Buffer.NumElements = cap;
-	hr = device->CreateShaderResourceView(b.fadeBuf, &sv, &b.fadeSRV);
-	if (FAILED(hr) || !b.fadeSRV) {
-		logger::error("[GRASS OPTIMIZATIONS] fade SRV create failed hr={:08X} elements={}", (unsigned)hr, cap);
-		b.ReleaseResources();
-		return false;
+	// --- Per-instance origin: StructuredBuffer<float3> ---
+	{
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = cap * 4 * sizeof(float);
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = 4 * sizeof(float);
+		HRESULT hr = device->CreateBuffer(&bd, nullptr, &b.originBuf);
+		if (FAILED(hr) || !b.originBuf) {
+			logger::error("[GRASS OPTIMIZATIONS] origin buffer create failed hr={:08X}", (unsigned)hr);
+			b.ReleaseResources();
+			return false;
+		}
+		Util::SetResourceName(b.originBuf, "GrassOptimizations::OriginBuf");
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+		sv.Format = DXGI_FORMAT_UNKNOWN;
+		sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+		sv.Buffer.NumElements = cap;
+		hr = device->CreateShaderResourceView(b.originBuf, &sv, &b.originSRV);
+		if (FAILED(hr) || !b.originSRV) {
+			logger::error("[GRASS OPTIMIZATIONS] origin SRV create failed hr={:08X}", (unsigned)hr);
+			b.ReleaseResources();
+			return false;
+		}
+		Util::SetResourceName(b.originSRV, "GrassOptimizations::OriginBuf SRV");
 	}
-	Util::SetResourceName(b.fadeSRV, "GrassOptimizations::BucketFadeBuf SRV");
+
+	// --- Per-instance fade start: StructuredBuffer<float> ---
+	{
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = cap * sizeof(float);
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = sizeof(float);
+		HRESULT hr = device->CreateBuffer(&bd, nullptr, &b.fadeBuf);
+		if (FAILED(hr) || !b.fadeBuf) {
+			logger::error("[GRASS OPTIMIZATIONS] fade buffer create failed hr={:08X}", (unsigned)hr);
+			b.ReleaseResources();
+			return false;
+		}
+		Util::SetResourceName(b.fadeBuf, "GrassOptimizations::FadeBuf");
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+		sv.Format = DXGI_FORMAT_UNKNOWN;
+		sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+		sv.Buffer.NumElements = cap;
+		HRESULT hr2 = device->CreateShaderResourceView(b.fadeBuf, &sv, &b.fadeSRV);
+		if (FAILED(hr2) || !b.fadeSRV) {
+			logger::error("[GRASS OPTIMIZATIONS] fade SRV create failed hr={:08X}", (unsigned)hr2);
+			b.ReleaseResources();
+			return false;
+		}
+		Util::SetResourceName(b.fadeSRV, "GrassOptimizations::FadeBuf SRV");
+	}
+
+	for (uint32_t band = 0; band < GrassBucket::kBands; ++band) {
+		{
+			D3D11_BUFFER_DESC bd{};
+			bd.ByteWidth = cap * sizeof(uint32_t);
+			bd.Usage = D3D11_USAGE_DEFAULT;
+			bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+			bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+			bd.StructureByteStride = sizeof(uint32_t);
+			HRESULT hr = device->CreateBuffer(&bd, nullptr, &b.visibleBuf[band]);
+			if (FAILED(hr) || !b.visibleBuf[band]) {
+				logger::error("[GRASS OPTIMIZATIONS] visible buffer {} create failed hr={:08X}", band, (unsigned)hr);
+				b.ReleaseResources();
+				return false;
+			}
+			Util::SetResourceName(b.visibleBuf[band], "GrassOptimizations::VisibleBuf");
+
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
+			uav.Format = DXGI_FORMAT_UNKNOWN;
+			uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+			uav.Buffer.FirstElement = 0;
+			uav.Buffer.NumElements = cap;
+			uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_APPEND;
+			hr = device->CreateUnorderedAccessView(b.visibleBuf[band], &uav, &b.visibleUAV[band]);
+			if (FAILED(hr) || !b.visibleUAV[band]) {
+				logger::error("[GRASS OPTIMIZATIONS] visible UAV {} create failed hr={:08X}", band, (unsigned)hr);
+				b.ReleaseResources();
+				return false;
+			}
+			Util::SetResourceName(b.visibleUAV[band], "GrassOptimizations::VisibleBuf UAV");
+
+			D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+			sv.Format = DXGI_FORMAT_UNKNOWN;
+			sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+			sv.Buffer.NumElements = cap;
+			hr = device->CreateShaderResourceView(b.visibleBuf[band], &sv, &b.visibleSRV[band]);
+			if (FAILED(hr) || !b.visibleSRV[band]) {
+				logger::error("[GRASS OPTIMIZATIONS] visible SRV {} create failed hr={:08X}", band, (unsigned)hr);
+				b.ReleaseResources();
+				return false;
+			}
+			Util::SetResourceName(b.visibleSRV[band], "GrassOptimizations::VisibleBuf SRV");
+		}
+
+		{
+			D3D11_BUFFER_DESC bd{};
+			bd.ByteWidth = 5 * sizeof(uint32_t);
+			bd.Usage = D3D11_USAGE_DEFAULT;
+			bd.BindFlags = 0;
+			bd.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
+			const uint32_t initArgs[5] = { 0, 0, 0, 0, 0 };
+			D3D11_SUBRESOURCE_DATA init{ initArgs, 0, 0 };
+			HRESULT hr = device->CreateBuffer(&bd, &init, &b.argsBuf[band]);
+			if (FAILED(hr) || !b.argsBuf[band]) {
+				logger::error("[GRASS OPTIMIZATIONS] args buffer {} create failed hr={:08X}", band, (unsigned)hr);
+				b.ReleaseResources();
+				return false;
+			}
+			Util::SetResourceName(b.argsBuf[band], "GrassOptimizations::ArgsBuf");
+		}
+	}
+
+	// --- per-instance wind scalars: RW structured (CS write) + SRV (VS read) ---
+	{
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = cap * 2 * sizeof(float);
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = 2 * sizeof(float);
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &b.windBuf)) || !b.windBuf) {
+			logger::error("[GRASS OPTIMIZATIONS] wind buffer create failed");
+			b.ReleaseResources();
+			return false;
+		}
+		Util::SetResourceName(b.windBuf, "GrassOptimizations::WindBuf");
+
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
+		uav.Format = DXGI_FORMAT_UNKNOWN;
+		uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		uav.Buffer.FirstElement = 0;
+		uav.Buffer.NumElements = cap;
+		uav.Buffer.Flags = 0;  // plain RW, no counter
+		if (FAILED(device->CreateUnorderedAccessView(b.windBuf, &uav, &b.windUAV)) || !b.windUAV) {
+			logger::error("[GRASS OPTIMIZATIONS] wind UAV create failed");
+			b.ReleaseResources();
+			return false;
+		}
+		Util::SetResourceName(b.windUAV, "GrassOptimizations::WindBuf UAV");
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+		sv.Format = DXGI_FORMAT_UNKNOWN;
+		sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+		sv.Buffer.NumElements = cap;
+		if (FAILED(device->CreateShaderResourceView(b.windBuf, &sv, &b.windSRV)) || !b.windSRV) {
+			logger::error("[GRASS OPTIMIZATIONS] wind SRV create failed");
+			b.ReleaseResources();
+			return false;
+		}
+		Util::SetResourceName(b.windSRV, "GrassOptimizations::WindBuf SRV");
+	}
 
 	b.capacityInstances = cap;
 	return true;
@@ -479,88 +708,198 @@ void GrassOptimizations::CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shap
 	pendingCaptures.push_back(std::move(pc));
 }
 
-void GrassOptimizations::BuildSubCellSlices(GrassBucket& bucket, RE::BSMultiStreamInstanceTriShape* shape, const uint8_t* src, uint32_t count, uint32_t stride, const RE::NiPoint3& wt, float fadeStart)
+void GrassOptimizations::InitCullResources()
 {
-	constexpr int kGrid = 4;
-	constexpr int kCells = kGrid * kGrid;
-	constexpr float kCellSize = 4096.0f;
+	auto* device = globals::d3d::device;
 
-	const __m128 wtV = _mm_set_ps(0.0f, wt.z, wt.y, wt.x);
-	const __m128 invV = _mm_set1_ps(kGrid / kCellSize);  // hoisted reciprocal
-	const __m128i gridMax = _mm_set1_epi32(kGrid - 1);
-
-	uint32_t cellCount[kCells] = {};
-	__m128 cellMin[kCells];
-	__m128 cellMax[kCells];
-	for (int c = 0; c < kCells; ++c) {
-		cellMin[c] = _mm_set1_ps(FLT_MAX);
-		cellMax[c] = _mm_set1_ps(-FLT_MAX);
-	}
-
-	static thread_local std::vector<uint8_t> binOf; 
-	binOf.resize(count);
-
-	{
-		const uint8_t* p = src;
-		for (uint32_t i = 0; i < count; ++i, p += stride) {
-			const __m128i h = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));  // 4×u16
-			const __m128 local = _mm_cvtph_ps(h);                                    // {lx,ly,lz,_}
-			const __m128 world = _mm_add_ps(local, wtV);
-
-			const __m128i idx = _mm_cvttps_epi32(_mm_mul_ps(local, invV));
-			const __m128i cl = _mm_max_epi32(_mm_setzero_si128(),
-				_mm_min_epi32(idx, gridMax));
-			const int gx = _mm_cvtsi128_si32(cl);
-			const int gy = _mm_extract_epi32(cl, 1);
-			const int slot = gy * kGrid + gx;
-
-			binOf[i] = (uint8_t)slot;
-			cellCount[slot]++;
-			cellMin[slot] = _mm_min_ps(cellMin[slot], world);
-			cellMax[slot] = _mm_max_ps(cellMax[slot], world);
+	// --- small CBs first: no external dependency, can't fail from missing shaders ---
+	auto makeDynamicCB = [&](ID3D11Buffer** out, UINT bytes, const char* name) -> bool {
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = bytes;
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		if (FAILED(device->CreateBuffer(&bd, nullptr, out)) || !*out) {
+			logger::error("[GRASS OPTIMIZATIONS] {} create failed", name);
+			return false;
 		}
-	}
-
-	struct CellOut
-	{
-		std::vector<uint8_t> bytes;
-		uint32_t cursor;
+		Util::SetResourceName(*out, name);
+		return true;
 	};
-	static thread_local std::array<CellOut, kCells> out;
-	for (int c = 0; c < kCells; ++c) {
-		if (cellCount[c]) {
-			out[c].bytes.resize((size_t)cellCount[c] * stride);  // one alloc per cell
-			out[c].cursor = 0;
-		}
+
+	if (!makeDynamicCB(&cullParamsCB, sizeof(CullParamsCB), "GrassOptimizations::CullParamsCB"))
+		return;
+	if (!makeDynamicCB(&cullBucketCB, sizeof(CullBucketCB), "GrassOptimizations::CullBucketCB"))
+		return;
+	if (!makeDynamicCB(&grassFrameCB, 16, "GrassOptimizations::GrassFrameCB"))
+		return;
+	if (!makeDynamicCB(&detectParamsCB, 16, "GrassOptimizations::DetectParamsCB"))
+		return;
+
+	std::vector<std::pair<const char*, const char*>> defines;
+	cullCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\GrassCullingCS.hlsl", defines, "cs_5_0"));
+	if (!cullCS) {
+		logger::error("[GRASS OPTIMIZATIONS] cull CS load failed — feature disabled");
+		return;
 	}
 
 	{
-		const uint8_t* p = src;
-		for (uint32_t i = 0; i < count; ++i, p += stride) {
-			CellOut& co = out[binOf[i]];
-			std::memcpy(co.bytes.data() + co.cursor, p, stride);
-			co.cursor += stride;
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = sizeof(uint32_t);
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = sizeof(uint32_t);
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &detectResultBuf)) || !detectResultBuf) {
+			logger::error("[GRASS OPTIMIZATIONS] detect result buffer create failed");
+			return;
+		}
+		Util::SetResourceName(detectResultBuf, "GrassOptimizations::DetectResultBuf");
+
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
+		uav.Format = DXGI_FORMAT_UNKNOWN;
+		uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		uav.Buffer.FirstElement = 0;
+		uav.Buffer.NumElements = 1;
+		uav.Buffer.Flags = 0;
+		if (FAILED(device->CreateUnorderedAccessView(detectResultBuf, &uav, &detectResultUAV)) || !detectResultUAV) {
+			logger::error("[GRASS OPTIMIZATIONS] detect result UAV create failed");
+			return;
+		}
+		Util::SetResourceName(detectResultUAV, "GrassOptimizations::DetectResultBuf UAV");
+	}
+
+	{
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = sizeof(uint32_t);
+		bd.Usage = D3D11_USAGE_STAGING;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &detectStaging)) || !detectStaging) {
+			logger::error("[GRASS OPTIMIZATIONS] detect staging create failed");
+			return;
 		}
 	}
 
-	for (int c = 0; c < kCells; ++c) {
-		if (!cellCount[c])
-			continue;
-
-		alignas(16) float mn[4], mx[4];
-		_mm_store_ps(mn, cellMin[c]);
-		_mm_store_ps(mx, cellMax[c]);
-
-		BucketSlice s;
-		s.shape = shape;
-		s.count = cellCount[c];
-		s.fadeStart = fadeStart;
-		s.origin = wt;
-		s.aabbMin = { mn[0], mn[1], mn[2] };
-		s.aabbMax = { mx[0], mx[1], mx[2] };
-		s.data = std::move(out[c].bytes); 
-		bucket.slices.push_back(std::move(s));
+	detectCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\DetectComplexCS.hlsl", defines, "cs_5_0"));
+	if (!detectCS) {
+		logger::error("[GRASS OPTIMIZATIONS] detect CS load failed — complex detection disabled");
 	}
+}
+
+void GrassOptimizations::CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
+{
+	float wavePeriod = 1.0f;
+	if (!b.slices.empty() && b.slices[0].shape) {
+		if (auto* prop = static_cast<RE::BSGrassShaderProperty*>(b.slices[0].shape->GetGeometryRuntimeData().shaderProperty.get()))
+			wavePeriod = prop->wavePeriod;
+	}
+
+	{
+		D3D11_MAPPED_SUBRESOURCE m{};
+		if (!cullBucketCB || FAILED(ctx->Map(cullBucketCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+			return;
+		auto* cb = static_cast<CullBucketCB*>(m.pData);
+		cb->instanceCount = b.totalInstances;
+		cb->wavePeriod = wavePeriod;
+		cb->timeBase = timeBase;
+		cb->prevTimeBase = prevTimeBase;
+		ctx->Unmap(cullBucketCB, 0);
+	}
+
+	ID3D11UnorderedAccessView* uavs[GrassBucket::kBands + 1] = {
+		b.visibleUAV[0], b.visibleUAV[1], b.visibleUAV[2], b.visibleUAV[3], b.windUAV
+	};
+	UINT initialCounts[GrassBucket::kBands + 1] = { 0, 0, 0, 0, (UINT)-1 };
+	ctx->CSSetUnorderedAccessViews(0, GrassBucket::kBands + 1, uavs, initialCounts);
+
+	ctx->CSSetShader(cullCS, nullptr, 0);
+	ID3D11Buffer* cbs[2] = { cullParamsCB, cullBucketCB };
+	ctx->CSSetConstantBuffers(0, 2, cbs);
+	ID3D11ShaderResourceView* srvs[2] = { b.instanceSRV, b.originSRV };
+	ctx->CSSetShaderResources(0, 2, srvs);
+
+	ctx->Dispatch((b.totalInstances + 63) / 64, 1, 1);
+
+	ID3D11UnorderedAccessView* nullUAVs[GrassBucket::kBands + 1] = {};
+	ctx->CSSetUnorderedAccessViews(0, GrassBucket::kBands + 1, nullUAVs, nullptr);
+	ID3D11ShaderResourceView* nullSRVs[2] = {};
+	ctx->CSSetShaderResources(0, 2, nullSRVs);
+
+	for (uint32_t band = 0; band < GrassBucket::kBands; ++band)
+		ctx->CopyStructureCount(b.argsBuf[band], sizeof(uint32_t), b.visibleUAV[band]);
+}
+
+void GrassOptimizations::UpdateCoarseBounds(GrassBucket& b)
+{
+	constexpr float kCell = 4096.0f;
+	RE::NiPoint3 mn{ FLT_MAX, FLT_MAX, FLT_MAX };
+	RE::NiPoint3 mx{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+	for (const auto& s : b.slices) {
+		// cell spans [origin, origin + cell] in XY; Z from actual data is unknown here,
+		// so use a generous Z band around origin (grass height + terrain relief).
+		mn.x = std::min(mn.x, s.origin.x);
+		mn.y = std::min(mn.y, s.origin.y);
+		mx.x = std::max(mx.x, s.origin.x + kCell);
+		mx.y = std::max(mx.y, s.origin.y + kCell);
+	}
+	// Z: cells are XY-lattice (origin.z == 0 in your data); grass sits near terrain.
+	// Use a wide Z to stay conservative — refine if you store per-slice Z extent.
+	mn.z = -8192.0f;
+	mx.z = 8192.0f;
+	b.coarseMin = mn;
+	b.coarseMax = mx;
+	b.coarseValid = true;
+}
+
+bool GrassOptimizations::DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11Device*, ID3D11DeviceContext* ctx)
+{
+	if (auto it = complexCache.find(tex); it != complexCache.end())
+		return it->second;
+
+	bool complex = false;
+
+	auto* rt = tex ? tex->rendererTexture : nullptr;
+	if (detectCS && rt && rt->resourceView && rt->height > 0) {
+		{
+			D3D11_MAPPED_SUBRESOURCE m{};
+			if (SUCCEEDED(ctx->Map(detectParamsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+				struct DetectParams
+				{
+					uint32_t texHeight;
+					float threshold;
+					uint32_t pad[2];
+				};
+				auto* dp = static_cast<DetectParams*>(m.pData);
+				dp->texHeight = rt->height;
+				dp->threshold = globals::features::grassLighting.settings.ComplexGrassThreshold;
+				dp->pad[0] = dp->pad[1] = 0;
+				ctx->Unmap(detectParamsCB, 0);
+			}
+		}
+
+		UINT initialCount = 0;
+		ctx->CSSetUnorderedAccessViews(0, 1, &detectResultUAV, &initialCount);
+		ctx->CSSetShader(detectCS, nullptr, 0);
+		ctx->CSSetConstantBuffers(0, 1, &detectParamsCB);
+		ctx->CSSetShaderResources(0, 1, &rt->resourceView);
+		ctx->Dispatch(1, 1, 1);
+
+		ID3D11UnorderedAccessView* nullUAV = nullptr;
+		ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+		ID3D11ShaderResourceView* nullSRV = nullptr;
+		ctx->CSSetShaderResources(0, 1, &nullSRV);
+
+		// one stall per unique texture, at cell load — never per frame
+		ctx->CopyResource(detectStaging, detectResultBuf);
+		D3D11_MAPPED_SUBRESOURCE m{};
+		if (SUCCEEDED(ctx->Map(detectStaging, 0, D3D11_MAP_READ, 0, &m))) {
+			complex = (*static_cast<const uint32_t*>(m.pData)) != 0;
+			ctx->Unmap(detectStaging, 0);
+		}
+	}
+
+	complexCache.emplace(tex, complex);
+	return complex;
 }
 
 void GrassOptimizations::Hooks::BSMultiStreamInstanceTriShape_dtor::thunk(RE::BSMultiStreamInstanceTriShape* shape)
@@ -571,135 +910,6 @@ void GrassOptimizations::Hooks::BSMultiStreamInstanceTriShape_dtor::thunk(RE::BS
 		self.pendingRemoves.push_back(shape);
 	}
 	func(shape);
-}
-
-void GrassOptimizations::InitRunBaseCB()
-{
-	if (FAILED(globals::d3d::context->QueryInterface(
-			__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1)))) {
-		ctx1 = nullptr;
-		logger::warn("[GRASS OPTIMIZATIONS] ID3D11DeviceContext1 unavailable — per-run cb7 fallback in use");
-	}
-}
-
-bool GrassOptimizations::EnsureRunBaseCapacity(uint32_t slots, ID3D11Device* device)
-{
-	if (runBaseCB && runBaseCBCapacity >= slots)
-		return true;
-
-	uint32_t cap = runBaseCBCapacity ? runBaseCBCapacity : 256;
-	while (cap < slots)
-		cap *= 2;
-
-	D3D11_BUFFER_DESC bd{};
-	bd.ByteWidth = cap * 256;
-	bd.Usage = D3D11_USAGE_DYNAMIC;
-	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-	ID3D11Buffer* newCB = nullptr;
-	const HRESULT hr = device->CreateBuffer(&bd, nullptr, &newCB);
-	if (FAILED(hr) || !newCB) {
-		logger::error("[GRASS OPTIMIZATIONS] run base CB create failed hr={:08X} bytes={}", (unsigned)hr, bd.ByteWidth);
-		return false; 
-	}
-	Util::SetResourceName(newCB, "GrassOptimizations::RunBaseCB");
-
-	
-	if (runBaseCB) {
-		if (runBaseCBRetired)
-			runBaseCBRetired->Release(); 
-		runBaseCBRetired = runBaseCB;
-		retireFrame = globals::game::graphicsState->frameCount;
-	}
-	runBaseCB = newCB;
-	runBaseCBCapacity = cap;
-	return true;
-}
-
-void GrassOptimizations::UploadRunBases(ID3D11DeviceContext* ctx)
-{
-	ZoneScoped;
-
-	if (!ctx1)
-		return; 
-
-	uint32_t totalRuns = 0;
-	for (auto& [key, b] : buckets)
-		totalRuns += (uint32_t)b.visibleRuns.size();
-	if (!totalRuns)
-		return;
-
-	if (!EnsureRunBaseCapacity(totalRuns, globals::d3d::device)) {
-		for (auto& [key, b] : buckets)
-			for (auto& r : b.visibleRuns)
-				r.cbFirstConst = UINT32_MAX;
-		return;
-	}
-
-	D3D11_MAPPED_SUBRESOURCE m{};
-	const HRESULT hr = ctx->Map(runBaseCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
-	if (FAILED(hr)) {
-		logger::error("[GRASS OPTIMIZATIONS] run base CB map failed hr={:08X} runs={}", (unsigned)hr, totalRuns);
-		for (auto& [key, b] : buckets)
-			for (auto& r : b.visibleRuns)
-				r.cbFirstConst = UINT32_MAX;
-		return;
-	}
-
-	auto* bytes = static_cast<uint8_t*>(m.pData);
-	uint32_t slot = 0;
-	for (auto& [key, b] : buckets) {
-		b.slotBase = slot;
-		for (auto& r : b.visibleRuns) {
-			auto* rs = reinterpret_cast<RunSlot*>(bytes + (size_t)slot * 256);
-			rs->base = r.base;
-			rs->fadeNow = timeAccum;
-			rs->fadeInTimeRcp = fadeInTimeRcp;
-			rs->debugFlags = settings.ShowDebugVisualization;
-			rs->origin[0] = r.origin.x;
-			rs->origin[1] = r.origin.y;
-			rs->origin[2] = r.origin.z;
-			rs->pad1 = 0.0f;
-			rs->slotIndex = slot;
-			rs->isFar = (r.sortKeySq > settings.farGrassDistance * settings.farGrassDistance) ? 1u : 0u;
-			rs->pad2[0] = rs->pad2[1] = 0;
-			r.cbFirstConst = slot * 16;
-			++slot;
-		}
-	}
-	ctx->Unmap(runBaseCB, 0);
-}
-
-static bool IsGrassWorthyPass(RE::NiCullingProcess* proc)
-{
-	auto& self = globals::features::grassOptimizations;
-
-	if (proc->GetRTTI() == self.BSParabolicCullingProcess_Ni_RTTI.get())
-		return false;
-
-	if (auto* cam = proc->camera; cam && cam->GetRTTI() == self.BSCubeMapCamera_Ni_RTTI.get())
-		return false;
-
-	return true;
-}
-
-bool GrassOptimizations::EnsureTriggerCB(ID3D11Device* device)
-{
-	if (triggerCB)
-		return true;
-	D3D11_BUFFER_DESC bd{};
-	bd.ByteWidth = 16;
-	bd.Usage = D3D11_USAGE_DYNAMIC;
-	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-	const HRESULT hr = device->CreateBuffer(&bd, nullptr, &triggerCB);
-	if (FAILED(hr) || !triggerCB) {
-		logger::error("[GRASS OPTIMIZATIONS] trigger CB create failed hr={:08X}", (unsigned)hr);
-		return false;
-	}
-	Util::SetResourceName(triggerCB, "GrassOptimizations::TriggerCB");
-	return true;
 }
 
 void GrassOptimizations::Hooks::BSMultiStreamInstanceTriShape_OnVisible::thunk(RE::BSMultiStreamInstanceTriShape* This, RE::NiCullingProcess* process, std::int32_t alphaGroupIndex)
@@ -924,7 +1134,6 @@ void VanillaDrawInstanceTriShape(RE::BSMultiStreamInstanceTriShape* geometry)
 	}
 }
 
-
 void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pass, RE::BSMultiStreamInstanceTriShape* geometry)
 {
 	auto& self = globals::features::grassOptimizations;
@@ -936,9 +1145,7 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 			return;
 		}
 	}
-
-	auto grassProperty = reinterpret_cast<RE::BSGrassShaderProperty*>(geometry->GetGeometryRuntimeData().shaderProperty.get());
-	RE::NiSourceTexture* diffuseTexture = grassProperty->GetBaseTexture();
+	RE::NiSourceTexture* diffuseTexture = geometry->GetGeometryRuntimeData().shaderProperty->GetBaseTexture();
 	if (!diffuseTexture) {
 		VanillaDrawInstanceTriShape(geometry);
 		return;
@@ -946,6 +1153,7 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 
 	const uint64_t descVal = *reinterpret_cast<uint64_t*>(&geometry->GetGeometryRuntimeData().vertexDesc);
 	const uint32_t frame = globals::game::graphicsState->frameCount;
+
 	GrassBucket* b = nullptr;
 	{
 		std::scoped_lock lk(self.bucketMutex);
@@ -955,23 +1163,26 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 			return;
 		}
 		b = &it->second;
-		
 		if (b->drawnFrame == frame && b->drawnPass == pass)
 			return;
 		b->drawnFrame = frame;
 		b->drawnPass = pass;
 	}
 
-	const uint32_t meshStride = (uint32_t)((4 * descVal) & 0x3C);
-	const uint32_t instanceStride = (uint32_t)((descVal >> 2) & 0x3C);
+	if (!b->cullVisible) {
+		return;
+	}
 
+	const uint32_t meshStride = (uint32_t)((4 * descVal) & 0x3C);
 	auto* meshVB = reinterpret_cast<ID3D11Buffer*>(geometry->GetGeometryRuntimeData().rendererData->vertexBuffer);
 	auto* indexB = reinterpret_cast<ID3D11Buffer*>(geometry->GetGeometryRuntimeData().rendererData->indexBuffer);
 	if (!meshVB || !indexB)
 		return;
 
-	const UINT indexCount = 3u * geometry->GetTrishapeRuntimeData().triangleCount;
+	const uint32_t indexCount = 3u * geometry->GetTrishapeRuntimeData().triangleCount;
+	const D3D11_BOX argBox{ 0, 0, 0, sizeof(uint32_t), 1, 1 };
 
+	// engine state
 	auto& shadowState = globals::game::shadowState->GetRuntimeData();
 	if (shadowState.vertexDesc != descVal) {
 		shadowState.vertexDesc = descVal;
@@ -981,69 +1192,25 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 		shadowState.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 		shadowState.stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_PRIMITIVE_TOPO);
 	}
-
 	static REL::Relocation<void (*)(uint32_t)> SetDirtyStates{ REL::RelocationID(75580, 77386) };
 	SetDirtyStates(0);
 
+	// IA: mesh VB + index only — NO instance stream (moved to SRV)
 	ctx->IASetIndexBuffer(indexB, DXGI_FORMAT_R16_UINT, 0);
+	ID3D11Buffer* buffers[1] = { meshVB };
+	UINT strides[1] = { meshStride };
+	UINT offsets[1] = { 0 };
+	ctx->IASetVertexBuffers(0, 1, buffers, strides, offsets);
+	ID3D11ShaderResourceView* vsSRVs[5] = {
+		b->instanceSRV, b->originSRV, b->fadeSRV, nullptr, b->windSRV
+	};
+	ctx->VSSetConstantBuffers(7, 1, &self.grassFrameCB);
 
-	ID3D11Buffer* buffers[2] = { meshVB, b->instanceBuf };
-	UINT strides[2] = { meshStride, instanceStride };
-	UINT offsets[2] = { 0, 0 };
-	ctx->IASetVertexBuffers(0, 2, buffers, strides, offsets);
-
-	ctx->VSSetShaderResources(2, 1, &b->fadeSRV);
-
-	if (!self.EnsureTriggerCB(globals::d3d::device))
-		return;
-
-	const auto& wt = geometry->world.translate;
-	if (self.lastTriggerOrigin.x != wt.x || self.lastTriggerOrigin.y != wt.y || self.lastTriggerOrigin.z != wt.z) {
-		D3D11_MAPPED_SUBRESOURCE tm{};
-		if (FAILED(ctx->Map(self.triggerCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &tm)))
-			return;
-		float* t = static_cast<float*>(tm.pData);
-		t[0] = wt.x;
-		t[1] = wt.y;
-		t[2] = wt.z;
-		t[3] = 0.0f;
-		ctx->Unmap(self.triggerCB, 0);
-		self.lastTriggerOrigin = wt;
-	}
-	ctx->VSSetConstantBuffers(8, 1, &self.triggerCB);
-
-	if (!self.ctx1 || !self.runBaseCB) {
-		VanillaDrawInstanceTriShape(geometry);
-		return;
-	}
-
-	if (b->slotBase == UINT32_MAX)
-		return; 
-
-	const bool shadowPass = pass != grassProperty->depthPass && globals::game::smState->currentShaderTechnique == 0x5C00005C;
-
-	ID3D11Buffer* cbs[1] = { self.runBaseCB };
-	uint32_t runIndex = 0;
-	for (const auto& r : b->visibleRuns) {
-		const UINT derived = (b->slotBase + runIndex) * 16;
-		++runIndex;
-
-		if (shadowPass && self.shadowGrassDistSq > 0.0f && r.sortKeySq > self.shadowGrassDistSq)
-			continue;
-
-		if (r.cbFirstConst == UINT32_MAX)
-			continue;
-		if (r.cbFirstConst != derived) {
-			logger::error("[GRASS OPTIMIZATIONS] slot pairing mismatch: stored={} derived={} bucketBase={} run={}",
-				r.cbFirstConst, derived, b->slotBase, runIndex - 1);
-			continue;
-		}
-
-		UINT first = derived;
-		UINT num = 16;
-		self.ctx1->VSSetConstantBuffers1(7, 1, cbs, &first, &num);
-		ctx->DrawIndexedInstanced(indexCount, r.drawCount, 0, 0, r.base);  // drawCount from LOD thinning
+	// near → far: each band's survivors write depth for the next to early-Z against
+	for (uint32_t band = 0; band < GrassBucket::kBands; ++band) {
+		ctx->UpdateSubresource(b->argsBuf[band], 0, &argBox, &indexCount, 0, 0);
+		vsSRVs[3] = b->visibleSRV[band];
+		ctx->VSSetShaderResources(2, 5, vsSRVs);
+		ctx->DrawIndexedInstancedIndirect(b->argsBuf[band], 0);
 	}
 }
-
-
