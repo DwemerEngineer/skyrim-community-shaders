@@ -6,11 +6,21 @@
 struct BucketSlice
 {
 	RE::BSMultiStreamInstanceTriShape* shape;
-	std::vector<uint8_t> data;
+	std::vector<float> data;
 	uint32_t count;
 	float fadeStart;
 	RE::NiPoint3 origin;
 	uint32_t bufferOffset = UINT32_MAX;
+};
+
+struct PendingCapture
+{
+	RE::BSMultiStreamInstanceTriShape* shape = nullptr;
+	RE::NiSourceTexture* diffuseTexture = nullptr;
+	std::vector<float> expanded;
+	uint32_t count = 0;
+	uint64_t descVal = 0;
+	RE::NiPoint3 origin;
 };
 
 struct VisibleRun
@@ -25,7 +35,7 @@ struct VisibleRun
 
 struct GrassBucket
 {
-	static constexpr uint32_t kBands = 4;
+	static constexpr uint32_t kBands = 2;
 
 	// Static GPU state (rebuilt on capture/removal)
 	ID3D11Buffer* instanceBuf = nullptr;  // ByteAddressBuffer: raw half-packed records
@@ -44,6 +54,10 @@ struct GrassBucket
 	ID3D11UnorderedAccessView* windUAV = nullptr;
 	ID3D11ShaderResourceView* windSRV = nullptr;
 
+	ID3D11Buffer* lodFadeBuf = nullptr;  // float per instance
+	ID3D11UnorderedAccessView* lodFadeUAV = nullptr;
+	ID3D11ShaderResourceView* lodFadeSRV = nullptr;
+
 	uint32_t capacityInstances = 0;
 	uint32_t totalInstances = 0;
 	std::vector<BucketSlice> slices;
@@ -60,6 +74,16 @@ struct GrassBucket
 	bool cullVisible = false;
 
 	bool isComplex = false;
+	bool argsIndexCountWritten = false;
+
+	uint32_t cullSlot = UINT32_MAX;
+
+	bool typeParamsValid = false;
+	float wavePeriod = 1.0f;
+	RE::NiPoint3 boundCenter{};
+	float clumpRadius = 128.0f;
+	float distScale = 1.0f;
+	float minPixelScale = 1.0f;
 
 	void ReleaseResources()
 	{
@@ -79,7 +103,11 @@ struct GrassBucket
 		rel(windSRV);
 		rel(windUAV);
 		rel(windBuf);
+		rel(lodFadeSRV);
+		rel(lodFadeUAV);
+		rel(lodFadeBuf);
 		capacityInstances = 0;
+		argsIndexCountWritten = false;
 	}
 
 	void Release()
@@ -91,19 +119,6 @@ struct GrassBucket
 	// cull buffers (visibleBuf/argsBuf + UAVs) added in piece 2
 };
 
-
-struct PendingCapture
-{
-	RE::BSMultiStreamInstanceTriShape* shape = nullptr;
-	RE::NiSourceTexture* diffuseTexture = nullptr;
-	uint32_t instanceStride = 0;
-	std::vector<uint8_t> bytes{};
-	uint32_t count = 0;
-	uint64_t descVal = 0;
-	RE::NiPoint3 aabbMin;
-	RE::NiPoint3 aabbMax;
-	RE::NiPoint3 origin;
-};
 
 struct RunSlot
 {
@@ -141,8 +156,8 @@ public:
 	{
 		bool ShowDebugVisualization = false;
 		float BeginThinningDistance = 8000.0f;
-		float ThinningDistance = 8000.0f;
-		float MinDistantAmmount = 0.15f;
+		float ThinningDistance = 10000.0f;
+		float MinDistantAmmount = 0.10f;
 		float shadowGrassDistance = 8000.0f;
 		float farGrassDistance = 8000.0f;
 	};
@@ -209,30 +224,37 @@ public:
 		float wavePeriod;
 		float timeBase;
 		float prevTimeBase;
+		float boundCenter[3];
+		float clumpRadius;
+		float distScale;
+		float minPixelScale;
+		float pad[2];
 	};
-	static_assert(sizeof(CullBucketCB) == 16);
+	static_assert(sizeof(CullBucketCB) == 48);
 
 	ID3D11ComputeShader* cullCS = nullptr;
 	ID3D11Buffer* cullParamsCB = nullptr;  // per-frame frustum + params
 	ID3D11Buffer* cullBucketCB = nullptr;
+	uint32_t cullBucketCBSlots = 0;
+	static constexpr uint32_t kSlotBytes = 256;
 	bool cullInit = false;
+	ID3D11Buffer* bandCB = nullptr;  // static 2 slots: {0} near, {1} far
+
 	struct CullParamsCB
 	{
-		float frustumPlanes[6][4];
-		float cameraPos[3];
-		uint32_t pad0;
+		float frustumPlanes[6][4];  // 96
+		float cameraPos[3];         // 108
+		uint32_t pad0;              // 112
 		float maxDistSq;
-		float pad1;
 		float lodNearDistSq;
 		float lodFarDistSq;
-		float lodMinKeep;
-		float clumpRadius;
+		float lodMinKeep;  // 128
+		float lodFadeBand;
 		float projScale;
 		float minPixelSize;
-		float bandDistSq[3];  // NEW — 3 boundaries → 4 bands
-		float pad2;           // NEW
+		float bandDistSq;  // 144
 	};
-	static_assert(sizeof(CullParamsCB) % 16 == 0);  // 160
+	static_assert(sizeof(CullParamsCB) == 144);
 	ID3D11Buffer* grassFrameCB = nullptr; 
 
 	ID3D11ComputeShader* detectCS = nullptr;
@@ -256,12 +278,15 @@ public:
 	void ApplyRemovals(const std::vector<RE::BSMultiStreamInstanceTriShape*>& removes);
 	void ApplyCaptures(std::vector<PendingCapture>& captures);
 	void UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceContext* ctx);
-	void RebuildBucket(GrassBucket& bucket, uint32_t instanceStride, ID3D11Device* device, ID3D11DeviceContext* ctx);
-	void AppendNewSlices(GrassBucket& bucket, uint32_t instanceStride, ID3D11DeviceContext* ctx);
-	bool EnsureBucketCapacity(GrassBucket& b, uint32_t neededInstances, uint32_t instanceStride, ID3D11Device* device);
+	void RebuildBucket(GrassBucket& bucket, ID3D11Device* device, ID3D11DeviceContext* ctx);
+	void AppendNewSlices(GrassBucket& bucket, ID3D11DeviceContext* ctx);
+	bool EnsureBucketCapacity(GrassBucket& b, uint32_t neededInstances, ID3D11Device* device);
 	bool AabbVisible(const RE::NiFrustumPlanes& f, const RE::NiPoint3& mn, const RE::NiPoint3& mx);
 	void CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape, RE::BSMultiStreamInstanceTriShape::GroupHeader* header, const uint16_t* instanceData);
 	void UpdateCoarseBounds(GrassBucket& b);
+	bool EnsureCullBucketCapacity(uint32_t slots, ID3D11Device* device);
+	void CacheBucketTypeParams(GrassBucket& b, RE::BSMultiStreamInstanceTriShape* shape);
+	bool StageCapture(RE::BSMultiStreamInstanceTriShape* shape, const void* src,uint32_t count, uint32_t stride, uint64_t descVal, RE::NiSourceTexture* tex);
 
 	bool DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11Device* device, ID3D11DeviceContext* ctx);
 
@@ -355,7 +380,7 @@ public:
 			auto& trampoline = SKSE::GetTrampoline();
 
 			stl::write_vfunc<0x0, BSMultiStreamInstanceTriShape_dtor>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
-			//stl::write_vfunc<0x34, BSMultiStreamInstanceTriShape_OnVisible>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
+			stl::write_vfunc<0x34, BSMultiStreamInstanceTriShape_OnVisible>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 			stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 
 			stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
