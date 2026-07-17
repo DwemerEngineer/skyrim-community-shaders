@@ -6,15 +6,13 @@ cbuffer CullParams : register(b0)
     float3 CameraPos;
     uint _pad0;
     float MaxDistSq;
-    float pad1;
     float LODNearDistSq;
     float LODFarDistSq;
     float LODMinKeep;
-    float ClumpRadius;
+    float LODFadeBand;
     float ProjScale;
     float MinPixelSize;
-    float3 BandDistSq;
-    float _pad2;
+    float BandDistSq;
 };
 
 cbuffer CullBucket : register(b1)
@@ -23,16 +21,20 @@ cbuffer CullBucket : register(b1)
     float WavePeriod;
     float TimeBase;
     float PrevTimeBase;
+    float3 BoundCenter;
+    float ClumpRadius;
+    float DistScale;
+    float MinPixelScale;
+    float2 _pad1;
 };
 
 StructuredBuffer<float4> Instances : register(t0);
 StructuredBuffer<float4> Origins : register(t1);
 
-AppendStructuredBuffer<uint> Visible0 : register(u0); // nearest
-AppendStructuredBuffer<uint> Visible1 : register(u1);
-AppendStructuredBuffer<uint> Visible2 : register(u2);
-AppendStructuredBuffer<uint> Visible3 : register(u3); // farthest
-RWStructuredBuffer<float2> WindScalars : register(u4);
+AppendStructuredBuffer<uint> VisibleNear : register(u0);
+AppendStructuredBuffer<uint> VisibleFar : register(u1);
+RWStructuredBuffer<float2> WindScalars : register(u2);
+RWStructuredBuffer<float> LodFades : register(u3);
 
 float Hash(uint i)
 {
@@ -63,19 +65,29 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
 
     const float4 d1 = Instances[idx * 4];
-    const float3 local = d1.xyz;
-    const float3 world = local + Origins[idx].xyz;
+    const float3 world = d1.xyz + Origins[idx].xyz;
 
     const float3 dv = world - CameraPos;
     const float distSq = dot(dv, dv);
-    if (distSq > MaxDistSq)
+
+	// heavy meshes stop sooner: DistScale < 1 for high vertex counts
+    const float scaleSq = DistScale * DistScale;
+    if (distSq > MaxDistSq * scaleSq)
         return;
 
-    if (distSq > LODNearDistSq)
+	// LOD thinning with a fade band: instances leave gradually via Color.w instead of
+	// popping at the hash boundary, which is what capped how low LODMinKeep could go.
+    float lodFade = 1.0;
+    const float effNearSq = LODNearDistSq * scaleSq;
+    if (distSq > effNearSq)
     {
-        const float t = saturate((distSq - LODNearDistSq) / (LODFarDistSq - LODNearDistSq));
-        if (Hash(idx) > lerp(1.0, LODMinKeep, t))
-            return;
+        const float effFarSq = LODFarDistSq * scaleSq;
+        const float t = saturate((distSq - effNearSq) / max(effFarSq - effNearSq, 1e-4));
+        const float keep = lerp(1.0, LODMinKeep, t);
+        const float h = Hash(idx);
+        if (h > keep + LODFadeBand)
+            return; // fully faded — costs no VS at all
+        lodFade = saturate((keep + LODFadeBand - h) / LODFadeBand);
     }
 
 	[unroll]
@@ -85,28 +97,17 @@ void main(uint3 tid : SV_DispatchThreadID)
             return;
     }
 
-    if ((ClumpRadius / sqrt(distSq)) * ProjScale < MinPixelSize)
+    if ((ClumpRadius / sqrt(distSq)) * ProjScale < MinPixelSize * MinPixelScale)
         return;
 
-	// survivor: wind is only ever read for these
+	// survivor: these are only ever read for appended instances
     const float basis = (d1.x + d1.y) * -0.0078125;
-    WindScalars[idx] = float2(WindScalar(basis, TimeBase * WavePeriod), WindScalar(basis, PrevTimeBase * WavePeriod));
+    WindScalars[idx] = float2(WindScalar(basis, TimeBase * WavePeriod),
+	                          WindScalar(basis, PrevTimeBase * WavePeriod));
+    LodFades[idx] = lodFade;
 
-	// distance band → draw order. Dynamic UAV indexing needs SM5.1, so branch.
-    uint band = 0;
-    if (distSq > BandDistSq.x)
-        band = 1;
-    if (distSq > BandDistSq.y)
-        band = 2;
-    if (distSq > BandDistSq.z)
-        band = 3;
-
-    if (band == 0)
-        Visible0.Append(idx);
-    else if (band == 1)
-        Visible1.Append(idx);
-    else if (band == 2)
-        Visible2.Append(idx);
+    if (distSq > BandDistSq)
+        VisibleFar.Append(idx);
     else
-        Visible3.Append(idx);
+        VisibleNear.Append(idx);
 }
