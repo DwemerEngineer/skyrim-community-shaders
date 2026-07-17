@@ -96,20 +96,9 @@ cbuffer PerGeometry : register(
 #	endif  // GRASS_COLLISION
 
 #	ifdef GRASS_OPTIMIZATIONS
-StructuredBuffer<float4> InstanceData    : register(t2);
-StructuredBuffer<float4> InstanceOrigin  : register(t3);
-StructuredBuffer<float>  InstanceFade    : register(t4);
-StructuredBuffer<uint>   VisibleIndices  : register(t5);
-StructuredBuffer<float2> InstanceWind    : register(t6);
-StructuredBuffer<float>  InstanceLodFade : register(t7);
-
-cbuffer GrassOptFrame : register(b7)
-{
-	float FadeNow;
-	float FadeInTimeRcp;
-	uint DebugFlags;
-	uint _padGOF;
-}
+StructuredBuffer<float4> InstanceData   : register(t2);
+StructuredBuffer<uint>   VisibleIndices : register(t5);
+StructuredBuffer<float4> InstanceParams : register(t6);   // {windCur, windPrev, fade, isComplex}
 
 cbuffer GrassOptBand : register(b8)
 {
@@ -199,29 +188,23 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	input.InstanceData2 = inst.d2;
 	input.InstanceData3 = inst.d3;
 	input.InstanceData4 = inst.d4;
-	const float4 originData = InstanceOrigin[realIdx];
-	float3 originAdj = originData.xyz;
-	vsout.IsComplex = originData.w;
+	const float4 prm = InstanceParams[realIdx];
+	vsout.IsComplex = prm.w;
 #		endif
 
 	float3x3 world3x3 = float3x3(input.InstanceData2.xyz, input.InstanceData3.xyz, float3(input.InstanceData4.x, input.InstanceData2.w, input.InstanceData3.w));
 
 	float4 msPosition = GetMSPosition(input, world3x3);
 
-#		ifdef GRASS_OPTIMIZATIONS
-	msPosition.xyz += originAdj;
-#		endif
-
 #		if !defined(RENDER_DEPTH)
 	float4 previousMsPosition = msPosition;
 #		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
-	const float2 ws = InstanceWind[realIdx];
 	const float vertexTerm = WindVector.z * (0.5 * (input.Color.w * input.Color.w));
-	const float3 windDisplacement = float3(WindVector.xy, 0) * (ws.x * vertexTerm);
+	const float3 windDisplacement = float3(WindVector.xy, 0) * (prm.x * vertexTerm);
 #			if !defined(RENDER_DEPTH)
-	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (ws.y * vertexTerm);
+	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (prm.y * vertexTerm);
 #			endif
 #		else
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
@@ -277,20 +260,12 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.Depth = projSpacePosition.zw;
 #		endif
 
-	// Color.w feeds the RENDER_DEPTH alpha test, which is what makes fades work at all:
-	// fade lowers alpha -> prepass discards -> color pass EQUAL finds no matching depth.
-#		ifdef GRASS_OPTIMIZATIONS
-	float perInstanceFade = saturate((FadeNow - InstanceFade[realIdx]) * FadeInTimeRcp);
-#		else
-	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
-#		endif
-
-	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
-
 	vsout.Color.xyz = input.Color.xyz;
 #		ifdef GRASS_OPTIMIZATIONS
-	vsout.Color.w = distanceFade * perInstanceFade * InstanceLodFade[realIdx];
+	vsout.Color.w = prm.z;
 #		else
+	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
+	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
 	vsout.Color.w = distanceFade * perInstanceFade;
 #		endif
 
@@ -321,27 +296,21 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	input.InstanceData2 = inst.d2;
 	input.InstanceData3 = inst.d3;
 	input.InstanceData4 = inst.d4;
-	const float4 originData = InstanceOrigin[realIdx];
-	float3 originAdj = originData.xyz;
-	vsout.IsComplex = originData.w;
+	const float4 prm = InstanceParams[realIdx];
+	vsout.IsComplex = prm.w;
 #		endif
 
 	float4 msPosition = GetMSPosition(input);
-
-#		ifdef GRASS_OPTIMIZATIONS
-	msPosition.xyz += originAdj;
-#		endif
 
 #		if !defined(RENDER_DEPTH)
 	float4 previousMsPosition = msPosition;
 #		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
-	const float2 ws = InstanceWind[realIdx];
 	const float vertexTerm = WindVector.z * (0.5 * (input.Color.w * input.Color.w));
-	const float3 windDisplacement = float3(WindVector.xy, 0) * (ws.x * vertexTerm);
+	const float3 windDisplacement = float3(WindVector.xy, 0) * (prm.x * vertexTerm);
 #			if !defined(RENDER_DEPTH)
-	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (ws.y * vertexTerm);
+	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (prm.y * vertexTerm);
 #			endif
 #		else
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
@@ -388,18 +357,12 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.Depth = projSpacePosition.zw;
 #		endif
 
-#		ifdef GRASS_OPTIMIZATIONS
-	float perInstanceFade = saturate((FadeNow - InstanceFade[realIdx]) * FadeInTimeRcp);
-#		else
-	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
-#		endif
-
-	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
-
 	vsout.Color.xyz = input.Color.xyz;
 #		ifdef GRASS_OPTIMIZATIONS
-	vsout.Color.w = distanceFade * perInstanceFade * InstanceLodFade[realIdx];
+	vsout.Color.w = prm.z;
 #		else
+	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
+	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
 	vsout.Color.w = distanceFade * perInstanceFade;
 #		endif
 
