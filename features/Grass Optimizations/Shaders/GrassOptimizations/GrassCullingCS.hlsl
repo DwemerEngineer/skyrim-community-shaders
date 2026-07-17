@@ -1,10 +1,9 @@
+#include "Common/FrameBuffer.hlsli"
 #include "Common/Math.hlsli"
 
 cbuffer CullParams : register(b0)
 {
     float4 FrustumPlanes[6];
-    float3 CameraPos;
-    uint _pad0;
     float MaxDistSq;
     float LODNearDistSq;
     float LODFarDistSq;
@@ -13,6 +12,10 @@ cbuffer CullParams : register(b0)
     float ProjScale;
     float MinPixelSize;
     float BandDistSq;
+    float AlphaParam1;
+    float AlphaParam2;
+    float FadeNow;
+    float FadeInTimeRcp;
 };
 
 cbuffer CullBucket : register(b1)
@@ -25,16 +28,16 @@ cbuffer CullBucket : register(b1)
     float ClumpRadius;
     float DistScale;
     float MinPixelScale;
-    float2 _pad1;
+    float IsComplex;
+    float _pad1;
 };
 
 StructuredBuffer<float4> Instances : register(t0);
-StructuredBuffer<float4> Origins : register(t1);
+StructuredBuffer<float> SpawnTimes : register(t1);
 
 AppendStructuredBuffer<uint> VisibleNear : register(u0);
 AppendStructuredBuffer<uint> VisibleFar : register(u1);
-RWStructuredBuffer<float2> WindScalars : register(u2);
-RWStructuredBuffer<float> LodFades : register(u3);
+RWStructuredBuffer<float4> InstanceParams : register(u2);
 
 float Hash(uint i)
 {
@@ -65,18 +68,14 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
 
     const float4 d1 = Instances[idx * 4];
-    const float3 world = d1.xyz + Origins[idx].xyz;
-
-    const float3 dv = world - CameraPos;
+    const float3 world = d1.xyz; 
+    const float3 dv = world - FrameBuffer::CameraPosAdjust.xyz;
     const float distSq = dot(dv, dv);
 
-	// heavy meshes stop sooner: DistScale < 1 for high vertex counts
     const float scaleSq = DistScale * DistScale;
     if (distSq > MaxDistSq * scaleSq)
         return;
 
-	// LOD thinning with a fade band: instances leave gradually via Color.w instead of
-	// popping at the hash boundary, which is what capped how low LODMinKeep could go.
     float lodFade = 1.0;
     const float effNearSq = LODNearDistSq * scaleSq;
     if (distSq > effNearSq)
@@ -86,7 +85,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float keep = lerp(1.0, LODMinKeep, t);
         const float h = Hash(idx);
         if (h > keep + LODFadeBand)
-            return; // fully faded — costs no VS at all
+            return;
         lodFade = saturate((keep + LODFadeBand - h) / LODFadeBand);
     }
 
@@ -100,11 +99,18 @@ void main(uint3 tid : SV_DispatchThreadID)
     if ((ClumpRadius / sqrt(distSq)) * ProjScale < MinPixelSize * MinPixelScale)
         return;
 
-	// survivor: these are only ever read for appended instances
-    const float basis = (d1.x + d1.y) * -0.0078125;
-    WindScalars[idx] = float2(WindScalar(basis, TimeBase * WavePeriod),
-	                          WindScalar(basis, PrevTimeBase * WavePeriod));
-    LodFades[idx] = lodFade;
+	// Everything below was per-vertex in the VS and is per-instance constant.
+	// Matches the VS expression exactly: same ViewProj, same eye-relative input.
+    const float4 clip = mul(FrameBuffer::CameraViewProj, float4(dv, 1.0));
+    const float distFade = 1.0 - saturate((length(clip.xyz) - AlphaParam1) / AlphaParam2);
+    const float spawnFade = saturate((FadeNow - SpawnTimes[idx]) * FadeInTimeRcp);
+
+    const float basis = d1.w; // precomputed from local coords at capture
+    InstanceParams[idx] = float4(
+		WindScalar(basis, TimeBase * WavePeriod),
+		WindScalar(basis, PrevTimeBase * WavePeriod),
+		distFade * spawnFade * lodFade,
+		IsComplex);
 
     if (distSq > BandDistSq)
         VisibleFar.Append(idx);
