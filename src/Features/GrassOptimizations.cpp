@@ -183,12 +183,13 @@ void GrassOptimizations::UpdateGrass()
 			cp->cameraPos[2] = camPos.z;
 			cp->maxDistSq = maxDistSq;
 			// thinning starts closer and floors lower — the fade makes it survivable
-			cp->lodNearDistSq = 4000.0f * 4000.0f;
-			cp->lodFarDistSq = 16000.0f * 16000.0f;
+			cp->lodNearDistSq = 6000.0f * 6000.0f;
+			cp->lodFarDistSq = 20000.0f * 20000.0f;
 			cp->lodMinKeep = 0.05f;
 			cp->lodFadeBand = 0.15f;
-			cp->projScale = screenH / (2.0f * tanf(0.5f * Util::GetVerticalFOVRad()));
-			cp->minPixelSize = 2.0f;
+			const auto& vf = cam->GetRuntimeData2().viewFrustum;
+			cp->projScale = screenH / (2.0f * std::abs(vf.fTop));
+			cp->minPixelSize = 6.0f;
 			cp->bandDistSq = (maxGrassDistance * 0.3f) * (maxGrassDistance * 0.3f);
 			ctx->Unmap(cullParamsCB, 0);
 		}
@@ -415,7 +416,6 @@ void GrassOptimizations::CacheBucketTypeParams(GrassBucket& b, RE::BSMultiStream
 	const float w = std::sqrt(cost);
 	b.distScale = 1.0f / w;
 	b.minPixelScale = w;
-
 	b.typeParamsValid = true;
 }
 
