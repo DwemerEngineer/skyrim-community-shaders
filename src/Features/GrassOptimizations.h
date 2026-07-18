@@ -51,7 +51,7 @@ public:
 	struct BucketSlice
 	{
 		RE::BSMultiStreamInstanceTriShape* shape;
-		std::vector<float> data;
+		std::vector<uint8_t> data;  // REVERTED to raw 32B half records
 		uint32_t count;
 		float fadeStart;
 		RE::NiPoint3 origin;
@@ -62,7 +62,7 @@ public:
 	{
 		RE::BSMultiStreamInstanceTriShape* shape = nullptr;
 		RE::NiSourceTexture* diffuseTexture = nullptr;
-		std::vector<float> expanded;
+		std::vector<uint8_t> bytes;  // REVERTED
 		uint32_t count = 0;
 		uint64_t descVal = 0;
 		RE::NiPoint3 origin;
@@ -80,21 +80,29 @@ public:
 
 	struct GrassBucket
 	{
-		static constexpr uint32_t kBands = 2;
-
-		ID3D11Buffer* instanceBuf = nullptr;  // float4 x4, origin baked into d1.xyz, wind basis in d1.w
+		ID3D11Buffer* instanceBuf = nullptr;
 		ID3D11ShaderResourceView* instanceSRV = nullptr;
-		ID3D11Buffer* spawnBuf = nullptr;  // float per instance — CS input now, not VS
-		ID3D11ShaderResourceView* spawnSRV = nullptr;
+		ID3D11Buffer* originBuf = nullptr;
+		ID3D11ShaderResourceView* originSRV = nullptr;
 
-		ID3D11Buffer* paramsBuf = nullptr;  // float4 {windCur, windPrev, fade, isComplex}
-		ID3D11UnorderedAccessView* paramsUAV = nullptr;
-		ID3D11ShaderResourceView* paramsSRV = nullptr;
+		ID3D11Buffer* compactedBuf = nullptr;
+		ID3D11UnorderedAccessView* compactedUAV = nullptr;
+		ID3D11Buffer* extrasBuf = nullptr;
+		ID3D11UnorderedAccessView* extrasUAV = nullptr;
+		ID3D11ShaderResourceView* extrasSRV = nullptr;
+		ID3D11Buffer* counterBuf = nullptr;
+		ID3D11UnorderedAccessView* counterUAV = nullptr;
+		ID3D11Buffer* argsBuf = nullptr;
 
-		ID3D11Buffer* visibleBuf[kBands] = {};
-		ID3D11UnorderedAccessView* visibleUAV[kBands] = {};
-		ID3D11ShaderResourceView* visibleSRV[kBands] = {};
-		ID3D11Buffer* argsBuf[kBands] = {};
+		uint32_t cullSlot = UINT32_MAX;
+		bool typeParamsValid = false;
+		float wavePeriod = 1.0f;
+		RE::NiPoint3 boundCenter{};
+		float clumpRadius = 128.0f;
+		float distScale = 1.0f;
+		float minPixelScale = 1.0f;
+		bool isComplex = false;
+		bool argsIndexCountWritten = false;
 
 		uint32_t capacityInstances = 0;
 		uint32_t totalInstances = 0;
@@ -111,34 +119,21 @@ public:
 		bool coarseValid = false;
 		bool cullVisible = false;
 
-		bool isComplex = false;
-		bool argsIndexCountWritten = false;
-
-		uint32_t cullSlot = UINT32_MAX;
-
-		bool typeParamsValid = false;
-		float wavePeriod = 1.0f;
-		RE::NiPoint3 boundCenter{};
-		float clumpRadius = 128.0f;
-		float distScale = 1.0f;
-		float minPixelScale = 1.0f;
-
 		void ReleaseResources()
 		{
 			auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
 			rel(instanceBuf);
 			rel(instanceSRV);
-			rel(spawnBuf);
-			rel(spawnSRV);
-			rel(paramsBuf);
-			rel(paramsUAV);
-			rel(paramsSRV);
-			for (uint32_t i = 0; i < kBands; ++i) {
-				rel(visibleSRV[i]);
-				rel(visibleUAV[i]);
-				rel(visibleBuf[i]);
-				rel(argsBuf[i]);
-			}
+			rel(originBuf);
+			rel(originSRV);
+			rel(compactedBuf);
+			rel(compactedUAV);
+			rel(extrasBuf);
+			rel(extrasUAV);
+			rel(extrasSRV);
+			rel(counterBuf);
+			rel(counterUAV);
+			rel(argsBuf);
 			capacityInstances = 0;
 			argsIndexCountWritten = false;
 		}
@@ -149,7 +144,6 @@ public:
 			totalInstances = 0;
 			slices.clear();
 		}
-		// cull buffers (visibleBuf/argsBuf + UAVs) added in piece 2
 	};
 
 	struct RunSlot
@@ -171,17 +165,19 @@ public:
 		float maxDistSq;
 		float lodNearDistSq;
 		float lodFarDistSq;
-		float lodMinKeep;  // 128
+		float lodMinKeep;  // 112
 		float lodFadeBand;
 		float projScale;
 		float minPixelSize;
-		float bandDistSq;      // 144
+		float edgeFadeStart;    // 128 — fraction of max distance where the cull fade begins
+		float collisionDistSq;  // 132
 		float alphaParam1;
 		float alphaParam2;
-		float fadeNow;
-		float fadeInTimeRcp;  // 224
+		float fadeNow;  // 144
+		float fadeInTimeRcp;
+		float pad[3];  // 160
 	};
-	static_assert(sizeof(CullParamsCB) == 144);
+	static_assert(sizeof(CullParamsCB) % 16 == 0);
 
 	struct CullBucketCB
 	{
