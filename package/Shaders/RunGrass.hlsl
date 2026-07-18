@@ -218,7 +218,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.HPosition = projSpacePosition;
 #			if !defined(RENDER_DEPTH)
 	float3 prevEyeRel = previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz;
-	vsout.PreviousWorldPosition = mul(FrameBuffer::CameraPreviousViewProjUnjittered, float4(prevEyeRel, 1.0));
+	vsout.PreviousWorldPosition = float4(prevEyeRel, 1.0);
 #			endif
 #		else
 	precise float4 projSpacePosition = mul(WorldViewProj, msPosition);
@@ -356,7 +356,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 #		if !defined(RENDER_DEPTH)
 #			ifdef GRASS_OPTIMIZATIONS
 	vsout.WorldPosition = float4(eyeRel, 1.0);
-	vsout.PreviousWorldPosition = mul(FrameBuffer::CameraPreviousViewProjUnjittered, float4(previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz, 1.0));
+	vsout.PreviousWorldPosition = float4(previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz, 1.0);
 #			else
 	vsout.WorldPosition = mul(World, msPosition);
 	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
