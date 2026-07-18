@@ -33,11 +33,13 @@ struct VS_INPUT
 struct VS_OUTPUT
 {
 	float4 HPosition: SV_POSITION0;
-	float4 Color: COLOR0;
-	float2 TexCoord: TEXCOORD0;
 #if defined(RENDER_DEPTH)
+	float Alpha: COLOR0;
+	float2 TexCoord: TEXCOORD0;
 	float2 Depth: TEXCOORD2;
 #else
+	float4 Color: COLOR0;
+	float2 TexCoord: TEXCOORD0;
 	float4 WorldPosition: POSITION1;
 	float4 PreviousWorldPosition: POSITION2;
 	float4 VertexNormal: POSITION4;
@@ -50,11 +52,13 @@ struct VS_OUTPUT
 struct VS_OUTPUT
 {
 	float4 HPosition: SV_POSITION0;
-	float4 Color: COLOR0;
-	float2 TexCoord: TEXCOORD0;
 #if defined(RENDER_DEPTH)
+	float Alpha: COLOR0;
+	float2 TexCoord: TEXCOORD0;
 	float2 Depth: TEXCOORD3;
 #else
+	float4 Color: COLOR0;
+	float2 TexCoord: TEXCOORD0;
 	float4 WorldPosition: POSITION1;
 	float4 PreviousWorldPosition: POSITION2;
 #endif
@@ -96,31 +100,8 @@ cbuffer PerGeometry : register(
 #	endif  // GRASS_COLLISION
 
 #	ifdef GRASS_OPTIMIZATIONS
-StructuredBuffer<float4> InstanceData   : register(t2);
-StructuredBuffer<uint>   VisibleIndices : register(t5);
-StructuredBuffer<float4> InstanceParams : register(t6);   // {windCur, windPrev, fade, isComplex}
-
-cbuffer GrassOptBand : register(b8)
-{
-	uint IsFarBand;
-	uint3 _padBand;
-}
-
-struct InstanceRec
-{
-	float4 d1, d2, d3, d4;
-};
-
-InstanceRec LoadInstance(uint realIdx)
-{
-	uint b = realIdx * 4;
-	InstanceRec r;
-	r.d1 = InstanceData[b + 0];
-	r.d2 = InstanceData[b + 1];
-	r.d3 = InstanceData[b + 2];
-	r.d4 = InstanceData[b + 3];
-	return r;
-}
+//windCur, windPrev, fade, collisionActive
+StructuredBuffer<float4> InstanceExtras : register(t2);
 #	else
 cbuffer cb7 : register(b7)
 {
@@ -182,29 +163,28 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	VS_OUTPUT vsout;
 
 #		ifdef GRASS_OPTIMIZATIONS
-	uint realIdx = VisibleIndices[instanceID];
-	InstanceRec inst = LoadInstance(realIdx);
-	input.InstanceData1 = inst.d1;
-	input.InstanceData2 = inst.d2;
-	input.InstanceData3 = inst.d3;
-	input.InstanceData4 = inst.d4;
-	const float4 prm = InstanceParams[realIdx];
-	vsout.IsComplex = prm.w;
+	const float4 e0 = InstanceExtras[instanceID * 2 + 0];
+	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
+	vsout.IsComplex = e0.w;
 #		endif
 
 	float3x3 world3x3 = float3x3(input.InstanceData2.xyz, input.InstanceData3.xyz, float3(input.InstanceData4.x, input.InstanceData2.w, input.InstanceData3.w));
 
-	float4 msPosition = GetMSPosition(input, world3x3);
+	precise float4 msPosition = GetMSPosition(input, world3x3);
+
+#		ifdef GRASS_OPTIMIZATIONS
+	msPosition.xyz += e0.xyz;
+#		endif
 
 #		if !defined(RENDER_DEPTH)
-	float4 previousMsPosition = msPosition;
+	precise float4 previousMsPosition = msPosition;
 #		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
 	const float vertexTerm = WindVector.z * (0.5 * (input.Color.w * input.Color.w));
-	const float3 windDisplacement = float3(WindVector.xy, 0) * (prm.x * vertexTerm);
+	const float3 windDisplacement = float3(WindVector.xy, 0) * (e1.x * vertexTerm);
 #			if !defined(RENDER_DEPTH)
-	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (prm.y * vertexTerm);
+	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (e1.y * vertexTerm);
 #			endif
 #		else
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
@@ -213,43 +193,35 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 #			endif
 #		endif
 
-#		ifdef GRASS_OPTIMIZATIONS
-	[branch] if (IsFarBand)
-	{
-		// Far band: skip collision, and previous == current so wind sway contributes
-		// no motion vectors at a range where they are invisible.
-		msPosition.xyz += windDisplacement;
-#			if !defined(RENDER_DEPTH)
-		previousMsPosition = msPosition;
-#			endif
-	}
-	else
-#		endif
-	{
 #		ifdef GRASS_COLLISION
+#			ifdef GRASS_OPTIMIZATIONS
+	[branch] if (e1.w > 0.5)
+#			endif
+	{
 		float3 displacement, previousDisplacement;
 		GrassCollision::GetDisplacedPosition(input, msPosition.xyz, displacement, previousDisplacement);
 		msPosition.xyz += displacement;
 #			if !defined(RENDER_DEPTH)
 		previousMsPosition.xyz += previousDisplacement;
 #			endif
-#		endif
-		msPosition.xyz += windDisplacement;
-#		if !defined(RENDER_DEPTH)
-		previousMsPosition.xyz += previousWindDisplacement;
-#		endif
 	}
+#		endif
+
+	msPosition.xyz += windDisplacement;
+#		if !defined(RENDER_DEPTH)
+	previousMsPosition.xyz += previousWindDisplacement;
+#		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
-	float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
-	float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
+	precise float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
+	precise float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
 	vsout.HPosition = projSpacePosition;
 #			if !defined(RENDER_DEPTH)
 	float3 prevEyeRel = previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz;
 	vsout.PreviousWorldPosition = mul(FrameBuffer::CameraPreviousViewProjUnjittered, float4(prevEyeRel, 1.0));
 #			endif
 #		else
-	float4 projSpacePosition = mul(WorldViewProj, msPosition);
+	precise float4 projSpacePosition = mul(WorldViewProj, msPosition);
 	vsout.HPosition = projSpacePosition;
 #			if !defined(RENDER_DEPTH)
 	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
@@ -260,20 +232,30 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.Depth = projSpacePosition.zw;
 #		endif
 
-	vsout.Color.xyz = input.Color.xyz;
-#		ifdef GRASS_OPTIMIZATIONS
-	vsout.Color.w = prm.z;
+#		if defined(RENDER_DEPTH)
+#			ifdef GRASS_OPTIMIZATIONS
+	vsout.Alpha = e1.z;
+#			else
+	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
+	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
+	vsout.Alpha = distanceFade * perInstanceFade;
+#			endif
 #		else
+	vsout.Color.xyz = input.Color.xyz;
+#			ifdef GRASS_OPTIMIZATIONS
+	vsout.Color.w = e1.z;
+#			else
 	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
 	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
 	vsout.Color.w = distanceFade * perInstanceFade;
+#			endif
 #		endif
 
 	vsout.TexCoord.xy = input.TexCoord.xy;
 
 #		if !defined(RENDER_DEPTH)
 #			ifdef GRASS_OPTIMIZATIONS
-	vsout.WorldPosition = float4(msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz, 1.0);
+	vsout.WorldPosition = float4(eyeRel, 1.0);
 #			else
 	vsout.WorldPosition = mul(World, msPosition);
 #			endif
@@ -290,27 +272,26 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	VS_OUTPUT vsout;
 
 #		ifdef GRASS_OPTIMIZATIONS
-	uint realIdx = VisibleIndices[instanceID];
-	InstanceRec inst = LoadInstance(realIdx);
-	input.InstanceData1 = inst.d1;
-	input.InstanceData2 = inst.d2;
-	input.InstanceData3 = inst.d3;
-	input.InstanceData4 = inst.d4;
-	const float4 prm = InstanceParams[realIdx];
-	vsout.IsComplex = prm.w;
+	const float4 e0 = InstanceExtras[instanceID * 2 + 0];
+	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
+	vsout.IsComplex = e0.w;
 #		endif
 
-	float4 msPosition = GetMSPosition(input);
+	precise float4 msPosition = GetMSPosition(input);
+
+#		ifdef GRASS_OPTIMIZATIONS
+	msPosition.xyz += e0.xyz;
+#		endif
 
 #		if !defined(RENDER_DEPTH)
-	float4 previousMsPosition = msPosition;
+	precise float4 previousMsPosition = msPosition;
 #		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
 	const float vertexTerm = WindVector.z * (0.5 * (input.Color.w * input.Color.w));
-	const float3 windDisplacement = float3(WindVector.xy, 0) * (prm.x * vertexTerm);
+	const float3 windDisplacement = float3(WindVector.xy, 0) * (e1.x * vertexTerm);
 #			if !defined(RENDER_DEPTH)
-	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (prm.y * vertexTerm);
+	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (e1.y * vertexTerm);
 #			endif
 #		else
 	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
@@ -319,37 +300,31 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 #			endif
 #		endif
 
-#		ifdef GRASS_OPTIMIZATIONS
-	[branch] if (IsFarBand)
-	{
-		msPosition.xyz += windDisplacement;
-#			if !defined(RENDER_DEPTH)
-		previousMsPosition = msPosition;
-#			endif
-	}
-	else
-#		endif
-	{
 #		ifdef GRASS_COLLISION
+#			ifdef GRASS_OPTIMIZATIONS
+	[branch] if (e1.w > 0.5)
+#			endif
+	{
 		float3 displacement, previousDisplacement;
 		GrassCollision::GetDisplacedPosition(input, msPosition.xyz, displacement, previousDisplacement);
 		msPosition.xyz += displacement;
 #			if !defined(RENDER_DEPTH)
 		previousMsPosition.xyz += previousDisplacement;
 #			endif
-#		endif
-		msPosition.xyz += windDisplacement;
-#		if !defined(RENDER_DEPTH)
-		previousMsPosition.xyz += previousWindDisplacement;
-#		endif
 	}
+#		endif
+
+	msPosition.xyz += windDisplacement;
+#		if !defined(RENDER_DEPTH)
+	previousMsPosition.xyz += previousWindDisplacement;
+#		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
-	float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
-	float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
+	precise float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
+	precise float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
 	vsout.HPosition = projSpacePosition;
 #		else
-	float4 projSpacePosition = mul(WorldViewProj, msPosition);
+	precise float4 projSpacePosition = mul(WorldViewProj, msPosition);
 	vsout.HPosition = projSpacePosition;
 #		endif
 
@@ -357,20 +332,30 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.Depth = projSpacePosition.zw;
 #		endif
 
-	vsout.Color.xyz = input.Color.xyz;
-#		ifdef GRASS_OPTIMIZATIONS
-	vsout.Color.w = prm.z;
+#		if defined(RENDER_DEPTH)
+#			ifdef GRASS_OPTIMIZATIONS
+	vsout.Alpha = e1.z;
+#			else
+	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
+	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
+	vsout.Alpha = distanceFade * perInstanceFade;
+#			endif
 #		else
+	vsout.Color.xyz = input.Color.xyz;
+#			ifdef GRASS_OPTIMIZATIONS
+	vsout.Color.w = e1.z;
+#			else
 	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
 	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
 	vsout.Color.w = distanceFade * perInstanceFade;
+#			endif
 #		endif
 
 	vsout.TexCoord.xy = input.TexCoord.xy;
 
 #		if !defined(RENDER_DEPTH)
 #			ifdef GRASS_OPTIMIZATIONS
-	vsout.WorldPosition = float4(msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz, 1.0);
+	vsout.WorldPosition = float4(eyeRel, 1.0);
 	vsout.PreviousWorldPosition = mul(FrameBuffer::CameraPreviousViewProjUnjittered, float4(previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz, 1.0));
 #			else
 	vsout.WorldPosition = mul(World, msPosition);
@@ -508,17 +493,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			endif
 #		endif  // !TRUE_PBR
 
-	float4 baseColor;
+#		if defined(RENDER_DEPTH)
+	float baseAlpha;
+#			if !defined(TRUE_PBR)
 	if (complex) {
-		baseColor = TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, input.TexCoord.y * 0.5), SharedData::MipBias);
-	} else {
-		baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
+		baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, input.TexCoord.y * 0.5), SharedData::MipBias).w;
+	} else
+#			endif  // !TRUE_PBR
+	{
+		baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias).w;
 	}
 
-#		if defined(RENDER_DEPTH)
-	// Depth-only: alpha test then depth out. Color::Diffuse() does not touch .w, so it is
-	// skipped here — the whole point of this permutation is that nothing else is computed.
-	float diffuseAlpha = input.Color.w * baseColor.w;
+	float diffuseAlpha = input.Alpha * baseAlpha;
 	if ((diffuseAlpha - AlphaTestRefRS) < 0) {
 		discard;
 	}
@@ -526,6 +512,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	psout.PS.xyz = input.Depth.xxx / input.Depth.yyy;
 	psout.PS.w = diffuseAlpha;
 #		else
+	float4 baseColor;
+#			if !defined(TRUE_PBR)
+	if (complex) {
+		baseColor = TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, input.TexCoord.y * 0.5), SharedData::MipBias);
+	} else
+#			endif  // !TRUE_PBR
+	{
+		baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
+	}
+
 	baseColor.xyz = Color::Diffuse(baseColor.xyz);
 
 	if (SharedData::lodBlendingSettings.DisableTerrainVertexColors)
@@ -754,10 +750,10 @@ PS_OUTPUT main(PS_INPUT input)
 	float skylightingShadowVisibility = 1.0;
 #		endif
 
-	float4 baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
-
 #		if defined(RENDER_DEPTH)
-	float diffuseAlpha = input.Color.w * baseColor.w;
+	float baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias).w;
+
+	float diffuseAlpha = input.Alpha * baseAlpha;
 	if ((diffuseAlpha - AlphaTestRefRS) < 0) {
 		discard;
 	}
@@ -765,6 +761,8 @@ PS_OUTPUT main(PS_INPUT input)
 	psout.PS.xyz = input.Depth.xxx / input.Depth.yyy;
 	psout.PS.w = diffuseAlpha;
 #		else
+	float4 baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
+
 	if (SharedData::lodBlendingSettings.DisableTerrainVertexColors)
 		input.Color.xyz = 1;
 
