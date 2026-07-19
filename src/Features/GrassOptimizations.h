@@ -56,6 +56,10 @@ public:
 		float fadeStart;
 		RE::NiPoint3 origin;
 		uint32_t bufferOffset = UINT32_MAX;
+		// Actual instance-local position extent (origin-relative), decoded from the half-packed
+		// records at capture. World AABB of this slice = origin + [localMin, localMax].
+		RE::NiPoint3 localMin{ 0.0f, 0.0f, 0.0f };
+		RE::NiPoint3 localMax{ 0.0f, 0.0f, 0.0f };
 	};
 
 	struct PendingCapture
@@ -66,6 +70,8 @@ public:
 		uint32_t count = 0;
 		uint64_t descVal = 0;
 		RE::NiPoint3 origin;
+		RE::NiPoint3 localMin{ 0.0f, 0.0f, 0.0f };
+		RE::NiPoint3 localMax{ 0.0f, 0.0f, 0.0f };
 	};
 
 	struct VisibleRun
