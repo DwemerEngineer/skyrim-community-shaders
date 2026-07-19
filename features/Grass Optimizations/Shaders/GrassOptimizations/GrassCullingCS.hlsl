@@ -125,10 +125,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float basis = (localXY.x + localXY.y) * -0.0078125;
 
     const float4 e0 = float4(og.xyz, IsComplex);
-    const float4 e1 = float4(WindScalar(basis, TimeBase * WavePeriod),
-	                         WindScalar(basis, PrevTimeBase * WavePeriod),
-	                         distFade * spawnFade * lodFade * edgeFade,
-	                         (distSq < CollisionDistSq) ? 1.0 : 0.0);
+    const float4 e1 = float4(WindScalar(basis, TimeBase * WavePeriod), WindScalar(basis, PrevTimeBase * WavePeriod), distFade * spawnFade * lodFade * edgeFade, (distSq < CollisionDistSq) ? 1.0 : 0.0);
     
     uint slot;
     Counter.InterlockedAdd(0, 1, slot);
