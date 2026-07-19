@@ -338,6 +338,8 @@ void GrassOptimizations::ApplyCaptures(std::vector<PendingCapture>& captures)
 		s.count = pc.count;
 		s.fadeStart = timeAccum;
 		s.origin = pc.origin;
+		s.localMin = pc.localMin;
+		s.localMax = pc.localMax;
 		s.data = std::move(pc.bytes);
 		b.slices.push_back(std::move(s));
 		b.coarseValid = false;
@@ -380,6 +382,27 @@ bool GrassOptimizations::StageCapture(RE::BSMultiStreamInstanceTriShape* shape, 
 	pc.origin = shape->world.translate;
 	pc.bytes.resize((size_t)count * 32);
 	std::memcpy(pc.bytes.data(), src, pc.bytes.size());
+
+	{
+		using DirectX::PackedVector::XMConvertHalfToFloat;
+		RE::NiPoint3 lmn{ FLT_MAX, FLT_MAX, FLT_MAX };
+		RE::NiPoint3 lmx{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+		const uint8_t* d = pc.bytes.data();
+		for (uint32_t i = 0; i < count; ++i) {
+			const uint8_t* r = d + (size_t)i * 32;
+			const float lx = XMConvertHalfToFloat(*reinterpret_cast<const uint16_t*>(r + 0));
+			const float ly = XMConvertHalfToFloat(*reinterpret_cast<const uint16_t*>(r + 2));
+			const float lz = XMConvertHalfToFloat(*reinterpret_cast<const uint16_t*>(r + 4));
+			lmn.x = std::min(lmn.x, lx);
+			lmn.y = std::min(lmn.y, ly);
+			lmn.z = std::min(lmn.z, lz);
+			lmx.x = std::max(lmx.x, lx);
+			lmx.y = std::max(lmx.y, ly);
+			lmx.z = std::max(lmx.z, lz);
+		}
+		pc.localMin = lmn;
+		pc.localMax = lmx;
+	}
 
 	std::scoped_lock lk(pendingMutex);
 	pendingCaptures.push_back(std::move(pc));
@@ -890,21 +913,29 @@ bool GrassOptimizations::EnsureCullBucketCapacity(uint32_t slots, ID3D11Device* 
 
 void GrassOptimizations::UpdateCoarseBounds(GrassBucket& b)
 {
-	constexpr float kCell = 4096.0f;
 	RE::NiPoint3 mn{ FLT_MAX, FLT_MAX, FLT_MAX };
 	RE::NiPoint3 mx{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
 	for (const auto& s : b.slices) {
-		// cell spans [origin, origin + cell] in XY; Z from actual data is unknown here,
-		// so use a generous Z band around origin (grass height + terrain relief).
-		mn.x = std::min(mn.x, s.origin.x);
-		mn.y = std::min(mn.y, s.origin.y);
-		mx.x = std::max(mx.x, s.origin.x + kCell);
-		mx.y = std::max(mx.y, s.origin.y + kCell);
+		mn.x = std::min(mn.x, s.origin.x + s.localMin.x);
+		mn.y = std::min(mn.y, s.origin.y + s.localMin.y);
+		mn.z = std::min(mn.z, s.origin.z + s.localMin.z);
+		mx.x = std::max(mx.x, s.origin.x + s.localMax.x);
+		mx.y = std::max(mx.y, s.origin.y + s.localMax.y);
+		mx.z = std::max(mx.z, s.origin.z + s.localMax.z);
 	}
-	// Z: cells are XY-lattice (origin.z == 0 in your data); grass sits near terrain.
-	// Use a wide Z to stay conservative — refine if you store per-slice Z extent.
-	mn.z = -8192.0f;
-	mx.z = 8192.0f;
+	if (mn.x > mx.x) {  // no slices / no instances — leave an empty box
+		mn = { 0.0f, 0.0f, 0.0f };
+		mx = { 0.0f, 0.0f, 0.0f };
+	}
+
+	const float pad = b.clumpRadius + 64.0f;
+	mn.x -= pad;
+	mn.y -= pad;
+	mn.z -= pad;
+	mx.x += pad;
+	mx.y += pad;
+	mx.z += pad;
+
 	b.coarseMin = mn;
 	b.coarseMax = mx;
 	b.coarseValid = true;
