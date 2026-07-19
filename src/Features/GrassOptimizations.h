@@ -223,9 +223,7 @@ public:
 	uint32_t cullBucketCBSlots = 0;
 	static constexpr uint32_t kSlotBytes = 256;
 	bool cullInit = false;
-	ID3D11Buffer* bandCB = nullptr;  // static 2 slots: {0} near, {1} far
 	ID3D11Buffer* detectStaging = nullptr;
-	ID3D11Buffer* grassFrameCB = nullptr;
 
 	ID3D11ComputeShader* detectCS = nullptr;
 	ID3D11Buffer* detectResultBuf = nullptr;
@@ -239,6 +237,7 @@ public:
 	float timeBase = 0.0f;
 	float prevTimeBase = 0.0f;
 	float cachedComplexThreshold = -1.0f;
+	float grassStartFadeDistance = 0.0f;
 	float maxGrassDistance = 0.0f;
 	float maxDistSq = 0.0f;
 

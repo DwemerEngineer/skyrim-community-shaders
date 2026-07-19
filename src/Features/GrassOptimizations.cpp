@@ -133,8 +133,8 @@ void GrassOptimizations::UpdateGrass()
 		fadeInTimeRcp = t > 0.0f ? 1.0f / t : 1e6f;
 	}
 	if (maxDistSq == 0.0f) {
-		maxGrassDistance = RE::GetINISetting("fGrassStartFadeDistance:Grass")->GetFloat() +
-		                   RE::GetINISetting("fGrassFadeRange:Grass")->GetFloat();
+		grassStartFadeDistance = RE::GetINISetting("fGrassStartFadeDistance:Grass")->GetFloat();
+		maxGrassDistance = grassStartFadeDistance + RE::GetINISetting("fGrassFadeRange:Grass")->GetFloat();
 		maxDistSq = maxGrassDistance * maxGrassDistance;
 	}
 
@@ -175,7 +175,7 @@ void GrassOptimizations::UpdateGrass()
 				cp->frustumPlanes[i][3] = frustum.cullingPlanes[i].constant;
 			}
 
-			cp->alphaParam1 = RE::GetINISetting("fGrassStartFadeDistance:Grass")->GetFloat();
+			cp->alphaParam1 = grassStartFadeDistance;
 			cp->alphaParam2 = maxGrassDistance;
 			cp->fadeNow = timeAccum;
 			cp->fadeInTimeRcp = fadeInTimeRcp;
@@ -252,25 +252,6 @@ void GrassOptimizations::UpdateGrass()
 	ID3D11ShaderResourceView* nullSRVs[2] = {};
 	ctx->CSSetShaderResources(0, 2, nullSRVs);
 	ctx->CSSetShader(nullptr, nullptr, 0);
-
-	{
-		D3D11_MAPPED_SUBRESOURCE m{};
-		if (SUCCEEDED(ctx->Map(grassFrameCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-			struct GrassFrame
-			{
-				float fadeNow;
-				float fadeInTimeRcp;
-				uint32_t debugFlags;
-				uint32_t instanceStride;
-			};
-			auto* g = static_cast<GrassFrame*>(m.pData);
-			g->fadeNow = timeAccum;
-			g->fadeInTimeRcp = fadeInTimeRcp;
-			g->debugFlags = settings.ShowDebugVisualization ? 1u : 0u;
-			g->instanceStride = 32;
-			ctx->Unmap(grassFrameCB, 0);
-		}
-	}
 }
 
 void GrassOptimizations::ApplyRemovals(const std::vector<RE::BSMultiStreamInstanceTriShape*>& removes)
@@ -778,8 +759,6 @@ void GrassOptimizations::InitCullResources()
 		return;
 	if (!makeDynamicCB(&cullBucketCB, sizeof(CullBucketCB), "GrassOptimizations::CullBucketCB"))
 		return;
-	if (!makeDynamicCB(&grassFrameCB, 16, "GrassOptimizations::GrassFrameCB"))
-		return;
 	if (!makeDynamicCB(&detectParamsCB, 16, "GrassOptimizations::DetectParamsCB"))
 		return;
 
@@ -825,22 +804,6 @@ void GrassOptimizations::InitCullResources()
 			logger::error("[GRASS OPTIMIZATIONS] detect staging create failed");
 			return;
 		}
-	}
-
-	{
-		alignas(16) uint8_t init[2 * kSlotBytes] = {};
-		*reinterpret_cast<uint32_t*>(init + 0 * kSlotBytes) = 0u;  // near
-		*reinterpret_cast<uint32_t*>(init + 1 * kSlotBytes) = 1u;  // far
-		D3D11_BUFFER_DESC bd{};
-		bd.ByteWidth = 2 * kSlotBytes;
-		bd.Usage = D3D11_USAGE_IMMUTABLE;
-		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-		D3D11_SUBRESOURCE_DATA sd{ init, 0, 0 };
-		if (FAILED(device->CreateBuffer(&bd, &sd, &bandCB)) || !bandCB) {
-			logger::error("[GRASS OPTIMIZATIONS] band CB create failed");
-			return;
-		}
-		Util::SetResourceName(bandCB, "GrassOptimizations::BandCB");
 	}
 
 	detectCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\DetectComplexCS.hlsl", defines, "cs_5_0"));
@@ -1271,7 +1234,6 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	SetDirtyStates(0);
 
 	ctx->IASetIndexBuffer(indexB, DXGI_FORMAT_R16_UINT, 0);
-	ctx->VSSetConstantBuffers(7, 1, &self.grassFrameCB);
 
 	ID3D11Buffer* vbs[2] = { meshVB, nullptr };
 	UINT strides[2] = { meshStride, 32 };
@@ -1280,7 +1242,5 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	vbs[1] = b->compactedBuf;
 	ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
 	ctx->VSSetShaderResources(2, 1, &b->extrasSRV);
-	UINT first = 0, num = 16;
-	self.ctx1->VSSetConstantBuffers1(8, 1, &self.bandCB, &first, &num);
 	ctx->DrawIndexedInstancedIndirect(b->argsBuf, 0);
 }
