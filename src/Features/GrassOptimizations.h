@@ -23,20 +23,53 @@ public:
 
 	struct Settings
 	{
-		bool ShowDebugVisualization = false;
-		float BeginThinningDistance = 8000.0f;
-		float ThinningDistance = 10000.0f;
-		float MinDistantAmmount = 0.10f;
-		float shadowGrassDistance = 8000.0f;
-		float farGrassDistance = 8000.0f;
+		// Projected-size LOD, lowest level: clumps whose on-screen radius is below this many pixels
+		// are culled entirely.
+		float MinPixelSize = 4.0f;
+		// Projected-size LOD, full-detail level: clumps larger than this (px) render at full
+		// density; between this and MinPixelSize they are stochastically thinned toward MinDensity.
+		float FullDetailPixelSize = 16.0f;
+		float MinDensity = 0.03f;
+		// Blends in a per-mesh cost weighting (sqrt(triangles/6)) that culls heavier grass meshes
+		// sooner. 0 = the pixel/distance settings are literal and identical for every grass type;
+		// 1 = full weighting (the old hidden behaviour).
+		float MeshCostBias = 0.0f;
+		// Cull instances whose fade is at/below this before they are ever drawn. The alpha test
+		// discards every fragment of such instances anyway (fade * baseAlpha < ref), so raising
+		// this toward the game's alpha-test ref removes invisible-but-rasterized grass. 0 = only
+		// provably-invisible (zero-fade) instances.
+		float InvisibleFadeCull = 0.0f;
+		// Max grass render distance override, in units. 0 = use the vanilla INI
+		// (fGrassStartFadeDistance + fGrassFadeRange).
+		float MaxDistanceOverride = 0.0f;
+
+		// Discard instances hidden behind already-drawn geometry, tested against a 1/16-res
+		// max-depth reduction of the scene depth copy. Early-Z already kills their fragments, but
+		// only after the vertex shader has run; this removes the vertex work too.
+		bool EnableOcclusionCulling = true;
+
+		// Mesh-swap LOD: clumps whose on-screen radius is below MeshLODPixelSize (but still above
+		// the MinPixelSize cull) are drawn with a lower-poly LOD .nif instead of the full mesh.
+		bool EnableMeshLOD = false;
+		float MeshLODPixelSize = 8.0f;
+		// Width in pixels of the dithered swap band centred on MeshLODPixelSize. Instances inside
+		// it are hash-assigned to full/LOD so the transition scatters across a clump rather than
+		// every instance flipping at once. 0 = hard swap.
+		float MeshLODBandPixels = 3.0f;
 	};
 
 	Settings settings;
 
+	// Keyed by SOURCE MESH (interned .nif filename stem) so one bucket == one mesh. Required for the
+	// mesh-swap LOD, and it also stops two grass types that merely share a diffuse texture + vertex
+	// format from landing in one bucket and being drawn with each other's mesh.
+	// meshId == 0 means the mesh could not be resolved — fall back to the old texture identity so
+	// that grass still gets the instancing optimization.
 	struct BucketKey
 	{
-		RE::NiSourceTexture* tex;
-		uint64_t descVal;
+		uint32_t meshId = 0;
+		RE::NiSourceTexture* tex = nullptr;  // part of the identity only when meshId == 0
+		uint64_t descVal = 0;
 		bool operator==(const BucketKey&) const = default;
 	};
 
@@ -44,7 +77,9 @@ public:
 	{
 		size_t operator()(const BucketKey& k) const
 		{
-			return std::hash<void*>{}(k.tex) ^ (std::hash<uint64_t>{}(k.descVal) << 1);
+			return (std::hash<uint32_t>{}(k.meshId) * 31) ^
+			       std::hash<void*>{}(k.tex) ^
+			       (std::hash<uint64_t>{}(k.descVal) << 1);
 		}
 	};
 
@@ -84,6 +119,14 @@ public:
 		uint32_t drawCount;
 	};
 
+	// Byte offset of the DrawIndexedInstancedIndirect args block inside its buffer. The 5-uint block
+	// is deliberately NOT at 0: placing it at 12 puts instanceCount (block + 4) on byte 16, and a
+	// D3D11 raw UAV must start 16-byte aligned — FirstElement a multiple of 4. Windowing onto
+	// instanceCount at byte 4 is illegal, which is why the earlier FirstElement=1 attempt was
+	// rejected by the runtime and silently fell back to the counter + copy path.
+	static constexpr uint32_t kArgsByteOffset = 12;
+	static constexpr uint32_t kArgsInstanceCountOffset = kArgsByteOffset + sizeof(uint32_t);  // 16
+
 	struct GrassBucket
 	{
 		ID3D11Buffer* instanceBuf = nullptr;
@@ -99,6 +142,31 @@ public:
 		ID3D11Buffer* counterBuf = nullptr;
 		ID3D11UnorderedAccessView* counterUAV = nullptr;
 		ID3D11Buffer* argsBuf = nullptr;
+		// View over args[1] (instanceCount) only, so the cull CS can InterlockedAdd the survivor
+		// count straight into the indirect args. Null => runtime rejected a UAV-capable args
+		// buffer, fall back to the counter + CopySubresourceRegion path.
+		ID3D11UnorderedAccessView* argsUAV = nullptr;
+
+		// Second compaction bin, for the mesh-swap LOD. Allocated only for buckets whose
+		// LOD\Grass\<stem>.nif actually loaded, so grass types without an authored LOD cost nothing.
+		// While these are null the cull CS routes every survivor to the full-detail bin.
+		ID3D11Buffer* lodCompactedBuf = nullptr;
+		ID3D11UnorderedAccessView* lodCompactedUAV = nullptr;
+		ID3D11Buffer* lodExtrasBuf = nullptr;
+		ID3D11UnorderedAccessView* lodExtrasUAV = nullptr;
+		ID3D11ShaderResourceView* lodExtrasSRV = nullptr;
+		ID3D11Buffer* lodCounterBuf = nullptr;
+		ID3D11UnorderedAccessView* lodCounterUAV = nullptr;
+		ID3D11Buffer* lodArgsBuf = nullptr;
+		ID3D11UnorderedAccessView* lodArgsUAV = nullptr;
+		bool lodArgsIndexCountWritten = false;
+		// capacity the LOD bin was sized for; recreated when the bucket grows past it
+		uint32_t lodCapacityInstances = 0;
+		// set per frame: LOD bin allocated and the setting is on -> the CS may use bin 1
+		bool lodActive = false;
+
+		// source mesh id, kept so the draw path can find this bucket's LOD mesh without re-resolving
+		uint32_t meshId = 0;
 
 		uint32_t cullSlot = UINT32_MAX;
 		bool typeParamsValid = false;
@@ -125,6 +193,9 @@ public:
 		bool coarseValid = false;
 		bool cullVisible = false;
 
+		// kept alongside the key so removal bookkeeping still works when the key is mesh-based
+		RE::NiSourceTexture* diffuseTex = nullptr;
+
 		void ReleaseResources()
 		{
 			auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
@@ -139,9 +210,28 @@ public:
 			rel(extrasSRV);
 			rel(counterBuf);
 			rel(counterUAV);
+			rel(argsUAV);
 			rel(argsBuf);
+			ReleaseLODBin();
 			capacityInstances = 0;
 			argsIndexCountWritten = false;
+		}
+
+		void ReleaseLODBin()
+		{
+			auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
+			rel(lodCompactedUAV);
+			rel(lodCompactedBuf);
+			rel(lodExtrasSRV);
+			rel(lodExtrasUAV);
+			rel(lodExtrasBuf);
+			rel(lodCounterUAV);
+			rel(lodCounterBuf);
+			rel(lodArgsUAV);
+			rel(lodArgsBuf);
+			lodCapacityInstances = 0;
+			lodArgsIndexCountWritten = false;
+			lodActive = false;
 		}
 
 		void Release()
@@ -169,8 +259,8 @@ public:
 	{
 		float frustumPlanes[6][4];  // 96
 		float maxDistSq;
-		float lodNearDistSq;
-		float lodFarDistSq;
+		float fullDetailPixelSize;
+		float meshCostBias;
 		float lodMinKeep;  // 112
 		float lodFadeBand;
 		float projScale;
@@ -181,7 +271,17 @@ public:
 		float alphaParam2;
 		float fadeNow;  // 144
 		float fadeInTimeRcp;
-		float pad[3];  // 160
+		float invisibleFadeCull;
+		// Mesh-swap LOD: instances below this projected size take the LOD mesh, hash-dithered
+		// across a band of meshLODBandPx so a clump scatters into the swap instead of popping.
+		float meshLODPixelSize;
+		float meshLODBandPx;  // 160
+		float hiZEnabled;
+		float hiZSizeX;
+		float hiZSizeY;
+		float hiZTexelPixels;  // 176
+		float hiZMipCount;
+		float hiZPad[3];  // 192
 	};
 	static_assert(sizeof(CullParamsCB) % 16 == 0);
 
@@ -196,7 +296,8 @@ public:
 		float distScale;
 		float minPixelScale;
 		float isComplex;
-		float pad;
+		// 0 = this bucket has no LOD bin this frame, every survivor goes to full detail
+		float lodEnabled;
 	};
 	static_assert(sizeof(CullBucketCB) == 48);
 
@@ -211,6 +312,33 @@ public:
 	std::mutex pendingMutex;
 
 	std::unordered_map<RE::NiSourceTexture*, bool> complexCache;
+
+	// Lower-poly LOD mesh for a grass type, loaded from meshes\LOD\Grass\<source-mesh-stem>.nif.
+	// `valid` is false when no LOD mesh exists (or it is incompatible) — draw the full mesh then.
+	struct LODMesh
+	{
+		RE::NiPointer<RE::NiAVObject> keepAlive;  // owns the loaded model tree
+		ID3D11Buffer* vertexBuffer = nullptr;
+		ID3D11Buffer* indexBuffer = nullptr;
+		uint32_t indexCount = 0;
+		uint32_t meshStride = 0;
+		uint64_t descVal = 0;
+		bool valid = false;
+	};
+	std::unordered_map<uint32_t, LODMesh> lodMeshCache;  // keyed by meshId
+
+	// Interned source-mesh stems: id 1..N (0 = unresolved). Interning keeps the per-draw bucket
+	// lookup on integers instead of hashing a string every draw.
+	std::unordered_map<std::string, uint32_t> meshIdMap;
+	std::vector<std::string> meshStems;  // meshStems[id - 1]
+	// resolved meshId per grass shape (cached so resolution happens once per shape)
+	std::unordered_map<RE::BSMultiStreamInstanceTriShape*, uint32_t> shapeMeshId;
+
+	// shape -> source .nif stem, recorded by the LoadGrassType hook at grass-type creation. Its
+	// own mutex: the hook runs on the grass loader thread and must not block on bucketMutex,
+	// which UpdateGrass holds across its GPU work.
+	std::unordered_map<RE::BSMultiStreamInstanceTriShape*, std::string> shapeModelStem;
+	std::mutex meshPathMutex;
 
 	uint32_t lastFrame = UINT32_MAX;
 
@@ -238,7 +366,8 @@ public:
 	float prevTimeBase = 0.0f;
 	float cachedComplexThreshold = -1.0f;
 	float grassStartFadeDistance = 0.0f;
-	float maxGrassDistance = 0.0f;
+	float vanillaMaxDistance = 0.0f;  // INI fGrassStartFadeDistance + fGrassFadeRange, cached once
+	float maxGrassDistance = 0.0f;    // effective max this frame (vanilla or thinning-override)
 	float maxDistSq = 0.0f;
 
 	void InitCullResources();                                   // once
@@ -261,6 +390,39 @@ public:
 	bool StageCapture(RE::BSMultiStreamInstanceTriShape* shape, const void* src, uint32_t count, uint32_t stride, uint64_t descVal, RE::NiSourceTexture* tex);
 
 	bool DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11Device* device, ID3D11DeviceContext* ctx);
+
+	/** @brief Resolves a grass shape to an interned source-mesh id (0 = unresolved). */
+	uint32_t ResolveMeshId(RE::BSMultiStreamInstanceTriShape* shape);
+
+	/** @brief Loads (once per source mesh) the lower-poly LOD .nif for this mesh id. */
+	/** @brief Reduces the scene depth copy to the 1/16-res max-depth buffer the occlusion cull
+	    samples. Returns true when hiZSRV is valid for this frame. */
+	bool BuildHiZ(ID3D11Device* device, ID3D11DeviceContext* ctx);
+
+	// 1/16-res max-depth reduction, rebuilt once per frame from POST_ZPREPASS_COPY
+	ID3D11Texture2D* hiZTex = nullptr;
+	ID3D11UnorderedAccessView* hiZUAV = nullptr;
+	ID3D11ShaderResourceView* hiZSRV = nullptr;
+	ID3D11ComputeShader* hiZCS = nullptr;
+	ID3D11ComputeShader* hiZMipCS = nullptr;
+	// TerrainBlending state the current hiZCS was compiled against; a change re-compiles it
+	bool hiZCSTerrainBlending = false;
+	// Per-level views for the max-depth pyramid. A coarse level is the exact max of its children,
+	// which is what lets a large clump be tested with a fixed number of samples.
+	std::vector<ID3D11UnorderedAccessView*> hiZMipUAVs;
+	std::vector<ID3D11ShaderResourceView*> hiZMipSRVs;
+	uint32_t hiZMipCount = 1;
+	ID3D11Buffer* hiZParamsCB = nullptr;
+	uint32_t hiZWidth = 0;
+	uint32_t hiZHeight = 0;
+	bool hiZValid = false;
+	static constexpr uint32_t kHiZTileSize = 16;
+
+	void EnsureLODMesh(uint32_t meshId);
+
+	/** @brief Allocates/frees a bucket's second (LOD) compaction bin to match the current setting
+	    and the bucket's capacity. Returns true when the bucket has a usable LOD bin this frame. */
+	bool EnsureLODBin(GrassBucket& b, ID3D11Device* device);
 
 	/** @brief Draws the ImGui settings panel for grass optimizations configuration. */
 	virtual void DrawSettings() override;
@@ -347,6 +509,17 @@ public:
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
 
+		struct LoadGrassType
+		{
+			static RE::BSMultiStreamInstanceTriShape* thunk(RE::BGSGrassManager* grassManager,
+				RE::GrassParam* a_param,
+				uint32_t CellXDivided,
+				uint32_t CellYDivided,
+				uint64_t* typeKey,
+				RE::BSFixedString* modelPath);
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
 		static void Install()
 		{
 			auto& trampoline = SKSE::GetTrampoline();
@@ -366,6 +539,10 @@ public:
 			stl::write_thunk_call<ReadInstanceGroupStreamTraits>(REL::RelocationID(74607, 76339).address() + REL::Relocate(0xCF, 0xCF));
 			stl::write_thunk_call<AddGroupQueuedGIDFile>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x394, 0x384));
 			stl::write_thunk_call<AddGroupGIDFile>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x39B, 0x38B));
+
+			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15204, 15372).address() + REL::Relocate(0x2F5, 0x0));
+			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x62B, 0x0));
+			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x25C, 0x0));
 
 			std::uint8_t patch[] = { 0x4C, 0x89, 0xF2 };  // mov rdx, r14
 			REL::safe_write(REL::RelocationID(100847, 107637).address() + REL::Relocate(0x660, 0x648), patch, sizeof(patch));

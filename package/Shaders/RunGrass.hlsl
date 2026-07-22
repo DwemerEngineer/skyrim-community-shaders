@@ -170,14 +170,14 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 
 	float3x3 world3x3 = float3x3(input.InstanceData2.xyz, input.InstanceData3.xyz, float3(input.InstanceData4.x, input.InstanceData2.w, input.InstanceData3.w));
 
-	precise float4 msPosition = GetMSPosition(input, world3x3);
+	float4 msPosition = GetMSPosition(input, world3x3);
 
 #		ifdef GRASS_OPTIMIZATIONS
 	msPosition.xyz += e0.xyz;
 #		endif
 
 #		if !defined(RENDER_DEPTH)
-	precise float4 previousMsPosition = msPosition;
+	float4 previousMsPosition = msPosition;
 #		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
@@ -213,15 +213,15 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 #		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
-	precise float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
-	precise float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
+	float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
+	float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
 	vsout.HPosition = projSpacePosition;
 #			if !defined(RENDER_DEPTH)
 	float3 prevEyeRel = previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz;
 	vsout.PreviousWorldPosition = float4(prevEyeRel, 1.0);
 #			endif
 #		else
-	precise float4 projSpacePosition = mul(WorldViewProj, msPosition);
+	float4 projSpacePosition = mul(WorldViewProj, msPosition);
 	vsout.HPosition = projSpacePosition;
 #			if !defined(RENDER_DEPTH)
 	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
@@ -277,14 +277,14 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.IsComplex = e0.w;
 #		endif
 
-	precise float4 msPosition = GetMSPosition(input);
+	float4 msPosition = GetMSPosition(input);
 
 #		ifdef GRASS_OPTIMIZATIONS
 	msPosition.xyz += e0.xyz;
 #		endif
 
 #		if !defined(RENDER_DEPTH)
-	precise float4 previousMsPosition = msPosition;
+	float4 previousMsPosition = msPosition;
 #		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
@@ -320,11 +320,11 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 #		endif
 
 #		ifdef GRASS_OPTIMIZATIONS
-	precise float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
-	precise float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
+	float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
+	float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
 	vsout.HPosition = projSpacePosition;
 #		else
-	precise float4 projSpacePosition = mul(WorldViewProj, msPosition);
+	float4 projSpacePosition = mul(WorldViewProj, msPosition);
 	vsout.HPosition = projSpacePosition;
 #		endif
 
