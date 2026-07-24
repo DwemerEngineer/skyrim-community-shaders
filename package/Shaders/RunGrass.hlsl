@@ -36,7 +36,9 @@ struct VS_OUTPUT
 #if defined(RENDER_DEPTH)
 	float Alpha: COLOR0;
 	float2 TexCoord: TEXCOORD0;
-	float2 Depth: TEXCOORD2;
+	// No Depth interpolator: the rasterizer already performs the perspective divide, so the pixel
+	// shader reads z/w straight out of SV_POSITION.z. Carrying projSpacePosition.zw across just to
+	// divide it again cost two interpolators and a divide for a value that arrives free.
 #else
 	float4 Color: COLOR0;
 	float2 TexCoord: TEXCOORD0;
@@ -46,6 +48,11 @@ struct VS_OUTPUT
 #endif
 #	ifdef GRASS_OPTIMIZATIONS
 	nointerpolation float IsComplex: TEXCOORD8;
+#	if !defined(RENDER_DEPTH)
+	// Clump is small enough on screen that detail work the pixel shader would do here cannot be
+	// resolved. Only carried on the colour pass — the depth pass has nothing to skip.
+	nointerpolation float IsFar: TEXCOORD9;
+#	endif
 #	endif
 };
 #else
@@ -55,7 +62,7 @@ struct VS_OUTPUT
 #if defined(RENDER_DEPTH)
 	float Alpha: COLOR0;
 	float2 TexCoord: TEXCOORD0;
-	float2 Depth: TEXCOORD3;
+	// see above — z/w comes from SV_POSITION.z in the pixel shader
 #else
 	float4 Color: COLOR0;
 	float2 TexCoord: TEXCOORD0;
@@ -166,6 +173,14 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	const float4 e0 = InstanceExtras[instanceID * 2 + 0];
 	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
 	vsout.IsComplex = e0.w;
+
+	// e1.w packs two flags: 1.0 = within collision range, 2.0 = far. Unpack before testing, or a
+	// far instance outside collision range would read as "collides".
+	const float isFarFlag = (e1.w >= 2.0) ? 1.0 : 0.0;
+	const float collisionFlag = e1.w - 2.0 * isFarFlag;
+#			if !defined(RENDER_DEPTH)
+	vsout.IsFar = isFarFlag;
+#			endif
 #		endif
 
 	float3x3 world3x3 = float3x3(input.InstanceData2.xyz, input.InstanceData3.xyz, float3(input.InstanceData4.x, input.InstanceData2.w, input.InstanceData3.w));
@@ -195,7 +210,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 
 #		ifdef GRASS_COLLISION
 #			ifdef GRASS_OPTIMIZATIONS
-	[branch] if (e1.w > 0.5)
+	[branch] if (collisionFlag > 0.5)
 #			endif
 	{
 		float3 displacement, previousDisplacement;
@@ -228,9 +243,6 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 #			endif
 #		endif
 
-#		if defined(RENDER_DEPTH)
-	vsout.Depth = projSpacePosition.zw;
-#		endif
 
 #		if defined(RENDER_DEPTH)
 #			ifdef GRASS_OPTIMIZATIONS
@@ -275,6 +287,10 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	const float4 e0 = InstanceExtras[instanceID * 2 + 0];
 	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
 	vsout.IsComplex = e0.w;
+
+	// see the GRASS_LIGHTING path — e1.w packs collision (1.0) and far (2.0)
+	const float isFarFlag = (e1.w >= 2.0) ? 1.0 : 0.0;
+	const float collisionFlag = e1.w - 2.0 * isFarFlag;
 #		endif
 
 	float4 msPosition = GetMSPosition(input);
@@ -302,7 +318,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 
 #		ifdef GRASS_COLLISION
 #			ifdef GRASS_OPTIMIZATIONS
-	[branch] if (e1.w > 0.5)
+	[branch] if (collisionFlag > 0.5)
 #			endif
 	{
 		float3 displacement, previousDisplacement;
@@ -328,9 +344,6 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.HPosition = projSpacePosition;
 #		endif
 
-#		if defined(RENDER_DEPTH)
-	vsout.Depth = projSpacePosition.zw;
-#		endif
 
 #		if defined(RENDER_DEPTH)
 #			ifdef GRASS_OPTIMIZATIONS
@@ -497,22 +510,22 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif  // !TRUE_PBR
 
 #		if defined(RENDER_DEPTH)
-	float baseAlpha;
+	// Complex grass packs two layers into the texture, so it samples the top half. Selecting the
+	// scale rather than branching keeps this to one sample instruction — IsComplex is
+	// nointerpolation and constant per bucket, so there was never divergence to save.
 #			if !defined(TRUE_PBR)
-	if (complex) {
-		baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, input.TexCoord.y * 0.5), SharedData::MipBias).w;
-	} else
+	const float2 alphaUV = float2(input.TexCoord.x, input.TexCoord.y * (complex ? 0.5 : 1.0));
+#			else
+	const float2 alphaUV = input.TexCoord.xy;
 #			endif  // !TRUE_PBR
-	{
-		baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias).w;
-	}
+	const float baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, alphaUV, SharedData::MipBias).w;
 
 	float diffuseAlpha = input.Alpha * baseAlpha;
 	if ((diffuseAlpha - AlphaTestRefRS) < 0) {
 		discard;
 	}
 
-	psout.PS.xyz = input.Depth.xxx / input.Depth.yyy;
+	psout.PS.xyz = input.HPosition.zzz;
 	psout.PS.w = diffuseAlpha;
 #		else
 	float4 baseColor;
@@ -530,7 +543,21 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (SharedData::lodBlendingSettings.DisableTerrainVertexColors)
 		input.Color.xyz = 1;
 
-	float4 specColor = complex ? TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, 0.5 + input.TexCoord.y * 0.5), SharedData::MipBias) : 1;
+	// Detail work skipped once a clump is too small to resolve it. Note this uses a SEPARATE flag
+	// from `complex`: `complex` still selects which half of the atlas the base colour comes from
+	// and must never change, or far grass would sample the wrong region entirely.
+#			ifdef GRASS_OPTIMIZATIONS
+	const bool isFar = input.IsFar > 0.5;
+#			else
+	const bool isFar = false;
+#			endif
+	const bool complexDetail = complex && !isFar;
+
+#			if !defined(TRUE_PBR)
+	float4 specColor = complexDetail ? TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, 0.5 + input.TexCoord.y * 0.5), SharedData::MipBias) : 1;
+#			else
+	float4 specColor = TexNormalSampler.SampleBias(SampNormalSampler, input.TexCoord.xy, SharedData::MipBias);
+#			endif
 
 	psout.MotionVectors = MotionBlur::GetSSMotionVector(input.WorldPosition, input.PreviousWorldPosition);
 
@@ -584,7 +611,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		dirDetailedShadow *= shadowColor.x;
 
 #			if defined(SCREEN_SPACE_SHADOWS)
-	if (!SharedData::InInterior && dirLightAngle >= 0.0)
+	// Contact shadows are a raymarch, and at a few pixels across there is no contact detail left
+	// to shadow — this is the most expensive thing far grass can skip.
+	if (!SharedData::InInterior && dirLightAngle >= 0.0 && !isFar)
 		dirDetailedShadow *= ScreenSpaceShadows::GetScreenSpaceShadow(input.HPosition.xyz, screenUV, screenNoise);
 #			endif  // SCREEN_SPACE_SHADOWS
 
@@ -623,7 +652,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float3 subsurfaceColor = dirLightColor * dirSoftShadow * (GetSoftLightMultiplier(dirLightAngle, softLightRolloff)) * Color::VanillaNormalization();
 
-	if (complex)
+	// Specular highlights are sub-pixel at this size.
+	if (complexDetail)
 		lightsSpecularColor += dirDetailedShadow * GrassLighting::GetLightSpecularInput(SharedData::DirLightDirection.xyz, viewDirection, normal, dirLightColor, SharedData::grassLightingSettings.Glossiness) * Color::VanillaNormalization();
 
 #			if defined(LIGHT_LIMIT_FIX)
@@ -761,7 +791,7 @@ PS_OUTPUT main(PS_INPUT input)
 		discard;
 	}
 
-	psout.PS.xyz = input.Depth.xxx / input.Depth.yyy;
+	psout.PS.xyz = input.HPosition.zzz;
 	psout.PS.w = diffuseAlpha;
 #		else
 	float4 baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
