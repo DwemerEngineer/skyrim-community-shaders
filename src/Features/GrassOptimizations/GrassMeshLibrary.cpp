@@ -101,7 +101,7 @@ void GrassMeshLibrary::EnsureLODMesh(uint32_t meshId)
 				entry.descVal = *reinterpret_cast<const uint64_t*>(&grd.vertexDesc);
 				entry.meshStride = (uint32_t)((4 * entry.descVal) & 0x3C);
 				entry.indexCount = 3u * ts->GetTrishapeRuntimeData().triangleCount;
-				entry.valid = true;
+				entry.valid = entry.meshStride != 0;
 				logger::info("[GRASS OPTIMIZATIONS] LOD mesh {} loaded: tris={} descVal={:016X}",
 					modelPath, entry.indexCount / 3, entry.descVal);
 			} else {
