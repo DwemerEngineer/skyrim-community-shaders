@@ -6,8 +6,8 @@
 // the cull bound its sample count without ever underestimating the max — underestimating would
 // cull grass that is actually visible.
 //
-// Note this cannot be GenerateMips: that averages, and an averaged depth is neither the max nor
-// meaningful on a nonlinear depth buffer.
+// Not GenerateMips: that averages, and an averaged depth is neither the max nor meaningful on a
+// nonlinear depth buffer.
 
 Texture2D<float> SrcMip : register(t0);
 RWTexture2D<float> DstMip : register(u0);
