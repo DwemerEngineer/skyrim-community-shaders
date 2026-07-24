@@ -13,6 +13,7 @@
 #include "Features/InteriorSun.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/Skin.h"
+#include "Features/Skylighting.h"
 #include "Features/SkySync.h"
 #include "Features/TerrainBlending.h"
 #include "Features/TerrainHelper.h"
@@ -51,6 +52,8 @@ void State::Draw()
 	ZoneScoped;
 
 	auto shaderCache = globals::shaderCache;
+	auto weatherManager = globals::weatherManager;
+	auto sceneSettingsManager = globals::sceneSettingsManager;
 	auto& terrainBlending = globals::features::terrainBlending;
 	auto& terrainHelper = globals::features::terrainHelper;
 	auto& cloudShadows = globals::features::cloudShadows;
@@ -59,14 +62,15 @@ void State::Draw()
 	auto& truePBR = globals::features::truePBR;
 	auto context = globals::d3d::context;
 	auto& volumetricShadows = globals::features::volumetricShadows;
+	auto& skylighting = globals::features::skylighting;
 
 	if (shaderCache->IsEnabled()) {
 		// Process deferred cell transitions (interior detection)
-		SceneSettingsManager::GetSingleton()->Update();
+		sceneSettingsManager->Update();
 
 		if (csEditor.loaded) {
 			ZoneScopedN("WeatherManager::UpdateFeatures");
-			WeatherManager::GetSingleton()->UpdateFeatures();
+			weatherManager->UpdateFeatures();
 		}
 
 		if (terrainBlending.loaded && terrainBlending.settings.Enabled) {
@@ -106,6 +110,8 @@ void State::Draw()
 						volumetricShadows.CopyShadowLightData();
 					if (globals::features::exponentialHeightFog.loaded)
 						globals::features::exponentialHeightFog.CaptureDirectionalShadowMap();
+					if (skylighting.loaded)
+						skylighting.CaptureShadowCascadeSRV();
 				}
 			}
 		}
@@ -241,10 +247,10 @@ void State::Setup()
 	globals::deferred->SetupResources();
 
 	// Load per-weather settings after features are setup
-	WeatherManager::GetSingleton()->LoadPerWeatherSettingsFromDisk();
+	globals::weatherManager->LoadPerWeatherSettingsFromDisk();
 
 	// Load scene-specific settings (Interior Only, etc.)
-	SceneSettingsManager::GetSingleton()->LoadAll();
+	globals::sceneSettingsManager->LoadAll();
 }
 
 static std::string GetConfigPath(State::ConfigMode a_configMode)
@@ -900,16 +906,6 @@ void State::ModifyShaderLookup(const RE::BSShader& a_shader, uint& a_vertexDescr
 			{
 				if (deferred->deferredPass || a_forceDeferred)
 					a_pixelDescriptor |= 256;
-			}
-			break;
-		case RE::BSShader::Type::Grass:
-			{
-				auto technique = a_vertexDescriptor & 0xF;
-				auto flags = a_vertexDescriptor & ~0xF;
-				if (technique == static_cast<uint32_t>(SIE::ShaderCache::GrassShaderTechniques::TruePbr)) {
-					technique = 0;
-				}
-				a_vertexDescriptor = flags | technique;
 			}
 			break;
 		}

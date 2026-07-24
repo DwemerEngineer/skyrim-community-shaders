@@ -10,6 +10,7 @@ struct GrassCollision;
 struct GrassLighting;
 struct GrassOptimizations;
 struct HairSpecular;
+struct HorizonFix;
 struct IBL;
 struct LightLimitFix;
 struct LinearLighting;
@@ -45,6 +46,8 @@ struct TruePBR;
 class RenderDoc;
 class RemoteControl;
 class Menu;
+class WeatherManager;
+class SceneSettingsManager;
 
 namespace SIE
 {
@@ -96,6 +99,7 @@ namespace globals
 		extern GrassLighting grassLighting;
 		extern GrassOptimizations grassOptimizations;
 		extern HairSpecular hairSpecular;
+		extern HorizonFix horizonFix;
 		extern IBL ibl;
 		extern LightLimitFix lightLimitFix;
 		extern LinearLighting linearLighting;
@@ -242,6 +246,8 @@ namespace globals
 	extern Menu* menu;
 	extern SIE::ShaderCache* shaderCache;
 	extern Profiler* profiler;
+	extern WeatherManager* weatherManager;
+	extern SceneSettingsManager* sceneSettingsManager;
 
 	/** @brief Initializes core singletons (ShaderCache, State, Menu, Deferred). Called once at plugin load. */
 	void OnInit();
