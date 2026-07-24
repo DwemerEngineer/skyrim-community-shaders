@@ -27,7 +27,9 @@ cbuffer CullParams : register(b0)
     float2 HiZSize;
     float HiZTexelPixels;
     float HiZMipCount;
-    float3 hiZPad;
+    // Below this projected size the pixel shader drops detail it cannot resolve. 0 = never.
+    float SimpleShadingPixelSize;
+    float2 hiZPad;
 };
 
 cbuffer CullBucket : register(b1)
@@ -42,12 +44,21 @@ cbuffer CullBucket : register(b1)
     float MinPixelScale;
     float IsComplex;
     float LODEnabled;
+    // Window into SliceTable describing which slices of this bucket are worth visiting. The
+    // dispatch covers only their combined instance count, so whole cells that are out of range or
+    // behind the camera cost nothing at all rather than a thread each.
+    uint SliceTableOffset;
+    uint SliceCount;
+    float2 _pad2;
 };
 
 ByteAddressBuffer Instances : register(t0);
 StructuredBuffer<float4> Origins : register(t1);
 // 1/16-res max-depth reduction of the scene depth copy (see GrassHiZCS.hlsl).
 Texture2D<float> HiZ : register(t2);
+// .x = first instance of the slice in the bucket's buffers, .y = running total of the visible
+// slices before it. Lets a compacted thread index map back to a real instance index.
+StructuredBuffer<uint2> SliceTable : register(t3);
 
 RWByteAddressBuffer Compacted : register(u0);
 RWStructuredBuffer<float4> Extras : register(u1);
@@ -83,9 +94,28 @@ float WindScalar(float basis, float timer)
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    const uint idx = tid.x;
-    if (idx >= InstanceCount)
+    const uint compactIdx = tid.x;
+    if (compactIdx >= InstanceCount)
         return;
+
+    // Map the compacted index back to a real instance. Binary search over the visible slices —
+    // at most a handful of steps, and it replaces threads that would otherwise have been spawned
+    // for every instance in the bucket including whole cells nowhere near the view.
+    uint lo = 0;
+    uint hi = SliceCount - 1;
+    [loop] while (lo < hi)
+    {
+        const uint mid = (lo + hi + 1) >> 1;
+        if (SliceTable[SliceTableOffset + mid].y <= compactIdx)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    const uint2 slice = SliceTable[SliceTableOffset + lo];
+
+    // Everything downstream keys off the real index, including Hash() — a clump must keep the
+    // same dither decision as slices come and go, or thinning would flicker.
+    const uint idx = slice.x + (compactIdx - slice.y);
 
     const uint base = idx * 32;
     const uint4 raw0 = Instances.Load4(base);
@@ -130,9 +160,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
 
     // --- Hi-Z occlusion cull ---
-    // Early-Z in the depth pass already rejects the FRAGMENTS of hidden grass, but only after the
-    // vertex shader has run — whole buckets were measured burning 50k VS invocations for zero
-    // pixels. Vertex work dominates that pass, so discarding hidden instances here is the part
+    // Early-Z already rejects the FRAGMENTS of hidden grass, but only after the vertex shader has
+    // run. Vertex work dominates the depth pass, so discarding hidden instances here is the part
     // the hardware cannot do for us.
     if (HiZEnabled > 0.5)
     {
@@ -225,7 +254,13 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float basis = (localXY.x + localXY.y) * -0.0078125;
 
     const float4 e0 = float4(og.xyz, IsComplex);
-    const float4 e1 = float4(WindScalar(basis, TimeBase * WavePeriod), WindScalar(basis, PrevTimeBase * WavePeriod), fade, (distSq < CollisionDistSq) ? 1.0 : 0.0);
+    // e1.w packs two flags for the vertex shader: 1.0 = within collision range, 2.0 = far enough
+    // that the pixel shader should skip detail work. Packed rather than given its own channel
+    // because all eight Extras channels are already spoken for.
+    const float collisionFlag = (distSq < CollisionDistSq) ? 1.0 : 0.0;
+    const float farFlag = (SimpleShadingPixelSize > 0.0 && projPx < SimpleShadingPixelSize) ? 2.0 : 0.0;
+
+    const float4 e1 = float4(WindScalar(basis, TimeBase * WavePeriod), WindScalar(basis, PrevTimeBase * WavePeriod), fade, collisionFlag + farFlag);
     
     // --- Mesh-swap LOD bin selection ---
     // Below MeshLODPixelSize this instance is drawn with the low-poly LOD mesh instead. The swap
