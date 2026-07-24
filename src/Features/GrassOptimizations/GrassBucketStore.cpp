@@ -168,10 +168,9 @@ void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstance
 		if (b.slices.empty()) {
 			// Taken before the bucket dies: the map holds a GrassBucket* that ClaimQueueSlot
 			// dereferences on the culling threads, and it only drops the reader lock once it is
-			// done. Clearing costs one frame of un-deduped queueing (absent shapes queue
-			// normally), which beats a use-after-free window.
+			// done. Only this bucket's entries go, so every surviving bucket keeps its dedup.
 			std::unique_lock lk(shapeBucketMutex);
-			shapeBucketId.clear();
+			std::erase_if(shapeBucketId, [dying = &b](const auto& entry) { return entry.second == dying; });
 			b.Release();
 			it = buckets.erase(it);
 			continue;
