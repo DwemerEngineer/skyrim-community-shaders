@@ -120,6 +120,7 @@ public:
 		float hiZPad[2];  // 192
 	};
 	STATIC_ASSERT_ALIGNAS_16(CullParamsCB);
+	static_assert(sizeof(CullParamsCB) == 192);
 
 	struct CullBucketCB
 	{

@@ -29,10 +29,10 @@ struct BucketKeyHash
 /** @brief One captured group of grass instances: raw half-packed records plus placement data. */
 struct BucketSlice
 {
-	RE::BSMultiStreamInstanceTriShape* shape;
+	RE::BSMultiStreamInstanceTriShape* shape = nullptr;
 	std::vector<uint8_t> data;  // raw 32-byte half-packed instance records
-	uint32_t count;
-	float fadeStart;
+	uint32_t count = 0;
+	float fadeStart = 0.0f;
 	RE::NiPoint3 origin;
 	uint32_t bufferOffset = UINT32_MAX;
 	// Instance-local position extent (origin-relative), decoded from the half-packed records
@@ -226,6 +226,8 @@ struct GrassBucket
 		sliceRuns.clear();
 		clustersValid = false;
 	}
+
+	~GrassBucket() { Release(); }
 };
 
 /** @brief Owns the grass instance data: captures staged by the loader hooks, the buckets they fold
@@ -269,8 +271,18 @@ public:
 	/** @brief Stages a dead shape for removal on the next grass frame. */
 	void StageRemoval(RE::BSMultiStreamInstanceTriShape* shape);
 
-	/** @brief Returns the bucket a shape's instances live in, or nullptr. Takes shapeBucketMutex. */
-	GrassBucket* FindBucketForShape(RE::BSMultiStreamInstanceTriShape* shape) const;
+	/**
+	 * @brief Claims this frame's single queue slot for the bucket owning `shape`.
+	 *
+	 * Returns true when the caller should queue the shape: either it has no instanced bucket (so
+	 * vanilla per-shape drawing still needs it) or it is the first of its bucket this frame.
+	 * Runs on the game's culling threads, and holds shapeBucketMutex across the whole claim — the
+	 * bucket it points at can be erased by ApplyRemovals on the render thread.
+	 */
+	bool ClaimQueueSlot(RE::BSMultiStreamInstanceTriShape* shape, uint32_t frame);
+
+	/** @brief Drops staged captures and removals without applying them. */
+	void DiscardPending();
 
 	/** @brief Recomputes a bucket's padded union AABB over all of its slices. */
 	void UpdateCoarseBounds(GrassBucket& b);

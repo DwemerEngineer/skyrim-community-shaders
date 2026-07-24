@@ -726,7 +726,7 @@ void ScreenSpaceGI::DrawSSGI()
 	auto& BSImagespaceShaderISSAOBlurH = imageSpaceManager->GetRuntimeData().BSImagespaceShaderISSAOBlurH;
 
 	// Toggle vanilla SSAO
-	static bool* enableSSAO = reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(BSImagespaceShaderISSAOBlurH.get()) + 0x50LL);
+	static bool* enableSSAO = reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(BSImagespaceShaderISSAOBlurH) + 0x50LL);
 	*enableSSAO = settings.EnableVanillaSSAO;
 
 	if (!(settings.Enabled && ShadersOK())) {

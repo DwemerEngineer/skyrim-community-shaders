@@ -83,11 +83,30 @@ void GrassBucketStore::StageRemoval(RE::BSMultiStreamInstanceTriShape* shape)
 	pendingRemoves.push_back(shape);
 }
 
-GrassBucket* GrassBucketStore::FindBucketForShape(RE::BSMultiStreamInstanceTriShape* shape) const
+bool GrassBucketStore::ClaimQueueSlot(RE::BSMultiStreamInstanceTriShape* shape, uint32_t frame)
 {
 	std::shared_lock lk(shapeBucketMutex);
+
 	auto it = shapeBucketId.find(shape);
-	return it != shapeBucketId.end() ? it->second : nullptr;
+	// A bucket with no instance buffer falls back to vanilla per-shape drawing, so every one of its
+	// shapes must still be queued. Checked here rather than when the map is built, so the map can
+	// be maintained incrementally without tracking buffer state.
+	if (it == shapeBucketId.end() || !it->second->instanceBuf)
+		return true;
+
+	auto& lastQueued = it->second->lastQueuedFrame;
+	uint32_t prev = lastQueued.load(std::memory_order_relaxed);
+	if (prev == frame)
+		return false;  // already queued this frame — the overwhelmingly common path, no write
+	return lastQueued.compare_exchange_strong(prev, frame, std::memory_order_relaxed);
+}
+
+void GrassBucketStore::DiscardPending()
+{
+	std::scoped_lock lk(pendingMutex);
+	pendingCaptures.clear();
+	pendingCaptures.shrink_to_fit();
+	pendingRemoves.clear();
 }
 
 void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstanceTriShape*>& removes)
@@ -147,14 +166,14 @@ void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstance
 		}
 
 		if (b.slices.empty()) {
-			b.Release();
-			it = buckets.erase(it);
-
-			// Clear now, not at end of frame: the map holds a GrassBucket* to the bucket being
-			// erased and the culling thread dereferences those. Costs one frame of un-deduped
-			// queueing (absent shapes queue normally), which beats a use-after-free window.
+			// Taken before the bucket dies: the map holds a GrassBucket* that ClaimQueueSlot
+			// dereferences on the culling threads, and it only drops the reader lock once it is
+			// done. Clearing costs one frame of un-deduped queueing (absent shapes queue
+			// normally), which beats a use-after-free window.
 			std::unique_lock lk(shapeBucketMutex);
 			shapeBucketId.clear();
+			b.Release();
+			it = buckets.erase(it);
 			continue;
 		}
 		if (b.slices.size() != before) {
