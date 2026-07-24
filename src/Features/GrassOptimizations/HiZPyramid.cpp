@@ -112,7 +112,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	valid = false;
 
 	ID3D11ShaderResourceView* srcSRV = GetSourceDepthSRV();
-	if (!srcSRV || !paramsCB)
+	if (!srcSRV || !paramsCB || !globals::game::renderer)
 		return false;
 
 	const auto [screenW, screenH] = globals::game::renderer->GetScreenSize();

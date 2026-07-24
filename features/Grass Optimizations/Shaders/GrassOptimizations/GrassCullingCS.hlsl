@@ -1,9 +1,6 @@
 #include "Common/FrameBuffer.hlsli"
 #include "Common/Math.hlsli"
 
-#include "Common/FrameBuffer.hlsli"
-#include "Common/Math.hlsli"
-
 cbuffer CullParams : register(b0)
 {
     float4 FrustumPlanes[6];
@@ -95,7 +92,9 @@ float WindScalar(float basis, float timer)
 void main(uint3 tid : SV_DispatchThreadID)
 {
     const uint compactIdx = tid.x;
-    if (compactIdx >= InstanceCount)
+    // SliceCount 0 would make the search bound below underflow to 0xFFFFFFFF and read the table
+    // out of bounds. The CPU never dispatches an empty bucket, so this only guards the invariant.
+    if (compactIdx >= InstanceCount || SliceCount == 0)
         return;
 
     // Map the compacted index back to a real instance. Binary search over the visible slices —

@@ -182,20 +182,26 @@ void GrassOptimizations::UpdateGrass()
 	auto* device = globals::d3d::device;
 	auto* ctx = globals::d3d::context;
 
-	if (!GetCullCS() || !ctx1 || !cullParamsCB)
+	if (!GetCullCS() || !ctx1 || !cullParamsCB) {
+		bucketStore.DiscardPending();
 		return;
+	}
 
 	timeAccum += globals::game::smState->timerValues[1];
 	prevTimeBase = timeBase;
 	timeBase = globals::game::smState->timerValues[4] * 0.0016666667f * 6.2831802f;
 
+	const auto iniFloat = [](const char* name, float fallback) {
+		auto* setting = RE::GetINISetting(name);
+		return setting ? setting->GetFloat() : fallback;
+	};
 	if (fadeInTimeRcp == 0.0f) {
-		const float t = RE::GetINISetting("fGrassFadeInTime:Grass")->GetFloat();
+		const float t = iniFloat("fGrassFadeInTime:Grass", 0.0f);
 		fadeInTimeRcp = t > 0.0f ? 1.0f / t : 1e6f;
 	}
 	if (vanillaMaxDistance == 0.0f) {
-		grassStartFadeDistance = RE::GetINISetting("fGrassStartFadeDistance:Grass")->GetFloat();
-		vanillaMaxDistance = grassStartFadeDistance + RE::GetINISetting("fGrassFadeRange:Grass")->GetFloat();
+		grassStartFadeDistance = iniFloat("fGrassStartFadeDistance:Grass", 6000.0f);
+		vanillaMaxDistance = grassStartFadeDistance + iniFloat("fGrassFadeRange:Grass", 2000.0f);
 	}
 
 	maxGrassDistance = settings.RenderDistanceOverride > 0.0f ? settings.RenderDistanceOverride : vanillaMaxDistance;
@@ -684,20 +690,11 @@ void GrassOptimizations::Hooks::BSMultiStreamInstanceTriShape_OnVisible::thunk(R
 		// this shape — that setup, not the draw, is the real per-shape cost. One shape per bucket
 		// suffices since the draw path renders the whole bucket. First to arrive wins rather than
 		// a designated shape, which could itself be engine-culled while its siblings are visible.
-		GrassBucket* bucket = self.bucketStore.FindBucketForShape(This);
-		// A bucket with no instance buffer falls back to vanilla per-shape drawing, so every one of
-		// its shapes must still be queued. Checked here rather than when the map is built, so the
-		// map can be maintained incrementally without tracking buffer state.
-		if (bucket && bucket->instanceBuf) {
-			const uint32_t frame = globals::game::graphicsState->frameCount;
-			uint32_t prev = bucket->lastQueuedFrame.load(std::memory_order_relaxed);
-			if (prev == frame)
-				return;  // already queued this frame — the overwhelmingly common path, no write
-			if (!bucket->lastQueuedFrame.compare_exchange_strong(prev, frame, std::memory_order_relaxed))
-				return;  // another culling thread claimed it first
-		}
+		if (!self.bucketStore.ClaimQueueSlot(This, globals::game::graphicsState->frameCount))
+			return;
 
-		process->AppendVirtual(This, alphaGroupIndex);
+		auto& shape = *This;
+		process->AppendVirtual(shape, alphaGroupIndex);
 		return;
 	}
 
@@ -835,7 +832,7 @@ void GrassOptimizations::Hooks::ReadGroupHeaderStreamTraits::thunk(RE::BSStreamH
 void GrassOptimizations::Hooks::ReadInstanceGroupStreamTraits::thunk(RE::BSStreamHeader* streamHeader, uint16_t* instanceData, uint32_t size)
 {
 	func(streamHeader, instanceData, size);
-	tl_lastFileInstanceData.resize(size / sizeof(uint16_t));
+	tl_lastFileInstanceData.resize((size + sizeof(uint16_t) - 1) / sizeof(uint16_t));
 	std::memcpy(tl_lastFileInstanceData.data(), instanceData, size);
 	tl_haveFileGroup = true;
 }
@@ -865,29 +862,24 @@ void GrassOptimizations::Hooks::AddGroupGIDFile::thunk(RE::BSMultiStreamInstance
 void VanillaDrawInstanceTriShape(RE::BSMultiStreamInstanceTriShape* geometry)
 {
 	auto* ctx = globals::d3d::context;
-	auto& groups = geometry->GetMultiStreamTrishapeRuntimeData().unk160;
+	auto& groups = geometry->GetMultiStreamTrishapeRuntimeData().instanceGroups;
 
 	for (uint32_t i = 0; i < groups.size(); ++i) {
 		auto curInstanceGroup = groups[i];
-		if (!curInstanceGroup || !curInstanceGroup->unk50)
+		if (!curInstanceGroup || !curInstanceGroup->isVisible)
 			continue;
 
 		uint32_t indexCount = 0;
 		uint32_t* indexCountPtr = &indexCount;
-		static REL::Relocation<ID3D11Buffer** (*)(RE::BSGraphics::Renderer*, uint64_t, uint32_t**, uint32_t)>
-			MapDynamicBuffer{ REL::RelocationID(75561, 77362) };
+		static REL::Relocation<ID3D11Buffer** (*)(RE::BSGraphics::Renderer*, uint64_t, uint32_t**, uint32_t)> MapDynamicBuffer{ REL::RelocationID(75561, 77362) };
 		auto buffer = MapDynamicBuffer(globals::game::renderer, 1, &indexCountPtr, 7);
 		*indexCountPtr = i;
 		if (*buffer)
 			ctx->Unmap(*buffer, 0);
 		ctx->VSSetConstantBuffers(7u, 1u, buffer);
 
-		static REL::Relocation<void (*)(RE::BSGraphics::Renderer*, RE::BSGraphics::TriShape*, uint32_t, uint32_t, uint32_t, RE::BSGraphics::VertexDesc, ID3D11Buffer**)>
-			DrawInstancedTriShape{ REL::RelocationID(75479, 77265) };
-		DrawInstancedTriShape(globals::game::renderer, geometry->GetGeometryRuntimeData().rendererData, 0,
-			geometry->GetTrishapeRuntimeData().triangleCount, curInstanceGroup->instanceCount,
-			geometry->GetGeometryRuntimeData().vertexDesc,
-			reinterpret_cast<ID3D11Buffer**>(curInstanceGroup->buffer));
+		static REL::Relocation<void (*)(RE::BSGraphics::Renderer*, RE::BSGraphics::TriShape*, uint32_t, uint32_t, uint32_t, RE::BSGraphics::VertexDesc, RE::BSGraphics::VertexBuffer*)> DrawInstancedTriShape{ REL::RelocationID(75479, 77265) };
+		DrawInstancedTriShape(globals::game::renderer, geometry->GetGeometryRuntimeData().rendererData, 0,geometry->GetTrishapeRuntimeData().triangleCount, curInstanceGroup->instanceCount,geometry->GetGeometryRuntimeData().vertexDesc, curInstanceGroup->vertexBuffer);
 	}
 }
 
@@ -915,13 +907,12 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	auto& self = globals::features::grassOptimizations;
 	auto* ctx = globals::d3d::context;
 
-	if (auto rtti = geometry->GetGeometryRuntimeData().shaderProperty->GetRTTI()) {
-		if (rtti != globals::rtti::BSGrassShaderPropertyRTTI.get()) {
-			VanillaDrawInstanceTriShape(geometry);
-			return;
-		}
+	auto shaderProperty = geometry->GetGeometryRuntimeData().shaderProperty;
+	if (!shaderProperty || shaderProperty->GetRTTI() != globals::rtti::BSGrassShaderPropertyRTTI.get()) {
+		VanillaDrawInstanceTriShape(geometry);
+		return;
 	}
-	RE::NiSourceTexture* diffuseTexture = geometry->GetGeometryRuntimeData().shaderProperty->GetBaseTexture();
+	RE::NiSourceTexture* diffuseTexture = shaderProperty->GetBaseTexture();
 	if (!diffuseTexture) {
 		VanillaDrawInstanceTriShape(geometry);
 		return;
