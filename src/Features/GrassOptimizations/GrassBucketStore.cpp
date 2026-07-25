@@ -262,7 +262,7 @@ void GrassBucketStore::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceCont
 }
 
 void GrassBucketStore::CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape,
-	RE::BSMultiStreamInstanceTriShape::GroupHeader* header, const uint16_t* instanceData)
+	RE::BSMultiStreamInstanceTriShape::GroupHeader* header, const uint16_t* instanceData, size_t dataBytes)
 {
 	if (!shape || !header || !instanceData)
 		return;
@@ -276,7 +276,13 @@ void GrassBucketStore::CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape,
 		return;
 
 	const uint64_t descVal = *reinterpret_cast<const uint64_t*>(&shape->GetGeometryRuntimeData().vertexDesc);
-	StageCapture(shape, instanceData, header->groupInstanceCount, ((descVal >> 2) & 0x3C), descVal, tex);
+	const uint32_t stride = (uint32_t)((descVal >> 2) & 0x3C);
+
+	uint32_t count = header->groupInstanceCount;
+	if (stride && dataBytes / stride < count)
+		count = (uint32_t)(dataBytes / stride);
+
+	StageCapture(shape, instanceData, count, stride, descVal, tex);
 }
 
 bool GrassBucketStore::StageCapture(RE::BSMultiStreamInstanceTriShape* shape, const void* src,
