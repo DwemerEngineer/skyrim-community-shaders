@@ -261,8 +261,14 @@ public:
 	 */
 	void RefreshComplexGrass(float threshold, ID3D11DeviceContext* ctx);
 
-	/** @brief Captures one GID group's instance records from the loader hooks. */
-	void CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape, RE::BSMultiStreamInstanceTriShape::GroupHeader* header, const uint16_t* instanceData);
+	/**
+	 * @brief Captures one GID group's instance records from the loader hooks.
+	 *
+	 * `dataBytes` bounds the read: the group header and the instance data arrive through separate
+	 * hooks, so a truncated file can advertise more instances than were actually read. Pass
+	 * SIZE_MAX for engine-owned buffers whose length is not knowable.
+	 */
+	void CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape, RE::BSMultiStreamInstanceTriShape::GroupHeader* header, const uint16_t* instanceData, size_t dataBytes);
 
 	/** @brief Stages a raw instance-record capture for the next grass frame. Returns false and
 	    leaves vanilla rendering untouched when the record layout is not the expected 32 bytes. */

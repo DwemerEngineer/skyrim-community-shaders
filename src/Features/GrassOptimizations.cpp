@@ -400,6 +400,7 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 	uint32_t visibleBuckets)
 {
 	// One map fills every visible bucket's slot — replaces a Map/Unmap per bucket.
+	bool cullStateUploaded = false;
 	if (visibleBuckets && EnsureCullBucketCapacity(visibleBuckets, device)) {
 		D3D11_MAPPED_SUBRESOURCE m{};
 		if (SUCCEEDED(ctx->Map(cullBucketCB->CB(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -427,7 +428,16 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 				++slot;
 			}
 			ctx->Unmap(cullBucketCB->CB(), 0);
+			cullStateUploaded = true;
 		}
+	}
+
+	// Without this frame's constants every CullBucket bails on its UINT32_MAX slot, leaving the
+	// indirect args holding last frame's instance count. Drop the buckets rather than let the draw
+	// path issue indirect draws over a stale compaction buffer.
+	if (visibleBuckets && !cullStateUploaded) {
+		for (auto& [key, b] : bucketStore.buckets)
+			b.cullVisible = false;
 	}
 
 	ID3D11Buffer* paramsCB = cullParamsCB->CB();
@@ -806,13 +816,13 @@ bool GrassOptimizations::Hooks::BSMultiBoundAABB_WithinFrustum::thunk(RE::BSMult
 
 std::uint32_t GrassOptimizations::Hooks::AddGroupGIDBuffer::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSMultiStreamInstanceTriShape::GroupHeader* a2, std::uint16_t* a3)
 {
-	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3);
+	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3, SIZE_MAX);
 	return func(a1, a2, a3);
 }
 
 std::uint32_t GrassOptimizations::Hooks::AddQueuedGroupGIDBuffer::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSMultiStreamInstanceTriShape::GroupHeader* a2, std::uint16_t* a3, RE::BSTArray<std::uint32_t>& a4)
 {
-	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3);
+	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3, SIZE_MAX);
 	return func(a1, a2, a3, a4);
 }
 
@@ -840,7 +850,8 @@ void GrassOptimizations::Hooks::AddGroupQueuedGIDFile::thunk(RE::BSMultiStreamIn
 	func(a1, a2, a3);
 
 	if (tl_haveFileGroup) {
-		globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, &tl_lastFileGroupHeader, tl_lastFileInstanceData.data());
+		globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, &tl_lastFileGroupHeader,
+			tl_lastFileInstanceData.data(), tl_lastFileInstanceData.size() * sizeof(uint16_t));
 		tl_haveFileGroup = false;
 	}
 }
@@ -851,7 +862,8 @@ void GrassOptimizations::Hooks::AddGroupGIDFile::thunk(RE::BSMultiStreamInstance
 	func(a1, a2);
 
 	if (tl_haveFileGroup) {
-		globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, &tl_lastFileGroupHeader, tl_lastFileInstanceData.data());
+		globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, &tl_lastFileGroupHeader,
+			tl_lastFileInstanceData.data(), tl_lastFileInstanceData.size() * sizeof(uint16_t));
 		tl_haveFileGroup = false;
 	}
 }
@@ -870,10 +882,12 @@ void VanillaDrawInstanceTriShape(RE::BSMultiStreamInstanceTriShape* geometry)
 		uint32_t* indexCountPtr = &indexCount;
 		static REL::Relocation<ID3D11Buffer** (*)(RE::BSGraphics::Renderer*, uint64_t, uint32_t**, uint32_t)> MapDynamicBuffer{ REL::RelocationID(75561, 77362) };
 		auto buffer = MapDynamicBuffer(globals::game::renderer, 1, &indexCountPtr, 7);
-		*indexCountPtr = i;
-		if (*buffer)
-			ctx->Unmap(*buffer, 0);
-		ctx->VSSetConstantBuffers(7u, 1u, buffer);
+		if (buffer && indexCountPtr) {
+			*indexCountPtr = i;
+			if (*buffer)
+				ctx->Unmap(*buffer, 0);
+			ctx->VSSetConstantBuffers(7u, 1u, buffer);
+		}
 
 		static REL::Relocation<void (*)(RE::BSGraphics::Renderer*, RE::BSGraphics::TriShape*, uint32_t, uint32_t, uint32_t, RE::BSGraphics::VertexDesc, RE::BSGraphics::VertexBuffer*)> DrawInstancedTriShape{ REL::RelocationID(75479, 77265) };
 		DrawInstancedTriShape(globals::game::renderer, geometry->GetGeometryRuntimeData().rendererData, 0,geometry->GetTrishapeRuntimeData().triangleCount, curInstanceGroup->instanceCount,geometry->GetGeometryRuntimeData().vertexDesc, curInstanceGroup->vertexBuffer);
@@ -950,6 +964,8 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 
 	const uint32_t meshStride = (uint32_t)((4 * descVal) & 0x3C);
 	auto* rendererData = geometry->GetGeometryRuntimeData().rendererData;
+	if (!rendererData)
+		return;
 	auto* meshVB = reinterpret_cast<ID3D11Buffer*>(rendererData->vertexBuffer);
 	auto* indexB = reinterpret_cast<ID3D11Buffer*>(rendererData->indexBuffer);
 	if (!meshVB || !indexB)
