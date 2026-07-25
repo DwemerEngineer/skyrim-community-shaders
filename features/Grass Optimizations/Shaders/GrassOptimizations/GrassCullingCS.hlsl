@@ -97,9 +97,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (compactIdx >= InstanceCount || SliceCount == 0)
         return;
 
-    // Map the compacted index back to a real instance. Binary search over the visible slices —
-    // at most a handful of steps, and it replaces threads that would otherwise have been spawned
-    // for every instance in the bucket including whole cells nowhere near the view.
+    // Map the compacted index back to a real instance, searching on the running total in .y.
     uint lo = 0;
     uint hi = SliceCount - 1;
     [loop] while (lo < hi)
@@ -129,9 +127,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 dv = world - FrameBuffer::CameraPosAdjust.xyz;
     const float distSq = dot(dv, dv);
 
-    // Per-mesh cost weighting, blended by MeshCostBias: 0 = thresholds are literal (a "4 px"
-    // setting means 4 px on every grass type), 1 = full sqrt(tris/6) weighting that culls
-    // heavier meshes sooner. Applied to both the distance cap and the pixel thresholds.
+    // Per-mesh cost weighting, blended by MeshCostBias into both the distance cap and the pixel
+    // thresholds below.
     const float dScale = lerp(1.0, DistScale, MeshCostBias);
     const float scaleSq = dScale * dScale;
     const float effMaxDistSq = MaxDistSq * scaleSq;
@@ -148,10 +145,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float dist = sqrt(distSq);
 
     // --- Projected-size LOD ---
-    // projPx = this clump's on-screen radius in pixels (distance + clump size + FOV + resolution
-    // via ProjScale, and per-type mesh cost via MinPixelScale). Full density above
-    // FullDetailPixelSize, stochastically thinned toward LODMinKeep as it shrinks, culled below
-    // MinPixelSize. Replaces the old raw-distance thinning with a resolution/FOV-aware metric.
+    // projPx is the clump's on-screen radius in pixels; ProjScale folds in FOV and resolution, so
+    // every threshold below is resolution-independent.
     const float projPx = (ClumpRadius / dist) * ProjScale;
     const float pxScale = lerp(1.0, MinPixelScale, MeshCostBias);
     const float effMinPx = MinPixelSize * pxScale;
@@ -240,12 +235,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float distFade = 1.0 - saturate((length(clip.xyz) - AlphaParam1) / AlphaParam2);
     const float spawnFade = saturate((FadeNow - og.w) * FadeInTimeRcp);
 
-    // The depth PS discards when fade * baseAlpha < AlphaTestRefRS, so any instance whose fade
-    // is at/below the alpha-test ref cannot pass even at baseAlpha == 1 — it is invisible but
-    // would still be fully rasterized in both passes. Cull it here instead. At the default
-    // threshold 0.0 this only removes exactly-zero-fade instances (provably invisible, e.g.
-    // freshly spawned cells before fade-in starts); raising it toward the game's alpha-test ref
-    // trims the invisible outer fade shell too.
+    // The depth PS discards when fade * baseAlpha < AlphaTestRefRS, so an instance at/below the
+    // ref cannot pass even at baseAlpha == 1 — invisible, but still fully rasterized in both
+    // passes unless it is dropped here.
     const float fade = distFade * spawnFade * lodFade * edgeFade;
     if (fade <= InvisibleFadeCull)
         return;
@@ -262,10 +254,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 e1 = float4(WindScalar(basis, TimeBase * WavePeriod), WindScalar(basis, PrevTimeBase * WavePeriod), fade, collisionFlag + farFlag);
     
     // --- Mesh-swap LOD bin selection ---
-    // Below MeshLODPixelSize this instance is drawn with the low-poly LOD mesh instead. The swap
-    // is dithered over MeshLODBandPx: t ramps 0 -> 1 across the band and each instance draws its
-    // own hash, so a clump crossing the threshold converts gradually rather than flipping whole.
-    // A different hash salt than the density thinning above keeps the two decisions uncorrelated.
+    // Dithered over MeshLODBandPx so a clump crossing the threshold converts gradually rather than
+    // flipping whole. The hash salt keeps this decision uncorrelated with the density thinning
+    // above, which draws from the same Hash(idx).
     bool useLOD = false;
     if (LODEnabled > 0.5)
     {

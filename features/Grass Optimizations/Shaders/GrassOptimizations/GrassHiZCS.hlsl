@@ -25,8 +25,7 @@ cbuffer HiZParams : register(b0)
 	uint2 DstSize;
 };
 
-[numthreads(8, 8, 1)] void main(uint3 tid
-								: SV_DispatchThreadID) {
+[numthreads(8, 8, 1)] void main(uint3 tid : SV_DispatchThreadID) {
 	if (any(tid.xy >= DstSize))
 		return;
 

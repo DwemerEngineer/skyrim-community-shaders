@@ -698,7 +698,7 @@
     "feature.grass_optimizations.culling": "Culling & LOD",
     "feature.grass_optimizations.description": "Rewrites grass rendering around GPU-driven culling and instancing, consolidating thousands of engine draw calls into a handful of indirect draws and removing hidden grass before it costs anything.",
     "feature.grass_optimizations.enable_mesh_lod": "Enable Mesh LOD",
-    "feature.grass_optimizations.enable_mesh_lod_tooltip": "Swap distant grass clumps to a lower-poly LOD mesh to cut overdraw. Requires a LOD .nif per grass type at meshes\\LOD\\Grass\\<source-mesh-name>.nif, authored in the same local space and vertex format as the source grass. Grass with no LOD mesh keeps its full mesh.",
+    "feature.grass_optimizations.enable_mesh_lod_tooltip": "Swap distant grass clumps to a lower-poly LOD mesh to cut overdraw. Requires a LOD .nif per grass type at meshes\\LOD\\Grass\\<source-mesh-name>_LOD.nif, authored in the same local space and vertex format as the source grass. Grass with no LOD mesh keeps its full mesh.",
     "feature.grass_optimizations.full_detail_pixel_size": "Full-Detail Pixel Size",
     "feature.grass_optimizations.full_detail_pixel_size_tooltip": "Projected-size LOD: clumps whose on-screen radius is above this render at full density. Below it, density is thinned by screen size down to Minimum Density, then culled at Min Pixel Size. Lower = grass thins closer to the camera (less overdraw, more visible thinning).",
     "feature.grass_optimizations.invisible_fade_cull": "Invisible Fade Cull",

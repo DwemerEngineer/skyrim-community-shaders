@@ -90,7 +90,7 @@ void GrassOptimizations::DrawSettings()
 	ImGui::Checkbox(T(TKEY("enable_mesh_lod"), "Enable Mesh LOD"), &settings.EnableMeshLOD);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("enable_mesh_lod_tooltip"),
-							  "Swap distant grass clumps to a lower-poly LOD mesh to cut overdraw. Requires a LOD .nif per grass type at meshes\\LOD\\Grass\\<source-mesh-name>.nif, authored in the same local space and vertex format as the source grass. Grass with no LOD mesh keeps its full mesh."));
+							  "Swap distant grass clumps to a lower-poly LOD mesh to cut overdraw. Requires a LOD .nif per grass type at meshes\\LOD\\Grass\\<source-mesh-name>_LOD.nif, authored in the same local space and vertex format as the source grass. Grass with no LOD mesh keeps its full mesh."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("mesh_lod_pixel_size"), "Mesh LOD Pixel Size"), &settings.MeshLODPixelSize, 1.0f, 64.0f, "%.1f px");
@@ -485,9 +485,6 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 	ID3D11ShaderResourceView* nullSRVs[4] = {};
 	ctx->CSSetShaderResources(0, 4, nullSRVs);
 	ctx->CSSetShader(nullptr, nullptr, 0);
-
-
-
 }
 
 void GrassOptimizations::BuildFrustumSoA(FrustumSoA& out, const RE::NiFrustumPlanes& f)
