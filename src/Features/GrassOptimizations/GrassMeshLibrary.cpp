@@ -81,9 +81,9 @@ void GrassMeshLibrary::EnsureLODMesh(uint32_t meshId)
 
 	LODMesh entry;  // valid == false: no LOD mesh → the full mesh is drawn
 
-	// Convention: meshes\LOD\Grass\<source-mesh-stem>.nif, authored in the same local space and
-	// vertex format as the source grass (BSModelDB::Demand prepends "meshes\").
-	const std::string modelPath = "LOD\\Grass\\" + stems[meshId - 1] + ".nif";
+	// Convention: meshes\LOD\Grass\<source-mesh-stem>_LOD.nif, authored in the same local space
+	// and vertex format as the source grass (BSModelDB::Demand prepends "meshes\").
+	const std::string modelPath = "LOD\\Grass\\" + stems[meshId - 1] + "_LOD.nif";
 
 	RE::BSModelDB::DBTraits::ArgsType args{};
 	args.unk8 = false;

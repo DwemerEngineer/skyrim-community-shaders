@@ -6,7 +6,7 @@
 class GrassMeshLibrary
 {
 public:
-	/** @brief A lower-poly LOD mesh, loaded from meshes\LOD\Grass\<source-mesh-stem>.nif.
+	/** @brief A lower-poly LOD mesh, loaded from meshes\LOD\Grass\<source-mesh-stem>_LOD.nif.
 	    `valid` is false when no LOD mesh exists — the full mesh is drawn then. */
 	struct LODMesh
 	{
