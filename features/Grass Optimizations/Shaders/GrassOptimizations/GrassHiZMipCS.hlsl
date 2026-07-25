@@ -1,10 +1,5 @@
-// Builds one level of the grass occlusion max-depth pyramid from the level above it.
-//
-// A max reduction is what makes the pyramid usable for conservative culling: a texel at level N
-// is exactly the farthest depth of everything under it, so testing a large clump against a single
-// coarse texel is equivalent to testing it against every fine texel it covers. That is what lets
-// the cull bound its sample count without ever underestimating the max — underestimating would
-// cull grass that is actually visible.
+// Builds one level of the grass occlusion max-depth pyramid from the level above it, carrying on
+// the max reduction GrassHiZCS.hlsl starts.
 //
 // Not GenerateMips: that averages, and an averaged depth is neither the max nor meaningful on a
 // nonlinear depth buffer.

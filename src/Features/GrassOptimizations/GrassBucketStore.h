@@ -96,7 +96,7 @@ struct GrassBucket
 	ID3D11UnorderedAccessView* argsUAV = nullptr;
 
 	// Second compaction bin, for the mesh-swap LOD. Allocated only for buckets whose
-	// LOD\Grass\<stem>.nif actually loaded, so grass types without an authored LOD cost
+	// LOD\Grass\<stem>_LOD.nif actually loaded, so grass types without an authored LOD cost
 	// nothing. While these are null the cull CS routes every survivor to the full-detail bin.
 	ID3D11Buffer* lodCompactedBuf = nullptr;
 	ID3D11UnorderedAccessView* lodCompactedUAV = nullptr;
