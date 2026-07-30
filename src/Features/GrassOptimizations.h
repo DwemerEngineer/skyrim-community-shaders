@@ -268,7 +268,7 @@ public:
 			stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
 
 			// Capture raw instance data for cached grass.
-			stl::write_thunk_call<AddQueuedGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x7FF, 0));
+			stl::write_thunk_call<AddQueuedGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x7FF, 0x756));
 			stl::write_thunk_call<AddGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x806, 0x75D));
 			stl::write_thunk_call<ReadGroupHeaderStreamTraits>(REL::RelocationID(74599, 76327).address() + REL::Relocate(0x36, 0x36));
 			stl::write_thunk_call<ReadGroupHeaderStreamTraits>(REL::RelocationID(74596, 76324).address() + REL::Relocate(0x2F, 0x33));
@@ -277,9 +277,9 @@ public:
 			stl::write_thunk_call<AddGroupGIDFile>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x39B, 0x38B));
 
 			// Record each grass type's source .nif path alongside its shape.
-			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15204, 15372).address() + REL::Relocate(0x2F5, 0x0));
-			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x62B, 0x0));
-			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x25C, 0x0));
+			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15204, 15372).address() + REL::Relocate(0x2F5, 0x2F5));
+			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x62B, 0x597));
+			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x25C, 0x25C));
 
 			std::uint8_t patch[] = { 0x4C, 0x89, 0xF2 };  // mov rdx, r14
 			REL::safe_write(REL::RelocationID(100847, 107637).address() + REL::Relocate(0x660, 0x648), patch, sizeof(patch));
