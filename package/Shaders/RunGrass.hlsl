@@ -36,9 +36,7 @@ struct VS_OUTPUT
 #if defined(RENDER_DEPTH)
 	float Alpha: COLOR0;
 	float2 TexCoord: TEXCOORD0;
-	// No Depth interpolator: the rasterizer already performs the perspective divide, so the pixel
-	// shader reads z/w straight out of SV_POSITION.z. Carrying projSpacePosition.zw across just to
-	// divide it again cost two interpolators and a divide for a value that arrives free.
+	// No Depth interpolator: the rasterizer already divides, so SV_POSITION.z carries z/w for free.
 #else
 	float4 Color: COLOR0;
 	float2 TexCoord: TEXCOORD0;
@@ -49,8 +47,7 @@ struct VS_OUTPUT
 #	ifdef GRASS_OPTIMIZATIONS
 	nointerpolation float IsComplex: TEXCOORD8;
 #	if !defined(RENDER_DEPTH)
-	// Clump is small enough on screen that detail work the pixel shader would do here cannot be
-	// resolved. Only carried on the colour pass — the depth pass has nothing to skip.
+	// Only gates pixel shader work, so the depth pass has no use for it.
 	nointerpolation float IsFar: TEXCOORD9;
 #	endif
 #	endif
@@ -62,7 +59,7 @@ struct VS_OUTPUT
 #if defined(RENDER_DEPTH)
 	float Alpha: COLOR0;
 	float2 TexCoord: TEXCOORD0;
-	// see above — z/w comes from SV_POSITION.z in the pixel shader
+	// No Depth interpolator, as above.
 #else
 	float4 Color: COLOR0;
 	float2 TexCoord: TEXCOORD0;
@@ -107,7 +104,7 @@ cbuffer PerGeometry : register(
 #	endif  // GRASS_COLLISION
 
 #	ifdef GRASS_OPTIMIZATIONS
-//windCur, windPrev, fade, collisionActive
+// Two per instance: [0] = origin.xyz + isComplex, [1] = windCur, windPrev, fade, packed flags.
 StructuredBuffer<float4> InstanceExtras : register(t2);
 #	else
 cbuffer cb7 : register(b7)
@@ -174,8 +171,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
 	vsout.IsComplex = e0.w;
 
-	// e1.w packs two flags: 1.0 = within collision range, 2.0 = far. Unpack before testing, or a
-	// far instance outside collision range would read as "collides".
+	// e1.w packs 1.0 = in collision range and 2.0 = far. Unpack before testing, or a far instance out of collision range reads as colliding.
 	const float isFarFlag = (e1.w >= 2.0) ? 1.0 : 0.0;
 	const float collisionFlag = e1.w - 2.0 * isFarFlag;
 #			if !defined(RENDER_DEPTH)
@@ -288,7 +284,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
 	vsout.IsComplex = e0.w;
 
-	// see the GRASS_LIGHTING path — e1.w packs collision (1.0) and far (2.0)
+	// e1.w packs collision (1.0) and far (2.0), as above.
 	const float isFarFlag = (e1.w >= 2.0) ? 1.0 : 0.0;
 	const float collisionFlag = e1.w - 2.0 * isFarFlag;
 #		endif
@@ -510,9 +506,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif  // !TRUE_PBR
 
 #		if defined(RENDER_DEPTH)
-	// Complex grass packs two layers into the texture, so it samples the top half. Selecting the
-	// scale rather than branching keeps this to one sample instruction — IsComplex is
-	// nointerpolation and constant per bucket, so there was never divergence to save.
+	// Complex grass packs two layers, so scale the coord to the top half rather than branching.
 #			if !defined(TRUE_PBR)
 	const float2 alphaUV = float2(input.TexCoord.x, input.TexCoord.y * (complex ? 0.5 : 1.0));
 #			else
@@ -543,9 +537,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (SharedData::lodBlendingSettings.DisableTerrainVertexColors)
 		input.Color.xyz = 1;
 
-	// Detail work skipped once a clump is too small to resolve it. Note this uses a SEPARATE flag
-	// from `complex`: `complex` still selects which half of the atlas the base colour comes from
-	// and must never change, or far grass would sample the wrong region entirely.
+	// Gates unresolvable detail only. `complex` still picks the atlas half and must not change.
 #			ifdef GRASS_OPTIMIZATIONS
 	const bool isFar = input.IsFar > 0.5;
 #			else
@@ -611,8 +603,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		dirDetailedShadow *= shadowColor.x;
 
 #			if defined(SCREEN_SPACE_SHADOWS)
-	// Contact shadows are a raymarch, and at a few pixels across there is no contact detail left
-	// to shadow — this is the most expensive thing far grass can skip.
 	if (!SharedData::InInterior && dirLightAngle >= 0.0 && !isFar)
 		dirDetailedShadow *= ScreenSpaceShadows::GetScreenSpaceShadow(input.HPosition.xyz, screenUV, screenNoise);
 #			endif  // SCREEN_SPACE_SHADOWS

@@ -1,32 +1,38 @@
 #include "Common/FrameBuffer.hlsli"
 #include "Common/Math.hlsli"
+#include "Common/Random.hlsli"
 
 cbuffer CullParams : register(b0)
 {
     float4 FrustumPlanes[6];
-    float MaxDistSq;
+
+    float MinPixelSize;
     float FullDetailPixelSize;
-    float MeshCostBias;
     float LODMinKeep;
     float LODFadeBand;
+
+    float MeshCostBias;
     float ProjScale;
-    float MinPixelSize;
+    float MaxDistSq;
     float EdgeFadeStart;
-    float CollisionDistSq;
+
     float AlphaParam1;
     float AlphaParam2;
     float FadeNow;
     float FadeInTimeRcp;
+
     float InvisibleFadeCull;
+    float SimpleShadingPixelSize;
+    float CollisionDistSq;
     float MeshLODPixelSize;
+
     float MeshLODBandPx;
     float HiZEnabled;
     float2 HiZSize;
+
     float HiZTexelPixels;
     float HiZMipCount;
-    // Below this projected size the pixel shader drops detail it cannot resolve. 0 = never.
-    float SimpleShadingPixelSize;
-    float2 hiZPad;
+    float2 _pad;
 };
 
 cbuffer CullBucket : register(b1)
@@ -41,9 +47,7 @@ cbuffer CullBucket : register(b1)
     float MinPixelScale;
     float IsComplex;
     float LODEnabled;
-    // Window into SliceTable describing which slices of this bucket are worth visiting. The
-    // dispatch covers only their combined instance count, so whole cells that are out of range or
-    // behind the camera cost nothing at all rather than a thread each.
+    // Window into SliceTable: the dispatch covers only these slices' combined instance count.
     uint SliceTableOffset;
     uint SliceCount;
     float2 _pad2;
@@ -53,30 +57,31 @@ ByteAddressBuffer Instances : register(t0);
 StructuredBuffer<float4> Origins : register(t1);
 // 1/16-res max-depth reduction of the scene depth copy (see GrassHiZCS.hlsl).
 Texture2D<float> HiZ : register(t2);
-// .x = first instance of the slice in the bucket's buffers, .y = running total of the visible
-// slices before it. Lets a compacted thread index map back to a real instance index.
+// .x = first instance of the slice in the bucket's buffers, .y = running total of the visible slices before it. 
+// Maps compacted thread indices to a real instance indices.
 StructuredBuffer<uint2> SliceTable : register(t3);
 
 RWByteAddressBuffer Compacted : register(u0);
 RWStructuredBuffer<float4> Extras : register(u1);
 RWByteAddressBuffer Counter : register(u2);
 
-// Second bin, drawn with the low-poly LOD mesh. Bound as null when the bucket has no LOD mesh,
-// in which case LODEnabled is 0 and nothing is ever routed here.
 RWByteAddressBuffer LODCompacted : register(u3);
 RWStructuredBuffer<float4> LODExtras : register(u4);
 RWByteAddressBuffer LODCounter : register(u5);
 
-float Hash(uint i)
+// Converts a uint hash to a random float between [0, 1)
+float RandFloat(uint bits)
 {
-    i = (i ^ 61u) ^ (i >> 16u);
-    i *= 9u;
-    i ^= i >> 4u;
-    i *= 0x27d4eb2du;
-    i ^= i >> 15u;
-    return (float) (i & 0xFFFFFFu) / (float) 0x1000000u;
+    const uint mantissaMask = 0x007FFFFFu;
+    const uint one = 0x3F800000u;
+
+    bits &= mantissaMask;
+    bits |= one;
+    
+    return asfloat(bits) - 1.0;
 }
 
+// Precalculate wind sway per-instance, so the vertex shader can just multiply by the wind vector and add to the position.
 float WindScalar(float basis, float timer)
 {
     const float a = 0.4 * (basis + timer);
@@ -88,12 +93,9 @@ float WindScalar(float basis, float timer)
     return (t1 + t2) * 0.3 + t3;
 }
 
-[numthreads(64, 1, 1)]
-void main(uint3 tid : SV_DispatchThreadID)
+[numthreads(64, 1, 1)] void main(uint3 tid : SV_DispatchThreadID)
 {
     const uint compactIdx = tid.x;
-    // SliceCount 0 would make the search bound below underflow to 0xFFFFFFFF and read the table
-    // out of bounds. The CPU never dispatches an empty bucket, so this only guards the invariant.
     if (compactIdx >= InstanceCount || SliceCount == 0)
         return;
 
@@ -110,9 +112,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     const uint2 slice = SliceTable[SliceTableOffset + lo];
 
-    // Everything downstream keys off the real index, including Hash() — a clump must keep the
-    // same dither decision as slices come and go, or thinning would flicker.
+    // Keyed off the real index, so an instance keeps its dither decisions as slices come and go.
     const uint idx = slice.x + (compactIdx - slice.y);
+
+    // Utilize one hash for both dithers, since pcg2d's outputs are independent
+    const uint2 rand = Random::pcg2d(uint2(idx, 0u));
 
     const uint base = idx * 32;
     const uint4 raw0 = Instances.Load4(base);
@@ -127,8 +131,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 dv = world - FrameBuffer::CameraPosAdjust.xyz;
     const float distSq = dot(dv, dv);
 
-    // Per-mesh cost weighting, blended by MeshCostBias into both the distance cap and the pixel
-    // thresholds below.
     const float dScale = lerp(1.0, DistScale, MeshCostBias);
     const float scaleSq = dScale * dScale;
     const float effMaxDistSq = MaxDistSq * scaleSq;
@@ -144,19 +146,13 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float dist = sqrt(distSq);
 
-    // --- Projected-size LOD ---
-    // projPx is the clump's on-screen radius in pixels; ProjScale folds in FOV and resolution, so
-    // every threshold below is resolution-independent.
+    // projPx is the instance's on-screen radius with ProjScale coming from the FOV and resolution
     const float projPx = (ClumpRadius / dist) * ProjScale;
     const float pxScale = lerp(1.0, MinPixelScale, MeshCostBias);
     const float effMinPx = MinPixelSize * pxScale;
     if (projPx < effMinPx)
         return;
 
-    // --- Hi-Z occlusion cull ---
-    // Early-Z already rejects the FRAGMENTS of hidden grass, but only after the vertex shader has
-    // run. Vertex work dominates the depth pass, so discarding hidden instances here is the part
-    // the hardware cannot do for us.
     if (HiZEnabled > 0.5)
     {
         const float4 clipC = mul(FrameBuffer::CameraViewProj, float4(dv, 1.0));
@@ -164,19 +160,12 @@ void main(uint3 tid : SV_DispatchThreadID)
         {
             const float2 uv = (clipC.xy / clipC.w) * float2(0.5, -0.5) + 0.5;
             const float2 tc = uv * HiZSize;
-            const float rT = projPx / HiZTexelPixels;  // clump radius expressed in level-0 texels
+            const float rT = projPx / HiZTexelPixels;  // instance radius expressed in level-0 texels
 
-            // Pick the pyramid level where this clump spans at most ~2 texels, so the sample count
-            // stays fixed no matter how large it projects. Near-camera clumps cover hundreds of
-            // level-0 texels; a coarse texel is the exact max of all of them, so this loses no
-            // conservatism — unlike sampling a subset of fine texels, which could underestimate
-            // the max and cull visible grass.
+            // The level where the instance spans ~2 texels, fixing the sample count. 
             const float wantLevel = ceil(log2(max(2.0 * rT, 1.0)));
 
-            // If the clump needs a coarser level than the pyramid has, skip the test rather than
-            // testing against a level that does not cover it. Not culling is always safe; culling
-            // on an underestimated max is not. This also covers the case where the mip reduction
-            // failed to load and only level 0 holds valid data.
+            // Skip the test when the pyramid lacks the level this instance needs. A level that does not cover it would underestimate the max and cull visible grass.
             [branch] if (wantLevel <= HiZMipCount - 1.0)
             {
             const int level = (int)wantLevel;
@@ -188,8 +177,8 @@ void main(uint3 tid : SV_DispatchThreadID)
             const int2 t0 = int2(floor(tcL - rTL));
             const int2 t1 = int2(floor(tcL + rTL));
 
-            // Nearest point of the clump's bounding sphere, as NDC z. Camera inside the sphere
-            // collapses this to the camera position, which never culls.
+            // Pull dv back to the bounding sphere's near surface, since an instance hides only when even its closest point sits behind the occluder.
+            // A camera inside the sphere shortens dv to nothing, putting nearZ far below any tile depth so the test never culls.
             const float3 dvNear = dv * (max(dist - ClumpRadius, 0.0) / max(dist, 1e-4));
             const float4 clipN = mul(FrameBuffer::CameraViewProj, float4(dvNear, 1.0));
             const float nearZ = clipN.z / max(clipN.w, 1e-4);
@@ -207,8 +196,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                 }
             }
 
-            // Nearest point still behind the farthest occluder in every covering tile means every
-            // one of those tiles is fully closed off in front of this clump.
+            // Behind the farthest occluder of every covering tile means fully hidden.
             if (nearZ > tileMax)
                 return;
             }
@@ -221,7 +209,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     {
         const float t = saturate((effFullPx - projPx) / max(effFullPx - effMinPx, 1e-4));
         const float keep = lerp(1.0, LODMinKeep, t);
-        const float h = Hash(idx);
+        const float h = RandFloat(rand.x);
         if (h > keep + LODFadeBand)
             return;
         lodFade = saturate((keep + LODFadeBand - h) / LODFadeBand);
@@ -234,10 +222,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 clip = mul(FrameBuffer::CameraViewProj, float4(dv, 1.0));
     const float distFade = 1.0 - saturate((length(clip.xyz) - AlphaParam1) / AlphaParam2);
     const float spawnFade = saturate((FadeNow - og.w) * FadeInTimeRcp);
-
-    // The depth PS discards when fade * baseAlpha < AlphaTestRefRS, so an instance at/below the
-    // ref cannot pass even at baseAlpha == 1 — invisible, but still fully rasterized in both
-    // passes unless it is dropped here.
+    
     const float fade = distFade * spawnFade * lodFade * edgeFade;
     if (fade <= InvisibleFadeCull)
         return;
@@ -245,24 +230,19 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float basis = (localXY.x + localXY.y) * -0.0078125;
 
     const float4 e0 = float4(og.xyz, IsComplex);
-    // e1.w packs two flags for the vertex shader: 1.0 = within collision range, 2.0 = far enough
-    // that the pixel shader should skip detail work. Packed rather than given its own channel
-    // because all eight Extras channels are already spoken for.
+    
     const float collisionFlag = (distSq < CollisionDistSq) ? 1.0 : 0.0;
     const float farFlag = (SimpleShadingPixelSize > 0.0 && projPx < SimpleShadingPixelSize) ? 2.0 : 0.0;
 
     const float4 e1 = float4(WindScalar(basis, TimeBase * WavePeriod), WindScalar(basis, PrevTimeBase * WavePeriod), fade, collisionFlag + farFlag);
     
-    // --- Mesh-swap LOD bin selection ---
-    // Dithered over MeshLODBandPx so a clump crossing the threshold converts gradually rather than
-    // flipping whole. The hash salt keeps this decision uncorrelated with the density thinning
-    // above, which draws from the same Hash(idx).
+    // Dither over MeshLODBandPx so there is a smooth transition between full-detail and LOD instances
     bool useLOD = false;
     if (LODEnabled > 0.5)
     {
         const float halfBand = MeshLODBandPx * 0.5;
         const float t = saturate((MeshLODPixelSize + halfBand - projPx) / max(MeshLODBandPx, 1e-4));
-        useLOD = Hash(idx ^ 0x9E3779B9u) < t;
+        useLOD = RandFloat(rand.y) < t;
     }
 
     uint slot;

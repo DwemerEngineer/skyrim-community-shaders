@@ -2,10 +2,7 @@
 
 #include "Buffer.h"
 
-/** @brief Max-depth mip pyramid over the scene depth copy, used to occlusion-cull grass instances.
-    A texel at level N is exactly the farthest depth of everything beneath it, so a clump of any
-    on-screen size can be tested against a fixed number of texels without ever underestimating the
-    occluder depth — underestimating would cull grass that is actually visible. */
+/* @brief Max-depth mip pyramid over the scene depth copy, used to occlusion-cull grass instances. A texel at level N is exactly the farthest depth of everything beneath it */
 class HiZPyramid
 {
 public:
@@ -16,6 +13,9 @@ public:
 	 * @return True when the pyramid is valid for this frame.
 	 */
 	bool Build(ID3D11Device* device, ID3D11DeviceContext* ctx);
+
+	/* @brief Marks the pyramid unusable for this frame without releasing anything. */
+	void Invalidate() { valid = false; }
 
 	/** @brief Returns the full-chain SRV, or nullptr when the pyramid is not valid this frame. */
 	ID3D11ShaderResourceView* GetSRV() const { return valid && texture ? texture->srv.get() : nullptr; }
@@ -28,7 +28,7 @@ public:
 	/** @brief Returns the number of trustworthy mip levels; 1 when the reduction chain is absent. */
 	uint32_t GetMipCount() const { return mipCS ? mipCount : 1u; }
 	/** @brief Returns how many screen pixels one base-level texel covers. */
-	static constexpr uint32_t GetTileSize() { return kTileSize; }
+	static constexpr uint32_t GetTileSize() { return downsampleFactor; }
 
 	/** @brief Creates the parameter constant buffer. Called from the feature's SetupResources. */
 	void SetupResources();
@@ -64,8 +64,5 @@ private:
 	uint32_t mipCount = 1;
 	bool valid = false;
 
-	// The base level reduces the depth buffer 4x; the mip chain carries on from there. A coarser
-	// base needs one thread group per output texel and a barrier-heavy reduction for very little
-	// output, and leaves the cull a blunter base for small clumps.
-	static constexpr uint32_t kTileSize = 4;
+	static constexpr uint32_t downsampleFactor = 4;
 };

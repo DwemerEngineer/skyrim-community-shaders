@@ -45,8 +45,7 @@ uint32_t GrassMeshLibrary::ResolveMeshId(RE::BSMultiStreamInstanceTriShape* shap
 	if (auto it = idByShape.find(shape); it != idByShape.end())
 		return it->second;
 
-	// The LoadGrassType hook records this shape's source .nif at grass-type creation, before any
-	// instance of it is captured, so the entry exists by the time we get here.
+	// LoadGrassType records every grass type at creation, before any instance of it is captured.
 	std::string stem;
 	{
 		std::scoped_lock lk(stemMutex);
@@ -56,33 +55,29 @@ uint32_t GrassMeshLibrary::ResolveMeshId(RE::BSMultiStreamInstanceTriShape* shap
 
 	uint32_t meshId = 0;
 	if (!stem.empty()) {
-		if (auto it = idByStem.find(stem); it != idByStem.end()) {
-			meshId = it->second;
-		} else {
+		const auto it = std::find(stems.begin(), stems.end(), stem);
+		meshId = static_cast<uint32_t>(std::distance(stems.begin(), it)) + 1;  // ids are 1-based, with 0 reserved for unresolved shapes
+		if (it == stems.end())
 			stems.push_back(stem);
-			meshId = static_cast<uint32_t>(stems.size());  // ids are 1-based
-			idByStem.emplace(stem, meshId);
-		}
 	}
 
 	idByShape.emplace(shape, meshId);
 	return meshId;
 }
 
-std::string GrassMeshLibrary::GetStem(uint32_t meshId) const
-{
-	return (meshId && meshId <= stems.size()) ? stems[meshId - 1] : std::string("?");
-}
-
 void GrassMeshLibrary::EnsureLODMesh(uint32_t meshId)
 {
-	if (meshId == 0 || meshId > stems.size() || lodMeshes.contains(meshId))
+	if (meshId == 0 || meshId > stems.size())
 		return;
 
-	LODMesh entry;  // valid == false: no LOD mesh → the full mesh is drawn
+	if (lodMeshes.size() < stems.size())
+		lodMeshes.resize(stems.size());
 
-	// Convention: meshes\LOD\Grass\<source-mesh-stem>_LOD.nif, authored in the same local space
-	// and vertex format as the source grass (BSModelDB::Demand prepends "meshes\").
+	LODMesh& entry = lodMeshes[meshId - 1];
+	if (entry.attemptedLoad)
+		return;
+	entry.attemptedLoad = true;
+
 	const std::string modelPath = "LOD\\Grass\\" + stems[meshId - 1] + "_LOD.nif";
 
 	RE::BSModelDB::DBTraits::ArgsType args{};
@@ -111,15 +106,16 @@ void GrassMeshLibrary::EnsureLODMesh(uint32_t meshId)
 			logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} has no TriShape", modelPath);
 		}
 	}
-	// File absent → error != kNone → silent; that grass type keeps its full mesh.
-
-	lodMeshes.emplace(meshId, std::move(entry));
+	// If the file absent, that grass type keeps its full mesh.
 }
 
 const GrassMeshLibrary::LODMesh* GrassMeshLibrary::GetLODMesh(uint32_t meshId) const
 {
-	auto it = lodMeshes.find(meshId);
-	return (it != lodMeshes.end() && it->second.valid) ? &it->second : nullptr;
+	if (meshId == 0 || meshId > lodMeshes.size())
+		return nullptr;
+
+	const LODMesh& entry = lodMeshes[meshId - 1];
+	return entry.valid ? &entry : nullptr;
 }
 
 void GrassMeshLibrary::ForgetShape(RE::BSMultiStreamInstanceTriShape* shape)

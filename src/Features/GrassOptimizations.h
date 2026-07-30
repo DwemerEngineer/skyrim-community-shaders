@@ -6,9 +6,7 @@
 #include "GrassOptimizations/GrassBucketStore.h"
 #include "GrassOptimizations/HiZPyramid.h"
 
-/** @brief Rewrites vanilla grass rendering around GPU-driven culling and instancing: per-bucket
-    indirect draws replace the engine's per-shape draws, and a compute pass culls individual
-    instances by frustum, distance, projected size and Hi-Z occlusion before anything is drawn. */
+/** @brief Rewrites vanilla grass rendering with a bucket based system utilizing indirect draws and compute shader per instance culling. */
 struct GrassOptimizations : Feature
 {
 public:
@@ -34,39 +32,18 @@ public:
 
 	struct Settings
 	{
-		// Projected-size LOD, lowest level: clumps whose on-screen radius is below this many pixels
-		// are culled entirely.
 		float MinPixelSize = 4.0f;
-		// Projected-size LOD, full-detail level: clumps larger than this (px) render at full
-		// density; between this and MinPixelSize they are stochastically thinned toward MinDensity.
 		float FullDetailPixelSize = 16.0f;
 		float MinDensity = 0.03f;
-		// Blends in a per-mesh cost weighting (sqrt(triangles/6)) that culls heavier grass meshes
-		// sooner. 0 = the pixel/distance settings are literal and identical for every grass type.
-		float MeshCostBias = 0.0f;
-		// Cull instances whose fade is at/below this before they are ever drawn. The alpha test
-		// discards every fragment of such instances anyway (fade * baseAlpha < ref), so raising
-		// this toward the game's alpha-test ref removes invisible-but-rasterized grass.
+		float MeshCostBias = 0.5f;
 		float InvisibleFadeCull = 0.0f;
-		// Grass render distance in units; 0 uses the vanilla INI cap.
 		float RenderDistanceOverride = 0.0f;
-
-		// Discard instances hidden behind already-drawn geometry, tested against a max-depth
-		// reduction of the scene depth copy. Early-Z already kills their fragments, but only after
-		// the vertex shader has run; this removes the vertex work too.
+		float EdgeFadeStart = 0.85f;
 		bool EnableOcclusionCulling = true;
-
-		// Clumps below this on-screen radius drop pixel-shader detail they are too small to
-		// resolve: contact shadows, specular, and the complex-grass second texture sample. 0 = off.
 		float SimpleShadingPixelSize = 0.0f;
-
-		// Mesh-swap LOD: clumps whose on-screen radius is below MeshLODPixelSize (but still above
-		// the MinPixelSize cull) are drawn with a lower-poly LOD .nif instead of the full mesh.
+		float CollisionDistance = 2048.0f;
 		bool EnableMeshLOD = false;
 		float MeshLODPixelSize = 8.0f;
-		// Width in pixels of the dithered swap band centred on MeshLODPixelSize. Instances inside
-		// it are hash-assigned to full/LOD so the transition scatters across a clump rather than
-		// every instance flipping at once. 0 = hard swap.
 		float MeshLODBandPixels = 3.0f;
 	};
 
@@ -90,39 +67,42 @@ public:
 	/** @brief Returns the instance culling compute shader, compiling it on first use. */
 	ID3D11ComputeShader* GetCullCS();
 
-	// --- Constant buffer layouts (must match GrassCullingCS.hlsl) --------------------------------
-
-	struct CullParamsCB
+	struct alignas(16) CullParamsCB
 	{
-		float frustumPlanes[6][4];  // 96
-		float maxDistSq;
-		float fullDetailPixelSize;
-		float meshCostBias;
-		float lodMinKeep;  // 112
-		float lodFadeBand;
-		float projScale;
+		float frustumPlanes[6][4];
+
 		float minPixelSize;
-		float edgeFadeStart;    // 128 — fraction of max distance where the cull fade begins
-		float collisionDistSq;  // 132
+		float fullDetailPixelSize;
+		float lodMinKeep;
+		float lodFadeBand;
+
+		float meshCostBias;
+		float projScale;
+		float maxDistSq;
+		float edgeFadeStart;
+
 		float alphaParam1;
 		float alphaParam2;
-		float fadeNow;  // 144
+		float fadeNow;
 		float fadeInTimeRcp;
+
 		float invisibleFadeCull;
+		float simpleShadingPixelSize;
+		float collisionDistSq;
 		float meshLODPixelSize;
-		float meshLODBandPx;  // 160
+
+		float meshLODBandPx;
 		float hiZEnabled;
 		float hiZSizeX;
 		float hiZSizeY;
-		float hiZTexelPixels;  // 176
+
+		float hiZTexelPixels;
 		float hiZMipCount;
-		float simpleShadingPixelSize;
-		float hiZPad[2];  // 192
+		float pad[2];
 	};
 	STATIC_ASSERT_ALIGNAS_16(CullParamsCB);
-	static_assert(sizeof(CullParamsCB) == 192);
 
-	struct CullBucketCB
+	struct alignas(16) CullBucketCB
 	{
 		uint32_t instanceCount;
 		float wavePeriod;
@@ -133,20 +113,14 @@ public:
 		float distScale;
 		float minPixelScale;
 		float isComplex;
-		// 0 = this bucket has no LOD bin this frame, every survivor goes to full detail.
 		float lodEnabled;
 		uint32_t sliceTableOffset;
 		uint32_t sliceCount;
 		float pad[2];
 	};
-	static_assert(sizeof(CullBucketCB) == 64);
+	STATIC_ASSERT_ALIGNAS_16(CullBucketCB);
 
-	// --- Frustum ---------------------------------------------------------------------------------
-
-	/** @brief The six frustum planes transposed to structure-of-arrays, so an AABB test does four
-	    planes per instruction instead of one 3-wide dot product plus horizontal adds. Eight slots:
-	    six real planes and two padding slots that always pass, which also lets an inactive plane
-	    be neutralised rather than branched around. */
+	/** @brief The six frustum planes transposed to a structure of arrays, with two padding slots to fit optimized SSE/AVX instructions  */
 	struct FrustumSoA
 	{
 		__m128 nx[2], ny[2], nz[2], d[2];
@@ -161,19 +135,16 @@ public:
 	/** @brief Derives world-space frustum planes from the camera frustum and transform. */
 	void ComputeFrustumPlanes(RE::NiFrustumPlanes& out, const RE::NiFrustum& viewFrustum, const RE::NiTransform& transform);
 
-	// --- Per-frame update ------------------------------------------------------------------------
-
-	/** @brief Once-per-frame grass update: applies staged captures/removals, uploads dirty
-	    buckets, builds the Hi-Z pyramid and issues the culling dispatches. Called from the first
-	    BSGrassShader::SetupGeometry of the frame. */
+	/** @brief Once-per-frame grass update called in BSGrassShader::SetupGeometry: applies staged captures/removals, uploads dirty buckets, builds the Hi-Z pyramid and issues the culling dispatches. */
 	void UpdateGrass();
 
-	/** @brief Per-bucket slice culling: appends this bucket's visible slice runs to sliceTableCPU
-	    and records the window in the bucket. */
+	/** @brief Merges this bucket's slices into runs of contiguous buffer ranges that share a cell, for the per-bucket slice table. */
+	void MergeSlicesIntoRuns(GrassBucket& b);
+
+	/** @brief Appends this bucket's visible slice runs to sliceTableCPU and records the window in the bucket. */
 	void CullBucketSlices(GrassBucket& b, const FrustumSoA& frustumSoA, __m128 camPosV);
 
-	/** @brief Fills the per-bucket cull constant buffer, uploads the slice table and issues the
-	    cull dispatches. Sequential — all of it touches the immediate context. */
+	/** @brief Fills the per-bucket cull constant buffer, uploads the slice table and issues the cull dispatches. */
 	void UploadCullState(ID3D11Device* device, ID3D11DeviceContext* ctx, uint32_t visibleBuckets);
 
 	/** @brief Binds a bucket's resources and dispatches the instance culling compute shader. */
@@ -181,8 +152,6 @@ public:
 
 	/** @brief Grows the slotted per-bucket constant buffer to hold at least `slots` entries. */
 	bool EnsureCullBucketCapacity(uint32_t slots, ID3D11Device* device);
-
-	// --- State -----------------------------------------------------------------------------------
 
 	GrassBucketStore bucketStore;
 	HiZPyramid hiZ;
@@ -210,11 +179,9 @@ public:
 	float timeBase = 0.0f;
 	float prevTimeBase = 0.0f;
 	float grassStartFadeDistance = 0.0f;
-	float vanillaMaxDistance = 0.0f;  // INI fGrassStartFadeDistance + fGrassFadeRange, cached once
-	float maxGrassDistance = 0.0f;    // effective max this frame (vanilla or override)
+	float vanillaMaxDistance = 0.0f;
+	float maxGrassDistance = 0.0f;
 	float maxDistSq = 0.0f;
-
-	// --- Hooks -----------------------------------------------------------------------------------
 
 	struct Hooks
 	{
@@ -239,12 +206,6 @@ public:
 		struct BSGrassShader_SetupGeometry
 		{
 			static void thunk(RE::BSShader* This, RE::BSRenderPass* a2, std::uint32_t flags);
-			static inline REL::Relocation<decltype(thunk)> func;
-		};
-
-		struct BSMultiBoundAABB_WithinFrustum
-		{
-			static bool thunk(RE::BSMultiBoundAABB* a_this, RE::NiFrustumPlanes* a_planes);
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
 
@@ -292,12 +253,7 @@ public:
 
 		struct LoadGrassType
 		{
-			static RE::BSMultiStreamInstanceTriShape* thunk(RE::BGSGrassManager* grassManager,
-				RE::GrassParam* a_param,
-				uint32_t CellXDivided,
-				uint32_t CellYDivided,
-				uint64_t* typeKey,
-				RE::BSFixedString* modelPath);
+			static RE::BSMultiStreamInstanceTriShape* thunk(RE::BGSGrassManager* grassManager, RE::GrassParam* a_param, uint32_t CellXDivided, uint32_t CellYDivided, uint64_t* typeKey, RE::BSFixedString* modelPath);
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
 
@@ -310,7 +266,6 @@ public:
 			stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 
 			stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
-			stl::write_vfunc<0x29, BSMultiBoundAABB_WithinFrustum>(RE::VTABLE_BSMultiBoundAABB[0]);
 
 			// Capture raw instance data for cached grass.
 			stl::write_thunk_call<AddQueuedGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x7FF, 0));

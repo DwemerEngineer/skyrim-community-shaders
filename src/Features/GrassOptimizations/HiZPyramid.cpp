@@ -19,15 +19,7 @@ void HiZPyramid::ClearShaderCache()
 
 ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
 {
-	// The live main depth is bound as the DSV while grass draws, so it cannot also be an SRV. The
-	// game's post-Z-prepass copy already holds this frame's statics by the first grass
-	// SetupGeometry.
-	//
-	// Deliberately NOT Util::GetCurrentSceneDepthSRV: with TerrainBlending that returns
-	// blendedDepthTexture, produced at the END of the frame, so culling would run against last
-	// frame's depth and flicker grass during fast camera movement. TerrainBlending points the
-	// renderer's SRV for this slot at its blended texture, so take the original it saved.
-	// Always R24_UNORM_X8_TYPELESS, hence a single unorm shader variant.
+	// Since grass runs before the terrain blending pass, it must use the original prepass copy, not the blended depth texture. Otherwise, the culling would run against last frame's depth and flicker grass during fast camera movement.
 	auto& tb = globals::features::terrainBlending;
 	if (tb.loaded && tb.settings.Enabled && tb.prepassSRVBackup)
 		return tb.prepassSRVBackup;
@@ -60,8 +52,7 @@ bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dst
 	try {
 		texture = std::make_unique<Texture2D>(td, "GrassOptimizations::HiZ");
 
-		// Full-chain SRV for the cull (it Loads from an explicit level), plus single-level views
-		// for the reduction passes.
+		// Full-chain SRV for the cull plus single-level views for the reduction passes.
 		D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
 		sd.Format = DXGI_FORMAT_R32_FLOAT;
 		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -116,15 +107,15 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 		return false;
 
 	const auto [screenW, screenH] = globals::game::renderer->GetScreenSize();
-	const uint32_t dstW = ((uint32_t)screenW + kTileSize - 1) / kTileSize;
-	const uint32_t dstH = ((uint32_t)screenH + kTileSize - 1) / kTileSize;
+	const uint32_t dstW = ((uint32_t)screenW + downsampleFactor - 1) / downsampleFactor;
+	const uint32_t dstH = ((uint32_t)screenH + downsampleFactor - 1) / downsampleFactor;
 	if (!dstW || !dstH)
 		return false;
 
 	if ((dstW != width || dstH != height) && !CreateTexture(device, dstW, dstH))
 		return false;
 
-	// One variant only — the source is always the game's R24_UNORM_X8_TYPELESS prepass copy.
+	// One variant only, since the only source is the game's R24_UNORM_X8_TYPELESS prepass copy.
 	if (!baseCS) {
 		baseCS = static_cast<ID3D11ComputeShader*>(
 			Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\GrassHiZCS.hlsl", {}, "cs_5_0"));
@@ -134,7 +125,6 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 		}
 	}
 
-	// Reads our own R32_FLOAT pyramid, so it needs no TERRAIN_BLENDING variant.
 	if (!mipCS) {
 		mipCS = static_cast<ID3D11ComputeShader*>(
 			Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\GrassHiZMipCS.hlsl", {}, "cs_5_0"));
@@ -157,8 +147,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
 	ctx->CSSetShaderResources(0, 1, &nullSRV);
 
-	// Each level is the exact max of the one above, so a clump of any on-screen size is testable
-	// against a fixed number of texels.
+	// Each level is the exact max of the one above, so an instance of any on-screen size is testable against a fixed number of texels.
 	if (mipCS && mipCount > 1) {
 		ctx->CSSetShader(mipCS, nullptr, 0);
 		uint32_t srcW = dstW, srcH = dstH;
@@ -185,7 +174,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	if (!logged) {
 		logged = true;
 		logger::info("[GRASS OPTIMIZATIONS] HiZ occlusion cull active: {}x{} tiles (1/{} res), {} mips, source=POST_ZPREPASS_COPY (R24_UNORM)",
-			dstW, dstH, kTileSize, GetMipCount());
+			dstW, dstH, downsampleFactor, GetMipCount());
 	}
 
 	valid = true;
