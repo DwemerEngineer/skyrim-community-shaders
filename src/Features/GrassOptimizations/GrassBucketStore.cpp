@@ -71,10 +71,9 @@ void GrassBucketStore::RefreshComplexGrass(float threshold, ID3D11DeviceContext*
 
 	cachedComplexThreshold = threshold;
 	complexCache.clear();
-	for (auto& [key, b] : buckets) {
-		b.isComplex = DetectComplexGrass(key.tex, ctx);
-		b.dirty = true;
-	}
+
+	for (auto& [key, b] : buckets)
+		b.isComplex = DetectComplexGrass(b.diffuseTexture, ctx);
 }
 
 void GrassBucketStore::StageRemoval(RE::BSMultiStreamInstanceTriShape* shape)
@@ -192,6 +191,7 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures)
 		const BucketKey bk{ meshId, meshId ? nullptr : pc.diffuseTexture, pc.descVal };
 		auto& b = buckets[bk];
 		b.meshId = meshId;
+		b.diffuseTexture = pc.diffuseTexture;
 
 		if (b.slices.empty() && b.totalInstances == 0)
 			b.isComplex = DetectComplexGrass(pc.diffuseTexture, ctx);

@@ -92,6 +92,8 @@ struct GrassBucket
 
 	// Source mesh id, for easy lookup of the LOD mesh.
 	uint32_t meshId = 0;
+	// BucketKey only carries the texture for unresolved meshes, so keep it here for re-detection.
+	RE::NiSourceTexture* diffuseTexture = nullptr;
 
 	uint32_t cullSlot = UINT32_MAX;
 	bool typeParamsValid = false;
@@ -216,7 +218,7 @@ public:
 	/** @brief Applies staged removals and captures, then uploads dirty buckets. */
 	void ApplyPending(ID3D11Device* device, ID3D11DeviceContext* ctx);
 
-	/** @brief Re-runs complex-grass detection for every bucket when the threshold changes. Marks buckets dirty, so must be called before ApplyPending. */
+	/** @brief Re-runs complex-grass detection for every bucket when the threshold changes. */
 	void RefreshComplexGrass(float threshold, ID3D11DeviceContext* ctx);
 
 	/** @brief Captures one GID group's instance records from the cell-load hooks. */

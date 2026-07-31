@@ -61,6 +61,8 @@ private:
 
 	uint32_t width = 0;
 	uint32_t height = 0;
+	uint32_t paddedWidth = 0;
+	uint32_t paddedHeight = 0;
 	uint32_t mipCount = 1;
 	bool valid = false;
 
