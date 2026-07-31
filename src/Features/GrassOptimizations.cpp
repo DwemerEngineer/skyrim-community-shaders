@@ -88,13 +88,13 @@ void GrassOptimizations::DrawSettings()
 	ImGui::Checkbox(T(TKEY("occlusion_culling"), "Occlusion Culling"), &settings.EnableOcclusionCulling);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("occlusion_culling_tooltip"),
-							  "Skips grass hidden behind rocks, buildings and NPCs. Depending on how much grass is not visible, this may cost more than its benefits. If you see grass flickering when moving, try disabling this. Terrain such as hills is not considered Terrain Blending is enabled reducing the benefit."));
+							  "Skips grass hidden behind rocks, buildings and NPCs. Depending on how much grass is not visible, this may cost more than its benefits. If you see grass flickering when moving, try disabling this. Terrain such as hills is not treated as an occluder when Terrain Blending is enabled, which reduces the benefit."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("simple_shading_px"), "Simple Shading Below"), &settings.SimpleShadingPixelSize, 0.0f, 32.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("simple_shading_px_tooltip"),
-							  "Grass clumps smaller than size on screen will skip barely visible detail including contact shadows, specular highlights, and other complex grass visual elements. Zero disables this feature."));
+							  "Grass clumps smaller than this size on screen will skip barely visible detail including contact shadows, specular highlights, and other complex grass visual elements. Zero disables this feature."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("collision_distance"), "Collision Distance"), &settings.CollisionDistance, 0.0f, 8192.0f, "%.0f");
@@ -124,7 +124,7 @@ void GrassOptimizations::DrawSettings()
 	ImGui::SliderFloat(T(TKEY("mesh_lod_band"), "Mesh LOD Transition Band"), &settings.MeshLODBandPixels, 0.0f, 16.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("mesh_lod_band_tooltip"),
-							  "The distance in screen size over which a random ammount of regular meshes are swapped out before completely transitioning to LOD. A wider range results in a smoother transition."));
+							  "The range of on-screen sizes over which a random amount of regular meshes are swapped out before completely transitioning to LOD. A wider range results in a smoother transition."));
 	}
 }
 
@@ -235,8 +235,12 @@ void GrassOptimizations::UpdateGrass()
 	bucketStore.ApplyPending(device, ctx);
 
 	RE::NiCamera* cam = RE::Main::WorldRootCamera();
-	if (!cam)
+	if (!cam) {
+		// Leaving last frame's flags up would let the draw path re-issue its indirect draws.
+		for (auto& [key, b] : bucketStore.buckets)
+			b.cullVisible = false;
 		return;
+	}
 
 	RE::NiFrustumPlanes frustum{};
 	ComputeFrustumPlanes(frustum, cam->GetRuntimeData2().viewFrustum, cam->world);
@@ -454,6 +458,7 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 	ID3D11Buffer* frameBuffers[1]{ *globals::game::perFrame.get() };
 	ctx->CSSetConstantBuffers(12, 1, frameBuffers);
 
+	bool sliceTableUploaded = sliceTableCPU.empty();
 	if (!sliceTableCPU.empty()) {
 		if (sliceTableCPU.size() > sliceTableCapacity) {
 			sliceTable.reset();
@@ -489,8 +494,14 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 			if (SUCCEEDED(ctx->Map(sliceTable->resource.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
 				std::memcpy(m.pData, sliceTableCPU.data(), sliceTableCPU.size() * 2 * sizeof(uint32_t));
 				ctx->Unmap(sliceTable->resource.get(), 0);
+				sliceTableUploaded = true;
 			}
 		}
+	}
+
+	if (!sliceTableUploaded) {
+		for (auto& [key, b] : bucketStore.buckets)
+			b.cullVisible = false;
 	}
 
 	ctx->CSSetShader(cullCS, nullptr, 0);

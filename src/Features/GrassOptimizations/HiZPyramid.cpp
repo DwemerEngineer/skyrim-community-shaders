@@ -1,6 +1,7 @@
 #include "HiZPyramid.h"
 
 #include "Features/TerrainBlending.h"
+#include "Profiler.h"
 
 void HiZPyramid::SetupResources()
 {
@@ -33,8 +34,9 @@ bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dst
 	mipUAVs.clear();
 	mipSRVs.clear();
 	texture.reset();
-	width = 0;
-	height = 0;
+	paddedWidth = 0;
+	paddedHeight = 0;
+	mipCount = 1;
 
 	uint32_t mips = 1;
 	for (uint32_t d = std::max(dstW, dstH); d > 1; d >>= 1)
@@ -92,8 +94,8 @@ bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dst
 		mipSRVs.push_back(srv);
 	}
 
-	width = dstW;
-	height = dstH;
+	paddedWidth = dstW;
+	paddedHeight = dstH;
 	mipCount = mips;
 	return true;
 }
@@ -107,13 +109,27 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 		return false;
 
 	const auto [screenW, screenH] = globals::game::renderer->GetScreenSize();
-	const uint32_t dstW = ((uint32_t)screenW + downsampleFactor - 1) / downsampleFactor;
-	const uint32_t dstH = ((uint32_t)screenH + downsampleFactor - 1) / downsampleFactor;
-	if (!dstW || !dstH)
+	// The extent the depth actually covers, which is what the cull maps NDC onto.
+	const uint32_t validW = ((uint32_t)screenW + downsampleFactor - 1) / downsampleFactor;
+	const uint32_t validH = ((uint32_t)screenH + downsampleFactor - 1) / downsampleFactor;
+	if (!validW || !validH)
 		return false;
 
-	if ((dstW != width || dstH != height) && !CreateTexture(device, dstW, dstH))
+	// Allocated at a power of two so every level halves exactly to prevent odd dimensions from causing an inaccurate max reduction.
+	const auto nextPow2 = [](uint32_t v) {
+		uint32_t p = 1;
+		while (p < v)
+			p <<= 1;
+		return p;
+	};
+	const uint32_t padW = nextPow2(validW);
+	const uint32_t padH = nextPow2(validH);
+
+	if ((padW != paddedWidth || padH != paddedHeight) && !CreateTexture(device, padW, padH))
 		return false;
+
+	width = validW;
+	height = validH;
 
 	// One variant only, since the only source is the game's R24_UNORM_X8_TYPELESS prepass copy.
 	if (!baseCS) {
@@ -132,25 +148,30 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 			logger::error("[GRASS OPTIMIZATIONS] HiZ mip CS load failed — large clumps will not be occlusion culled");
 	}
 
-	paramsCB->Update(Params{ (uint32_t)screenW, (uint32_t)screenH, dstW, dstH });
+	// Threads past validW/validH read beyond the depth buffer, so the base pass's out-of-bounds guard writes 1.0 there and the padding can never cull.
+	paramsCB->Update(Params{ (uint32_t)screenW, (uint32_t)screenH, padW, padH });
 
 	ID3D11UnorderedAccessView* nullUAV = nullptr;
 	ID3D11ShaderResourceView* nullSRV = nullptr;
 
+	globals::profiler->BeginPass("GrassOptimizations::HiZBase");
 	ID3D11Buffer* cb = paramsCB->CB();
 	ID3D11UnorderedAccessView* baseUAV = mipUAVs[0].get();
 	ctx->CSSetShader(baseCS, nullptr, 0);
 	ctx->CSSetConstantBuffers(0, 1, &cb);
 	ctx->CSSetShaderResources(0, 1, &srcSRV);
 	ctx->CSSetUnorderedAccessViews(0, 1, &baseUAV, nullptr);
-	ctx->Dispatch((dstW + 7) / 8, (dstH + 7) / 8, 1);
+	ctx->Dispatch((padW + 7) / 8, (padH + 7) / 8, 1);
 	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
 	ctx->CSSetShaderResources(0, 1, &nullSRV);
+	globals::profiler->EndPass();
 
 	// Each level is the exact max of the one above, so an instance of any on-screen size is testable against a fixed number of texels.
 	if (mipCS && mipCount > 1) {
+		globals::profiler->BeginPass("GrassOptimizations::HiZMips");
 		ctx->CSSetShader(mipCS, nullptr, 0);
-		uint32_t srcW = dstW, srcH = dstH;
+
+		uint32_t srcW = padW, srcH = padH;
 		for (uint32_t m = 1; m < mipCount; ++m) {
 			const uint32_t mw = std::max(1u, srcW >> 1);
 			const uint32_t mh = std::max(1u, srcH >> 1);
@@ -168,13 +189,15 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 			srcW = mw;
 			srcH = mh;
 		}
+
+		globals::profiler->EndPass();
 	}
 
 	static bool logged = false;
 	if (!logged) {
 		logged = true;
-		logger::info("[GRASS OPTIMIZATIONS] HiZ occlusion cull active: {}x{} tiles (1/{} res), {} mips, source=POST_ZPREPASS_COPY (R24_UNORM)",
-			dstW, dstH, downsampleFactor, GetMipCount());
+		logger::info("[GRASS OPTIMIZATIONS] HiZ occlusion cull active: {}x{} tiles (1/{} res) in a {}x{} texture, {} mips, source=POST_ZPREPASS_COPY (R24_UNORM)",
+			validW, validH, downsampleFactor, padW, padH, GetMipCount());
 	}
 
 	valid = true;

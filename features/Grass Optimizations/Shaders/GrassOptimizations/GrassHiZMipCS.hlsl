@@ -1,4 +1,5 @@
 // Used to create HiZ mips instead of the built-in GenerateMips, which provides average depth instead of the needed max depth.
+
 Texture2D<float> SrcMip : register(t0);
 RWTexture2D<float> DstMip : register(u0);
 
@@ -14,7 +15,7 @@ cbuffer MipParams : register(b0)
 
 	const int2 src = int2(tid.xy) * 2;
 
-	// Clamped so odd dimensions re-read the edge texel, ensuring accurate max depth
+	// Clamped so a source smaller than the dispatch re-reads the edge texel
 	const int2 maxSrc = int2(SrcSize) - 1;
 	float d = SrcMip.Load(int3(min(src, maxSrc), 0));
 	d = max(d, SrcMip.Load(int3(min(src + int2(1, 0), maxSrc), 0)));
