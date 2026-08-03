@@ -146,6 +146,20 @@ struct GrassBucket
 	uint32_t sliceTableCount = 0;
 	uint32_t visibleInstances = 0;
 
+	/** @brief Drops this frame's cull verdict, so a skipped or failed cull cannot be reissued from stale args. */
+	void ResetCullState()
+	{
+		cullSlot = UINT32_MAX;
+		cullVisible = false;
+		sliceTableCount = 0;
+		visibleInstances = 0;
+	}
+
+	GrassBucket() = default;
+	// Owns raw COM pointers released in the destructor, so a copy would double-release them.
+	GrassBucket(const GrassBucket&) = delete;
+	GrassBucket& operator=(const GrassBucket&) = delete;
+
 	/** @brief Releases the GPU buffers and views, while keeping the instance data and slices. */
 	void ReleaseResources()
 	{
@@ -230,7 +244,7 @@ public:
 	/** @brief Stages a dead shape for removal on the next grass frame. */
 	void StageRemoval(RE::BSMultiStreamInstanceTriShape* shape);
 
-	/** @brief Marks a bucket's represtative shape for this frame as having been queued for setup. Returns true when there is no instanced bucket or first of its bucket this frame. */
+	/** @brief Marks a bucket's representative shape for this frame as having been queued for setup. Returns true when there is no instanced bucket or first of its bucket this frame. */
 	bool ClaimQueueSlot(RE::BSMultiStreamInstanceTriShape* shape, uint32_t frame);
 
 	/** @brief Drops staged captures and removals without applying them. */
@@ -297,6 +311,7 @@ private:
 	std::vector<RE::BSMultiStreamInstanceTriShape*> pendingRemoves;
 	std::mutex pendingMutex;
 
+	// Read by culling jobs, so this guards the pointed-to buckets' lifetime as well as the map itself.
 	std::unordered_map<RE::BSMultiStreamInstanceTriShape*, GrassBucket*> shapeBucketId;
 	mutable std::shared_mutex shapeBucketMutex;
 

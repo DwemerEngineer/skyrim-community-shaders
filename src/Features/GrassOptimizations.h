@@ -288,9 +288,9 @@ public:
 
 			// Skip mapping the vanilla dynamic fade buffer.
 			if (REL::Module::IsAE()) {
-				trampoline.write_branch<5>(REL::RelocationID(99996, 106685).address() + REL::Relocate(0x54D, 0x595), REL::RelocationID(99996, 106685).address() + REL::Relocate(0x54D, 0x6C6));
+				trampoline.write_branch<5>(REL::RelocationID(99996, 106685).address() + 0x595, REL::RelocationID(99996, 106685).address() + 0x6C6);
 			} else {
-				REL::safe_write(REL::RelocationID(99996, 106685).address() + REL::Relocate(0x54D, 0x595), REL::NOP5);
+				REL::safe_write(REL::RelocationID(99996, 106685).address() + 0x54D, REL::NOP5);
 			}
 
 			logger::info("[GRASS OPTIMIZATIONS] Installed hooks");
