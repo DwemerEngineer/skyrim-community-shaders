@@ -87,6 +87,7 @@ bool GrassBucketStore::ClaimQueueSlot(RE::BSMultiStreamInstanceTriShape* shape, 
 
 	auto it = shapeBucketId.find(shape);
 	// A bucket with no instance buffer falls back to vanilla per-shape drawing, so all shapes must still be queued. Checked here so the map does not need to track buffer state.
+	// Deliberately read without bucketMutex, which UpdateGrass holds whole and would serialise every culling job.
 	if (it == shapeBucketId.end() || !it->second->instanceBuf)
 		return true;
 
@@ -162,7 +163,6 @@ void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstance
 		if (b.slices.empty()) {
 			std::unique_lock lk(shapeBucketMutex);
 			std::erase_if(shapeBucketId, [dying = &b](const auto& entry) { return entry.second == dying; });
-			b.Release();
 			it = buckets.erase(it);
 			continue;
 		}
@@ -191,9 +191,6 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures)
 		auto& b = buckets[bk];
 		b.meshId = meshId;
 		b.diffuseTexture = pc.diffuseTexture;
-
-		if (b.slices.empty() && b.totalInstances == 0)
-			b.isComplex = DetectComplexGrass(pc.diffuseTexture, ctx);
 
 		if (b.firstNewSlice == UINT32_MAX)
 			b.firstNewSlice = (uint32_t)b.slices.size();
@@ -276,7 +273,7 @@ bool GrassBucketStore::CompactBucket(GrassBucket& b, ID3D11Device* device, ID3D1
 	if (runs.size() == 1 && runs[0].oldFirst == 0)
 		return true;
 
-	// D3D11 doesn't alllow overlapping copies within one resource, so shift the survivors into a new buffer and swap it in.
+	// D3D11 doesn't allow overlapping copies within one resource, so shift the survivors into a new buffer and swap it in.
 	ID3D11Buffer* oldInstance = b.instanceBuf;
 	ID3D11Buffer* oldOrigin = b.originBuf;
 	ID3D11ShaderResourceView* oldInstanceSRV = b.instanceSRV;
@@ -299,7 +296,7 @@ bool GrassBucketStore::CompactBucket(GrassBucket& b, ID3D11Device* device, ID3D1
 		return false;  // offsets are untouched, so a CPU rebuild is still valid
 	}
 
-	constexpr UINT kRecordBytes = 32;
+	constexpr UINT kRecordBytes = kGrassStride;
 	constexpr UINT kOriginBytes = 4 * (UINT)sizeof(float);
 	for (const Run& run : runs) {
 		const D3D11_BOX ibox{ run.oldFirst * kRecordBytes, 0, 0, (run.oldFirst + run.instances) * kRecordBytes, 1, 1 };
@@ -362,7 +359,7 @@ void GrassBucketStore::CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape,
 	const uint32_t stride = kGrassStride;
 
 	uint32_t count = header->groupInstanceCount;
-	if (stride && dataBytes / stride < count)
+	if (dataBytes / stride < count)
 		count = (uint32_t)(dataBytes / stride);
 
 	StageCapture(shape, instanceData, count, stride, descVal, tex);
@@ -370,7 +367,7 @@ void GrassBucketStore::CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape,
 
 bool GrassBucketStore::StageCapture(RE::BSMultiStreamInstanceTriShape* shape, const void* src, uint32_t count, uint32_t stride, uint64_t descVal, RE::NiSourceTexture* tex)
 {
-	if (!shape || !src || !tex || !count || stride != 32) {
+	if (!shape || !src || !tex || !count || stride != kGrassStride) {
 		logger::warn("[GRASS OPTIMIZATIONS] capture rejected: count={} stride={} desc={:016X} shape={:p}",
 			count, stride, descVal, (void*)shape);
 		return false;
@@ -382,7 +379,7 @@ bool GrassBucketStore::StageCapture(RE::BSMultiStreamInstanceTriShape* shape, co
 	pc.diffuseTexture = tex;
 	pc.count = count;
 	pc.origin = shape->world.translate;
-	pc.bytes.resize((size_t)count * 32);
+	pc.bytes.resize((size_t)count * kGrassStride);
 	std::memcpy(pc.bytes.data(), src, pc.bytes.size());
 
 	// Read the instance coordinates from the source allocation. Store the local min/max in the slice so the coarse bounds can be computed without re-reading the instance data.
@@ -392,7 +389,7 @@ bool GrassBucketStore::StageCapture(RE::BSMultiStreamInstanceTriShape* shape, co
 		RE::NiPoint3 lmx{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
 		const uint8_t* data = pc.bytes.data();
 		for (uint32_t i = 0; i < count; ++i) {
-			const uint8_t* cord = data + (size_t)i * 32;
+			const uint8_t* cord = data + (size_t)i * kGrassStride;
 			const float lx = XMConvertHalfToFloat(*reinterpret_cast<const uint16_t*>(cord + 0));
 			const float ly = XMConvertHalfToFloat(*reinterpret_cast<const uint16_t*>(cord + 2));
 			const float lz = XMConvertHalfToFloat(*reinterpret_cast<const uint16_t*>(cord + 4));
@@ -451,7 +448,7 @@ void GrassBucketStore::RebuildBucket(GrassBucket& bucket, ID3D11Device* device, 
 		startInstance += s.count;
 	}
 
-	// Copy from the the old buffer starting with the given start instance to the new buffer on the GPU, so the rebuild below still only uploads the tail.
+	// Copy from the old buffer starting with the given start instance to the new buffer on the GPU, so the rebuild below still only uploads the tail.
 	if (!EnsureBucketCapacity(bucket, bucket.totalInstances, device, ctx, startInstance))
 		return;
 
@@ -472,7 +469,7 @@ void GrassBucketStore::RebuildBucket(GrassBucket& bucket, ID3D11Device* device, 
 		static thread_local std::vector<float> origins;
 
 		records.clear();
-		records.reserve((size_t)tailInstances * 32);
+		records.reserve((size_t)tailInstances * kGrassStride);
 		origins.resize((size_t)tailInstances * 4);
 		float* op = origins.data();
 
@@ -491,7 +488,7 @@ void GrassBucketStore::RebuildBucket(GrassBucket& bucket, ID3D11Device* device, 
 		}
 
 		// One upload per buffer covering the whole tail, not one per slice.
-		const D3D11_BOX ibox{ startInstance * 32, 0, 0, (startInstance + tailInstances) * 32, 1, 1 };
+		const D3D11_BOX ibox{ startInstance * kGrassStride, 0, 0, (startInstance + tailInstances) * kGrassStride, 1, 1 };
 		ctx->UpdateSubresource(bucket.instanceBuf, 0, &ibox, records.data(), 0, 0);
 
 		const D3D11_BOX obox{ startInstance * 4 * (UINT)sizeof(float), 0, 0,
@@ -536,7 +533,7 @@ void GrassBucketStore::AppendNewSlices(GrassBucket& bucket, ID3D11DeviceContext*
 	static thread_local std::vector<float> originTail;
 
 	recTail.clear();
-	recTail.reserve((size_t)tailInstances * 32);
+	recTail.reserve((size_t)tailInstances * kGrassStride);
 	originTail.resize((size_t)tailInstances * 4);
 	float* op = originTail.data();
 
@@ -554,7 +551,7 @@ void GrassBucketStore::AppendNewSlices(GrassBucket& bucket, ID3D11DeviceContext*
 		off += s.count;
 	}
 
-	const D3D11_BOX ibox{ prefix * 32, 0, 0, off * 32, 1, 1 };
+	const D3D11_BOX ibox{ prefix * kGrassStride, 0, 0, off * kGrassStride, 1, 1 };
 	ctx->UpdateSubresource(bucket.instanceBuf, 0, &ibox, recTail.data(), 0, 0);
 
 	const D3D11_BOX obox{ prefix * 4 * (UINT)sizeof(float), 0, 0,
@@ -607,13 +604,16 @@ bool GrassBucketStore::EnsureBucketCapacity(GrassBucket& b, uint32_t needed, ID3
 		!CreateBucketArgsBuffer(b, device)) {
 		b.ReleaseResources();
 		b.capacityInstances = 0;
+		// Ensure buffer offset is reset, so the next rebuild will not start from a stale offset. The rebuild will re-upload the whole bucket, so the offsets will be set correctly.
+		for (auto& s : b.slices)
+			s.bufferOffset = UINT32_MAX;
 		return false;
 	}
 
 	// Carry the unchanged head across on the GPU, so the caller still uploads only the tail.
 	if (preserve && ctx) {
 		if (old.instance && b.instanceBuf) {
-			const D3D11_BOX box{ 0, 0, 0, preserve * 32, 1, 1 };
+			const D3D11_BOX box{ 0, 0, 0, preserve * kGrassStride, 1, 1 };
 			ctx->CopySubresourceRegion(b.instanceBuf, 0, 0, 0, 0, old.instance, 0, &box);
 		}
 		if (old.origin && b.originBuf) {
@@ -631,7 +631,7 @@ bool GrassBucketStore::CreateBucketSourceBuffers(GrassBucket& b, uint32_t capaci
 {
 	{
 		D3D11_BUFFER_DESC bd{};
-		bd.ByteWidth = capacity * 32;
+		bd.ByteWidth = capacity * kGrassStride;
 		bd.Usage = D3D11_USAGE_DEFAULT;
 		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
@@ -687,7 +687,7 @@ bool GrassBucketStore::CreateBucketCullScratch(GrassBucket& b, uint32_t capacity
 	// Compacted survivors, consumed as an instanced vertex stream by the draw.
 	{
 		D3D11_BUFFER_DESC bd{};
-		bd.ByteWidth = capacity * 32;
+		bd.ByteWidth = capacity * kGrassStride;
 		bd.Usage = D3D11_USAGE_DEFAULT;
 		bd.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_UNORDERED_ACCESS;
 		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
@@ -751,7 +751,7 @@ bool GrassBucketStore::CreateBucketCullScratch(GrassBucket& b, uint32_t capacity
 
 bool GrassBucketStore::CreateBucketArgsBuffer(GrassBucket& b, ID3D11Device* device)
 {
-	// 3 uints of padding, so that the instanceCount is at UAV accessable, so the cull CS can write to it directly.
+	// 3 uints of padding, so that the instanceCount is UAV accessible, so the cull CS can write to it directly.
 	// Then the 5-uint args block at instanceCountOffset.
 	const uint32_t initArgs[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 	D3D11_SUBRESOURCE_DATA init{ initArgs, 0, 0 };
@@ -888,7 +888,7 @@ bool GrassBucketStore::EnsureLODBin(GrassBucket& b, ID3D11Device* device)
 
 	{
 		D3D11_BUFFER_DESC bd{};
-		bd.ByteWidth = cap * 32;
+		bd.ByteWidth = cap * kGrassStride;
 		bd.Usage = D3D11_USAGE_DEFAULT;
 		bd.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_UNORDERED_ACCESS;
 		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;

@@ -48,7 +48,7 @@ void GrassOptimizations::DrawSettings()
 	ImGui::SliderFloat(T(TKEY("min_pixel_size"), "Min Pixel Size"), &settings.MinPixelSize, 1.0f, 32.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("min_pixel_size_tooltip"),
-							  "Individual grass instances who visibly take up less space on the screen than this are dropped entirely. Higher values improve performance by removing far-away grass instances sooner."));
+							  "Individual grass instances that visibly take up less space on the screen than this are dropped entirely. Higher values improve performance by removing far-away grass instances sooner."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("min_density"), "Minimum Density"), &settings.MinDensity, 0.0f, 1.0f, "%.2f");
@@ -60,7 +60,7 @@ void GrassOptimizations::DrawSettings()
 	ImGui::SliderFloat(T(TKEY("mesh_cost_bias"), "Mesh Cost Bias"), &settings.MeshCostBias, 0.0f, 1.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("mesh_cost_bias_tooltip"),
-							  "Culls or removes grass meshes based on their complexity (performance impact). At 0 = the removal is identical between all grass types regardless of complexity. At 1, heavy more complex meshes are culled 2-6x sooner than simple ones."));
+							  "Culls or removes grass meshes based on their complexity (performance impact). At 0, removal is identical between all grass types regardless of complexity. At 1, heavier and more complex meshes are culled 2-6x sooner than simple ones."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("render_distance_override"), "Grass Render Distance"), &settings.RenderDistanceOverride, 0.0f, 100000.0f, "%.0f");
@@ -73,7 +73,7 @@ void GrassOptimizations::DrawSettings()
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		std::vector<std::string> tooltipLines = {
 			T(TKEY("edge_fade_start_tooltip"),
-				"Percent of the grass render distance at which grass starts fading out. The default of 0.85 fades over the last 15%. A lower value results in a longer, smoother fade out while, a value of 1.0 disables the fade and grass pops out at the render distance."),
+				"Percent of the grass render distance at which grass starts fading out. The default of 0.85 fades over the last 15%. A lower value results in a longer, smoother fade out, while a value of 1.0 disables the fade and grass pops out at the render distance."),
 			Util::Units::FormatDistance(maxGrassDistance * settings.EdgeFadeStart)
 		};
 		Util::DrawMultiLineTooltip(tooltipLines);
@@ -205,6 +205,9 @@ void GrassOptimizations::UpdateGrass()
 	auto* ctx = globals::d3d::context;
 
 	if (!GetCullCS() || !ctx1 || !cullParamsCB) {
+		// Without a cull dispatch, the args buffers are never written. Skip drawing grass this frame to avoid drawing stale data. 
+		for (auto& [key, b] : bucketStore.buckets)
+			b.ResetCullState();
 		bucketStore.DiscardPending();
 		return;
 	}
@@ -301,10 +304,7 @@ void GrassOptimizations::UpdateGrass()
 	sliceTableCPU.clear();
 
 	for (auto& [key, b] : bucketStore.buckets) {
-		b.cullSlot = UINT32_MAX;
-		b.cullVisible = false;
-		b.sliceTableCount = 0;
-		b.visibleInstances = 0;
+		b.ResetCullState();
 		if (!b.totalInstances || !b.instanceSRV)
 			continue;
 

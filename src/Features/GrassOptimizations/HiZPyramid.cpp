@@ -37,7 +37,10 @@ void HiZPyramid::ClearShaderCache()
 
 ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
 {
-	// Since grass runs before the terrain blending pass, it must use the original prepass copy, not the blended depth texture. Otherwise, the culling would run against last frame's depth and flicker grass during fast camera movement.
+	// Grass runs before the terrain blending pass, so it takes the original prepass copy; the blended
+	// texture would be a frame stale and flicker grass on fast camera movement. Both branches return
+	// that same R24_UNORM_X8_TYPELESS view, so GrassHiZCS needs no TERRAIN_BLENDING variant of its
+	// `unorm float` declaration the way Util::GetCurrentSceneDepthSRV's R32_FLOAT consumers do.
 	auto& tb = globals::features::terrainBlending;
 	if (tb.loaded && tb.settings.Enabled && tb.prepassSRVBackup)
 		return tb.prepassSRVBackup;
