@@ -291,7 +291,7 @@ void GrassOptimizations::UpdateGrass()
 		cp.hiZSizeX = (float)hiZ.GetWidth();
 		cp.hiZSizeY = (float)hiZ.GetHeight();
 
-		cp.hiZTexelPixels = (float)HiZPyramid::GetTileSize();
+		cp.hiZTexelPixels = hiZ.GetTexelPixels();
 		cp.hiZMipCount = (float)hiZ.GetMipCount();
 
 		cullParamsCB->Update(cp);
@@ -857,11 +857,11 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 		b->drawnPassKey = passKey;
 	}
 
+	// b outlives the lock: buckets is node-based and only UpdateGrass erases, on this same thread.
 	if (!b->cullVisible) {
 		return;
 	}
 
-	const uint32_t meshStride = (uint32_t)((4 * descVal) & 0x3C);
 	auto* rendererData = geometry->GetGeometryRuntimeData().rendererData;
 	if (!rendererData)
 		return;
@@ -893,7 +893,7 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	ctx->IASetIndexBuffer(indexB, DXGI_FORMAT_R16_UINT, 0);
 
 	ID3D11Buffer* vbs[2] = { meshVB, nullptr };
-	UINT strides[2] = { meshStride, 32 };
+	UINT strides[2] = { kGrassStride, kGrassStride };
 	UINT offsets[2] = { 0, 0 };
 
 	vbs[1] = b->compactedBuf;
@@ -929,7 +929,6 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 
 	vbs[0] = lod->vertexBuffer;
 	vbs[1] = b->lodCompactedBuf;
-	strides[0] = lod->meshStride;
 	ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
 	ctx->VSSetShaderResources(2, 1, &b->lodExtrasSRV);
 	ctx->DrawIndexedInstancedIndirect(b->lodArgsBuf, argsByteOffset);

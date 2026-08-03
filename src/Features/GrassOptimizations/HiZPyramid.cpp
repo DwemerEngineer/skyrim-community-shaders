@@ -6,6 +6,23 @@
 void HiZPyramid::SetupResources()
 {
 	paramsCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<Params>(), "GrassOptimizations::HiZParamsCB");
+
+	D3D11_BUFFER_DESC bd{};
+	bd.ByteWidth = sizeof(uint32_t);
+	bd.Usage = D3D11_USAGE_DEFAULT;
+	bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+	bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+	const uint32_t zero = 0;
+	D3D11_SUBRESOURCE_DATA init{ &zero, 0, 0 };
+	spdCounter = std::make_unique<Buffer>(bd, &init, "GrassOptimizations::SpdCounter");
+
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
+	uav.Format = DXGI_FORMAT_R32_TYPELESS;
+	uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+	uav.Buffer.FirstElement = 0;
+	uav.Buffer.NumElements = 1;
+	uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+	spdCounter->CreateUAV(uav);
 }
 
 void HiZPyramid::ClearShaderCache()
@@ -13,9 +30,9 @@ void HiZPyramid::ClearShaderCache()
 	if (baseCS)
 		baseCS->Release();
 	baseCS = nullptr;
-	if (mipCS)
-		mipCS->Release();
-	mipCS = nullptr;
+	if (spdCS)
+		spdCS->Release();
+	spdCS = nullptr;
 }
 
 ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
@@ -32,7 +49,6 @@ ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
 bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dstH)
 {
 	mipUAVs.clear();
-	mipSRVs.clear();
 	texture.reset();
 	paddedWidth = 0;
 	paddedHeight = 0;
@@ -41,6 +57,7 @@ bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dst
 	uint32_t mips = 1;
 	for (uint32_t d = std::max(dstW, dstH); d > 1; d >>= 1)
 		++mips;
+	mips = std::min(mips, kExactMips + 1u);
 
 	D3D11_TEXTURE2D_DESC td{};
 	td.Width = dstW;
@@ -79,19 +96,6 @@ bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dst
 		}
 		Util::SetResourceName(uav.get(), "GrassOptimizations::HiZ Mip%u UAV", m);
 		mipUAVs.push_back(uav);
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-		sd.Format = DXGI_FORMAT_R32_FLOAT;
-		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		sd.Texture2D.MostDetailedMip = m;
-		sd.Texture2D.MipLevels = 1;
-		winrt::com_ptr<ID3D11ShaderResourceView> srv;
-		if (FAILED(device->CreateShaderResourceView(texture->resource.get(), &sd, srv.put()))) {
-			logger::error("[GRASS OPTIMIZATIONS] HiZ mip SRV create failed");
-			return false;
-		}
-		Util::SetResourceName(srv.get(), "GrassOptimizations::HiZ Mip%u SRV", m);
-		mipSRVs.push_back(srv);
 	}
 
 	paddedWidth = dstW;
@@ -109,21 +113,27 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 		return false;
 
 	const auto [screenW, screenH] = globals::game::renderer->GetScreenSize();
-	// The extent the depth actually covers, which is what the cull maps NDC onto.
-	const uint32_t validW = ((uint32_t)screenW + downsampleFactor - 1) / downsampleFactor;
-	const uint32_t validH = ((uint32_t)screenH + downsampleFactor - 1) / downsampleFactor;
+
+	// Dynamic resolution renders the prepass into a top-left sub-rect of a full-size target, so the
+	// extent the depth actually covers is the scaled one. NDC maps onto that, not the nominal target.
+	const auto& gsRuntime = globals::game::graphicsState->GetRuntimeData();
+	const float drX = std::clamp(gsRuntime.dynamicResolutionWidthRatio, 0.01f, 1.0f);
+	const float drY = std::clamp(gsRuntime.dynamicResolutionHeightRatio, 0.01f, 1.0f);
+	const uint32_t srcW = std::max(1u, (uint32_t)std::lround(screenW * drX));
+	const uint32_t srcH = std::max(1u, (uint32_t)std::lround(screenH * drY));
+
+	const uint32_t validW = (srcW + downsampleFactor - 1) / downsampleFactor;
+	const uint32_t validH = (srcH + downsampleFactor - 1) / downsampleFactor;
 	if (!validW || !validH)
 		return false;
 
-	// Allocated at a power of two so every level halves exactly to prevent odd dimensions from causing an inaccurate max reduction.
-	const auto nextPow2 = [](uint32_t v) {
-		uint32_t p = 1;
-		while (p < v)
-			p <<= 1;
-		return p;
-	};
-	const uint32_t padW = nextPow2(validW);
-	const uint32_t padH = nextPow2(validH);
+	// One base texel spans downsampleFactor render pixels; the cull's projPx is in nominal pixels.
+	texelPixels = downsampleFactor / drY;
+
+	// Sized from the nominal extent so a shifting dynamic-resolution ratio never reallocates, then padded to SPD's tile granularity so every allocated level halves exactly. An odd level would drop its last row, underestimate the max, and cull visible grass.
+	const auto padToTile = [](uint32_t v) { return (v + tileSize - 1) & ~(tileSize - 1); };
+	const uint32_t padW = padToTile(((uint32_t)screenW + downsampleFactor - 1) / downsampleFactor);
+	const uint32_t padH = padToTile(((uint32_t)screenH + downsampleFactor - 1) / downsampleFactor);
 
 	if ((padW != paddedWidth || padH != paddedHeight) && !CreateTexture(device, padW, padH))
 		return false;
@@ -141,15 +151,15 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 		}
 	}
 
-	if (!mipCS) {
-		mipCS = static_cast<ID3D11ComputeShader*>(
-			Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\GrassHiZMipCS.hlsl", {}, "cs_5_0"));
-		if (!mipCS)
-			logger::error("[GRASS OPTIMIZATIONS] HiZ mip CS load failed — large clumps will not be occlusion culled");
+	if (!spdCS) {
+		spdCS = static_cast<ID3D11ComputeShader*>(
+			Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\SPD\\SPD.hlsl", {}, "cs_5_0"));
+		if (!spdCS)
+			logger::error("[GRASS OPTIMIZATIONS] SPD load failed — large instances will not be occlusion culled");
 	}
 
-	// Threads past validW/validH read beyond the depth buffer, so the base pass's out-of-bounds guard writes 1.0 there and the padding can never cull.
-	paramsCB->Update(Params{ (uint32_t)screenW, (uint32_t)screenH, padW, padH });
+	// Threads past the rendered sub-rect read beyond it, so the base pass's out-of-bounds guard writes 1.0 there and neither the padding nor the unrendered margin can cull.
+	paramsCB->Update(Params{ srcW, srcH, padW, padH });
 
 	ID3D11UnorderedAccessView* nullUAV = nullptr;
 	ID3D11ShaderResourceView* nullSRV = nullptr;
@@ -167,29 +177,28 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	globals::profiler->EndPass();
 
 	// Each level is the exact max of the one above, so an instance of any on-screen size is testable against a fixed number of texels.
-	if (mipCS && mipCount > 1) {
+	// One dispatch for the whole chain, every group reducing its own tile from LDS.
+	if (spdCS && spdCounter && mipCount > 1) {
 		globals::profiler->BeginPass("GrassOptimizations::HiZMips");
-		ctx->CSSetShader(mipCS, nullptr, 0);
 
-		uint32_t srcW = padW, srcH = padH;
-		for (uint32_t m = 1; m < mipCount; ++m) {
-			const uint32_t mw = std::max(1u, srcW >> 1);
-			const uint32_t mh = std::max(1u, srcH >> 1);
+		const uint32_t outputMips = mipCount - 1;
+		const uint32_t groupsX = padW / tileSize;
+		const uint32_t groupsY = padH / tileSize;
 
-			paramsCB->Update(Params{ srcW, srcH, mw, mh });
+		paramsCB->Update(Params{ padW, padH, outputMips, groupsX * groupsY });
 
-			ID3D11ShaderResourceView* mipSRV = mipSRVs[m - 1].get();
-			ID3D11UnorderedAccessView* mipUAV = mipUAVs[m].get();
-			ctx->CSSetShaderResources(0, 1, &mipSRV);
-			ctx->CSSetUnorderedAccessViews(0, 1, &mipUAV, nullptr);
-			ctx->Dispatch((mw + 7) / 8, (mh + 7) / 8, 1);
-			ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-			ctx->CSSetShaderResources(0, 1, &nullSRV);
+		ID3D11UnorderedAccessView* spdUAVs[14]{};
+		for (uint32_t i = 0; i < outputMips; ++i)
+			spdUAVs[i] = mipUAVs[i + 1].get();
+		spdUAVs[12] = spdCounter->uav.get();
+		spdUAVs[13] = mipUAVs[0].get();
 
-			srcW = mw;
-			srcH = mh;
-		}
+		ctx->CSSetShader(spdCS, nullptr, 0);
+		ctx->CSSetUnorderedAccessViews(0, 14, spdUAVs, nullptr);
+		ctx->Dispatch(groupsX, groupsY, 1);
 
+		ID3D11UnorderedAccessView* spdNulls[14]{};
+		ctx->CSSetUnorderedAccessViews(0, 14, spdNulls, nullptr);
 		globals::profiler->EndPass();
 	}
 

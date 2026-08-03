@@ -26,9 +26,9 @@ public:
 	/** @brief Returns the base level height in texels. */
 	uint32_t GetHeight() const { return height; }
 	/** @brief Returns the number of trustworthy mip levels; 1 when the reduction chain is absent. */
-	uint32_t GetMipCount() const { return mipCS ? mipCount : 1u; }
-	/** @brief Returns how many screen pixels one base-level texel covers. */
-	static constexpr uint32_t GetTileSize() { return downsampleFactor; }
+	uint32_t GetMipCount() const { return spdCS ? mipCount : 1u; }
+	/** @brief Returns how many nominal screen pixels one base-level texel covers, scaled by dynamic resolution. */
+	float GetTexelPixels() const { return texelPixels; }
 
 	/** @brief Creates the parameter constant buffer. Called from the feature's SetupResources. */
 	void SetupResources();
@@ -53,18 +53,24 @@ private:
 
 	std::unique_ptr<Texture2D> texture;
 	std::vector<winrt::com_ptr<ID3D11UnorderedAccessView>> mipUAVs;
-	std::vector<winrt::com_ptr<ID3D11ShaderResourceView>> mipSRVs;
 	std::unique_ptr<ConstantBuffer> paramsCB;
 
 	ID3D11ComputeShader* baseCS = nullptr;
-	ID3D11ComputeShader* mipCS = nullptr;
+	ID3D11ComputeShader* spdCS = nullptr;
+	// SPD's cross-group counter. The last group to finish the tile phase resets it for next frame.
+	std::unique_ptr<Buffer> spdCounter;
 
 	uint32_t width = 0;
 	uint32_t height = 0;
+	float texelPixels = (float)kDownsampleFactor;
 	uint32_t paddedWidth = 0;
 	uint32_t paddedHeight = 0;
 	uint32_t mipCount = 1;
 	bool valid = false;
 
-	static constexpr uint32_t downsampleFactor = 4;
+	static constexpr uint32_t kDownsampleFactor = 4;
+	// SPD reduces a 64x64 tile wholly in LDS, so a base padded to that granularity halves exactly for
+	// six levels. The seventh would floor an odd mip, dropping a row and underestimating the max.
+	static constexpr uint32_t kExactMips = 6;
+	static constexpr uint32_t tileSize = 64;
 };

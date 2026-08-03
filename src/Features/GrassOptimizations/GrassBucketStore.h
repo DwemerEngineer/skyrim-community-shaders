@@ -215,10 +215,10 @@ public:
 
 	void BeginFrame(const FrameParams& params) { frameParams = params; }
 
-	/** @brief Applies staged removals and captures, then uploads dirty buckets. */
+	/** @brief Applies staged removals and captures, then uploads dirty buckets. Caller holds bucketMutex. */
 	void ApplyPending(ID3D11Device* device, ID3D11DeviceContext* ctx);
 
-	/** @brief Re-runs complex-grass detection for every bucket when the threshold changes. */
+	/** @brief Re-runs complex-grass detection for every bucket when the threshold changes. Caller holds bucketMutex. */
 	void RefreshComplexGrass(float threshold, ID3D11DeviceContext* ctx);
 
 	/** @brief Captures one GID group's instance records from the cell-load hooks. */
@@ -245,6 +245,9 @@ public:
 	GrassMeshLibrary meshLibrary;
 
 	std::unordered_map<BucketKey, GrassBucket, BucketKeyHash> buckets;
+	// Callers hold this across the whole lifetime of a buckets traversal, and across ApplyPending and
+	// RefreshComplexGrass, which iterate without locking internally. UpdateGrass takes it for its full
+	// body, so everything it calls is already covered; taking it again there would deadlock.
 	std::mutex bucketMutex;
 
 private:
