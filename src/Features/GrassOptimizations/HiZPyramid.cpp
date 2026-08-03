@@ -122,18 +122,20 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	const uint32_t srcW = std::max(1u, (uint32_t)std::lround(screenW * drX));
 	const uint32_t srcH = std::max(1u, (uint32_t)std::lround(screenH * drY));
 
-	const uint32_t validW = (srcW + downsampleFactor - 1) / downsampleFactor;
-	const uint32_t validH = (srcH + downsampleFactor - 1) / downsampleFactor;
+	const uint32_t validW = (srcW + kDownsampleFactor - 1) / kDownsampleFactor;
+	const uint32_t validH = (srcH + kDownsampleFactor - 1) / kDownsampleFactor;
 	if (!validW || !validH)
 		return false;
 
-	// One base texel spans downsampleFactor render pixels; the cull's projPx is in nominal pixels.
-	texelPixels = downsampleFactor / drY;
+	// Converts the cull's nominal-pixel projPx into texels. Its radius is one scalar for both axes, so
+	// the larger ratio wins: too small a radius picks a level whose fixed 3x3 footprint misses part of
+	// the instance, culling it against an incomplete max.
+	texelPixels = kDownsampleFactor / std::max(drX, drY);
 
 	// Sized from the nominal extent so a shifting dynamic-resolution ratio never reallocates, then padded to SPD's tile granularity so every allocated level halves exactly. An odd level would drop its last row, underestimate the max, and cull visible grass.
 	const auto padToTile = [](uint32_t v) { return (v + tileSize - 1) & ~(tileSize - 1); };
-	const uint32_t padW = padToTile(((uint32_t)screenW + downsampleFactor - 1) / downsampleFactor);
-	const uint32_t padH = padToTile(((uint32_t)screenH + downsampleFactor - 1) / downsampleFactor);
+	const uint32_t padW = padToTile(((uint32_t)screenW + kDownsampleFactor - 1) / kDownsampleFactor);
+	const uint32_t padH = padToTile(((uint32_t)screenH + kDownsampleFactor - 1) / kDownsampleFactor);
 
 	if ((padW != paddedWidth || padH != paddedHeight) && !CreateTexture(device, padW, padH))
 		return false;
@@ -206,7 +208,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	if (!logged) {
 		logged = true;
 		logger::info("[GRASS OPTIMIZATIONS] HiZ occlusion cull active: {}x{} tiles (1/{} res) in a {}x{} texture, {} mips, source=POST_ZPREPASS_COPY (R24_UNORM)",
-			validW, validH, downsampleFactor, padW, padH, GetMipCount());
+			validW, validH, kDownsampleFactor, padW, padH, GetMipCount());
 	}
 
 	valid = true;
