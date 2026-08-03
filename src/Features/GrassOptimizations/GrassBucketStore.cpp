@@ -1,6 +1,5 @@
 #include "GrassBucketStore.h"
 
-#include "Features/GrassLighting.h"
 
 void GrassBucketStore::SetupResources()
 {
@@ -360,7 +359,7 @@ void GrassBucketStore::CaptureGIDGroup(RE::BSMultiStreamInstanceTriShape* shape,
 		return;
 
 	const uint64_t descVal = *reinterpret_cast<const uint64_t*>(&shape->GetGeometryRuntimeData().vertexDesc);
-	const uint32_t stride = (uint32_t)((descVal >> 2) & 0x3C);
+	const uint32_t stride = kGrassStride;
 
 	uint32_t count = header->groupInstanceCount;
 	if (stride && dataBytes / stride < count)
@@ -565,14 +564,23 @@ void GrassBucketStore::AppendNewSlices(GrassBucket& bucket, ID3D11DeviceContext*
 	bucket.firstNewSlice = UINT32_MAX;
 }
 
+// The widest allocation is kGrassStride bytes per instance, so a larger capacity wraps its ByteWidth
+// and silently under-allocates. Bounding capacityInstances here also bounds EnsureLODBin's cap.
+constexpr uint32_t kMaxBucketInstances = UINT32_MAX / kGrassStride;
+
 bool GrassBucketStore::EnsureBucketCapacity(GrassBucket& b, uint32_t needed, ID3D11Device* device, ID3D11DeviceContext* ctx, uint32_t preserveInstances)
 {
 	if (b.capacityInstances >= needed && b.instanceBuf)
 		return true;
 
+	if (needed > kMaxBucketInstances) {
+		logger::error("[GRASS OPTIMIZATIONS] bucket capacity rejected: needed={} max={}", needed, kMaxBucketInstances);
+		return false;
+	}
+
 	uint32_t cap = b.capacityInstances ? b.capacityInstances : 4096;
 	while (cap < needed)
-		cap *= 2;
+		cap = std::min(cap * 2, kMaxBucketInstances);
 
 	// Hold the old instance/origin buffers across the reallocation so the data up to preserve can be copied to the new buffers on the GPU.
 	const uint32_t preserve = std::min(preserveInstances, b.capacityInstances);
@@ -824,7 +832,7 @@ bool GrassBucketStore::DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11Device
 		};
 		DetectParams dp{};
 		dp.texHeight = rt->height;
-		dp.threshold = globals::features::grassLighting.settings.ComplexGrassThreshold;
+		dp.threshold = cachedComplexThreshold;
 		detectParamsCB->Update(dp);
 
 		UINT initialCount = 0;

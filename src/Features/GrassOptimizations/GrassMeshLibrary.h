@@ -1,5 +1,8 @@
 #pragma once
 
+/** @brief Byte stride of both the grass vertex records and the per-instance records. */
+constexpr uint32_t kGrassStride = 32;
+
 /** @brief Maps grass shapes to their source .nif and caches the optional LOD mesh. Assigns integer IDs to each unique source .nif to avoid string lookups. */
 class GrassMeshLibrary
 {
@@ -11,7 +14,6 @@ public:
 		ID3D11Buffer* vertexBuffer = nullptr;
 		ID3D11Buffer* indexBuffer = nullptr;
 		uint32_t indexCount = 0;
-		uint32_t meshStride = 0;
 		uint64_t descVal = 0;
 		bool attemptedLoad = false;
 		bool valid = false;
@@ -37,7 +39,10 @@ private:
 	std::vector<std::string> stems;
 	std::unordered_map<RE::BSMultiStreamInstanceTriShape*, uint32_t> idByShape;
 
-	// Prevent race conditions between the resolving of meshIDs on the game thread and the loading on the game thread.
+	// The only state here that crosses a thread boundary: RecordModelPath writes it from the game
+	// thread's LoadGrassType hook while ResolveMeshId reads it from the render thread. Every other
+	// member is reached from the render thread alone, under the store's bucketMutex, so it needs no
+	// lock of its own.
 	std::unordered_map<RE::BSMultiStreamInstanceTriShape*, std::string> stemByShape;
 	mutable std::mutex stemMutex;
 

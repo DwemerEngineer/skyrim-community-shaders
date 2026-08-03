@@ -491,10 +491,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float skylightingShadowVisibility = 1.0;
 #		endif
 
-#		if !defined(TRUE_PBR)
-#			ifdef GRASS_OPTIMIZATIONS
+#		ifdef GRASS_OPTIMIZATIONS
 	bool complex = input.IsComplex > 0.5;
-#			else
+#		else
 	float x;
 	float y;
 	TexBaseSampler.GetDimensions(x, y);
@@ -502,16 +501,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 complexTest = TexBaseSampler.Load(int3(0, int(y) - 1, 0)).xyz * 2.0 - 1.0;
 	float complexLength = length(complexTest);
 	bool complex = abs(complexLength - 1.0) < SharedData::grassLightingSettings.ComplexGrassThreshold;
-#			endif
-#		endif  // !TRUE_PBR
+#		endif
 
 #		if defined(RENDER_DEPTH)
 	// Complex grass packs two layers, so scale the coord to the top half rather than branching.
-#			if !defined(TRUE_PBR)
 	const float2 alphaUV = float2(input.TexCoord.x, input.TexCoord.y * (complex ? 0.5 : 1.0));
-#			else
-	const float2 alphaUV = input.TexCoord.xy;
-#			endif  // !TRUE_PBR
 	const float baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, alphaUV, SharedData::MipBias).w;
 
 	float diffuseAlpha = input.Alpha * baseAlpha;
@@ -523,12 +517,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	psout.PS.w = diffuseAlpha;
 #		else
 	float4 baseColor;
-#			if !defined(TRUE_PBR)
 	if (complex) {
 		baseColor = TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, input.TexCoord.y * 0.5), SharedData::MipBias);
-	} else
-#			endif  // !TRUE_PBR
-	{
+	} else {
 		baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
 	}
 
@@ -545,11 +536,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			endif
 	const bool complexDetail = complex && !isFar;
 
-#			if !defined(TRUE_PBR)
 	float4 specColor = complexDetail ? TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, 0.5 + input.TexCoord.y * 0.5), SharedData::MipBias) : 1;
-#			else
-	float4 specColor = TexNormalSampler.SampleBias(SampNormalSampler, input.TexCoord.xy, SharedData::MipBias);
-#			endif
 
 	psout.MotionVectors = MotionBlur::GetSSMotionVector(input.WorldPosition, input.PreviousWorldPosition);
 
