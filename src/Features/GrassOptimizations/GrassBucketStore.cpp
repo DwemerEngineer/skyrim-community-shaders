@@ -161,6 +161,9 @@ void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstance
 		}
 
 		if (b.slices.empty()) {
+			// Culling jobs read this bucket through shapeBucketId while holding the lock shared. Taking it
+			// exclusively blocks until those reads finish, and erasing the entry stops any later job from
+			// reaching it, so destroying the bucket here is safe.
 			std::unique_lock lk(shapeBucketMutex);
 			std::erase_if(shapeBucketId, [dying = &b](const auto& entry) { return entry.second == dying; });
 			it = buckets.erase(it);
