@@ -1,7 +1,10 @@
 #pragma once
 
-/** @brief Byte stride of both the grass vertex records and the per-instance records. */
+/** @brief Byte stride of the per-instance records. */
 constexpr uint32_t kGrassStride = 32;
+
+/** @brief Mesh vertex stride in bytes, from nibble 0 of a packed vertexDesc (stored as bytes/4). */
+constexpr uint32_t VertexStrideFromDesc(uint64_t descVal) { return static_cast<uint32_t>((4 * descVal) & 0x3C); }
 
 /** @brief Maps grass shapes to their source .nif and caches the optional LOD mesh. Assigns integer IDs to each unique source .nif to avoid string lookups. */
 class GrassMeshLibrary
@@ -14,6 +17,8 @@ public:
 		ID3D11Buffer* vertexBuffer = nullptr;
 		ID3D11Buffer* indexBuffer = nullptr;
 		uint32_t indexCount = 0;
+		// The LOD .nif is authored separately, so its vertex format need not match the source mesh's.
+		uint32_t meshStride = 0;
 		uint64_t descVal = 0;
 		bool attemptedLoad = false;
 		bool valid = false;

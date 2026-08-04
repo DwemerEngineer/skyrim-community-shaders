@@ -893,8 +893,12 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	ctx->IASetIndexBuffer(indexB, DXGI_FORMAT_R16_UINT, 0);
 
 	ID3D11Buffer* vbs[2] = { meshVB, nullptr };
-	UINT strides[2] = { kGrassStride, kGrassStride };
+	// Stream 0 is the mesh's own vertex buffer, so its stride comes from that mesh's descriptor; only
+	// stream 1, the compacted instance records, is fixed at kGrassStride.
+	UINT strides[2] = { VertexStrideFromDesc(descVal), kGrassStride };
 	UINT offsets[2] = { 0, 0 };
+	if (!strides[0])
+		return;
 
 	vbs[1] = b->compactedBuf;
 	ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
@@ -929,6 +933,7 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 
 	vbs[0] = lod->vertexBuffer;
 	vbs[1] = b->lodCompactedBuf;
+	strides[0] = lod->meshStride;
 	ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
 	ctx->VSSetShaderResources(2, 1, &b->lodExtrasSRV);
 	ctx->DrawIndexedInstancedIndirect(b->lodArgsBuf, argsByteOffset);

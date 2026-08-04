@@ -94,10 +94,15 @@ void GrassMeshLibrary::EnsureLODMesh(uint32_t meshId)
 				entry.vertexBuffer = reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer);
 				entry.indexBuffer = reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer);
 				entry.descVal = *reinterpret_cast<const uint64_t*>(&grd.vertexDesc);
+				entry.meshStride = VertexStrideFromDesc(entry.descVal);
 				entry.indexCount = 3u * ts->GetTrishapeRuntimeData().triangleCount;
-				entry.valid = true;
-				logger::info("[GRASS OPTIMIZATIONS] LOD mesh {} loaded: tris={} descVal={:016X}",
-					modelPath, entry.indexCount / 3, entry.descVal);
+				// A zero stride means the descriptor decoded to nothing, which would draw garbage vertices.
+				entry.valid = entry.meshStride != 0;
+				if (!entry.valid)
+					logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} rejected: vertex stride decoded to 0 from descVal={:016X}", modelPath, entry.descVal);
+				else
+					logger::info("[GRASS OPTIMIZATIONS] LOD mesh {} loaded: tris={} stride={} descVal={:016X}",
+						modelPath, entry.indexCount / 3, entry.meshStride, entry.descVal);
 			} else {
 				logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} has no GPU buffers", modelPath);
 			}
