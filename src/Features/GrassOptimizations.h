@@ -32,15 +32,16 @@ public:
 
 	struct Settings
 	{
-		float MinPixelSize = 4.0f;
+		float MinPixelSize = 2.0f;
 		float FullDetailPixelSize = 16.0f;
 		float MinDensity = 0.03f;
-		float MeshCostBias = 0.5f;
+		float MeshCostBias = 0.4f;
 		float InvisibleFadeCull = 0.0f;
 		float RenderDistanceOverride = 0.0f;
 		float EdgeFadeStart = 0.85f;
 		bool EnableOcclusionCulling = true;
 		float SimpleShadingPixelSize = 0.0f;
+		float OcclusionBias = 0.001f;
 		float CollisionDistance = 2048.0f;
 		bool EnableMeshLOD = false;
 		float MeshLODPixelSize = 8.0f;
@@ -98,7 +99,8 @@ public:
 
 		float hiZTexelPixels;
 		float hiZMipCount;
-		float pad[2];
+		float occlusionBias;
+		float pad;
 	};
 	STATIC_ASSERT_ALIGNAS_16(CullParamsCB);
 
@@ -109,7 +111,7 @@ public:
 		float timeBase;
 		float prevTimeBase;
 		float boundCenter[3];
-		float clumpRadius;
+		float modelRadius;
 		float distScale;
 		float minPixelScale;
 		float isComplex;

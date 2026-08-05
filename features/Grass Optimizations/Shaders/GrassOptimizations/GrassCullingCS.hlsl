@@ -32,7 +32,8 @@ cbuffer CullParams : register(b0)
 
     float HiZTexelPixels;
     float HiZMipCount;
-    float2 _pad;
+    float OcclusionBias;
+    float _pad;
 };
 
 cbuffer CullBucket : register(b1)
@@ -42,7 +43,7 @@ cbuffer CullBucket : register(b1)
     float TimeBase;
     float PrevTimeBase;
     float3 BoundCenter;
-    float ClumpRadius;
+    float ModelRadius;
     float DistScale;
     float MinPixelScale;
     float IsComplex;
@@ -55,10 +56,9 @@ cbuffer CullBucket : register(b1)
 
 ByteAddressBuffer Instances : register(t0);
 StructuredBuffer<float4> Origins : register(t1);
-// 1/16-res max-depth reduction of the scene depth copy (see GrassHiZCS.hlsl).
+// Max-depth reduction of the scene depth copy (see GrassHiZCS.hlsl).
 Texture2D<float> HiZ : register(t2);
-// .x = first instance of the slice in the bucket's buffers, .y = running total of the visible slices before it. 
-// Maps compacted thread indices to a real instance indices.
+// Maps a compacted thread index back to a real instance: .x = the slice's first instance, .y = the instance total of every visible slice before it.
 StructuredBuffer<uint2> SliceTable : register(t3);
 
 RWByteAddressBuffer Compacted : register(u0);
@@ -69,7 +69,7 @@ RWByteAddressBuffer LODCompacted : register(u3);
 RWStructuredBuffer<float4> LODExtras : register(u4);
 RWByteAddressBuffer LODCounter : register(u5);
 
-// Converts a uint hash to a random float between [0, 1)
+// Uses a uint hash to generate a random float between [0, 1)
 float RandFloat(uint bits)
 {
     const uint mantissaMask = 0x007FFFFFu;
@@ -81,7 +81,7 @@ float RandFloat(uint bits)
     return asfloat(bits) - 1.0;
 }
 
-// Precalculate wind sway per-instance, so the vertex shader can just multiply by the wind vector and add to the position.
+// Precomputed here so the vertex shader only scales by the wind vector and adds.
 float WindScalar(float basis, float timer)
 {
     const float a = 0.4 * (basis + timer);
@@ -146,8 +146,11 @@ float WindScalar(float basis, float timer)
 
     const float dist = sqrt(distSq);
 
-    // projPx is the instance's on-screen radius with ProjScale coming from the FOV and resolution
-    const float projPx = (ClumpRadius / dist) * ProjScale;
+    // Get the per-instance scale from the length of the first row of the rotation matrix, so that culling is consistent with the vertex shader's scaling.
+    const float3 rotRow0 = float3(f16tof32(raw0.z & 0xFFFF), f16tof32(raw0.z >> 16), f16tof32(raw0.w & 0xFFFF));
+    const float instanceRadius = ModelRadius * max(length(rotRow0), 1e-4);
+
+    const float projPx = (instanceRadius / dist) * ProjScale;
     const float pxScale = lerp(1.0, MinPixelScale, MeshCostBias);
     const float effMinPx = MinPixelSize * pxScale;
     if (projPx < effMinPx)
@@ -163,9 +166,9 @@ float WindScalar(float basis, float timer)
             const float rT = projPx / HiZTexelPixels;  // instance radius expressed in level-0 texels
 
             // The level where the instance spans ~2 texels, fixing the sample count. 
-            const float wantLevel = ceil(log2(max(2.0 * rT, 1.0)));
+            const float wantLevel = ceil(log2(max(2.0 * rT, 1.0))) + 1.0;
 
-            // Skip the test when the pyramid lacks the level this instance needs. A level that does not cover it would underestimate the max and cull visible grass.
+            // A level too fine to cover the instance would underestimate the max and cull visible grass.
             [branch] if (wantLevel <= HiZMipCount - 1.0)
             {
             const int level = (int)wantLevel;
@@ -177,9 +180,9 @@ float WindScalar(float basis, float timer)
             const int2 t0 = int2(floor(tcL - rTL));
             const int2 t1 = int2(floor(tcL + rTL));
 
-            // Pull dv back to the bounding sphere's near surface, since an instance hides only when even its closest point sits behind the occluder.
-            // A camera inside the sphere shortens dv to nothing, putting nearZ far below any tile depth so the test never culls.
-            const float3 dvNear = dv * (max(dist - ClumpRadius, 0.0) / max(dist, 1e-4));
+            // An instance hides only once even its nearest point is behind the occluder. A camera inside
+            // the sphere collapses dv, putting nearZ below any tile depth so the test never fires.
+            const float3 dvNear = dv * (max(dist - instanceRadius, 0.0) / max(dist, 1e-4));
             const float4 clipN = mul(FrameBuffer::CameraViewProj, float4(dvNear, 1.0));
             const float nearZ = clipN.z / max(clipN.w, 1e-4);
 
@@ -196,8 +199,9 @@ float WindScalar(float basis, float timer)
                 }
             }
 
-            // Behind the farthest occluder of every covering tile means fully hidden.
-            if (nearZ > tileMax)
+            // Behind the farthest occluder of every covering tile means hidden. The tolerance absorbs
+            // projection and depth error that would otherwise drop instances only marginally behind it.
+            if (nearZ > tileMax + OcclusionBias)
                 return;
             }
         }
@@ -236,7 +240,7 @@ float WindScalar(float basis, float timer)
 
     const float4 e1 = float4(WindScalar(basis, TimeBase * WavePeriod), WindScalar(basis, PrevTimeBase * WavePeriod), fade, collisionFlag + farFlag);
     
-    // Dither over MeshLODBandPx so there is a smooth transition between full-detail and LOD instances
+    // Dithered over MeshLODBandPx so the swap to LOD is gradual rather than a visible line.
     bool useLOD = false;
     if (LODEnabled > 0.5)
     {
