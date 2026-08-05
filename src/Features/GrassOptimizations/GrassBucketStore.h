@@ -6,7 +6,10 @@
 struct BucketKey
 {
 	uint32_t meshId = 0;
-	RE::NiSourceTexture* tex = nullptr;  // Used to key the bucket when meshId == 0
+	// Both only key the bucket when meshId == 0. Texture and vertex format alone would let two variant
+	// .nifs share one bucket, which draws each other's instances against a single cached index count.
+	RE::NiSourceTexture* tex = nullptr;
+	uint32_t triCount = 0;
 	uint64_t descVal = 0;
 	bool operator==(const BucketKey&) const = default;
 };
@@ -17,6 +20,7 @@ struct BucketKeyHash
 	{
 		return (std::hash<uint32_t>{}(k.meshId) * 31) ^
 		       std::hash<void*>{}(k.tex) ^
+		       (std::hash<uint32_t>{}(k.triCount) * 131) ^
 		       (std::hash<uint64_t>{}(k.descVal) << 1);
 	}
 };
@@ -92,14 +96,15 @@ struct GrassBucket
 
 	// Source mesh id, for easy lookup of the LOD mesh.
 	uint32_t meshId = 0;
-	// BucketKey only carries the texture for unresolved meshes, so keep it here for re-detection.
-	RE::NiSourceTexture* diffuseTexture = nullptr;
+	// BucketKey only carries the texture for unresolved meshes, so keep it here for re-detection. Owned,
+	// since re-detection dereferences it long after the shader property that supplied it may have gone.
+	RE::NiPointer<RE::NiSourceTexture> diffuseTexture;
 
 	uint32_t cullSlot = UINT32_MAX;
 	bool typeParamsValid = false;
 	float wavePeriod = 1.0f;
 	RE::NiPoint3 boundCenter{};
-	float clumpRadius = 128.0f;
+	float modelRadius = 128.0f;
 	float distScale = 1.0f;
 	float minPixelScale = 1.0f;
 	bool isComplex = false;
@@ -315,11 +320,16 @@ private:
 	std::unordered_map<RE::BSMultiStreamInstanceTriShape*, GrassBucket*> shapeBucketId;
 	mutable std::shared_mutex shapeBucketMutex;
 
-	std::unordered_map<RE::NiSourceTexture*, bool> complexCache;
+	// Keyed by raw pointer with each entry holding a strong reference to the texture so it is not released while the cache is valid.
+	struct ComplexEntry
+	{
+		RE::NiPointer<RE::NiSourceTexture> keepAlive;
+		bool complex = false;
+	};
+	std::unordered_map<RE::NiSourceTexture*, ComplexEntry> complexCache;
 	float cachedComplexThreshold = -1.0f;
 
 	ID3D11ComputeShader* detectCS = nullptr;
-	std::unique_ptr<ConstantBuffer> detectParamsCB;
 	std::unique_ptr<Buffer> detectResult;
 	std::unique_ptr<Buffer> detectStaging;
 };

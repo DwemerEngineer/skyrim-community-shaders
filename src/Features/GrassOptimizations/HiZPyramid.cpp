@@ -183,10 +183,10 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 
 	// Each level is the exact max of the one above, so an instance of any on-screen size is testable against a fixed number of texels.
 	// One dispatch for the whole chain, every group reducing its own tile from LDS.
-	if (spdCS && spdCounter && mipCount > 1) {
+	if (spdCS && spdCounter && GetMipCount() > 1) {
 		globals::profiler->BeginPass("GrassOptimizations::HiZMips");
 
-		const uint32_t outputMips = mipCount - 1;
+		const uint32_t outputMips = GetMipCount() - 1;
 		const uint32_t groupsX = padW / tileSize;
 		const uint32_t groupsY = padH / tileSize;
 

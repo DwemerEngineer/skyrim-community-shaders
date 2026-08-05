@@ -14,6 +14,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	RenderDistanceOverride,
 	EdgeFadeStart,
 	EnableOcclusionCulling,
+	OcclusionBias,
 	SimpleShadingPixelSize,
 	CollisionDistance,
 	EnableMeshLOD,
@@ -42,7 +43,7 @@ void GrassOptimizations::DrawSettings()
 	ImGui::SliderFloat(T(TKEY("full_detail_pixel_size"), "Full-Detail Pixel Size"), &settings.FullDetailPixelSize, 4.0f, 128.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("full_detail_pixel_size_tooltip"),
-							  "Meshes whose on-screen radius is above this render at full density. Below it, density is increasingly thinned down to Minimum Density at Min Pixel Size. Increasing this setting improves performance by removing closer grass."));
+							  "Instances whose on-screen radius is above this render at full density. Below it, density is increasingly thinned down to Minimum Density at Min Pixel Size. Increasing this setting improves performance by removing closer grass."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("min_pixel_size"), "Min Pixel Size"), &settings.MinPixelSize, 1.0f, 32.0f, "%.1f px");
@@ -51,13 +52,13 @@ void GrassOptimizations::DrawSettings()
 							  "Individual grass instances that visibly take up less space on the screen than this are dropped entirely. Higher values improve performance by removing far-away grass instances sooner."));
 	}
 
-	ImGui::SliderFloat(T(TKEY("min_density"), "Minimum Density"), &settings.MinDensity, 0.0f, 1.0f, "%.2f");
+	Util::PercentageSlider(T(TKEY("min_density"), "Minimum Density"), &settings.MinDensity);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("min_density_tooltip"),
 							  "The percentage of grass that remains at the smallest (Min Pixel Size) LOD level before culling."));
 	}
 
-	ImGui::SliderFloat(T(TKEY("mesh_cost_bias"), "Mesh Cost Bias"), &settings.MeshCostBias, 0.0f, 1.0f, "%.2f");
+	Util::PercentageSlider(T(TKEY("mesh_cost_bias"), "Mesh Cost Bias"), &settings.MeshCostBias);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("mesh_cost_bias_tooltip"),
 							  "Culls or removes grass meshes based on their complexity (performance impact). At 0, removal is identical between all grass types regardless of complexity. At 1, heavier and more complex meshes are culled 2-6x sooner than simple ones."));
@@ -69,7 +70,7 @@ void GrassOptimizations::DrawSettings()
 							  "Max grass render distance in units. 0 = use the game's INI cap (fGrassStartFadeDistance + fGrassFadeRange). Any grass beyond the vanilla range or this range will be removed."));
 	}
 
-	ImGui::SliderFloat(T(TKEY("edge_fade_start"), "Edge Fade Start"), &settings.EdgeFadeStart, 0.0f, 1.0f, "%.2f");
+	Util::PercentageSlider(T(TKEY("edge_fade_start"), "Edge Fade Start"), &settings.EdgeFadeStart);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		std::vector<std::string> tooltipLines = {
 			T(TKEY("edge_fade_start_tooltip"),
@@ -91,10 +92,16 @@ void GrassOptimizations::DrawSettings()
 							  "Skips grass hidden behind rocks, buildings and NPCs. Depending on how much grass is not visible, this may cost more than its benefits. If you see grass flickering when moving, try disabling this. Terrain such as hills is not treated as an occluder when Terrain Blending is enabled, which reduces the benefit."));
 	}
 
+	ImGui::SliderFloat(T(TKEY("occlusion_bias"), "Occlusion Bias"), &settings.OcclusionBias, 0.0f, 0.01f, "%.4f");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T(TKEY("occlusion_bias_tooltip"),
+							  "How far behind an occluder grass must sit before Occlusion Culling removes it. Raise this if grass disappears around the edges of rocks and hills, lower it to reclaim more performance. Has no effect unless Occlusion Culling is enabled."));
+	}
+
 	ImGui::SliderFloat(T(TKEY("simple_shading_px"), "Simple Shading Below"), &settings.SimpleShadingPixelSize, 0.0f, 32.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("simple_shading_px_tooltip"),
-							  "Grass clumps smaller than this size on screen will skip barely visible detail including contact shadows, specular highlights, and other complex grass visual elements. Zero disables this feature."));
+							  "Grass instances smaller than this size on screen will skip barely visible detail including contact shadows, specular highlights, and other complex grass visual elements. Zero disables this feature."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("collision_distance"), "Collision Distance"), &settings.CollisionDistance, 0.0f, 8192.0f, "%.0f");
@@ -112,13 +119,13 @@ void GrassOptimizations::DrawSettings()
 	ImGui::Checkbox(T(TKEY("enable_mesh_lod"), "Enable Mesh LOD"), &settings.EnableMeshLOD);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("enable_mesh_lod_tooltip"),
-							  "Improves performance by swapping distant grass clumps for a simpler LOD mesh. Requires LOD .nif per grass type at meshes\\LOD\\Grass\\<source-mesh-name>_LOD.nif. Grass with no LOD mesh keeps its full mesh."));
+							  "Improves performance by swapping distant grass instances for a simpler LOD mesh. Requires LOD .nif per grass type at meshes\\LOD\\Grass\\<source-mesh-name>_LOD.nif. Grass with no LOD mesh keeps its full mesh."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("mesh_lod_pixel_size"), "Mesh LOD Pixel Size"), &settings.MeshLODPixelSize, 1.0f, 64.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("mesh_lod_pixel_size_tooltip"),
-							  "Clumps whose on-screen radius is below this but above Min Pixel Size swap to the LOD mesh."));
+							  "Instances whose on-screen radius is below this but above Min Pixel Size swap to the LOD mesh."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("mesh_lod_band"), "Mesh LOD Transition Band"), &settings.MeshLODBandPixels, 0.0f, 16.0f, "%.1f px");
@@ -234,8 +241,11 @@ void GrassOptimizations::UpdateGrass()
 	maxDistSq = maxGrassDistance * maxGrassDistance;
 
 	bucketStore.BeginFrame({ settings.EnableMeshLOD, timeAccum });
+
+	globals::profiler->BeginPass("GrassOptimizations::ApplyPending");
 	bucketStore.RefreshComplexGrass(globals::features::grassLighting.settings.ComplexGrassThreshold, ctx);
 	bucketStore.ApplyPending(device, ctx);
+	globals::profiler->EndPass();
 
 	RE::NiCamera* cam = RE::Main::WorldRootCamera();
 	if (!cam) {
@@ -296,6 +306,7 @@ void GrassOptimizations::UpdateGrass()
 
 		cp.hiZTexelPixels = hiZ.GetTexelPixels();
 		cp.hiZMipCount = (float)hiZ.GetMipCount();
+		cp.occlusionBias = std::max(0.0f, settings.OcclusionBias);
 
 		cullParamsCB->Update(cp);
 	}
@@ -303,6 +314,8 @@ void GrassOptimizations::UpdateGrass()
 	uint32_t visibleBuckets = 0;
 	sliceTableCPU.clear();
 
+	// Measures the CPU time spent frustum culling bucket slices
+	globals::profiler->BeginPass("GrassOptimizations::SliceCull");
 	for (auto& [key, b] : bucketStore.buckets) {
 		b.ResetCullState();
 		if (!b.totalInstances || !b.instanceSRV)
@@ -319,8 +332,12 @@ void GrassOptimizations::UpdateGrass()
 		b.lodActive = bucketStore.EnsureLODBin(b, device);
 		++visibleBuckets;
 	}
+	globals::profiler->EndPass();
 
+	// Measures the slice table upload, the per-bucket constants, and the cull dispatch per visible bucket.
+	globals::profiler->BeginPass("GrassOptimizations::InstanceCull");
 	UploadCullState(device, ctx, visibleBuckets);
+	globals::profiler->EndPass();
 }
 
 void GrassOptimizations::MergeSlicesIntoRuns(GrassBucket& b)
@@ -390,7 +407,7 @@ void GrassOptimizations::CullBucketSlices(GrassBucket& b, const FrustumSoA& frus
 	if (!b.clustersValid)
 		MergeSlicesIntoRuns(b);
 
-	const __m128 pad = _mm_set1_ps(b.clumpRadius + 64.0f);
+	const __m128 pad = _mm_set1_ps(b.modelRadius + 64.0f);
 	for (const GrassBucket::SliceRun& run : b.sliceRuns) {
 		const __m128 lo = _mm_sub_ps(_mm_load_ps(run.bounds.lo), pad);
 		const __m128 hi = _mm_add_ps(_mm_load_ps(run.bounds.hi), pad);
@@ -435,7 +452,7 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 				cb->boundCenter[0] = b.boundCenter.x;
 				cb->boundCenter[1] = b.boundCenter.y;
 				cb->boundCenter[2] = b.boundCenter.z;
-				cb->clumpRadius = b.clumpRadius;
+				cb->modelRadius = b.modelRadius;
 				cb->distScale = b.distScale;
 				cb->minPixelScale = b.minPixelScale;
 				cb->isComplex = b.isComplex ? 1.0f : 0.0f;
@@ -724,15 +741,22 @@ void GrassOptimizations::Hooks::BSGrassShader_SetupGeometry::thunk(RE::BSShader*
 	func(This, a2, flags);
 }
 
+static size_t GIDGroupBytes(const RE::BSMultiStreamInstanceTriShape::GroupHeader* header)
+{
+	if (!header || !header->numShortsPerInstance)
+		return SIZE_MAX;
+	return (size_t)header->groupInstanceCount * header->numShortsPerInstance * sizeof(std::uint16_t);
+}
+
 std::uint32_t GrassOptimizations::Hooks::AddGroupGIDBuffer::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSMultiStreamInstanceTriShape::GroupHeader* a2, std::uint16_t* a3)
 {
-	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3, SIZE_MAX);
+	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3, GIDGroupBytes(a2));
 	return func(a1, a2, a3);
 }
 
 std::uint32_t GrassOptimizations::Hooks::AddQueuedGroupGIDBuffer::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSMultiStreamInstanceTriShape::GroupHeader* a2, std::uint16_t* a3, RE::BSTArray<std::uint32_t>& a4)
 {
-	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3, SIZE_MAX);
+	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3, GIDGroupBytes(a2));
 	return func(a1, a2, a3, a4);
 }
 
@@ -838,7 +862,8 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 		std::scoped_lock lk(self.bucketStore.bucketMutex);
 
 		const uint32_t meshId = self.bucketStore.meshLibrary.ResolveMeshId(geometry);
-		auto it = self.bucketStore.buckets.find({ meshId, meshId ? nullptr : diffuseTexture, descVal });
+		const uint32_t triCount = meshId ? 0u : (uint32_t)geometry->GetTrishapeRuntimeData().triangleCount;
+		auto it = self.bucketStore.buckets.find({ meshId, meshId ? nullptr : diffuseTexture, triCount, descVal });
 		if (it == self.bucketStore.buckets.end() || !it->second.totalInstances || !it->second.instanceBuf) {
 			VanillaDrawInstanceTriShape(geometry);
 			return;

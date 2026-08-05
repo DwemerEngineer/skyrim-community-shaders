@@ -3,8 +3,6 @@
 
 void GrassBucketStore::SetupResources()
 {
-	detectParamsCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc(16), "GrassOptimizations::DetectParamsCB");
-
 	{
 		D3D11_BUFFER_DESC bd{};
 		bd.ByteWidth = sizeof(uint32_t);
@@ -27,6 +25,9 @@ void GrassBucketStore::SetupResources()
 		bd.ByteWidth = sizeof(uint32_t);
 		bd.Usage = D3D11_USAGE_STAGING;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		// Match the source buffer's structure so the copy works.
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = sizeof(uint32_t);
 		detectStaging = std::make_unique<Buffer>(bd, nullptr, "GrassOptimizations::DetectStaging");
 	}
 }
@@ -72,7 +73,7 @@ void GrassBucketStore::RefreshComplexGrass(float threshold, ID3D11DeviceContext*
 	complexCache.clear();
 
 	for (auto& [key, b] : buckets)
-		b.isComplex = DetectComplexGrass(b.diffuseTexture, ctx);
+		b.isComplex = DetectComplexGrass(b.diffuseTexture.get(), ctx);
 }
 
 void GrassBucketStore::StageRemoval(RE::BSMultiStreamInstanceTriShape* shape)
@@ -137,8 +138,13 @@ void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstance
 		uint32_t firstRemoved = UINT32_MAX;
 		size_t write = 0;
 		uint32_t removedInstances = 0;
+		// firstNewSlice indexes b.slices, so compaction shifts it. Left stale it points past the pending
+		// slices and AppendNewSlices would upload none of them, leaving their records unwritten.
+		uint32_t remappedFirstNew = UINT32_MAX;
 
 		for (size_t read = 0; read < before; ++read) {
+			if ((uint32_t)read == b.firstNewSlice)
+				remappedFirstNew = (uint32_t)write;
 			if (isDead(b.slices[read].shape)) {
 				if (firstRemoved == UINT32_MAX)
 					firstRemoved = (uint32_t)write;
@@ -154,6 +160,9 @@ void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstance
 
 		b.slices.resize(write);
 		b.sliceBounds.resize(write);
+
+		if (b.firstNewSlice != UINT32_MAX)
+			b.firstNewSlice = (remappedFirstNew != UINT32_MAX) ? remappedFirstNew : (uint32_t)write;
 
 		if (write != before) {
 			b.clustersValid = false;
@@ -190,10 +199,11 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures)
 
 	for (auto& pc : captures) {
 		const uint32_t meshId = meshLibrary.ResolveMeshId(pc.shape);
-		const BucketKey bk{ meshId, meshId ? nullptr : pc.diffuseTexture, pc.descVal };
+		const uint32_t triCount = meshId ? 0u : (uint32_t)pc.shape->GetTrishapeRuntimeData().triangleCount;
+		const BucketKey bk{ meshId, meshId ? nullptr : pc.diffuseTexture, triCount, pc.descVal };
 		auto& b = buckets[bk];
 		b.meshId = meshId;
-		b.diffuseTexture = pc.diffuseTexture;
+		b.diffuseTexture = RE::NiPointer<RE::NiSourceTexture>(pc.diffuseTexture);
 
 		if (b.firstNewSlice == UINT32_MAX)
 			b.firstNewSlice = (uint32_t)b.slices.size();
@@ -421,10 +431,10 @@ void GrassBucketStore::CacheBucketTypeParams(GrassBucket& b, RE::BSMultiStreamIn
 
 	const auto& bound = shape->GetModelData().modelBound;
 	b.boundCenter = bound.center;
-	b.clumpRadius = bound.radius;
+	b.modelRadius = bound.radius;
 
 	const float tris = (float)shape->GetTrishapeRuntimeData().triangleCount;
-	const float cost = std::max(1.0f, tris / 6.0f);
+	const float cost = std::max(1.0f, tris / 8.0f);
 	const float w = std::sqrt(cost);
 	b.distScale = 1.0f / w;
 	b.minPixelScale = w;
@@ -804,7 +814,7 @@ void GrassBucketStore::UpdateCoarseBounds(GrassBucket& b)
 	}
 
 	// Generously pad to prevent instances on the screen edge from being visibly culled. 
-	const float pad = b.clumpRadius + 128.0f;
+	const float pad = b.modelRadius + 128.0f;
 	mn.x -= pad;
 	mn.y -= pad;
 	mn.z -= pad;
@@ -820,29 +830,16 @@ void GrassBucketStore::UpdateCoarseBounds(GrassBucket& b)
 bool GrassBucketStore::DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11DeviceContext* ctx)
 {
 	if (auto it = complexCache.find(tex); it != complexCache.end())
-		return it->second;
+		return it->second.complex;
 
 	bool complex = false;
 
 	auto* rt = tex ? tex->rendererTexture : nullptr;
-	if (GetDetectCS() && detectResult && detectStaging && rt && rt->resourceView && rt->height > 0) {
-		struct DetectParams
-		{
-			uint32_t texHeight;
-			float threshold;
-			uint32_t pad[2];
-		};
-		DetectParams dp{};
-		dp.texHeight = rt->height;
-		dp.threshold = cachedComplexThreshold;
-		detectParamsCB->Update(dp);
-
+	if (GetDetectCS() && detectResult && detectStaging && rt && rt->resourceView) {
 		UINT initialCount = 0;
 		ID3D11UnorderedAccessView* resultUAV = detectResult->uav.get();
 		ctx->CSSetUnorderedAccessViews(0, 1, &resultUAV, &initialCount);
 		ctx->CSSetShader(detectCS, nullptr, 0);
-		ID3D11Buffer* paramsCB = detectParamsCB->CB();
-		ctx->CSSetConstantBuffers(0, 1, &paramsCB);
 		ctx->CSSetShaderResources(0, 1, &rt->resourceView);
 		ctx->Dispatch(1, 1, 1);
 
@@ -855,12 +852,15 @@ bool GrassBucketStore::DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11Device
 		ctx->CopyResource(detectStaging->resource.get(), detectResult->resource.get());
 		D3D11_MAPPED_SUBRESOURCE m{};
 		if (SUCCEEDED(ctx->Map(detectStaging->resource.get(), 0, D3D11_MAP_READ, 0, &m))) {
-			complex = (*static_cast<const uint32_t*>(m.pData)) != 0;
+			// Compare using the decoded length from the shader to avoid requring a constant buffer
+			float normalLength = 0.0f;
+			std::memcpy(&normalLength, m.pData, sizeof(float));
+			complex = std::abs(normalLength - 1.0f) < cachedComplexThreshold;
 			ctx->Unmap(detectStaging->resource.get(), 0);
 		}
 	}
 
-	complexCache.emplace(tex, complex);
+	complexCache.emplace(tex, ComplexEntry{ RE::NiPointer<RE::NiSourceTexture>(tex), complex });
 	return complex;
 }
 

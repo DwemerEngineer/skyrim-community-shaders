@@ -2,7 +2,7 @@
 
 #include "Buffer.h"
 
-/* @brief Max-depth mip pyramid over the scene depth copy, used to occlusion-cull grass instances. A texel at level N is exactly the farthest depth of everything beneath it */
+/** @brief Max-depth mip pyramid over the scene depth copy, used to occlusion-cull grass instances. A texel at level N is exactly the farthest depth of everything beneath it */
 class HiZPyramid
 {
 public:
@@ -14,7 +14,7 @@ public:
 	 */
 	bool Build(ID3D11Device* device, ID3D11DeviceContext* ctx);
 
-	/* @brief Marks the pyramid unusable for this frame without releasing anything. */
+	/** @brief Marks the pyramid unusable for this frame without releasing anything. */
 	void Invalidate() { valid = false; }
 
 	/** @brief Returns the full-chain SRV, or nullptr when the pyramid is not valid this frame. */
