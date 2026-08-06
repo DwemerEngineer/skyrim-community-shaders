@@ -100,7 +100,7 @@ public:
 		float hiZTexelPixels;
 		float hiZMipCount;
 		float occlusionBias;
-		float pad;
+		float costBiasStartDist;
 	};
 	STATIC_ASSERT_ALIGNAS_16(CullParamsCB);
 
@@ -184,6 +184,9 @@ public:
 	float vanillaMaxDistance = 0.0f;
 	float maxGrassDistance = 0.0f;
 	float maxDistSq = 0.0f;
+
+	// Mesh Cost Bias is inert nearer than this, so complex grass is not thinned right in front of the player.
+	static constexpr float kCostBiasStartDistance = 6000.0f;
 
 	struct Hooks
 	{
