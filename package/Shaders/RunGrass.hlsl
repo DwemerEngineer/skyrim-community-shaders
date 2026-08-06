@@ -68,6 +68,9 @@ struct VS_OUTPUT
 #endif
 #	ifdef GRASS_OPTIMIZATIONS
 	nointerpolation float IsComplex: TEXCOORD8;
+#	if !defined(RENDER_DEPTH)
+	nointerpolation float IsFar: TEXCOORD9;
+#	endif
 #	endif
 };
 #endif
@@ -294,6 +297,9 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	// e1.w packs the flags, as above.
 	const float isFarFlag = (e1.w >= 2.0) ? 1.0 : 0.0;
 	const float collisionFlag = e1.w - 2.0 * isFarFlag;
+#			if !defined(RENDER_DEPTH)
+	vsout.IsFar = isFarFlag;
+#			endif
 #		endif
 
 	float4 msPosition = GetMSPosition(input);
@@ -799,7 +805,12 @@ PS_OUTPUT main(PS_INPUT input)
 		dirDetailedShadow = shadowColor.x;
 
 #			if defined(SCREEN_SPACE_SHADOWS)
-	if (!SharedData::InInterior)
+#				ifdef GRASS_OPTIMIZATIONS
+	const bool isFar = input.IsFar > 0.5;
+#				else
+	const bool isFar = false;
+#				endif
+	if (!SharedData::InInterior && !isFar)
 		dirDetailedShadow *= ScreenSpaceShadows::GetScreenSpaceShadow(input.HPosition.xyz, screenUV, screenNoise);
 #			endif  // SCREEN_SPACE_SHADOWS
 
