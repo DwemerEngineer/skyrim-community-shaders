@@ -61,7 +61,7 @@ void GrassOptimizations::DrawSettings()
 	Util::PercentageSlider(T(TKEY("mesh_cost_bias"), "Mesh Cost Bias"), &settings.MeshCostBias);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("mesh_cost_bias_tooltip"),
-							  "Culls or removes grass meshes based on their complexity (performance impact). At 0, removal is identical between all grass types regardless of complexity. At 1, heavier and more complex meshes are culled 2-6x sooner than simple ones."));
+							  "Culls or removes grass meshes based on their complexity (performance impact). At 0, removal is identical between all grass types regardless of complexity. At 1, heavier and more complex meshes are culled 2-6x sooner than simple ones. Only applies beyond 6000 units, so nearby grass is never thinned."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("render_distance_override"), "Grass Render Distance"), &settings.RenderDistanceOverride, 0.0f, 100000.0f, "%.0f");
@@ -307,6 +307,7 @@ void GrassOptimizations::UpdateGrass()
 		cp.hiZTexelPixels = hiZ.GetTexelPixels();
 		cp.hiZMipCount = (float)hiZ.GetMipCount();
 		cp.occlusionBias = std::max(0.0f, settings.OcclusionBias);
+		cp.costBiasStartDist = kCostBiasStartDistance;
 
 		cullParamsCB->Update(cp);
 	}

@@ -33,7 +33,7 @@ cbuffer CullParams : register(b0)
     float HiZTexelPixels;
     float HiZMipCount;
     float OcclusionBias;
-    float _pad;
+    float CostBiasStartDist;
 };
 
 cbuffer CullBucket : register(b1)
@@ -131,9 +131,14 @@ float WindScalar(float basis, float timer)
     const float3 dv = world - FrameBuffer::CameraPosAdjust.xyz;
     const float distSq = dot(dv, dv);
 
-    const float dScale = lerp(1.0, DistScale, MeshCostBias);
-    const float scaleSq = dScale * dScale;
-    const float effMaxDistSq = MaxDistSq * scaleSq;
+    const float dist = sqrt(distSq);
+
+    // Mesh complexity only biases culling past CostBiasStartDist, ramping to full over the distance past that
+    const float costRamp = saturate((dist - CostBiasStartDist) / max(CostBiasStartDist, 1e-4));
+    const float effCostBias = MeshCostBias * costRamp;
+
+    const float dScale = lerp(1.0, DistScale, effCostBias);
+    const float effMaxDistSq = MaxDistSq * dScale * dScale;
     if (distSq > effMaxDistSq)
         return;
 
@@ -144,14 +149,13 @@ float WindScalar(float basis, float timer)
             return;
     }
 
-    const float dist = sqrt(distSq);
-
-    // Get the per-instance scale from the length of the first row of the rotation matrix, so that culling is consistent with the vertex shader's scaling.
-    const float3 rotRow0 = float3(f16tof32(raw0.z & 0xFFFF), f16tof32(raw0.z >> 16), f16tof32(raw0.w & 0xFFFF));
-    const float instanceRadius = ModelRadius * max(length(rotRow0), 1e-4);
+    // The vertex shader grows each instance by (1 + InstanceData4.y * ScaleMask). ScaleMask is not
+    // visible here, so assume 1 and ignore shrink: over-estimating the radius only costs culling.
+    const float sizeVariance = f16tof32(raw1.z >> 16);
+    const float instanceRadius = ModelRadius * (1.0 + max(sizeVariance, 0.0));
 
     const float projPx = (instanceRadius / dist) * ProjScale;
-    const float pxScale = lerp(1.0, MinPixelScale, MeshCostBias);
+    const float pxScale = lerp(1.0, MinPixelScale, effCostBias);
     const float effMinPx = MinPixelSize * pxScale;
     if (projPx < effMinPx)
         return;
@@ -165,8 +169,8 @@ float WindScalar(float basis, float timer)
             const float2 tc = uv * HiZSize;
             const float rT = projPx / HiZTexelPixels;  // instance radius expressed in level-0 texels
 
-            // The level where the instance spans ~2 texels, fixing the sample count. 
-            const float wantLevel = ceil(log2(max(2.0 * rT, 1.0))) + 1.0;
+            // The level where the instance spans ~2 texels, so the 3x3 below covers it exactly. 
+            const float wantLevel = ceil(log2(max(2.0 * rT, 1.0)));
 
             // A level too fine to cover the instance would underestimate the max and cull visible grass.
             [branch] if (wantLevel <= HiZMipCount - 1.0)

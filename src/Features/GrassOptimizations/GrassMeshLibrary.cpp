@@ -93,7 +93,10 @@ void GrassMeshLibrary::EnsureLODMesh(uint32_t meshId)
 				entry.keepAlive = RE::NiPointer<RE::NiAVObject>(root.get());
 				entry.vertexBuffer = reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer);
 				entry.indexBuffer = reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer);
-				entry.descVal = *reinterpret_cast<const uint64_t*>(&grd.vertexDesc);
+				// Alter the descriptor to match the BSMultistreaminstanceTrishapes of normal grass
+				uint64_t& desc = *reinterpret_cast<uint64_t*>(&grd.vertexDesc);
+				desc |= 0x8000000000000080ull;
+				entry.descVal = desc;
 				entry.meshStride = VertexStrideFromDesc(entry.descVal);
 				entry.indexCount = 3u * ts->GetTrishapeRuntimeData().triangleCount;
 				// A zero stride means the descriptor decoded to nothing, which would draw garbage vertices.
