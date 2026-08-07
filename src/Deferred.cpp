@@ -9,6 +9,7 @@
 #include "Features/DynamicCubemaps.h"
 #include "Features/Effects11.h"
 #include "Features/IBL.h"
+#include "Features/ProceduralGrass.h"
 #include "Features/ScreenSpaceGI.h"
 #include "Features/Skylighting.h"
 #include "Features/SubsurfaceScattering.h"
@@ -274,9 +275,12 @@ void Deferred::StartDeferred()
 		MASKS2
 	};
 
-	for (uint i = 2; i < 8; i++) {
-		renderTargets[i] = targets[i];                                             // We must use unused targets to be indexable
-		setRenderTargetMode[i] = RE::BSGraphics::SetRenderTargetMode::SRTM_CLEAR;  // Dirty from last frame, this calls ClearRenderTargetView once
+	const auto proceduralGrass = globals::features::proceduralGrass;
+	if (!proceduralGrass->loaded || !proceduralGrass->settings.Enabled) {
+		for (uint i = 2; i < 8; i++) {
+			renderTargets[i] = targets[i];                                             // We must use unused targets to be indexable
+			setRenderTargetMode[i] = RE::BSGraphics::SetRenderTargetMode::SRTM_CLEAR;  // Dirty from last frame, this calls ClearRenderTargetView once
+		}
 	}
 
 	stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);  // Run OMSetRenderTargets again
@@ -293,6 +297,10 @@ void Deferred::StartDeferred()
 	PrepassPasses();
 
 	OverrideBlendStates();
+	
+	if (proceduralGrass->loaded && proceduralGrass->settings.Enabled) {
+		proceduralGrass->DeferredRendering();
+	}
 }
 
 void Deferred::DeferredPasses()

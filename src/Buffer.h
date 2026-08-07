@@ -171,13 +171,13 @@ public:
 	}
 
 	/** @brief Creates and appends an unordered access view for this buffer. */
-	virtual void CreateUAV()
+	virtual void CreateUAV(bool append = false)
 	{
 		auto device = globals::d3d::device;
 		D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
 		uav_desc.Format = DXGI_FORMAT_UNKNOWN;
 		uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-		uav_desc.Buffer.Flags = 0;
+		uav_desc.Buffer.Flags = append ? D3D11_BUFFER_UAV_FLAG_APPEND : 0;
 		uav_desc.Buffer.FirstElement = 0;
 		uav_desc.Buffer.NumElements = count;
 		winrt::com_ptr<ID3D11UnorderedAccessView> uav;
