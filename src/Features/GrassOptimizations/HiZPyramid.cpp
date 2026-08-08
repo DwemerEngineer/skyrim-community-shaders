@@ -1,6 +1,7 @@
 #include "HiZPyramid.h"
 
 #include "Features/TerrainBlending.h"
+#include "Features/Upscaling.h"
 #include "Profiler.h"
 
 void HiZPyramid::SetupResources()
@@ -47,6 +48,14 @@ ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
 	if (auto* renderer = globals::game::renderer)
 		return renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV;
 	return nullptr;
+}
+
+ID3D11ShaderResourceView* HiZPyramid::GetLiveDepthSRV()
+{
+	auto* renderer = globals::game::renderer;
+	if (!renderer)
+		return nullptr;
+	return renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV;
 }
 
 bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dstH)
@@ -111,34 +120,41 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
 	valid = false;
 
-	ID3D11ShaderResourceView* srcSRV = GetSourceDepthSRV();
-	if (!srcSRV || !paramsCB || !globals::game::renderer)
+	if (!paramsCB || !globals::game::renderer)
 		return false;
 
-	const auto [screenW, screenH] = globals::game::renderer->GetScreenSize();
+	float2 screenSize{ (float)globals::game::graphicsState->screenWidth, (float)globals::game::graphicsState->screenHeight };
+	auto renderSize = Util::ConvertToDynamic(screenSize);
 
-	// Dynamic resolution renders the prepass into a top-left sub-rect of a full-size target, so the
-	// extent the depth actually covers is the scaled one. NDC maps onto that, not the nominal target.
-	const auto& gsRuntime = globals::game::graphicsState->GetRuntimeData();
-	const float drX = std::clamp(gsRuntime.dynamicResolutionWidthRatio, 0.01f, 1.0f);
-	const float drY = std::clamp(gsRuntime.dynamicResolutionHeightRatio, 0.01f, 1.0f);
-	const uint32_t srcW = std::max(1u, (uint32_t)std::lround(screenW * drX));
-	const uint32_t srcH = std::max(1u, (uint32_t)std::lround(screenH * drY));
+	const uint32_t srcW = std::max(1u, (uint32_t)std::lround(renderSize.x));
+	const uint32_t srcH = std::max(1u, (uint32_t)std::lround(renderSize.y));
 
 	const uint32_t validW = (srcW + kDownsampleFactor - 1) / kDownsampleFactor;
 	const uint32_t validH = (srcH + kDownsampleFactor - 1) / kDownsampleFactor;
 	if (!validW || !validH)
 		return false;
 
-	// Converts the cull's nominal-pixel projPx into texels. Its radius is one scalar for both axes, so
-	// the larger ratio wins: too small a radius picks a level whose fixed 3x3 footprint misses part of
-	// the instance, culling it against an incomplete max.
-	texelPixels = kDownsampleFactor / std::max(drX, drY);
+	// kPOST_ZPREPASS_COPY is written before the opaque prepass, so it holds depth the scene no longer has, biased near enough to over-cull. Prefer the live target, and keep it only as a fallback.
+	usingLiveDepth = true;
+	ID3D11ShaderResourceView* srcSRV = GetLiveDepthSRV();
+	if (!srcSRV) {
+		usingLiveDepth = false;
+		srcSRV = GetSourceDepthSRV();
+	}
+	if (!srcSRV)
+		return false;
+
+	// Converts the cull's nominal-pixel projPx into texels, derived from the extent resolved above so
+	// the two cannot disagree. One scalar covers both axes, so the axis that shrank least wins: too
+	// small a radius picks a level whose fixed 3x3 footprint misses part of the instance.
+	const float effX = (float)srcW / std::max(1.0f, (float)screenSize.x);
+	const float effY = (float)srcH / std::max(1.0f, (float)screenSize.y);
+	texelPixels = kDownsampleFactor / std::clamp(std::max(effX, effY), 0.01f, 1.0f);
 
 	// Sized from the nominal extent so a shifting dynamic-resolution ratio never reallocates, then padded to SPD's tile granularity so every allocated level halves exactly. An odd level would drop its last row, underestimate the max, and cull visible grass.
 	const auto padToTile = [](uint32_t v) { return (v + tileSize - 1) & ~(tileSize - 1); };
-	const uint32_t padW = padToTile(((uint32_t)screenW + kDownsampleFactor - 1) / kDownsampleFactor);
-	const uint32_t padH = padToTile(((uint32_t)screenH + kDownsampleFactor - 1) / kDownsampleFactor);
+	const uint32_t padW = padToTile(((uint32_t)screenSize.x + kDownsampleFactor - 1) / kDownsampleFactor);
+	const uint32_t padH = padToTile(((uint32_t)screenSize.y + kDownsampleFactor - 1) / kDownsampleFactor);
 
 	if ((padW != paddedWidth || padH != paddedHeight) && !CreateTexture(device, padW, padH))
 		return false;
@@ -170,6 +186,14 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	ID3D11ShaderResourceView* nullSRV = nullptr;
 
 	globals::profiler->BeginPass("GrassOptimizations::HiZBase");
+	// Unbind kMAIN for the dispatch, so its use solely as an SRV, since a resource cannot be bound as both a DSV and an SRV at the same time.
+	ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+	ID3D11DepthStencilView* dsv = nullptr;
+	if (usingLiveDepth) {
+		ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+		ctx->OMSetRenderTargets(0, nullptr, nullptr);
+	}
+
 	ID3D11Buffer* cb = paramsCB->CB();
 	ID3D11UnorderedAccessView* baseUAV = mipUAVs[0].get();
 	ctx->CSSetShader(baseCS, nullptr, 0);
@@ -179,6 +203,16 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	ctx->Dispatch((padW + 7) / 8, (padH + 7) / 8, 1);
 	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
 	ctx->CSSetShaderResources(0, 1, &nullSRV);
+
+	if (usingLiveDepth) {
+		ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
+		for (auto* rtv : rtvs) {
+			if (rtv)
+				rtv->Release();
+		}
+		if (dsv)
+			dsv->Release();
+	}
 	globals::profiler->EndPass();
 
 	// Each level is the exact max of the one above, so an instance of any on-screen size is testable against a fixed number of texels.
@@ -207,11 +241,18 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 		globals::profiler->EndPass();
 	}
 
-	static bool logged = false;
-	if (!logged) {
-		logged = true;
-		logger::info("[GRASS OPTIMIZATIONS] HiZ occlusion cull active: {}x{} tiles (1/{} res) in a {}x{} texture, {} mips, source=POST_ZPREPASS_COPY (R24_UNORM)",
-			validW, validH, kDownsampleFactor, padW, padH, GetMipCount());
+	// The first build runs before Upscaling, so update the log after so accurate values are logged. The log key is the build's parameters, so it only logs when they change.
+	const std::array<uint32_t, 10> logKey{ validW, validH, padW, padH, GetMipCount(), srcW, srcH,
+		(uint32_t)screenSize.x, (uint32_t)screenSize.y, usingLiveDepth ? 1u : 0u };
+	if (logKey != lastLogKey) {
+		lastLogKey = logKey;
+		const auto& rt = globals::game::graphicsState->GetRuntimeData();
+		logger::info("[GRASS OPTIMIZATIONS] HiZ occlusion cull active: {}x{} tiles (1/{} res) in a {}x{} texture, {} mips, source={}; screen {}x{}, depth extent {}x{}, dynRes ratio {:.3f}x{:.3f} lock={}, upscale scale {:.3f}x{:.3f}",
+			validW, validH, kDownsampleFactor, padW, padH, GetMipCount(),
+			usingLiveDepth ? "LIVE kMAIN copy" : "POST_ZPREPASS_COPY (stale fallback)",
+			(uint32_t)screenSize.x, (uint32_t)screenSize.y, srcW, srcH,
+			rt.dynamicResolutionWidthRatio, rt.dynamicResolutionHeightRatio, (int)rt.dynamicResolutionLock,
+			globals::features::upscaling.resolutionScale.x, globals::features::upscaling.resolutionScale.y);
 	}
 
 	valid = true;
