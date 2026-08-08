@@ -36,6 +36,7 @@ public:
 		float FullDetailPixelSize = 16.0f;
 		float MinDensity = 0.03f;
 		float MeshCostBias = 0.4f;
+		float CostBiasStartDistance = 6000.0f;
 		float InvisibleFadeCull = 0.0f;
 		float RenderDistanceOverride = 0.0f;
 		float EdgeFadeStart = 0.85f;
@@ -184,9 +185,6 @@ public:
 	float vanillaMaxDistance = 0.0f;
 	float maxGrassDistance = 0.0f;
 	float maxDistSq = 0.0f;
-
-	// Mesh Cost Bias is inert nearer than this, so complex grass is not thinned right in front of the player.
-	static constexpr float kCostBiasStartDistance = 6000.0f;
 
 	struct Hooks
 	{

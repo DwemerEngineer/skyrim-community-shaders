@@ -48,7 +48,7 @@ cbuffer CullBucket : register(b1)
     float MinPixelScale;
     float IsComplex;
     float LODEnabled;
-    // Window into SliceTable: the dispatch covers only these slices' combined instance count.
+    // The dispatch covers only these slices' combined instance count.
     uint SliceTableOffset;
     uint SliceCount;
     float2 _pad2;
@@ -162,12 +162,24 @@ float WindScalar(float basis, float timer)
 
     if (HiZEnabled > 0.5)
     {
-        const float4 clipC = mul(FrameBuffer::CameraViewProj, float4(dv, 1.0));
+        // ModelRadius bounds about BoundCenter, not the instance root, so the sphere has to be there to be accurately occluded.
+        const float3 rot0 = float3(f16tof32(raw0.z & 0xFFFF), f16tof32(raw0.z >> 16), f16tof32(raw0.w & 0xFFFF));
+        const float3 rot1 = float3(f16tof32(raw1.x & 0xFFFF), f16tof32(raw1.x >> 16), f16tof32(raw1.y & 0xFFFF));
+        const float3 rot2 = float3(f16tof32(raw1.z & 0xFFFF), f16tof32(raw0.w >> 16), f16tof32(raw1.y >> 16));
+
+        const float3 msCentre = BoundCenter * (1.0 + max(sizeVariance, 0.0));
+        const float3 dvC = dv + float3(dot(rot0, msCentre), dot(rot1, msCentre), dot(rot2, msCentre));
+
+        const float occRadius = instanceRadius + length(BoundCenter) * abs(sizeVariance);
+        const float distC = max(length(dvC), 1e-4);
+        const float projPxOcc = (occRadius / distC) * ProjScale;
+
+        const float4 clipC = mul(FrameBuffer::CameraViewProj, float4(dvC, 1.0));
         if (clipC.w > 0.0)
         {
             const float2 uv = (clipC.xy / clipC.w) * float2(0.5, -0.5) + 0.5;
             const float2 tc = uv * HiZSize;
-            const float rT = projPx / HiZTexelPixels;  // instance radius expressed in level-0 texels
+            const float rT = projPxOcc / HiZTexelPixels;  // occlusion radius expressed in level-0 texels
 
             // The level where the instance spans ~2 texels, so the 3x3 below covers it exactly. 
             const float wantLevel = ceil(log2(max(2.0 * rT, 1.0)));
@@ -179,14 +191,14 @@ float WindScalar(float basis, float timer)
             const float scale = exp2((float)level);
             const float2 tcL = tc / scale;
             const float rTL = rT / scale;
-            const int2 dimL = max(int2(HiZSize / scale), int2(1, 1));
+            const int2 dimL = max(int2(ceil(HiZSize / scale)), int2(1, 1));
 
             const int2 t0 = int2(floor(tcL - rTL));
             const int2 t1 = int2(floor(tcL + rTL));
 
             // An instance hides only once even its nearest point is behind the occluder. A camera inside
-            // the sphere collapses dv, putting nearZ below any tile depth so the test never fires.
-            const float3 dvNear = dv * (max(dist - instanceRadius, 0.0) / max(dist, 1e-4));
+            // the sphere collapses dvC, putting nearZ below any tile depth so the test never fires.
+            const float3 dvNear = dvC * (max(distC - occRadius, 0.0) / distC);
             const float4 clipN = mul(FrameBuffer::CameraViewProj, float4(dvNear, 1.0));
             const float nearZ = clipN.z / max(clipN.w, 1e-4);
 

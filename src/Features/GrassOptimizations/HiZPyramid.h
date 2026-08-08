@@ -48,10 +48,19 @@ private:
 	/** @brief Returns the SRV of the depth copy that is current at grass draw time. */
 	static ID3D11ShaderResourceView* GetSourceDepthSRV();
 
+	/**
+	 * @brief Returns the SRV of the live main depth, which holds this frame's opaque geometry.
+	 * @return The SRV, or nullptr when it is unavailable and the caller should fall back.
+	 */
+	static ID3D11ShaderResourceView* GetLiveDepthSRV();
+
 	/** @brief (Re)creates the pyramid texture and its per-mip views for a new size. */
 	bool CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dstH);
 
 	std::unique_ptr<Texture2D> texture;
+	// False when the live target was unavailable and the base pass fell back to the stale prepass copy.
+	bool usingLiveDepth = false;
+	std::array<uint32_t, 10> lastLogKey{};
 	std::vector<winrt::com_ptr<ID3D11UnorderedAccessView>> mipUAVs;
 	std::unique_ptr<ConstantBuffer> paramsCB;
 

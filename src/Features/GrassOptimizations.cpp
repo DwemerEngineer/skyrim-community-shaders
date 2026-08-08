@@ -10,6 +10,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	FullDetailPixelSize,
 	MinDensity,
 	MeshCostBias,
+	CostBiasStartDistance,
 	InvisibleFadeCull,
 	RenderDistanceOverride,
 	EdgeFadeStart,
@@ -61,7 +62,17 @@ void GrassOptimizations::DrawSettings()
 	Util::PercentageSlider(T(TKEY("mesh_cost_bias"), "Mesh Cost Bias"), &settings.MeshCostBias);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("mesh_cost_bias_tooltip"),
-							  "Culls or removes grass meshes based on their complexity (performance impact). At 0, removal is identical between all grass types regardless of complexity. At 1, heavier and more complex meshes are culled 2-6x sooner than simple ones. Only applies beyond 6000 units, so nearby grass is never thinned."));
+							  "Culls or removes grass meshes based on their complexity (performance impact). At 0, removal is identical between all grass types regardless of complexity. At 1, heavier and more complex meshes are culled 2-6x sooner than simple ones. Only applies beyond the Cost Bias Start Distance, so nearby grass is never thinned."));
+	}
+
+	ImGui::SliderFloat(T(TKEY("cost_bias_start_distance"), "Cost Bias Start Distance"), &settings.CostBiasStartDistance, 0.0f, 20000.0f, "%.0f");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		std::vector<std::string> tooltipLines = {
+			T(TKEY("cost_bias_start_distance_tooltip"),
+				"Distance at which Mesh Cost Bias starts taking effect, ramping to full over the same distance again. Nearer than this, all grass types are treated identically no matter how complex. Zero applies the bias everywhere, including right in front of the player."),
+			Util::Units::FormatDistance(settings.CostBiasStartDistance)
+		};
+		Util::DrawMultiLineTooltip(tooltipLines);
 	}
 
 	ImGui::SliderFloat(T(TKEY("render_distance_override"), "Grass Render Distance"), &settings.RenderDistanceOverride, 0.0f, 100000.0f, "%.0f");
@@ -92,7 +103,7 @@ void GrassOptimizations::DrawSettings()
 							  "Skips grass hidden behind rocks, buildings and NPCs. Depending on how much grass is not visible, this may cost more than its benefits. If you see grass flickering when moving, try disabling this. Terrain such as hills is not treated as an occluder when Terrain Blending is enabled, which reduces the benefit."));
 	}
 
-	ImGui::SliderFloat(T(TKEY("occlusion_bias"), "Occlusion Bias"), &settings.OcclusionBias, 0.0f, 0.01f, "%.4f");
+	ImGui::SliderFloat(T(TKEY("occlusion_bias"), "Occlusion Bias"), &settings.OcclusionBias, 0.0f, 0.05f, "%.4f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("occlusion_bias_tooltip"),
 							  "How far behind an occluder grass must sit before Occlusion Culling removes it. Raise this if grass disappears around the edges of rocks and hills, lower it to reclaim more performance. Has no effect unless Occlusion Culling is enabled."));
@@ -307,7 +318,7 @@ void GrassOptimizations::UpdateGrass()
 		cp.hiZTexelPixels = hiZ.GetTexelPixels();
 		cp.hiZMipCount = (float)hiZ.GetMipCount();
 		cp.occlusionBias = std::max(0.0f, settings.OcclusionBias);
-		cp.costBiasStartDist = kCostBiasStartDistance;
+		cp.costBiasStartDist = std::max(0.0f, settings.CostBiasStartDistance);
 
 		cullParamsCB->Update(cp);
 	}
