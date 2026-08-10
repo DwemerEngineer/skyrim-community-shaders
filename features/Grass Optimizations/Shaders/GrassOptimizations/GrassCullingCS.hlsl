@@ -272,7 +272,8 @@ float WindScalar(float basis, float timer)
         LODCompacted.Store4(slot * 32, raw0);
         LODCompacted.Store4(slot * 32 + 16, raw1);
         LODExtras[slot * 2 + 0] = e0;
-        LODExtras[slot * 2 + 1] = e1;
+        // 4.0 marks the LOD bin, so the pixel shader can apply the separate LOD brightness.
+        LODExtras[slot * 2 + 1] = float4(e1.xyz, e1.w + 4.0);
     }
     else
     {

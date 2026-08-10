@@ -1,5 +1,6 @@
 #include "GrassLighting.h"
 
+#include "GrassOptimizations.h"
 #include "I18n/I18n.h"
 
 #define I18N_KEY_PREFIX "feature.grass_lighting."
@@ -11,7 +12,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SubsurfaceScatteringAmount,
 	OverrideComplexGrassSettings,
 	BasicGrassBrightness,
-	ComplexGrassThreshold)
+	ComplexGrassThreshold,
+	LODBrightness)
 
 void GrassLighting::DrawSettings()
 {
@@ -71,6 +73,18 @@ void GrassLighting::DrawSettings()
 		ImGui::SliderFloat(T(TKEY("brightness"), "Brightness"), &settings.BasicGrassBrightness, 0.0f, 1.0f);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("%s", T(TKEY("brightness_tooltip"), "Darkens the grass textures to look better with the new lighting"));
+		}
+
+		if (globals::features::grassOptimizations.loaded) {
+			ImGui::Spacing();
+			ImGui::TextWrapped("%s", T(TKEY("lod_grass"), "LOD Grass"));
+			ImGui::PushID("lod");
+			ImGui::SliderFloat(T(TKEY("lod_brightness"), "Brightness"), &settings.LODBrightness, 0.0f, 2.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("%s", T(TKEY("lod_brightness_tooltip"),
+									  "Raise or lower until distant grass matches the grass around it. Requires Grass Optimizations with Mesh LOD enabled."));
+			}
+			ImGui::PopID();
 		}
 
 		ImGui::TreePop();
