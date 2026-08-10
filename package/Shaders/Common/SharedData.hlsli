@@ -44,7 +44,9 @@ namespace SharedData
 
 		float BasicGrassBrightness;
 		float ComplexGrassThreshold;
-		float2 pad0;
+		// Only read by the GRASS_OPTIMIZATIONS permutation, for grass drawn with the LOD mesh.
+		float LODBrightness;
+		float pad0;
 	};
 
 	struct CPMSettings

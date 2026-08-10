@@ -49,6 +49,7 @@ struct VS_OUTPUT
 #	if !defined(RENDER_DEPTH)
 	// Only gates pixel shader work, so the depth pass has no use for it.
 	nointerpolation float IsFar: TEXCOORD9;
+	nointerpolation float IsLod: TEXCOORD10;
 #	endif
 #	endif
 };
@@ -70,6 +71,7 @@ struct VS_OUTPUT
 	nointerpolation float IsComplex: TEXCOORD8;
 #	if !defined(RENDER_DEPTH)
 	nointerpolation float IsFar: TEXCOORD9;
+	nointerpolation float IsLod: TEXCOORD10;
 #	endif
 #	endif
 };
@@ -174,11 +176,14 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
 	vsout.IsComplex = e0.w;
 
-	// e1.w packs 2.0 = far and 1.0 = in collision range. Unpack before testing, or a far instance out of collision range reads as colliding.
-	const float isFarFlag = (e1.w >= 2.0) ? 1.0 : 0.0;
-	const float collisionFlag = e1.w - 2.0 * isFarFlag;
+	// e1.w packs 4.0 = LOD bin, 2.0 = far and 1.0 = in collision range. Unpack before testing, or a far instance out of collision range reads as colliding.
+	const float isLodFlag = (e1.w >= 4.0) ? 1.0 : 0.0;
+	const float packedFlags = e1.w - 4.0 * isLodFlag;
+	const float isFarFlag = (packedFlags >= 2.0) ? 1.0 : 0.0;
+	const float collisionFlag = packedFlags - 2.0 * isFarFlag;
 #			if !defined(RENDER_DEPTH)
 	vsout.IsFar = isFarFlag;
+	vsout.IsLod = isLodFlag;
 #			endif
 #		endif
 
@@ -295,10 +300,13 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.IsComplex = e0.w;
 
 	// e1.w packs the flags, as above.
-	const float isFarFlag = (e1.w >= 2.0) ? 1.0 : 0.0;
-	const float collisionFlag = e1.w - 2.0 * isFarFlag;
+	const float isLodFlag = (e1.w >= 4.0) ? 1.0 : 0.0;
+	const float packedFlags = e1.w - 4.0 * isLodFlag;
+	const float isFarFlag = (packedFlags >= 2.0) ? 1.0 : 0.0;
+	const float collisionFlag = packedFlags - 2.0 * isFarFlag;
 #			if !defined(RENDER_DEPTH)
 	vsout.IsFar = isFarFlag;
+	vsout.IsLod = isLodFlag;
 #			endif
 #		endif
 
@@ -586,6 +594,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (!complex || SharedData::grassLightingSettings.OverrideComplexGrassSettings)
 		baseColor.xyz *= SharedData::grassLightingSettings.BasicGrassBrightness;
 
+#			ifdef GRASS_OPTIMIZATIONS
+	baseColor.xyz *= lerp(1.0, SharedData::grassLightingSettings.LODBrightness, input.IsLod);
+#			endif
+
 	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
 	float3 dirLightColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
 	float3 dirLightColorMultiplier = 1;
@@ -782,6 +794,10 @@ PS_OUTPUT main(PS_INPUT input)
 	psout.PS.w = diffuseAlpha;
 #		else
 	float4 baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
+
+#			ifdef GRASS_OPTIMIZATIONS
+	baseColor.xyz *= lerp(1.0, SharedData::grassLightingSettings.LODBrightness, input.IsLod);
+#			endif
 
 	if (SharedData::lodBlendingSettings.DisableTerrainVertexColors)
 		input.Color.xyz = 1;
