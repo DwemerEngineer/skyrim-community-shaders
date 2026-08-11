@@ -19,7 +19,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SimpleShadingPixelSize,
 	CollisionDistance,
 	EnableMeshLOD,
-	MeshLODPixelSize,
+	EnableMidLOD,
+	MidLODPixelSize,
+	EnableFarLOD,
+	FarLODPixelSize,
 	MeshLODBandPixels)
 
 void GrassOptimizations::LoadSettings(json& o_json)
@@ -125,25 +128,47 @@ void GrassOptimizations::DrawSettings()
 		Util::DrawMultiLineTooltip(tooltipLines);
 	}
 
-	ImGui::SeparatorText(T(TKEY("mesh_lod"), "Mesh LOD (experimental)"));
+	ImGui::SeparatorText(T(TKEY("mesh_lod"), "Mesh LOD"));
 
 	ImGui::Checkbox(T(TKEY("enable_mesh_lod"), "Enable Mesh LOD"), &settings.EnableMeshLOD);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("enable_mesh_lod_tooltip"),
-							  "Improves performance by swapping distant grass instances for a simpler LOD mesh. Requires LOD .nif per grass type at meshes\\LOD\\Grass\\<source-mesh-name>_LOD.nif. Grass with no LOD mesh keeps its full mesh."));
+							  "Improves performance by swapping distant grass instances for a simpler LOD mesh, in two bands. Requires an LOD .nif per grass type at meshes\\LOD\\Grass\\<source-mesh-name>_LOD0.nif, plus an optional _LOD1.nif for the far band. Grass with no LOD mesh keeps its full mesh."));
 	}
 
-	ImGui::SliderFloat(T(TKEY("mesh_lod_pixel_size"), "Mesh LOD Pixel Size"), &settings.MeshLODPixelSize, 1.0f, 64.0f, "%.1f px");
+	ImGui::BeginDisabled(!settings.EnableMeshLOD);
+
+	ImGui::Checkbox(T(TKEY("enable_mid_lod"), "Enable Middle LOD"), &settings.EnableMidLOD);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("%s", T(TKEY("mesh_lod_pixel_size_tooltip"),
-							  "Instances whose on-screen radius is below this but above Min Pixel Size swap to the LOD mesh."));
+		ImGui::Text("%s", T(TKEY("enable_mid_lod_tooltip"),
+							  "Swaps mid-distance grass to the _LOD0.nif mesh. With this off, grass stays on its full mesh until the far band takes over."));
+	}
+
+	ImGui::SliderFloat(T(TKEY("mid_lod_pixel_size"), "Middle LOD Pixel Size"), &settings.MidLODPixelSize, 1.0f, 64.0f, "%.1f px");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T(TKEY("mid_lod_pixel_size_tooltip"),
+							  "Instances whose on-screen radius is below this but above the Far LOD Pixel Size swap to the _LOD0.nif mesh."));
+	}
+
+	ImGui::Checkbox(T(TKEY("enable_far_lod"), "Enable Far LOD"), &settings.EnableFarLOD);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T(TKEY("enable_far_lod_tooltip"),
+							  "Swaps the most distant grass to the _LOD1.nif mesh. Grass types without that file reuse their _LOD0.nif, so the far band still gets its own brightness."));
+	}
+
+	ImGui::SliderFloat(T(TKEY("far_lod_pixel_size"), "Far LOD Pixel Size"), &settings.FarLODPixelSize, 1.0f, 64.0f, "%.1f px");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T(TKEY("far_lod_pixel_size_tooltip"),
+							  "Instances whose on-screen radius is below this but above Min Pixel Size swap to the _LOD1.nif mesh. Values above the Middle LOD Pixel Size are clamped to it, since the far band is always the more distant of the two."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("mesh_lod_band"), "Mesh LOD Transition Band"), &settings.MeshLODBandPixels, 0.0f, 16.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("mesh_lod_band_tooltip"),
-							  "The range of on-screen sizes over which a random amount of regular meshes are swapped out before completely transitioning to LOD. A wider range results in a smoother transition."));
+							  "The range of on-screen sizes over which a random amount of meshes are swapped out before completely transitioning to the next LOD. Applies to both transitions. A wider range results in a smoother transition."));
 	}
+
+	ImGui::EndDisabled();
 }
 
 void GrassOptimizations::PostPostLoad()
@@ -251,7 +276,7 @@ void GrassOptimizations::UpdateGrass()
 	maxGrassDistance = settings.RenderDistanceOverride > 0.0f ? settings.RenderDistanceOverride : vanillaMaxDistance;
 	maxDistSq = maxGrassDistance * maxGrassDistance;
 
-	bucketStore.BeginFrame({ settings.EnableMeshLOD, timeAccum });
+	bucketStore.BeginFrame({ settings.EnableMeshLOD, settings.EnableMidLOD, settings.EnableFarLOD, timeAccum });
 
 	globals::profiler->BeginPass("GrassOptimizations::ApplyPending");
 	bucketStore.RefreshComplexGrass(globals::features::grassLighting.settings.ComplexGrassThreshold, ctx);
@@ -308,7 +333,8 @@ void GrassOptimizations::UpdateGrass()
 		cp.invisibleFadeCull = settings.InvisibleFadeCull;
 		cp.simpleShadingPixelSize = std::max(0.0f, settings.SimpleShadingPixelSize);
 		cp.collisionDistSq = collisionDist * collisionDist;
-		cp.meshLODPixelSize = settings.MeshLODPixelSize;
+		cp.midLODPixelSize = settings.MidLODPixelSize;
+		cp.farLODPixelSize = settings.EnableMidLOD ? std::min(settings.FarLODPixelSize, settings.MidLODPixelSize) : settings.FarLODPixelSize;
 
 		cp.meshLODBandPx = std::max(0.0f, settings.MeshLODBandPixels);
 		cp.hiZEnabled = hiZ.IsValid() ? 1.0f : 0.0f;
@@ -341,7 +367,8 @@ void GrassOptimizations::UpdateGrass()
 		if (!b.cullVisible)
 			continue;
 
-		b.lodActive = bucketStore.EnsureLODBin(b, device);
+		for (uint32_t tier = 0; tier < (uint32_t)GrassMeshLibrary::LODTier::kCount; ++tier)
+			b.lodBins[tier].active = bucketStore.EnsureLODBin(b, (GrassMeshLibrary::LODTier)tier, device);
 		++visibleBuckets;
 	}
 	globals::profiler->EndPass();
@@ -406,7 +433,8 @@ void GrassOptimizations::CullBucketSlices(GrassBucket& b, const FrustumSoA& frus
 	b.sliceTableCount = 0;
 	b.visibleInstances = 0;
 	b.cullVisible = false;
-	b.lodActive = false;
+	for (GrassBucket::LODBin& bin : b.lodBins)
+		bin.active = false;
 
 	if (b.sliceBounds.size() != b.slices.size())
 		return;
@@ -468,7 +496,8 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 				cb->distScale = b.distScale;
 				cb->minPixelScale = b.minPixelScale;
 				cb->isComplex = b.isComplex ? 1.0f : 0.0f;
-				cb->lodEnabled = b.lodActive ? 1.0f : 0.0f;
+				cb->midLODEnabled = b.lodBins[(size_t)GrassMeshLibrary::LODTier::kMiddle].active ? 1.0f : 0.0f;
+				cb->farLODEnabled = b.lodBins[(size_t)GrassMeshLibrary::LODTier::kFar].active ? 1.0f : 0.0f;
 				++slot;
 			}
 			ctx->Unmap(cullBucketCB->CB(), 0);
@@ -539,8 +568,8 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 		if (b.cullVisible)
 			CullBucket(b, ctx);
 
-	ID3D11UnorderedAccessView* nullUAVs[7] = {};
-	ctx->CSSetUnorderedAccessViews(0, 7, nullUAVs, nullptr);
+	ID3D11UnorderedAccessView* nullUAVs[3 + 3 * (size_t)GrassMeshLibrary::LODTier::kCount] = {};
+	ctx->CSSetUnorderedAccessViews(0, (UINT)std::size(nullUAVs), nullUAVs, nullptr);
 	ID3D11ShaderResourceView* nullSRVs[4] = {};
 	ctx->CSSetShaderResources(0, 4, nullSRVs);
 	ctx->CSSetShader(nullptr, nullptr, 0);
@@ -650,16 +679,18 @@ void GrassOptimizations::CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
 	// Clearing the args view allows the instance count to be directly reset to zero for the draw.
 	const UINT zeros[4] = { 0, 0, 0, 0 };
 	ctx->ClearUnorderedAccessViewUint(b.argsUAV, zeros);
-	if (b.lodActive)
-		ctx->ClearUnorderedAccessViewUint(b.lodArgsUAV, zeros);
 
-	ID3D11UnorderedAccessView* uavs[6] = {
-		b.compactedUAV, b.extrasUAV, b.argsUAV,
-		b.lodActive ? b.lodCompactedUAV : nullptr,
-		b.lodActive ? b.lodExtrasUAV : nullptr,
-		b.lodActive ? b.lodArgsUAV : nullptr
-	};
-	ctx->CSSetUnorderedAccessViews(0, 6, uavs, nullptr);
+	// The main bin then one triple per LOD tier, matching u0-u8 in GrassCullingCS.
+	ID3D11UnorderedAccessView* uavs[3 + 3 * (size_t)GrassMeshLibrary::LODTier::kCount] = { b.compactedUAV, b.extrasUAV, b.argsUAV };
+	for (size_t tier = 0; tier < (size_t)GrassMeshLibrary::LODTier::kCount; ++tier) {
+		const GrassBucket::LODBin& bin = b.lodBins[tier];
+		if (bin.active)
+			ctx->ClearUnorderedAccessViewUint(bin.argsUAV, zeros);
+		uavs[3 + tier * 3 + 0] = bin.active ? bin.compactedUAV : nullptr;
+		uavs[3 + tier * 3 + 1] = bin.active ? bin.extrasUAV : nullptr;
+		uavs[3 + tier * 3 + 2] = bin.active ? bin.argsUAV : nullptr;
+	}
+	ctx->CSSetUnorderedAccessViews(0, (UINT)std::size(uavs), uavs, nullptr);
 
 	ID3D11ShaderResourceView* sliceTableSRV = sliceTable ? sliceTable->srv.get() : nullptr;
 	ID3D11ShaderResourceView* srvs[4] = { b.instanceSRV, b.originSRV,
@@ -942,36 +973,39 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	ctx->VSSetShaderResources(2, 1, &b->extrasSRV);
 	ctx->DrawIndexedInstancedIndirect(b->argsBuf, argsByteOffset);
 
-	if (!b->lodActive)
-		return;
+	for (uint32_t tier = 0; tier < (uint32_t)GrassMeshLibrary::LODTier::kCount; ++tier) {
+		GrassBucket::LODBin& bin = b->lodBins[tier];
+		if (!bin.active)
+			continue;
 
-	const GrassMeshLibrary::LODMesh* lod = nullptr;
-	{
-		std::scoped_lock lk(self.bucketStore.bucketMutex);
-		lod = self.bucketStore.meshLibrary.GetLODMesh(b->meshId);
+		const GrassMeshLibrary::LODMesh* lod = nullptr;
+		{
+			std::scoped_lock lk(self.bucketStore.bucketMutex);
+			lod = self.bucketStore.meshLibrary.GetLODMesh(b->meshId, (GrassMeshLibrary::LODTier)tier);
+		}
+
+		if (!lod || !lod->vertexBuffer || !lod->indexBuffer)
+			continue;
+
+		if (!bin.argsIndexCountWritten) {
+			const D3D11_BOX argBox{ argsByteOffset, 0, 0, argsByteOffset + sizeof(uint32_t), 1, 1 };
+			ctx->UpdateSubresource(bin.argsBuf, 0, &argBox, &lod->indexCount, 0, 0);
+			bin.argsIndexCountWritten = true;
+		}
+
+		if (shadowState.vertexDesc != lod->descVal) {
+			shadowState.vertexDesc = lod->descVal;
+			shadowState.stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_VERTEX_DESC);
+			SetDirtyStates(0);
+		}
+
+		ctx->IASetIndexBuffer(lod->indexBuffer, DXGI_FORMAT_R16_UINT, 0);
+
+		vbs[0] = lod->vertexBuffer;
+		vbs[1] = bin.compactedBuf;
+		strides[0] = lod->meshStride;
+		ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
+		ctx->VSSetShaderResources(2, 1, &bin.extrasSRV);
+		ctx->DrawIndexedInstancedIndirect(bin.argsBuf, argsByteOffset);
 	}
-
-	if (!lod || !lod->vertexBuffer || !lod->indexBuffer)
-		return;
-
-	if (!b->lodArgsIndexCountWritten) {
-		const D3D11_BOX argBox{ argsByteOffset, 0, 0, argsByteOffset + sizeof(uint32_t), 1, 1 };
-		ctx->UpdateSubresource(b->lodArgsBuf, 0, &argBox, &lod->indexCount, 0, 0);
-		b->lodArgsIndexCountWritten = true;
-	}
-
-	if (shadowState.vertexDesc != lod->descVal) {
-		shadowState.vertexDesc = lod->descVal;
-		shadowState.stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_VERTEX_DESC);
-		SetDirtyStates(0);
-	}
-
-	ctx->IASetIndexBuffer(lod->indexBuffer, DXGI_FORMAT_R16_UINT, 0);
-
-	vbs[0] = lod->vertexBuffer;
-	vbs[1] = b->lodCompactedBuf;
-	strides[0] = lod->meshStride;
-	ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
-	ctx->VSSetShaderResources(2, 1, &b->lodExtrasSRV);
-	ctx->DrawIndexedInstancedIndirect(b->lodArgsBuf, argsByteOffset);
 }

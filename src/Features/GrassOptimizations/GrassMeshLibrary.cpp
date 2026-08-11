@@ -65,7 +65,7 @@ uint32_t GrassMeshLibrary::ResolveMeshId(RE::BSMultiStreamInstanceTriShape* shap
 	return meshId;
 }
 
-void GrassMeshLibrary::EnsureLODMesh(uint32_t meshId)
+void GrassMeshLibrary::EnsureLODMeshes(uint32_t meshId)
 {
 	if (meshId == 0 || meshId > stems.size())
 		return;
@@ -73,12 +73,17 @@ void GrassMeshLibrary::EnsureLODMesh(uint32_t meshId)
 	if (lodMeshes.size() < stems.size())
 		lodMeshes.resize(stems.size());
 
-	LODMesh& entry = lodMeshes[meshId - 1];
+	for (uint32_t tier = 0; tier < (uint32_t)LODTier::kCount; ++tier)
+		LoadLODMesh(lodMeshes[meshId - 1][tier], stems[meshId - 1], (LODTier)tier);
+}
+
+void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODTier tier)
+{
 	if (entry.attemptedLoad)
 		return;
 	entry.attemptedLoad = true;
 
-	const std::string modelPath = "LOD\\Grass\\" + stems[meshId - 1] + "_LOD.nif";
+	const std::string modelPath = "LOD\\Grass\\" + stem + (tier == LODTier::kFar ? "_LOD1.nif" : "_LOD0.nif");
 
 	RE::BSModelDB::DBTraits::ArgsType args{};
 	args.unk8 = false;
@@ -114,13 +119,17 @@ void GrassMeshLibrary::EnsureLODMesh(uint32_t meshId)
 	// If the file absent, that grass type keeps its full mesh.
 }
 
-const GrassMeshLibrary::LODMesh* GrassMeshLibrary::GetLODMesh(uint32_t meshId) const
+const GrassMeshLibrary::LODMesh* GrassMeshLibrary::GetLODMesh(uint32_t meshId, LODTier tier) const
 {
 	if (meshId == 0 || meshId > lodMeshes.size())
 		return nullptr;
 
-	const LODMesh& entry = lodMeshes[meshId - 1];
-	return entry.valid ? &entry : nullptr;
+	const auto& entries = lodMeshes[meshId - 1];
+	if (entries[(size_t)tier].valid)
+		return &entries[(size_t)tier];
+
+	const LODMesh& middle = entries[(size_t)LODTier::kMiddle];
+	return (tier == LODTier::kFar && middle.valid) ? &middle : nullptr;
 }
 
 void GrassMeshLibrary::ForgetShape(RE::BSMultiStreamInstanceTriShape* shape)

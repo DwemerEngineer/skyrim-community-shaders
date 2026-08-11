@@ -82,17 +82,39 @@ struct GrassBucket
 	// Windows onto args[1] alone, so the cull CS adds survivors straight into the indirect args.
 	ID3D11UnorderedAccessView* argsUAV = nullptr;
 
-	// Second bin for LOD instances, allocated only when an LOD .nif loaded. When null all instances are drawn in the main bin.
-	ID3D11Buffer* lodCompactedBuf = nullptr;
-	ID3D11UnorderedAccessView* lodCompactedUAV = nullptr;
-	ID3D11Buffer* lodExtrasBuf = nullptr;
-	ID3D11UnorderedAccessView* lodExtrasUAV = nullptr;
-	ID3D11ShaderResourceView* lodExtrasSRV = nullptr;
-	ID3D11Buffer* lodArgsBuf = nullptr;
-	ID3D11UnorderedAccessView* lodArgsUAV = nullptr;
-	bool lodArgsIndexCountWritten = false;
-	uint32_t lodCapacityInstances = 0;
-	bool lodActive = false;
+	/** @brief A compaction bin and indirect draw for one LOD tier, allocated only when that tier's mesh loaded. */
+	struct LODBin
+	{
+		ID3D11Buffer* compactedBuf = nullptr;
+		ID3D11UnorderedAccessView* compactedUAV = nullptr;
+		ID3D11Buffer* extrasBuf = nullptr;
+		ID3D11UnorderedAccessView* extrasUAV = nullptr;
+		ID3D11ShaderResourceView* extrasSRV = nullptr;
+		ID3D11Buffer* argsBuf = nullptr;
+		ID3D11UnorderedAccessView* argsUAV = nullptr;
+		bool argsIndexCountWritten = false;
+		uint32_t capacityInstances = 0;
+		bool active = false;
+
+		/** @brief Releases this bin's buffers and views. */
+		void Release()
+		{
+			auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
+			rel(compactedUAV);
+			rel(compactedBuf);
+			rel(extrasSRV);
+			rel(extrasUAV);
+			rel(extrasBuf);
+			rel(argsUAV);
+			rel(argsBuf);
+			capacityInstances = 0;
+			argsIndexCountWritten = false;
+			active = false;
+		}
+	};
+
+	// Indexed by GrassMeshLibrary::LODTier. Instances land in the main bin unless a tier claims them.
+	std::array<LODBin, (size_t)GrassMeshLibrary::LODTier::kCount> lodBins;
 
 	// Source mesh id, for easy lookup of the LOD mesh.
 	uint32_t meshId = 0;
@@ -180,25 +202,10 @@ struct GrassBucket
 		rel(extrasSRV);
 		rel(argsUAV);
 		rel(argsBuf);
-		ReleaseLODBin();
+		for (LODBin& bin : lodBins)
+			bin.Release();
 		capacityInstances = 0;
 		argsIndexCountWritten = false;
-	}
-
-	/** @brief Releases the LOD compaction bin's buffers and views. */
-	void ReleaseLODBin()
-	{
-		auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
-		rel(lodCompactedUAV);
-		rel(lodCompactedBuf);
-		rel(lodExtrasSRV);
-		rel(lodExtrasUAV);
-		rel(lodExtrasBuf);
-		rel(lodArgsUAV);
-		rel(lodArgsBuf);
-		lodCapacityInstances = 0;
-		lodArgsIndexCountWritten = false;
-		lodActive = false;
 	}
 
 	/** @brief Releases everything including instance data and slices. */
@@ -223,6 +230,8 @@ public:
 	struct FrameParams
 	{
 		bool enableMeshLOD = false;
+		bool enableMidLOD = false;
+		bool enableFarLOD = false;
 		float fadeStart = 0.0f;  // stamped on newly captured slices as their fade-in start
 	};
 
@@ -258,8 +267,8 @@ public:
 	/** @brief Recomputes a bucket's padded union AABB over all of its slices. */
 	void UpdateCoarseBounds(GrassBucket& b);
 
-	/** @brief Allocates/frees a bucket's LOD compaction bin. Returns true if the bin is successfully allocated. */
-	bool EnsureLODBin(GrassBucket& b, ID3D11Device* device);
+	/** @brief Allocates/frees one of a bucket's LOD compaction bins. Returns true if the bin is successfully allocated. */
+	bool EnsureLODBin(GrassBucket& b, GrassMeshLibrary::LODTier tier, ID3D11Device* device);
 
 	GrassMeshLibrary meshLibrary;
 

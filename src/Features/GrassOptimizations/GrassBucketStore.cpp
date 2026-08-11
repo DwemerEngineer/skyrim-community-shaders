@@ -213,7 +213,7 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures)
 			b.isComplex = DetectComplexGrass(pc.diffuseTexture, ctx);
 		}
 		if (frameParams.enableMeshLOD)
-			meshLibrary.EnsureLODMesh(meshId);
+			meshLibrary.EnsureLODMeshes(meshId);
 
 		BucketSlice s;
 		s.shape = pc.shape;
@@ -864,29 +864,34 @@ bool GrassBucketStore::DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11Device
 	return complex;
 }
 
-bool GrassBucketStore::EnsureLODBin(GrassBucket& b, ID3D11Device* device)
+bool GrassBucketStore::EnsureLODBin(GrassBucket& b, GrassMeshLibrary::LODTier tier, ID3D11Device* device)
 {
-	if (!frameParams.enableMeshLOD || b.meshId == 0) {
-		if (b.lodCapacityInstances)
-			b.ReleaseLODBin();
+	GrassBucket::LODBin& bin = b.lodBins[(size_t)tier];
+	const bool tierEnabled = (tier == GrassMeshLibrary::LODTier::kFar) ? frameParams.enableFarLOD : frameParams.enableMidLOD;
+
+	if (!frameParams.enableMeshLOD || !tierEnabled || b.meshId == 0) {
+		if (bin.capacityInstances)
+			bin.Release();
 		return false;
 	}
 
-	meshLibrary.EnsureLODMesh(b.meshId);
-	if (!meshLibrary.GetLODMesh(b.meshId)) {
-		if (b.lodCapacityInstances)
-			b.ReleaseLODBin();
+	meshLibrary.EnsureLODMeshes(b.meshId);
+	if (!meshLibrary.GetLODMesh(b.meshId, tier)) {
+		if (bin.capacityInstances)
+			bin.Release();
 		return false;
 	}
 
 	const uint32_t cap = b.capacityInstances;
 	if (!cap)
 		return false;
-	if (b.lodCapacityInstances >= cap && b.lodCompactedBuf)
+	if (bin.capacityInstances >= cap && bin.compactedBuf)
 		return true;
 
-	// Worst case every survivor takes the LOD mesh, so the bin is sized like the full-detail one.
-	b.ReleaseLODBin();
+	// Worst case every survivor takes this tier's mesh, so the bin is sized like the full-detail one.
+	bin.Release();
+
+	const char* tierName = (tier == GrassMeshLibrary::LODTier::kFar) ? "far" : "middle";
 
 	{
 		D3D11_BUFFER_DESC bd{};
@@ -894,12 +899,12 @@ bool GrassBucketStore::EnsureLODBin(GrassBucket& b, ID3D11Device* device)
 		bd.Usage = D3D11_USAGE_DEFAULT;
 		bd.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_UNORDERED_ACCESS;
 		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-		if (FAILED(device->CreateBuffer(&bd, nullptr, &b.lodCompactedBuf)) || !b.lodCompactedBuf) {
-			logger::error("[GRASS OPTIMIZATIONS] LOD compacted buffer create failed");
-			b.ReleaseLODBin();
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &bin.compactedBuf)) || !bin.compactedBuf) {
+			logger::error("[GRASS OPTIMIZATIONS] {} LOD compacted buffer create failed", tierName);
+			bin.Release();
 			return false;
 		}
-		Util::SetResourceName(b.lodCompactedBuf, "GrassOptimizations::LODCompactedBuf");
+		Util::SetResourceName(bin.compactedBuf, "GrassOptimizations::LODCompactedBuf");
 
 		D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
 		uav.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -907,9 +912,9 @@ bool GrassBucketStore::EnsureLODBin(GrassBucket& b, ID3D11Device* device)
 		uav.Buffer.FirstElement = 0;
 		uav.Buffer.NumElements = cap * 8;
 		uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
-		if (FAILED(device->CreateUnorderedAccessView(b.lodCompactedBuf, &uav, &b.lodCompactedUAV))) {
-			logger::error("[GRASS OPTIMIZATIONS] LOD compacted UAV create failed");
-			b.ReleaseLODBin();
+		if (FAILED(device->CreateUnorderedAccessView(bin.compactedBuf, &uav, &bin.compactedUAV))) {
+			logger::error("[GRASS OPTIMIZATIONS] {} LOD compacted UAV create failed", tierName);
+			bin.Release();
 			return false;
 		}
 	}
@@ -921,12 +926,12 @@ bool GrassBucketStore::EnsureLODBin(GrassBucket& b, ID3D11Device* device)
 		bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
 		bd.StructureByteStride = 4 * sizeof(float);
-		if (FAILED(device->CreateBuffer(&bd, nullptr, &b.lodExtrasBuf)) || !b.lodExtrasBuf) {
-			logger::error("[GRASS OPTIMIZATIONS] LOD extras buffer create failed");
-			b.ReleaseLODBin();
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &bin.extrasBuf)) || !bin.extrasBuf) {
+			logger::error("[GRASS OPTIMIZATIONS] {} LOD extras buffer create failed", tierName);
+			bin.Release();
 			return false;
 		}
-		Util::SetResourceName(b.lodExtrasBuf, "GrassOptimizations::LODExtrasBuf");
+		Util::SetResourceName(bin.extrasBuf, "GrassOptimizations::LODExtrasBuf");
 
 		D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
 		uav.Format = DXGI_FORMAT_UNKNOWN;
@@ -934,9 +939,9 @@ bool GrassBucketStore::EnsureLODBin(GrassBucket& b, ID3D11Device* device)
 		uav.Buffer.FirstElement = 0;
 		uav.Buffer.NumElements = cap * 2;
 		uav.Buffer.Flags = 0;
-		if (FAILED(device->CreateUnorderedAccessView(b.lodExtrasBuf, &uav, &b.lodExtrasUAV))) {
-			logger::error("[GRASS OPTIMIZATIONS] LOD extras UAV create failed");
-			b.ReleaseLODBin();
+		if (FAILED(device->CreateUnorderedAccessView(bin.extrasBuf, &uav, &bin.extrasUAV))) {
+			logger::error("[GRASS OPTIMIZATIONS] {} LOD extras UAV create failed", tierName);
+			bin.Release();
 			return false;
 		}
 
@@ -944,9 +949,9 @@ bool GrassBucketStore::EnsureLODBin(GrassBucket& b, ID3D11Device* device)
 		sv.Format = DXGI_FORMAT_UNKNOWN;
 		sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
 		sv.Buffer.NumElements = cap * 2;
-		if (FAILED(device->CreateShaderResourceView(b.lodExtrasBuf, &sv, &b.lodExtrasSRV))) {
-			logger::error("[GRASS OPTIMIZATIONS] LOD extras SRV create failed");
-			b.ReleaseLODBin();
+		if (FAILED(device->CreateShaderResourceView(bin.extrasBuf, &sv, &bin.extrasSRV))) {
+			logger::error("[GRASS OPTIMIZATIONS] {} LOD extras SRV create failed", tierName);
+			bin.Release();
 			return false;
 		}
 	}
@@ -961,12 +966,12 @@ bool GrassBucketStore::EnsureLODBin(GrassBucket& b, ID3D11Device* device)
 		bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
 		bd.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
 
-		if (FAILED(device->CreateBuffer(&bd, &init, &b.lodArgsBuf)) || !b.lodArgsBuf) {
-			logger::error("[GRASS OPTIMIZATIONS] LOD args buffer create failed");
-			b.ReleaseLODBin();
+		if (FAILED(device->CreateBuffer(&bd, &init, &bin.argsBuf)) || !bin.argsBuf) {
+			logger::error("[GRASS OPTIMIZATIONS] {} LOD args buffer create failed", tierName);
+			bin.Release();
 			return false;
 		}
-		Util::SetResourceName(b.lodArgsBuf, "GrassOptimizations::LODArgsBuf");
+		Util::SetResourceName(bin.argsBuf, "GrassOptimizations::LODArgsBuf");
 
 		D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
 		uav.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -974,13 +979,13 @@ bool GrassBucketStore::EnsureLODBin(GrassBucket& b, ID3D11Device* device)
 		uav.Buffer.FirstElement = instanceCountOffset / sizeof(uint32_t);
 		uav.Buffer.NumElements = 1;
 		uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
-		if (FAILED(device->CreateUnorderedAccessView(b.lodArgsBuf, &uav, &b.lodArgsUAV)) || !b.lodArgsUAV) {
-			logger::error("[GRASS OPTIMIZATIONS] LOD args UAV create failed");
-			b.ReleaseLODBin();
+		if (FAILED(device->CreateUnorderedAccessView(bin.argsBuf, &uav, &bin.argsUAV)) || !bin.argsUAV) {
+			logger::error("[GRASS OPTIMIZATIONS] {} LOD args UAV create failed", tierName);
+			bin.Release();
 			return false;
 		}
 	}
 
-	b.lodCapacityInstances = cap;
+	bin.capacityInstances = cap;
 	return true;
 }

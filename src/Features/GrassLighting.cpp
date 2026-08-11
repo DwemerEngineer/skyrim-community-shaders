@@ -13,7 +13,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	OverrideComplexGrassSettings,
 	BasicGrassBrightness,
 	ComplexGrassThreshold,
-	LODBrightness)
+	MidLODBrightness,
+	FarLODBrightness)
 
 void GrassLighting::DrawSettings()
 {
@@ -77,12 +78,22 @@ void GrassLighting::DrawSettings()
 
 		if (globals::features::grassOptimizations.loaded) {
 			ImGui::Spacing();
-			ImGui::TextWrapped("%s", T(TKEY("lod_grass"), "LOD Grass"));
-			ImGui::PushID("lod");
-			ImGui::SliderFloat(T(TKEY("lod_brightness"), "Brightness"), &settings.LODBrightness, 0.0f, 2.0f, "%.2f");
+			ImGui::TextWrapped("%s", T(TKEY("mid_lod_grass"), "Middle LOD Grass"));
+			ImGui::PushID("midlod");
+			ImGui::SliderFloat(T(TKEY("lod_brightness"), "Brightness"), &settings.MidLODBrightness, 0.0f, 2.0f, "%.2f");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("%s", T(TKEY("lod_brightness_tooltip"),
-									  "Raise or lower until distant grass matches the grass around it. Requires Grass Optimizations with Mesh LOD enabled."));
+				ImGui::Text("%s", T(TKEY("mid_lod_brightness_tooltip"),
+									  "Raise or lower until middle-distance LOD grass matches the full-detail grass around it. Requires Grass Optimizations with Middle LOD enabled."));
+			}
+			ImGui::PopID();
+
+			ImGui::Spacing();
+			ImGui::TextWrapped("%s", T(TKEY("far_lod_grass"), "Far LOD Grass"));
+			ImGui::PushID("farlod");
+			ImGui::SliderFloat(T(TKEY("lod_brightness"), "Brightness"), &settings.FarLODBrightness, 0.0f, 2.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("%s", T(TKEY("far_lod_brightness_tooltip"),
+									  "Raise or lower until the most distant LOD grass matches the middle LOD grass in front of it. Requires Grass Optimizations with Far LOD enabled."));
 			}
 			ImGui::PopID();
 		}
