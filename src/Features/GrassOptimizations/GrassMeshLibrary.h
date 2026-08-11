@@ -6,11 +6,19 @@ constexpr uint32_t kGrassStride = 32;
 /** @brief Mesh vertex stride in bytes, from nibble 0 of a packed vertexDesc (stored as bytes/4). */
 constexpr uint32_t VertexStrideFromDesc(uint64_t descVal) { return static_cast<uint32_t>((4 * descVal) & 0x3C); }
 
-/** @brief Maps grass shapes to their source .nif and caches the optional LOD mesh. Assigns integer IDs to each unique source .nif to avoid string lookups. */
+/** @brief Maps grass shapes to their source .nif and caches the optional LOD meshes. Assigns integer IDs to each unique source .nif to avoid string lookups. */
 class GrassMeshLibrary
 {
 public:
-	/** @brief An LOD mesh, loaded from meshes\LOD\Grass\<source-mesh-stem>_LOD.nif. When `valid` is false, the full mesh is drawn then. */
+	/** @brief Which of the two mesh-swap distance bands an LOD mesh serves. */
+	enum class LODTier : uint32_t
+	{
+		kMiddle = 0,
+		kFar = 1,
+		kCount = 2
+	};
+
+	/** @brief An LOD mesh, loaded from meshes\LOD\Grass\<source-mesh-stem>_LOD0.nif (middle) or _LOD1.nif (far). When `valid` is false, the full mesh is drawn then. */
 	struct LODMesh
 	{
 		RE::NiPointer<RE::NiAVObject> keepAlive;  // owns the loaded model tree
@@ -30,16 +38,19 @@ public:
 	/** @brief Resolves a shape to a source-mesh id (0 = unresolved) and caches the result. */
 	uint32_t ResolveMeshId(RE::BSMultiStreamInstanceTriShape* shape);
 
-	/** @brief Loads the LOD .nif for this mesh id. */
-	void EnsureLODMesh(uint32_t meshId);
+	/** @brief Loads both LOD .nifs for this mesh id. */
+	void EnsureLODMeshes(uint32_t meshId);
 
-	/** @brief Returns the cached LOD mesh, or nullptr when none is loaded or it is unusable. */
-	const LODMesh* GetLODMesh(uint32_t meshId) const;
+	/** @brief Returns the cached LOD mesh for a tier, or nullptr when none is loaded or it is unusable. The far tier falls back to the middle mesh. */
+	const LODMesh* GetLODMesh(uint32_t meshId, LODTier tier) const;
 
 	/** @brief Removes no longer valid shapes from the lookup caches to prevent IDs and LOD meshes from being associated with the wrong shape. */
 	void ForgetShape(RE::BSMultiStreamInstanceTriShape* shape);
 		
 private:
+	/** @brief Loads one tier's .nif into an entry, once. */
+	static void LoadLODMesh(LODMesh& entry, const std::string& stem, LODTier tier);
+
 	// Resolves shapes by id to their source-mesh stems, with stems[id - 1] since zero is invalid.
 	std::vector<std::string> stems;
 	std::unordered_map<RE::BSMultiStreamInstanceTriShape*, uint32_t> idByShape;
@@ -51,6 +62,6 @@ private:
 	std::unordered_map<RE::BSMultiStreamInstanceTriShape*, std::string> stemByShape;
 	mutable std::mutex stemMutex;
 
-	// Parallel to stems, indexed by meshId - 1. A deque to keep GetLODMesh's pointers valid after growth.
-	std::deque<LODMesh> lodMeshes;
+	// Parallel to stems, indexed by meshId - 1 then by LODTier. A deque to keep GetLODMesh's pointers valid after growth.
+	std::deque<std::array<LODMesh, (size_t)LODTier::kCount>> lodMeshes;
 };

@@ -24,7 +24,7 @@ cbuffer CullParams : register(b0)
     float InvisibleFadeCull;
     float SimpleShadingPixelSize;
     float CollisionDistSq;
-    float MeshLODPixelSize;
+    float MidLODPixelSize;
 
     float MeshLODBandPx;
     float HiZEnabled;
@@ -34,6 +34,9 @@ cbuffer CullParams : register(b0)
     float HiZMipCount;
     float OcclusionBias;
     float CostBiasStartDist;
+
+    float FarLODPixelSize;
+    float3 _pad0;
 };
 
 cbuffer CullBucket : register(b1)
@@ -47,11 +50,12 @@ cbuffer CullBucket : register(b1)
     float DistScale;
     float MinPixelScale;
     float IsComplex;
-    float LODEnabled;
+    float MidLODEnabled;
     // The dispatch covers only these slices' combined instance count.
     uint SliceTableOffset;
     uint SliceCount;
-    float2 _pad2;
+    float FarLODEnabled;
+    float _pad2;
 };
 
 ByteAddressBuffer Instances : register(t0);
@@ -65,9 +69,13 @@ RWByteAddressBuffer Compacted : register(u0);
 RWStructuredBuffer<float4> Extras : register(u1);
 RWByteAddressBuffer Counter : register(u2);
 
-RWByteAddressBuffer LODCompacted : register(u3);
-RWStructuredBuffer<float4> LODExtras : register(u4);
-RWByteAddressBuffer LODCounter : register(u5);
+RWByteAddressBuffer MidLODCompacted : register(u3);
+RWStructuredBuffer<float4> MidLODExtras : register(u4);
+RWByteAddressBuffer MidLODCounter : register(u5);
+
+RWByteAddressBuffer FarLODCompacted : register(u6);
+RWStructuredBuffer<float4> FarLODExtras : register(u7);
+RWByteAddressBuffer FarLODCounter : register(u8);
 
 // Uses a uint hash to generate a random float between [0, 1)
 float RandFloat(uint bits)
@@ -255,25 +263,39 @@ float WindScalar(float basis, float timer)
     const float farFlag = (SimpleShadingPixelSize > 0.0 && projPx < SimpleShadingPixelSize) ? 2.0 : 0.0;
 
     const float4 e1 = float4(WindScalar(basis, TimeBase * WavePeriod), WindScalar(basis, PrevTimeBase * WavePeriod), fade, collisionFlag + farFlag);
-    
-    // Dithered over MeshLODBandPx so the swap to LOD is gradual rather than a visible line.
-    bool useLOD = false;
-    if (LODEnabled > 0.5)
-    {
-        const float halfBand = MeshLODBandPx * 0.5;
-        const float t = saturate((MeshLODPixelSize + halfBand - projPx) / max(MeshLODBandPx, 1e-4));
-        useLOD = RandFloat(rand.y) < t;
-    }
+
+    // Both thresholds are dithered over MeshLODBandPx so each swap is gradual rather than a visible
+    // line, and both compare the same hash so an instance crosses middle then far in order as it
+    // recedes, instead of picking each band independently and popping back to a nearer mesh.
+    const float h = RandFloat(rand.y);
+    const float halfBand = MeshLODBandPx * 0.5;
+    const float bandRcp = 1.0 / max(MeshLODBandPx, 1e-4);
+
+    uint tier = 0;
+    if (MidLODEnabled > 0.5 && h < saturate((MidLODPixelSize + halfBand - projPx) * bandRcp))
+        tier = 1;
+    if (FarLODEnabled > 0.5 && h < saturate((FarLODPixelSize + halfBand - projPx) * bandRcp))
+        tier = 2;
+
+    // Scaled by 4 so it clears the collision and far-shading flags already packed into e1.w.
+    const float4 e1Tier = float4(e1.xyz, e1.w + 4.0 * (float)tier);
 
     uint slot;
-    if (useLOD)
+    if (tier == 2)
     {
-        LODCounter.InterlockedAdd(0, 1, slot);
-        LODCompacted.Store4(slot * 32, raw0);
-        LODCompacted.Store4(slot * 32 + 16, raw1);
-        LODExtras[slot * 2 + 0] = e0;
-        // 4.0 marks the LOD bin, so the pixel shader can apply the separate LOD brightness.
-        LODExtras[slot * 2 + 1] = float4(e1.xyz, e1.w + 4.0);
+        FarLODCounter.InterlockedAdd(0, 1, slot);
+        FarLODCompacted.Store4(slot * 32, raw0);
+        FarLODCompacted.Store4(slot * 32 + 16, raw1);
+        FarLODExtras[slot * 2 + 0] = e0;
+        FarLODExtras[slot * 2 + 1] = e1Tier;
+    }
+    else if (tier == 1)
+    {
+        MidLODCounter.InterlockedAdd(0, 1, slot);
+        MidLODCompacted.Store4(slot * 32, raw0);
+        MidLODCompacted.Store4(slot * 32 + 16, raw1);
+        MidLODExtras[slot * 2 + 0] = e0;
+        MidLODExtras[slot * 2 + 1] = e1Tier;
     }
     else
     {

@@ -45,7 +45,10 @@ public:
 		float OcclusionBias = 0.001f;
 		float CollisionDistance = 2048.0f;
 		bool EnableMeshLOD = false;
-		float MeshLODPixelSize = 8.0f;
+		bool EnableMidLOD = true;
+		float MidLODPixelSize = 8.0f;
+		bool EnableFarLOD = true;
+		float FarLODPixelSize = 4.0f;
 		float MeshLODBandPixels = 3.0f;
 	};
 
@@ -91,7 +94,7 @@ public:
 		float invisibleFadeCull;
 		float simpleShadingPixelSize;
 		float collisionDistSq;
-		float meshLODPixelSize;
+		float midLODPixelSize;
 
 		float meshLODBandPx;
 		float hiZEnabled;
@@ -102,6 +105,9 @@ public:
 		float hiZMipCount;
 		float occlusionBias;
 		float costBiasStartDist;
+
+		float farLODPixelSize;
+		float pad0[3];
 	};
 	STATIC_ASSERT_ALIGNAS_16(CullParamsCB);
 
@@ -116,10 +122,11 @@ public:
 		float distScale;
 		float minPixelScale;
 		float isComplex;
-		float lodEnabled;
+		float midLODEnabled;
 		uint32_t sliceTableOffset;
 		uint32_t sliceCount;
-		float pad[2];
+		float farLODEnabled;
+		float pad;
 	};
 	STATIC_ASSERT_ALIGNAS_16(CullBucketCB);
 
