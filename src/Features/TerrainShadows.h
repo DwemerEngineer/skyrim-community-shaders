@@ -37,17 +37,6 @@ public:
 	uint shadowUpdateIdx = 0;
 	std::uint32_t handledTimeJumpRefreshGeneration = 0;
 
-	struct HeightMapMetadata
-	{
-		std::wstring dir;
-		std::string filename;
-		std::string worldspace;
-		float3 pos0, pos1;  // left-top-z=0 vs right-bottom-z=1
-		float2 zRange;
-	};
-	std::unordered_map<std::string, HeightMapMetadata> heightmaps;
-	HeightMapMetadata* cachedHeightmap;
-
 	struct ShadowUpdateCB
 	{
 		float2 LightPxDir;   // direction on which light descends, from one pixel to next via dda
@@ -75,21 +64,13 @@ public:
 
 	winrt::com_ptr<ID3D11ComputeShader> shadowUpdateProgram = nullptr;
 
-	std::unique_ptr<Texture2D> texHeightMap = nullptr;
 	std::unique_ptr<Texture2D> texShadowHeight = nullptr;
 
 	/** @brief Checks whether a valid heightmap is loaded for the current worldspace. */
 	bool IsHeightMapReady();
 
-	/** @brief Scans for heightmap DDS files and creates constant buffers and compute shaders. */
+	/** @brief Discovers heightmaps and creates constant buffers and compute shaders. */
 	virtual void SetupResources() override;
-
-	/**
-	 * @brief Parses a heightmap DDS filename to extract worldspace metadata.
-	 * @param p The filesystem path to the DDS file.
-	 * @param xlodgen_style Whether the filename follows xLODGen naming conventions.
-	 */
-	void ParseHeightmapPath(std::filesystem::path p, bool xlodgen_style);
 
 	/** @brief Compiles the shadow update compute shader from HLSL source. */
 	void CompileComputeShaders();
@@ -105,8 +86,6 @@ public:
 	virtual void DataLoaded() override;
 	/** @brief Requests celestial synchronization after loading an existing save. */
 	virtual void GameLoaded() override;
-	/** @brief Loads the heightmap DDS for the current worldspace if not already cached. */
-	void LoadHeightmap();
 	/** @brief Creates the shadow height texture after a new heightmap is loaded. */
 	void Precompute();
 	/**
