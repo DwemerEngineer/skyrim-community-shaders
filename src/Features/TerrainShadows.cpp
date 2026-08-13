@@ -5,6 +5,7 @@
 
 #include "I18n/I18n.h"
 #include "State.h"
+#include "TerrainHeightMap.h"
 #include "Util.h"
 
 #define I18N_KEY_PREFIX "feature.terrain_shadows."
@@ -39,7 +40,7 @@ void TerrainShadows::DrawSettings()
 			}
 		}
 		ImGui::Text(fmt::format("Current worldspace: {} ({})", curr_worldspace, curr_worldspace_name).c_str());
-		ImGui::Text(fmt::format("Has height map: {}", heightmaps.contains(curr_worldspace)).c_str());
+		ImGui::Text(fmt::format("Has height map: {}", TerrainHeightMap::GetSingleton()->Contains(curr_worldspace)).c_str());
 
 		ImGui::Separator();
 
@@ -75,84 +76,9 @@ void TerrainShadows::ClearShaderCache()
 	CompileComputeShaders();
 }
 
-void TerrainShadows::ParseHeightmapPath(std::filesystem::path p, bool xlodgen_style)
-{
-	auto filename = p.filename();
-	if (filename.extension() != ".dds")
-		return;
-	logger::debug("Found dds: {}", filename.string());
-
-	auto splitstr = pystring::split(filename.stem().string(), ".");
-	if (splitstr.size() != (xlodgen_style ? 9 : 10)) {
-		logger::debug("{} has incorrect number ({}) of fields", filename.string(), splitstr.size());
-		return;
-	}
-
-	bool middle_check = xlodgen_style ? ((splitstr[1] == "Terrain") && (splitstr[2] == "HeightMap")) : (splitstr[1] == "HeightMap");
-	if (middle_check) {
-		HeightMapMetadata metadata;
-		try {
-			if (xlodgen_style) {
-				metadata.worldspace = splitstr[0];
-				metadata.pos0.x = std::stoi(splitstr[3]) * 4096.f;
-				metadata.pos1.y = std::stoi(splitstr[4]) * 4096.f;
-				metadata.pos1.x = (std::stoi(splitstr[5]) + 1) * 4096.f;
-				metadata.pos0.y = (std::stoi(splitstr[6]) + 1) * 4096.f;
-				metadata.pos0.z = -32767 * 8.f;
-				metadata.pos1.z = 32767 * 8.f;
-				metadata.zRange.x = std::stoi(splitstr[7]) * 8.f;
-				metadata.zRange.y = std::stoi(splitstr[8]) * 8.f;
-			} else {
-				metadata.worldspace = splitstr[0];
-				metadata.pos0.x = std::stoi(splitstr[2]) * 4096.f;
-				metadata.pos1.y = std::stoi(splitstr[3]) * 4096.f;
-				metadata.pos1.x = (std::stoi(splitstr[4]) + 1) * 4096.f;
-				metadata.pos0.y = (std::stoi(splitstr[5]) + 1) * 4096.f;
-				metadata.pos0.z = std::stoi(splitstr[6]) * 8.f;
-				metadata.pos1.z = std::stoi(splitstr[7]) * 8.f;
-				metadata.zRange.x = std::stoi(splitstr[8]) * 8.f;
-				metadata.zRange.y = std::stoi(splitstr[9]) * 8.f;
-			}
-		} catch (std::exception& e) {
-			logger::debug("Failed to parse {}. Error: {}", filename.string(), e.what());
-			return;
-		}
-
-		metadata.dir = p.parent_path().wstring();
-		metadata.filename = filename.string();
-
-		if (heightmaps.contains(metadata.worldspace))
-			logger::warn("{} has more than one height maps!", metadata.worldspace);
-		heightmaps[metadata.worldspace] = metadata;
-
-		logger::info("{} loaded.", filename.string());
-	} else
-		logger::debug("{} has unknown type ({})", filename.string(), splitstr[1]);
-}
-
 void TerrainShadows::SetupResources()
 {
-	logger::debug("Listing xLODGen height maps...");
-	{
-		std::filesystem::path texture_dir{ L"Data\\textures\\Terrain\\" };
-		std::error_code ec;
-		for (auto const& dir_entry : std::filesystem::directory_iterator{ texture_dir, ec }) {
-			auto dir_path = dir_entry.path();
-			if (!std::filesystem::is_directory(dir_path))
-				continue;
-
-			for (auto const& sub_dir_entry : std::filesystem::directory_iterator{ dir_path })
-				ParseHeightmapPath(sub_dir_entry.path(), true);
-		}
-	}
-
-	logger::debug("Listing height maps...");
-	{
-		std::filesystem::path texture_dir{ L"Data\\textures\\heightmaps\\" };
-		std::error_code ec;
-		for (auto const& dir_entry : std::filesystem::directory_iterator{ texture_dir, ec })
-			ParseHeightmapPath(dir_entry.path(), false);
-	}
+	TerrainHeightMap::GetSingleton()->Discover();
 
 	logger::debug("Creating constant buffers...");
 	{
@@ -174,14 +100,12 @@ void TerrainShadows::CompileComputeShaders()
 
 bool TerrainShadows::IsHeightMapReady()
 {
-	if (auto tes = RE::TES::GetSingleton())
-		if (auto worldspace = tes->GetRuntimeData2().worldSpace)
-			return cachedHeightmap && cachedHeightmap->worldspace == worldspace->GetFormEditorID();
-	return false;
+	return TerrainHeightMap::GetSingleton()->IsReady();
 }
 
 TerrainShadows::PerFrame TerrainShadows::GetCommonBufferData()
 {
+	auto heightMap = TerrainHeightMap::GetSingleton();
 	bool isHeightmapReady = IsHeightMapReady();
 
 	PerFrame data = {
@@ -189,84 +113,17 @@ TerrainShadows::PerFrame TerrainShadows::GetCommonBufferData()
 	};
 
 	if (isHeightmapReady) {
-		auto invScale = cachedHeightmap->pos1 - cachedHeightmap->pos0;
-		data.Scale = float3(1.f, 1.f, 1.f) / invScale;
-		data.Offset = -cachedHeightmap->pos0 * float2{ data.Scale.x, data.Scale.y };
-		data.ZRange = cachedHeightmap->zRange;
+		data.Scale = heightMap->GetScale();
+		data.Offset = heightMap->GetOffset();
+		data.ZRange = heightMap->GetZRange();
 	}
 
 	return data;
 }
 
-void TerrainShadows::LoadHeightmap()
-{
-	auto tes = globals::game::tes;
-	if (!tes)
-		return;
-
-	auto worldspace = tes->GetRuntimeData2().worldSpace;
-	while (worldspace && worldspace->parentWorld && worldspace->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData))
-		worldspace = worldspace->parentWorld;
-
-	if (!worldspace)
-		return;
-
-	std::string worldspace_name = worldspace->GetFormEditorID();
-	if (!heightmaps.contains(worldspace_name))  // no height map for that, but we don't remove cache
-		return;
-
-	if (cachedHeightmap && cachedHeightmap->worldspace == worldspace_name)  // already cached
-		return;
-
-	auto device = globals::d3d::device;
-
-	logger::debug("Loading height map...");
-	{
-		auto& target_heightmap = heightmaps[worldspace_name];
-
-		DirectX::ScratchImage image;
-		try {
-			std::filesystem::path path{ target_heightmap.dir };
-			path /= target_heightmap.filename;
-
-			DX::ThrowIfFailed(LoadFromDDSFile(path.c_str(), DirectX::DDS_FLAGS_NONE, nullptr, image));
-		} catch (const DX::com_exception& e) {
-			logger::error("{}", e.what());
-			return;
-		}
-
-		ID3D11Resource* pResource = nullptr;
-		try {
-			DX::ThrowIfFailed(CreateTexture(device,
-				image.GetImages(), image.GetImageCount(),
-				image.GetMetadata(), &pResource));
-		} catch (const DX::com_exception& e) {
-			logger::error("{}", e.what());
-			return;
-		}
-
-		texHeightMap.release();
-		texHeightMap = std::make_unique<Texture2D>(reinterpret_cast<ID3D11Texture2D*>(pResource), "TerrainShadows::HeightMap");
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
-			.Format = texHeightMap->desc.Format,
-			.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
-			.Texture2D = {
-				.MostDetailedMip = 0,
-				.MipLevels = 1 }
-		};
-		texHeightMap->CreateSRV(srvDesc);
-
-		cachedHeightmap = &heightmaps[worldspace_name];
-	}
-
-	shadowUpdateIdx = 0;
-	needPrecompute = true;
-}
-
 void TerrainShadows::Precompute()
 {
-	if (!cachedHeightmap)
+	if (!TerrainHeightMap::GetSingleton()->GetCached())
 		return;
 
 	logger::info("Creating shadow texture...");
@@ -280,6 +137,8 @@ void TerrainShadows::Precompute()
 		}
 
 		texShadowHeight.release();
+
+		auto texHeightMap = TerrainHeightMap::GetSingleton()->GetTexture();
 
 		D3D11_TEXTURE2D_DESC texDesc = {
 			.Width = texHeightMap->desc.Width,
@@ -342,6 +201,10 @@ void TerrainShadows::UpdateShadow()
 	TracyD3D11Zone(globals::state->tracyCtx, "Terrain Occlusion - Update Shadows");
 
 	/* ---- UPDATE CB ---- */
+	auto heightMap = TerrainHeightMap::GetSingleton();
+	auto texHeightMap = heightMap->GetTexture();
+	auto cachedHeightmap = heightMap->GetCached();
+
 	uint width = texHeightMap->desc.Width;
 	uint height = texHeightMap->desc.Height;
 
@@ -441,7 +304,10 @@ void TerrainShadows::ReflectionsPrepass()
 
 void TerrainShadows::EarlyPrepass()
 {
-	LoadHeightmap();
+	if (TerrainHeightMap::GetSingleton()->LoadForCurrentWorldspace()) {
+		shadowUpdateIdx = 0;
+		needPrecompute = true;
+	}
 
 	if (!settings.EnableTerrainShadow)
 		return;
