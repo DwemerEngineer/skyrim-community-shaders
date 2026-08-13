@@ -278,7 +278,7 @@ namespace PBR
 		lobeWeights.specular *= SpecularOcclusion(NdotV, alpha, material.AO);
 	}
 	
-    void GetDirectLightInputProcGrass(out float3 diffuse, out float3 transmission, out float3 specular, float3 N, float3 V, float3 L, LightProperties lightProperties, SurfaceProperties surfaceProperties)
+    void GetDirectLightInputProcGrass(out float3 diffuse, out float3 transmission, out float3 specular, float3 N, float3 V, float3 L, DirectContext context, MaterialProperties material)
     {
         diffuse = 0;
         transmission = 0;
@@ -297,22 +297,26 @@ namespace PBR
         float satNdotH = saturate(NdotH);
         float satVdotH = saturate(VdotH);
 
-        diffuse += lightProperties.LightColor * satNdotL * BRDF::Diffuse_Lambert();
-
+        // Specular first: its Fresnel reserves reflected energy, leaving the rest for Lambert. The same
+        // albedo-aware multi-bounce AO as the indirect grass lobe darkens direct diffuse without a tint.
         float3 F;
-        specular += GetSpecularDirectLightMultiplierMicrofacet(surfaceProperties.Roughness, surfaceProperties.F0, satNdotL, satNdotV, satNdotH, satVdotH, F) * lightProperties.LightColor * satNdotL;
+        specular += SpecularMicrofacet(material.Roughness, material.F0, satNdotL, satNdotV, satNdotH, satVdotH, F) * context.lightColor * satNdotL;
 
-        float2 specularBRDF = BRDF::EnvBRDFApproxLazarov(surfaceProperties.Roughness, satNdotV);
-        specular *= 1 + surfaceProperties.F0 * (1 / (specularBRDF.x + specularBRDF.y) - 1);
+        float3 diffuseAO = MultiBounceAO(material.BaseColor, material.AO).y;
+        float3 diffuseEnergy = saturate(1.0f - F) * diffuseAO;
+        diffuse += context.lightColor * satNdotL * BRDF::Diffuse_Lambert() * diffuseEnergy;
+
+        float2 specularBRDF = BRDF::EnvBRDFApproxLazarov(material.Roughness, satNdotV);
+        specular *= 1 + material.F0 * (1 / (specularBRDF.x + specularBRDF.y) - 1);
 
         const float subsurfacePower = 12.234;
         float forwardScatter = exp2(saturate(-VdotL) * subsurfacePower - subsurfacePower);
-        float backScatter = saturate(satNdotL * surfaceProperties.Thickness + (1.0 - surfaceProperties.Thickness)) * 0.5;
-        float subsurface = lerp(backScatter, 1, forwardScatter) * (1.0 - surfaceProperties.Thickness);
-        transmission += surfaceProperties.SubsurfaceColor * subsurface * lightProperties.LightColor * BRDF::Diffuse_Lambert();
+        float backScatter = saturate(satNdotL * material.Thickness + (1.0 - material.Thickness)) * 0.5;
+        float subsurface = lerp(backScatter, 1, forwardScatter) * (1.0 - material.Thickness);
+        transmission += material.SubsurfaceColor * subsurface * context.lightColor * BRDF::Diffuse_Lambert();
     }
 	
-    void GetIndirectLobeWeightsProcGrass(out float3 diffuseLobeWeight, out float3 specularLobeWeight, float3 N, float3 V, float3 VN, float3 diffuseColor, SurfaceProperties surfaceProperties)
+    void GetIndirectLobeWeightsProcGrass(out float3 diffuseLobeWeight, out float3 specularLobeWeight, float3 N, float3 V, float3 VN, float3 diffuseColor, MaterialProperties material)
     {
         diffuseLobeWeight = 0;
         specularLobeWeight = 0;
@@ -324,14 +328,14 @@ namespace PBR
 		[branch]
         if ((PBRFlags & Flags::Subsurface) != 0)
         {
-            diffuseLobeWeight += surfaceProperties.SubsurfaceColor * (1 - surfaceProperties.Thickness) / Math::PI;
+            diffuseLobeWeight += material.SubsurfaceColor * (1 - material.Thickness) / Math::PI;
         }
 
-        float2 specularBRDF = BRDF::EnvBRDFApproxLazarov(surfaceProperties.Roughness, NdotV);
-        specularLobeWeight = surfaceProperties.F0 * specularBRDF.x + specularBRDF.y;
+        float2 specularBRDF = BRDF::EnvBRDFApproxLazarov(material.Roughness, NdotV);
+        specularLobeWeight = material.F0 * specularBRDF.x + specularBRDF.y;
 
         diffuseLobeWeight *= (1 - specularLobeWeight);
-        specularLobeWeight *= 1 + surfaceProperties.F0 * (1 / (specularBRDF.x + specularBRDF.y) - 1);
+        specularLobeWeight *= 1 + material.F0 * (1 / (specularBRDF.x + specularBRDF.y) - 1);
 
 		// Horizon specular occlusion
 		// https://marmosetco.tumblr.com/post/81245981087
@@ -340,13 +344,13 @@ namespace PBR
         horizon = horizon * horizon;
         specularLobeWeight *= horizon;
 
-        float3 diffuseAO = surfaceProperties.AO;
-        float3 specularAO = SpecularAOLagarde(NdotV, surfaceProperties.AO, surfaceProperties.Roughness);
+        float3 diffuseAO = material.AO;
+        float3 specularAO = SpecularAOLagarde(NdotV, material.AO, material.Roughness);
 
         diffuseAO = MultiBounceAO(diffuseColor, diffuseAO.x).y;
-        specularAO = MultiBounceAO(surfaceProperties.F0, specularAO.x).y;
+        specularAO = MultiBounceAO(material.F0, specularAO.x).y;
 
-        diffuseLobeWeight *= diffuseAO * Color::PBRLightingScale;
+        diffuseLobeWeight *= diffuseAO;
         specularLobeWeight *= specularAO;
     }
 }
