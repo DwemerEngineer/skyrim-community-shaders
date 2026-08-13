@@ -59,6 +59,45 @@ ID3D11ComputeShader* TerrainBlending::GetDepthBlendShader()
 	return depthBlendShader;
 }
 
+ID3D11ComputeShader* TerrainBlending::GetMergeDepthShader()
+{
+	if (!mergeDepthShader) {
+		logger::debug("Compiling DepthBlend.hlsl MERGE");
+		mergeDepthShader = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\TerrainBlending\\DepthBlend.hlsl", { { "MERGE", "" } }, "cs_5_0");
+	}
+	return mergeDepthShader;
+}
+
+void TerrainBlending::MergeSceneDepthIntoBlend()
+{
+	if (!settings.Enabled || !blendedDepthTexture || !depthSRVBackup)
+		return;
+
+	auto context = globals::d3d::context;
+
+	// The caller leaves the main-depth DSV bound as output. Unbind first to prevent the SRV from being dropped by dx11.
+	context->OMSetRenderTargets(0, nullptr, nullptr);
+
+	// depthSRVBackup views the real main-depth texture, which now carries the late geometry's depth.
+	ID3D11ShaderResourceView* views[1] = { depthSRVBackup };
+	context->CSSetShaderResources(0, 1, views);
+
+	ID3D11UnorderedAccessView* uavs[2] = { blendedDepthTexture->uav.get(), blendedDepthTexture16->uav.get() };
+	context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
+
+	context->CSSetShader(GetMergeDepthShader(), nullptr, 0);
+
+	auto dispatchCount = Util::GetScreenDispatchCount();
+	context->Dispatch(dispatchCount.x, dispatchCount.y, 1);
+
+	ID3D11ShaderResourceView* nullViews[1] = { nullptr };
+	context->CSSetShaderResources(0, 1, nullViews);
+	ID3D11UnorderedAccessView* nullUavs[2] = { nullptr, nullptr };
+	context->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
+	ID3D11ComputeShader* nullShader = nullptr;
+	context->CSSetShader(nullShader, nullptr, 0);
+}
+
 void TerrainBlending::SetupResources()
 {
 	auto renderer = globals::game::renderer;
@@ -249,6 +288,10 @@ void TerrainBlending::ClearShaderCache()
 	if (depthBlendShader) {
 		depthBlendShader->Release();
 		depthBlendShader = nullptr;
+	}
+	if (mergeDepthShader) {
+		mergeDepthShader->Release();
+		mergeDepthShader = nullptr;
 	}
 }
 
