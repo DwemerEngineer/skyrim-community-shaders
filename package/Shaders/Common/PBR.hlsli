@@ -297,7 +297,7 @@ namespace PBR
         float satNdotH = saturate(NdotH);
         float satVdotH = saturate(VdotH);
 
-        // Specular first: its Fresnel reserves reflected energy, leaving the rest for Lambert. The same
+        // Specular first, since its Fresnel reserves reflected energy, leaving the rest for Lambert. The same
         // albedo-aware multi-bounce AO as the indirect grass lobe darkens direct diffuse without a tint.
         float3 F;
         specular += SpecularMicrofacet(material.Roughness, material.F0, satNdotL, satNdotV, satNdotH, satVdotH, F) * context.lightColor * satNdotL;
