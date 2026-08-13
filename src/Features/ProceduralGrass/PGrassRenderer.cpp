@@ -316,7 +316,7 @@ std::string PGrassRenderer<QuadrantCount, PatchPatchBladeCount>::BuildDefineList
 	return out;
 }
 
-template class PGrassRenderer<25, 4>;
-template class PGrassRenderer<49, 2>;
-template class PGrassRenderer<121, 1>;
-template class PGrassRenderer<FarQuadrantCount, 1>;  // far tier for cells beyond the loaded grid
+template class PGrassRenderer<HighTierQuadrantCap, 4>;  // High
+template class PGrassRenderer<MidTierQuadrantCap, 2>;   // Mid
+template class PGrassRenderer<LowTierQuadrantCap, 1>;   // Low
+template class PGrassRenderer<FarQuadrantCount, 1>;     // Far, for quadrants beyond Low's reach (LowTierQuadrantRadius)
