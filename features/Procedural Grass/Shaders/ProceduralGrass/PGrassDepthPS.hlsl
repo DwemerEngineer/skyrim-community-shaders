@@ -2,11 +2,7 @@
 
 #include "Common/Random.hlsli"
 
-cbuffer GrassGlobals : register(b8)
-{
-	// Only the terrain-blend row is needed, so use packoffset to skip straight to it
-	float4 grassTerrainBlend : packoffset(c20);  // x: base dissolve, y: dissolve height (world units)
-}
+#include "ProceduralGrass/PGrassCommon.hlsli"
 
 struct PS_INPUT
 {
