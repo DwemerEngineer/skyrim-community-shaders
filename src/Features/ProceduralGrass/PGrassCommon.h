@@ -70,7 +70,7 @@ namespace PGrassCommon
 		float occlusionHalfExtent;
 		float occlusionInvExtent;  // 1 / (2 * half extent), used by the generator's top-down-map UV transform
 		float3 _occlusionPadding;
-		float4 occlusionParams;  // xy: window centre in world space, z: NDC depth bias for the occlusion test, w: occluder padding in world units
+		float4 occlusionParams;  // xy: window centre in world space, z: underside clearance, w: top-height bias (world units)
 
 		float4 grassAOParams;     // x: density map dim, y: darken strength, z: blades-per-texel for full dark, w: canopy height (world units)
 		float4 grassLightParams;  // x: density AO, y: canopy sky occlusion, z: sun self-shadow, w: base canopy shading
