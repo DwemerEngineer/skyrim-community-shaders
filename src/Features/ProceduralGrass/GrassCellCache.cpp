@@ -14,33 +14,33 @@ namespace
 	constexpr uint32_t kATXT = Util::FCC("ATXT");
 	constexpr uint32_t kVTXT = Util::FCC("VTXT");
 
-	constexpr uint32_t kPitch = PGrassCommon::QuadrantGrassPitch;   // 17
-	constexpr uint32_t kSamples = PGrassCommon::QuadrantGrassSamples;  // 289
-	constexpr uint32_t kCellVerts = 33;
+	constexpr uint32_t kQuadrantPitch = PGrassCommon::QuadrantGrassPitch;  // 17 vertices per side
+	constexpr uint32_t kQuadrantSamples = PGrassCommon::QuadrantGrassSamples; // 128
+	constexpr uint32_t kCellVertexPitch = 33;
 
 	// Swaps only fire on the rare big-endian file, matching the water cache.
 	uint32_t Swap32(uint32_t v) { return _byteswap_ulong(v); }
 	uint16_t Swap16(uint16_t v) { return _byteswap_ushort(v); }
 	float SwapF(float v) { return std::bit_cast<float>(_byteswap_ulong(std::bit_cast<uint32_t>(v))); }
 
-	// BTXT/ATXT share this 8-byte header of land texture, quadrant, and layer.
-	struct TextureHeader
+	// BTXT/ATXT share this 8-byte header: texture FormID, target quadrant, and layer index.
+	struct LandscapeTextureHeader
 	{
 		RE::FormID landTexture;
 		uint8_t quadrant;
 		uint8_t unused;
 		int16_t layer;
 	};
-	static_assert(sizeof(TextureHeader) == 8);
+	static_assert(sizeof(LandscapeTextureHeader) == 8);
 
 	// VTXT alpha entry of a quadrant-local vertex index and its blend opacity.
-	struct AlphaPoint
+	struct VertexTextureAlpha
 	{
 		uint16_t position;
 		uint8_t unused[2];
 		float opacity;
 	};
-	static_assert(sizeof(AlphaPoint) == 8);
+	static_assert(sizeof(VertexTextureAlpha) == 8);
 
 	RE::TESLandTexture* ResolveLandTexture(RE::TESFile* file, RE::FormID rawFormID)
 	{
@@ -115,11 +115,13 @@ const CellGrass* GrassCellCache::GetOrRequest(int32_t cellX, int32_t cellY)
 	const uint64_t gen = generation.load(std::memory_order_relaxed);
 	RE::TESWorldSpace* ws = worldSpace;
 	RE::TESFileArray* fileArray = files;
+
 	pool->detach_task([this, key, cellX, cellY, ws, fileArray, gen] {
 		auto data = ReadCell(ws, fileArray, cellX, cellY);
 		std::scoped_lock lock(completedMutex);
 		completed.emplace_back(key, gen, std::move(data));
 	});
+
 	return nullptr;
 }
 
@@ -141,6 +143,7 @@ void GrassCellCache::EvictUntouched()
 	for (size_t i = 0; i < toRemove; ++i) {
 		if (byAge[i].first == frame)
 			break;  // never evict a cell requested this frame - its pointers are live in quadrantsFarLOD
+
 		ready.erase(byAge[i].second);
 		lastTouched.erase(byAge[i].second);
 	}
@@ -152,6 +155,7 @@ void GrassCellCache::Shutdown()
 		pool->wait();
 		pool.reset();
 	}
+
 	ready.clear();
 	lastTouched.clear();
 	pending.clear();
@@ -164,6 +168,8 @@ std::unique_ptr<CellGrass> GrassCellCache::ReadCell(RE::TESWorldSpace* worldSpac
 	auto cell = std::make_unique<CellGrass>();
 	for (auto& quad : cell->heights)
 		quad.fill(PGrassCommon::QuadrantNoHeight);
+	cell->minHeights.fill(PGrassCommon::QuadrantNoHeight);
+	cell->maxHeights.fill(PGrassCommon::QuadrantNoHeight);
 
 	if (!files)
 		return cell;
@@ -187,39 +193,45 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out)
 {
 	const bool bigEndian = file->isBigEndian;
 
-	// Per-quadrant base texture, and per vertex the highest-opacity layer that beat it. 
-	// A vertex with no layer alpha keeps the base, as the loaded path's winner search does.
-	RE::TESLandTexture* baseTexture[4] = { nullptr, nullptr, nullptr, nullptr };
-	std::array<std::array<RE::TESLandTexture*, kSamples>, 4> layerWinner{};
-	std::array<std::array<float, kSamples>, 4> bestOpacity{};
+	using TextureGrid = std::array<RE::TESLandTexture*, kQuadrantSamples>;
+	using OpacityGrid = std::array<float, kQuadrantSamples>;
+	std::array<RE::TESLandTexture*, 4> baseTexture{};
+	std::array<TextureGrid, 4> layerWinner{};
+	std::array<OpacityGrid, 4> bestOpacity{};
 
-	int32_t currentQuad = -1;
-	RE::TESLandTexture* currentLayerTexture = nullptr;
+	int32_t activeQuadrant = -1;
+	RE::TESLandTexture* activeLayerTexture = nullptr;
 
 	while (file->SeekNextSubrecord()) {
-		const uint32_t type = file->GetCurrentSubRecordType();
-		const uint32_t size = file->GetCurrentSubRecordSize();
+		const uint32_t recordType = file->GetCurrentSubRecordType();
+		const uint32_t recordSize = file->GetCurrentSubRecordSize();
 
-		if (type == kVHGT) {
-			if (size < 4 + kCellVerts * kCellVerts + 3)
+		if (recordType == kVHGT) {
+			if (recordSize < 4 + kCellVertexPitch * kCellVertexPitch + 3)
 				continue;
+
 			struct VHGT
 			{
 				float offset;
-				int8_t deltas[kCellVerts * kCellVerts];
+				int8_t deltas[kCellVertexPitch * kCellVertexPitch];
 				uint8_t pad[3];
 			} data{};
+
 			file->ReadData(&data, sizeof(VHGT));
 
-			float rowBase = bigEndian ? SwapF(data.offset) : data.offset;
-			float decoded[kCellVerts * kCellVerts];
-			for (uint32_t y = 0; y < kCellVerts; ++y) {
-				rowBase += static_cast<float>(data.deltas[y * kCellVerts]);
-				float height = rowBase;
-				for (uint32_t x = 0; x < kCellVerts; ++x) {
+			// VHGT stores a row-start delta followed by deltas across that row. Decode it to world units first.
+			float accumulatedRowHeight = bigEndian ? SwapF(data.offset) : data.offset;
+			float cellHeights[kCellVertexPitch * kCellVertexPitch];
+
+			for (uint32_t y = 0; y < kCellVertexPitch; ++y) {
+				accumulatedRowHeight += static_cast<float>(data.deltas[y * kCellVertexPitch]);
+				float accumulatedHeight = accumulatedRowHeight;
+
+				for (uint32_t x = 0; x < kCellVertexPitch; ++x) {
 					if (x != 0)
-						height += static_cast<float>(data.deltas[y * kCellVerts + x]);
-					decoded[y * kCellVerts + x] = height * 8.0f;
+						accumulatedHeight += static_cast<float>(data.deltas[y * kCellVertexPitch + x]);
+
+					cellHeights[y * kCellVertexPitch + x] = accumulatedHeight * 8.0f;
 				}
 			}
 
@@ -227,42 +239,50 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out)
 			for (uint32_t qy = 0; qy < 2; ++qy) {
 				for (uint32_t qx = 0; qx < 2; ++qx) {
 					const uint32_t quad = qy * 2 + qx;
-					for (uint32_t ly = 0; ly < kPitch; ++ly) {
-						for (uint32_t lx = 0; lx < kPitch; ++lx) {
-							const uint32_t gx = qx * (kPitch - 1) + lx;
-							const uint32_t gy = qy * (kPitch - 1) + ly;
-							out.heights[quad][ly * kPitch + lx] = decoded[gy * kCellVerts + gx];
+					for (uint32_t localY = 0; localY < kQuadrantPitch; ++localY) {
+						for (uint32_t localX = 0; localX < kQuadrantPitch; ++localX) {
+							const uint32_t cellX = qx * (kQuadrantPitch - 1) + localX;
+							const uint32_t cellY = qy * (kQuadrantPitch - 1) + localY;
+							out.heights[quad][localY * kQuadrantPitch + localX] = cellHeights[cellY * kCellVertexPitch + cellX];
 						}
 					}
 				}
 			}
-		} else if (type == kBTXT) {
-			if (size < sizeof(TextureHeader))
+
+		} else if (recordType == kBTXT) {
+			if (recordSize < sizeof(LandscapeTextureHeader))
 				continue;
-			TextureHeader header{};
+
+			LandscapeTextureHeader header{};
 			file->ReadData(&header, sizeof(header));
+
 			if (header.quadrant < 4)
 				baseTexture[header.quadrant] = ResolveLandTexture(file, bigEndian ? Swap32(header.landTexture) : header.landTexture);
-		} else if (type == kATXT) {
-			if (size < sizeof(TextureHeader))
+
+		} else if (recordType == kATXT) {
+			if (recordSize < sizeof(LandscapeTextureHeader))
 				continue;
-			TextureHeader header{};
+
+			LandscapeTextureHeader header{};
 			file->ReadData(&header, sizeof(header));
-			currentQuad = header.quadrant < 4 ? header.quadrant : -1;
-			currentLayerTexture = ResolveLandTexture(file, bigEndian ? Swap32(header.landTexture) : header.landTexture);
-		} else if (type == kVTXT) {
-			// Alpha data always follows its ATXT header, so apply it to that layer.
-			if (currentQuad < 0 || !currentLayerTexture || size < sizeof(AlphaPoint))
+			activeQuadrant = header.quadrant < 4 ? header.quadrant : -1;
+			activeLayerTexture = ResolveLandTexture(file, bigEndian ? Swap32(header.landTexture) : header.landTexture);
+
+		} else if (recordType == kVTXT) {
+			if (activeQuadrant < 0 || !activeLayerTexture || recordSize < sizeof(VertexTextureAlpha))
 				continue;
-			const uint32_t count = size / sizeof(AlphaPoint);
-			std::vector<AlphaPoint> points(count);
-			file->ReadData(points.data(), count * sizeof(AlphaPoint));
-			for (const auto& point : points) {
+
+			const uint32_t pointCount = recordSize / sizeof(VertexTextureAlpha);
+			std::vector<VertexTextureAlpha> points(pointCount);
+			file->ReadData(points.data(), pointCount * sizeof(VertexTextureAlpha));
+
+			for (const VertexTextureAlpha& point : points) {
 				const uint16_t position = bigEndian ? Swap16(point.position) : point.position;
 				const float opacity = bigEndian ? SwapF(point.opacity) : point.opacity;
-				if (position < kSamples && opacity > bestOpacity[currentQuad][position]) {
-					bestOpacity[currentQuad][position] = opacity;
-					layerWinner[currentQuad][position] = currentLayerTexture;
+
+				if (position < kQuadrantSamples && opacity > bestOpacity[activeQuadrant][position]) {
+					bestOpacity[activeQuadrant][position] = opacity;
+					layerWinner[activeQuadrant][position] = activeLayerTexture;
 				}
 			}
 		}
@@ -270,9 +290,15 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out)
 
 	// A land texture grows grass when its grass list is non-empty, and the winning texture per vertex decides.
 	for (uint32_t quad = 0; quad < 4; ++quad) {
-		for (uint32_t v = 0; v < kSamples; ++v) {
+		for (uint32_t v = 0; v < kQuadrantSamples; ++v) {
 			RE::TESLandTexture* winner = bestOpacity[quad][v] > 0.0f ? layerWinner[quad][v] : baseTexture[quad];
 			out.ids[quad][v] = (winner && !winner->textureGrassList.empty()) ? 1u : 0u;
+		}
+
+		const auto [minIt, maxIt] = std::minmax_element(out.heights[quad].begin(), out.heights[quad].end());
+		if (*maxIt > PGrassCommon::QuadrantNoHeight) {
+			out.minHeights[quad] = *minIt;
+			out.maxHeights[quad] = *maxIt;
 		}
 	}
 }
