@@ -13,24 +13,16 @@
 
 #include <BS_thread_pool.hpp>
 
-namespace RE
-{
-	class TESWorldSpace;
-	class TESFileArray;
-	class TESFile;
-	class TESLandTexture;
-}
-
 /**
- * @brief One exterior cell's grass inputs for the far tier, read from plugin LAND records for cells beyond
- * Low's fixed reach (LowTierQuadrantRadius), no longer the whole loaded grid.
- *
+ * @brief One exterior cell's grass inputs for the far tier, read from plugin LAND records for cells beyond the loaded grid.
  * Four quadrants, each a 17x17 grid of world Z and grass-or-bare ids, laid out as the runtime path produces.
  */
 struct CellGrass
 {
 	std::array<std::array<uint8_t, PGrassCommon::QuadrantGrassSamples>, 4> ids{};
 	std::array<std::array<float, PGrassCommon::QuadrantGrassSamples>, 4> heights{};
+	std::array<float, 4> minHeights{};
+	std::array<float, 4> maxHeights{};
 };
 
 /**
