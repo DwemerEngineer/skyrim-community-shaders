@@ -1,4 +1,4 @@
-// Rasterises world geometry into the top-down height map. With no view or projection matrix, the window maps to clip space with a subtract and a divide.
+// Rasterises world geometry into the top-down height map. Maps world coordinates to clip space with a subtract and a divide.
 
 cbuffer HeightCB : register(b0)
 {
@@ -27,8 +27,7 @@ VS_OUTPUT main(VS_INPUT input)
 	float3 worldPos = float3(dot(WorldRow0, localPos), dot(WorldRow1, localPos), dot(WorldRow2, localPos));
 
 	VS_OUTPUT output;
-	// Flip y so world +Y runs down the texture. Depth is unused, as overlaps resolve via a max blend on Z.
-	output.Position = float4((worldPos.xy - WindowCentre) / HalfExtent * float2(1.0f, -1.0f), 0.5f, 1.0f);
+    output.Position = float4((worldPos.xy - WindowCentre) / HalfExtent * float2(1.0f, -1.0f), 0.5f, 1.0f); // Flip y so world +Y runs down the texture.
 	output.WorldZ = worldPos.z;
 	return output;
 }

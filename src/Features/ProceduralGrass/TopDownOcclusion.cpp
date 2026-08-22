@@ -18,6 +18,12 @@ namespace
 		float padding;
 	};
 
+	struct alignas(16) PadCB
+	{
+		int32_t axisX, axisY, radius, pad0;
+		uint32_t dimX, dimY, pad1, pad2;
+	};
+
 	// Keeps the bytecode, which Util::CompileShader discards but input-layout validation needs.
 	ID3DBlob* CompileWithBlob(const wchar_t* a_path, const char* a_target)
 	{
@@ -49,23 +55,41 @@ void TopDownOcclusion::SetupResources()
 	texDesc.Format = DXGI_FORMAT_R32_FLOAT;
 	texDesc.SampleDesc = { 1, 0 };
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
-	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
 
 	heightMap = new Texture2D(texDesc, "TopDownOcclusion::HeightMap");
+	heightMapLow = new Texture2D(texDesc, "TopDownOcclusion::HeightMapLow");
+
+	D3D11_TEXTURE2D_DESC tmpDesc = texDesc;
+	tmpDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	heightMapTmp = new Texture2D(tmpDesc, "TopDownOcclusion::HeightMapTmp");
+	heightMapLowTmp = new Texture2D(tmpDesc, "TopDownOcclusion::HeightMapLowTmp");
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
 	srvDesc.Format = texDesc.Format;
 	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Texture2D.MipLevels = 1;
 	heightMap->CreateSRV(srvDesc);
+	heightMapLow->CreateSRV(srvDesc);
+	heightMapTmp->CreateSRV(srvDesc);
+	heightMapLowTmp->CreateSRV(srvDesc);
+
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+	uavDesc.Format = texDesc.Format;
+	uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+	heightMap->CreateUAV(uavDesc);
+	heightMapLow->CreateUAV(uavDesc);
+	heightMapTmp->CreateUAV(uavDesc);
+	heightMapLowTmp->CreateUAV(uavDesc);
 
 	D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
 	rtvDesc.Format = texDesc.Format;
 	rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
 	heightMap->CreateRTV(rtvDesc);
+	heightMapLow->CreateRTV(rtvDesc);
 
-	// Max blend keeps the highest surface per texel, so this pass needs no depth buffer.
-	D3D11_BLEND_DESC blendDesc{};
+	// Seperate render targets for low and high, so that geometry with overhangs such as tree branches does not occlude the low map.
+	blendDesc.IndependentBlendEnable = TRUE;
 	blendDesc.RenderTarget[0].BlendEnable = TRUE;
 	blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
 	blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
@@ -74,6 +98,9 @@ void TopDownOcclusion::SetupResources()
 	blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
 	blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_MAX;
 	blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED;
+	blendDesc.RenderTarget[1] = blendDesc.RenderTarget[0];
+	blendDesc.RenderTarget[1].BlendOp = D3D11_BLEND_OP_MIN;
+	blendDesc.RenderTarget[1].BlendOpAlpha = D3D11_BLEND_OP_MIN;
 	device->CreateBlendState(&blendDesc, maxBlend.put());
 
 	D3D11_RASTERIZER_DESC rasterDesc{};
@@ -83,13 +110,14 @@ void TopDownOcclusion::SetupResources()
 	device->CreateRasterizerState(&rasterDesc, noCull.put());
 
 	heightCB = new ConstantBuffer(ConstantBufferDesc<HeightCB>());
+	padCB = new ConstantBuffer(ConstantBufferDesc<PadCB>());
 
 	CompileShaders();
 }
 
 void TopDownOcclusion::CompileShaders()
 {
-	if (heightVS && heightPS)
+	if (heightVS && heightPS && padCS)
 		return;
 
 	auto device = globals::d3d::device;
@@ -106,6 +134,13 @@ void TopDownOcclusion::CompileShaders()
 		if (ps)
 			device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &heightPS);
 	}
+
+	if (!padCS) {
+		winrt::com_ptr<ID3DBlob> cs;
+		cs.attach(CompileWithBlob(L"Data\\Shaders\\TopDownOcclusion\\OcclusionPadCS.hlsl", "cs_5_0"));
+		if (cs)
+			device->CreateComputeShader(cs->GetBufferPointer(), cs->GetBufferSize(), nullptr, &padCS);
+	}
 }
 
 void TopDownOcclusion::ClearShaderCache()
@@ -118,15 +153,26 @@ void TopDownOcclusion::ClearShaderCache()
 		heightPS->Release();
 		heightPS = nullptr;
 	}
+	if (padCS) {
+		padCS->Release();
+		padCS = nullptr;
+	}
 	heightVSBlob = nullptr;
-	// Layouts were validated against the old bytecode.
+
+	captured.clear();
+	capturedCentre = { 1.0e30f, 1.0e30f };
 	inputLayouts.clear();
 	CompileShaders();
 }
 
-ID3D11ShaderResourceView* TopDownOcclusion::GetSRV() const
+ID3D11ShaderResourceView* TopDownOcclusion::GetHighSRV() const
 {
-	return heightMap ? heightMap->srv.get() : nullptr;
+	return heightMapHigh ? heightMapHigh->srv.get() : nullptr;
+}
+
+ID3D11ShaderResourceView* TopDownOcclusion::GetLowSRV() const
+{
+	return heightMapLow ? heightMapLow->srv.get() : nullptr;
 }
 
 ID3D11InputLayout* TopDownOcclusion::GetInputLayout(const RE::BSGraphics::VertexDesc& a_desc)
@@ -140,7 +186,6 @@ ID3D11InputLayout* TopDownOcclusion::GetInputLayout(const RE::BSGraphics::Vertex
 
 	auto& layout = inputLayouts[descKey];
 
-	// Position width is the offset to the next attribute. The offset table is authoritative because VF_FULLPREC does not reliably flag float4 positions.
 	const uint32_t strideBytes = uint32_t(descKey & 0xF) * 4;
 	uint32_t positionBytes = strideBytes;
 	static constexpr std::pair<RE::BSGraphics::Vertex::Flags, RE::BSGraphics::Vertex::Attribute> attributes[] = {
@@ -180,8 +225,35 @@ void TopDownOcclusion::CollectFrom(RE::NiAVObject* a_object)
 		return;
 
 	if (auto* geometry = a_object->AsGeometry()) {
-		if (!geometry->AsTriShape() || geometry->worldBound.radius <= minOccluderRadius)
+		auto* triShape = geometry->AsTriShape();
+		if (!triShape || geometry->worldBound.radius <= minOccluderRadius)
 			return;
+
+		RE::BSFadeNode* fadeNode = nullptr;
+		RE::NiNode* parent = geometry->parent;
+		while (parent && !fadeNode) {
+			fadeNode = parent->AsFadeNode();
+			parent = parent->parent;
+		}
+
+		if (fadeNode) {
+			if (auto extraData = fadeNode->GetExtraData("BSX")) {
+				auto bsxFlags = (RE::BSXFlags*)extraData;
+				auto value = static_cast<int32_t>(bsxFlags->value);
+
+				if (value & (static_cast<int32_t>(RE::BSXFlags::Flag::kRagdoll) |
+								static_cast<int32_t>(RE::BSXFlags::Flag::kEditorMarker) |
+								static_cast<int32_t>(RE::BSXFlags::Flag::kDynamic) |
+								static_cast<int32_t>(RE::BSXFlags::Flag::kAddon) |
+								static_cast<int32_t>(RE::BSXFlags::Flag::kNeedsTransformUpdate) |
+								static_cast<int32_t>(RE::BSXFlags::Flag::kMagicShaderParticles) |
+								static_cast<int32_t>(RE::BSXFlags::Flag::kLights) |
+								static_cast<int32_t>(RE::BSXFlags::Flag::kBreakable) |
+								static_cast<int32_t>(RE::BSXFlags::Flag::kSearchedBreakable))) {
+					return;
+				}
+			}
+		}
 
 		using enum RE::BSShaderProperty::EShaderPropertyFlag;
 		if (auto* shaderProperty = geometry->GetGeometryRuntimeData().shaderProperty.get()) {
@@ -189,7 +261,31 @@ void TopDownOcclusion::CollectFrom(RE::NiAVObject* a_object)
 				return;
 		}
 
-		captured.push_back({ RE::NiPointer<RE::BSGeometry>(geometry), geometry->world });
+		auto* rendererData = geometry->GetGeometryRuntimeData().rendererData;
+		if (!rendererData || !rendererData->vertexBuffer || !rendererData->indexBuffer)
+			return;
+
+		const uint32_t indexCount = uint32_t(triShape->GetTrishapeRuntimeData().triangleCount) * 3;
+		const auto& desc = rendererData->vertexDesc;
+		if (indexCount == 0 || !desc.HasFlag(RE::BSGraphics::Vertex::VF_VERTEX))
+			return;
+
+		uint64_t descKey;
+		std::memcpy(&descKey, &desc, sizeof(descKey));
+		const uint32_t stride = uint32_t(descKey & 0xF) * 4;
+		auto* layout = GetInputLayout(desc);
+		if (stride == 0 || !layout)
+			return;
+
+		CapturedGeometry capturedGeometry{};
+		capturedGeometry.geometry = RE::NiPointer<RE::BSGeometry>(geometry);
+		capturedGeometry.world = geometry->world;
+		capturedGeometry.vertexBuffer.copy_from(reinterpret_cast<ID3D11Buffer*>(rendererData->vertexBuffer));
+		capturedGeometry.indexBuffer.copy_from(reinterpret_cast<ID3D11Buffer*>(rendererData->indexBuffer));
+		capturedGeometry.inputLayout = layout;
+		capturedGeometry.indexCount = indexCount;
+		capturedGeometry.stride = stride;
+		captured.push_back(std::move(capturedGeometry));
 		return;
 	}
 
@@ -208,7 +304,7 @@ void TopDownOcclusion::GatherGeometry()
 	if (!player || !tes)
 		return;
 
-	// Use the loaded reference list, not a render queue, so geometry behind the camera is still in the map. 
+	// Use the loaded reference list, not a render queue, so geometry behind the camera is still in the map.
 	const float radius = halfExtent * 1.5f;
 	tes->ForEachReferenceInRange(player, radius, [&](RE::TESObjectREFR* a_ref) {
 		if (!a_ref || a_ref->IsDisabled() || a_ref->IsDeleted() || !a_ref->Is3DLoaded())
@@ -220,11 +316,16 @@ void TopDownOcclusion::GatherGeometry()
 		CollectFrom(a_ref->Get3D());
 		return RE::BSContainer::ForEachResult::kContinue;
 	});
+
+	// The height blend is order-independent. Group layouts so Render avoids rebinding them for every geometry.
+	std::ranges::sort(captured, [](const CapturedGeometry& lhs, const CapturedGeometry& rhs) {
+		return std::less<>{}(lhs.inputLayout, rhs.inputLayout);
+	});
 }
 
 void TopDownOcclusion::Render()
 {
-	if (!heightMap || !heightVS || !heightPS)
+	if (!heightMapHigh || !heightMapLow || !heightVS || !heightPS)
 		return;
 
 	if (Util::IsInterior())
@@ -232,7 +333,7 @@ void TopDownOcclusion::Render()
 
 	auto context = globals::d3d::context;
 
-	// Snap the window to the texel grid so it jumps in whole texels instead of sliding and re-quantising silhouette edges each frame. 
+	// Snap the window to the texel grid so it jumps in whole texels instead of sliding and re-quantising silhouette edges each frame.
 	// Snapping to the coarsest consumer (snapDim) keeps both maps stable.
 	const auto& eye = globals::game::frameBufferCached.GetCameraPosAdjust();
 	const float texel = halfExtent * 2.0f / snapDim;
@@ -241,7 +342,8 @@ void TopDownOcclusion::Render()
 		std::floor(eye.y / texel) * texel
 	};
 
-	if (std::abs(windowCentre.x - capturedCentre.x) >= texel || std::abs(windowCentre.y - capturedCentre.y) >= texel) {
+	const float captureRefreshDistance = std::max(texel, halfExtent * 0.25f);
+	if (std::abs(windowCentre.x - capturedCentre.x) >= captureRefreshDistance || std::abs(windowCentre.y - capturedCentre.y) >= captureRefreshDistance) {
 		GatherGeometry();
 		capturedCentre = windowCentre;
 	}
@@ -254,11 +356,13 @@ void TopDownOcclusion::Render()
 	D3D11_VIEWPORT previousViewport{};
 	context->RSGetViewports(&previousViewportCount, &previousViewport);
 
-	const float clearValue[4] = { EmptyHeight, EmptyHeight, EmptyHeight, EmptyHeight };
-	context->ClearRenderTargetView(heightMap->rtv.get(), clearValue);
+	const float clearHigh[4] = { EmptyHigh, EmptyHigh, EmptyHigh, EmptyHigh };
+	const float clearLow[4] = { EmptyLow, EmptyLow, EmptyLow, EmptyLow };
+	context->ClearRenderTargetView(heightMapHigh->rtv.get(), clearHigh);
+	context->ClearRenderTargetView(heightMapLow->rtv.get(), clearLow);
 
-	ID3D11RenderTargetView* rtv = heightMap->rtv.get();
-	context->OMSetRenderTargets(1, &rtv, nullptr);
+	ID3D11RenderTargetView* rtvs[2] = { heightMapHigh->rtv.get(), heightMapLow->rtv.get() };
+	context->OMSetRenderTargets(2, rtvs, nullptr);
 	context->OMSetBlendState(maxBlend.get(), nullptr, 0xFFFFFFFF);
 	context->RSSetState(noCull.get());
 
@@ -272,45 +376,23 @@ void TopDownOcclusion::Render()
 	context->VSSetConstantBuffers(0, 1, &constants);
 
 	lastDrawCount = 0;
+	ID3D11InputLayout* currentLayout = nullptr;
 	for (const auto& entry : captured) {
 		auto* geometry = entry.geometry.get();
 		if (!geometry)
 			continue;
 
-		auto* triShape = geometry->AsTriShape();
-		if (!triShape)
-			continue;
-
-		auto* rendererData = geometry->GetGeometryRuntimeData().rendererData;
-		if (!rendererData || !rendererData->vertexBuffer || !rendererData->indexBuffer)
-			continue;
-
-		const uint32_t indexCount = uint32_t(triShape->GetTrishapeRuntimeData().triangleCount) * 3;
-		if (indexCount == 0)
-			continue;
-
-		const auto& desc = rendererData->vertexDesc;
-		if (!desc.HasFlag(RE::BSGraphics::Vertex::VF_VERTEX))
-			continue;
-
-		auto* layout = GetInputLayout(desc);
-		if (!layout)
-			continue;
-		context->IASetInputLayout(layout);
-
-		uint64_t descKey;
-		std::memcpy(&descKey, &desc, sizeof(descKey));
-		const UINT stride = uint32_t(descKey & 0xF) * 4;
-		if (stride == 0)
-			continue;
+		if (entry.inputLayout != currentLayout) {
+			context->IASetInputLayout(entry.inputLayout);
+			currentLayout = entry.inputLayout;
+		}
 
 		const UINT offset = 0;
-		auto* vertexBuffer = reinterpret_cast<ID3D11Buffer*>(rendererData->vertexBuffer);
-		auto* indexBuffer = reinterpret_cast<ID3D11Buffer*>(rendererData->indexBuffer);
+		const UINT stride = entry.stride;
+		auto* vertexBuffer = entry.vertexBuffer.get();
 		context->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
-		context->IASetIndexBuffer(indexBuffer, DXGI_FORMAT_R16_UINT, 0);
+		context->IASetIndexBuffer(entry.indexBuffer.get(), DXGI_FORMAT_R16_UINT, 0);
 
-		// Baked into the cbuffer as three rows, matching how the vertex shader consumes it.
 		const auto& transform = geometry->world;
 		const auto& rotate = transform.rotate;
 		const float scale = transform.scale;
@@ -323,12 +405,15 @@ void TopDownOcclusion::Render()
 		data.halfExtent = halfExtent;
 		heightCB->Update(data);
 
-		context->DrawIndexed(indexCount, 0, 0);
+		context->DrawIndexed(entry.indexCount, 0, 0);
 		lastDrawCount++;
 	}
 
-	ID3D11RenderTargetView* nullRTV = nullptr;
-	context->OMSetRenderTargets(1, &nullRTV, nullptr);
+	ID3D11RenderTargetView* nullRTVs[2] = { nullptr, nullptr };
+	context->OMSetRenderTargets(2, nullRTVs, nullptr);
+
+	PadMaps(context);
+
 	context->OMSetRenderTargets(8, previousRTVs, previousDSV);
 	for (auto* view : previousRTVs) {
 		if (view)
@@ -339,4 +424,48 @@ void TopDownOcclusion::Render()
 
 	if (previousViewportCount)
 		context->RSSetViewports(previousViewportCount, &previousViewport);
+}
+
+void TopDownOcclusion::PadMaps(ID3D11DeviceContext* context)
+{
+	if (!padCS || !heightMapTmp || !heightMapLowTmp || !padCB)
+		return;
+
+	// Convert world-space padding to texels. Skip padding if less than one texel.
+	const float texel = halfExtent * 2.0f / mapDim;
+	const int radius = static_cast<int>(std::lround(paddingWorld / texel));
+	if (radius <= 0)
+		return;
+
+	context->CSSetShader(padCS, nullptr, 0);
+	auto* cbuf = padCB->CB();
+	context->CSSetConstantBuffers(0, 1, &cbuf);
+	const UINT groups = (mapDim + 7) / 8;
+
+	ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+	ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
+
+	// Horizontal pass: heightMap/Low (SRV) -> Tmp (UAV).
+	PadCB h{ 1, 0, radius, 0, mapDim, mapDim, 0, 0 };
+	padCB->Update(h);
+	ID3D11ShaderResourceView* srvH[2] = { heightMap->srv.get(), heightMapLow->srv.get() };
+	ID3D11UnorderedAccessView* uavH[2] = { heightMapTmp->uav.get(), heightMapLowTmp->uav.get() };
+	context->CSSetShaderResources(0, 2, srvH);
+	context->CSSetUnorderedAccessViews(0, 2, uavH, nullptr);
+	context->Dispatch(groups, groups, 1);
+	context->CSSetShaderResources(0, 2, nullSRVs);
+	context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+
+	// Vertical pass: Tmp (SRV) -> heightMap/Low (UAV), padded in place.
+	PadCB v{ 0, 1, radius, 0, mapDim, mapDim, 0, 0 };
+	padCB->Update(v);
+	ID3D11ShaderResourceView* srvV[2] = { heightMapTmp->srv.get(), heightMapLowTmp->srv.get() };
+	ID3D11UnorderedAccessView* uavV[2] = { heightMap->uav.get(), heightMapLow->uav.get() };
+	context->CSSetShaderResources(0, 2, srvV);
+	context->CSSetUnorderedAccessViews(0, 2, uavV, nullptr);
+	context->Dispatch(groups, groups, 1);
+	context->CSSetShaderResources(0, 2, nullSRVs);
+	context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+
+	context->CSSetShader(nullptr, nullptr, 0);
 }
