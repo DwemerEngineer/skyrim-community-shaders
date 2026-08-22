@@ -42,7 +42,7 @@ namespace
 
 void TopDownOcclusion::SetupResources()
 {
-	if (heightMap)
+	if (heightMapHigh && heightMapLow)
 		return;
 
 	auto device = globals::d3d::device;
@@ -57,7 +57,7 @@ void TopDownOcclusion::SetupResources()
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
 
-	heightMap = new Texture2D(texDesc, "TopDownOcclusion::HeightMap");
+	heightMapHigh = new Texture2D(texDesc, "TopDownOcclusion::HeightMap");
 	heightMapLow = new Texture2D(texDesc, "TopDownOcclusion::HeightMapLow");
 
 	D3D11_TEXTURE2D_DESC tmpDesc = texDesc;
@@ -69,7 +69,7 @@ void TopDownOcclusion::SetupResources()
 	srvDesc.Format = texDesc.Format;
 	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Texture2D.MipLevels = 1;
-	heightMap->CreateSRV(srvDesc);
+	heightMapHigh->CreateSRV(srvDesc);
 	heightMapLow->CreateSRV(srvDesc);
 	heightMapTmp->CreateSRV(srvDesc);
 	heightMapLowTmp->CreateSRV(srvDesc);
@@ -77,7 +77,7 @@ void TopDownOcclusion::SetupResources()
 	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
 	uavDesc.Format = texDesc.Format;
 	uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-	heightMap->CreateUAV(uavDesc);
+	heightMapHigh->CreateUAV(uavDesc);
 	heightMapLow->CreateUAV(uavDesc);
 	heightMapTmp->CreateUAV(uavDesc);
 	heightMapLowTmp->CreateUAV(uavDesc);
@@ -85,10 +85,11 @@ void TopDownOcclusion::SetupResources()
 	D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
 	rtvDesc.Format = texDesc.Format;
 	rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-	heightMap->CreateRTV(rtvDesc);
+	heightMapHigh->CreateRTV(rtvDesc);
 	heightMapLow->CreateRTV(rtvDesc);
 
 	// Seperate render targets for low and high, so that geometry with overhangs such as tree branches does not occlude the low map.
+	D3D11_BLEND_DESC blendDesc;
 	blendDesc.IndependentBlendEnable = TRUE;
 	blendDesc.RenderTarget[0].BlendEnable = TRUE;
 	blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
@@ -448,7 +449,7 @@ void TopDownOcclusion::PadMaps(ID3D11DeviceContext* context)
 	// Horizontal pass: heightMap/Low (SRV) -> Tmp (UAV).
 	PadCB h{ 1, 0, radius, 0, mapDim, mapDim, 0, 0 };
 	padCB->Update(h);
-	ID3D11ShaderResourceView* srvH[2] = { heightMap->srv.get(), heightMapLow->srv.get() };
+	ID3D11ShaderResourceView* srvH[2] = { heightMapHigh->srv.get(), heightMapLow->srv.get() };
 	ID3D11UnorderedAccessView* uavH[2] = { heightMapTmp->uav.get(), heightMapLowTmp->uav.get() };
 	context->CSSetShaderResources(0, 2, srvH);
 	context->CSSetUnorderedAccessViews(0, 2, uavH, nullptr);
@@ -460,7 +461,7 @@ void TopDownOcclusion::PadMaps(ID3D11DeviceContext* context)
 	PadCB v{ 0, 1, radius, 0, mapDim, mapDim, 0, 0 };
 	padCB->Update(v);
 	ID3D11ShaderResourceView* srvV[2] = { heightMapTmp->srv.get(), heightMapLowTmp->srv.get() };
-	ID3D11UnorderedAccessView* uavV[2] = { heightMap->uav.get(), heightMapLow->uav.get() };
+	ID3D11UnorderedAccessView* uavV[2] = { heightMapHigh->uav.get(), heightMapLow->uav.get() };
 	context->CSSetShaderResources(0, 2, srvV);
 	context->CSSetUnorderedAccessViews(0, 2, uavV, nullptr);
 	context->Dispatch(groups, groups, 1);
