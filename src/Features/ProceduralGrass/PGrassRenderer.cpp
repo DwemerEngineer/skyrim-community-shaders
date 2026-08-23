@@ -510,7 +510,8 @@ ID3D11VertexShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetVS()
 		std::vector<std::pair<const char*, const char*>> defines;
 
 		for (auto feature : Feature::GetFeatureList()) {
-			if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting))
+			if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting) &&
+				(feature != &globals::features::skylighting || globals::features::skylighting.texProbeArray))
 				defines.push_back({ feature->GetShaderDefineName().data(), nullptr });
 		}
 
@@ -538,7 +539,8 @@ ID3D11PixelShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetPS(const b
 		std::vector<std::pair<const char*, const char*>> defines;
 
 		for (auto* feature : Feature::GetFeatureList()) {
-			if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting))
+			if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting) &&
+				(feature != &globals::features::skylighting || globals::features::skylighting.texProbeArray))
 				defines.push_back({ feature->GetShaderDefineName().data(), nullptr });
 		}
 

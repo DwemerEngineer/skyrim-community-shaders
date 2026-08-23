@@ -6,6 +6,16 @@
 #include "Globals.h"
 #include "Util.h"
 
+namespace
+{
+	RE::TESWorldSpace* ResolveLandWorldspace(RE::TESWorldSpace* worldspace)
+	{
+		while (worldspace && worldspace->parentWorld && worldspace->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData))
+			worldspace = worldspace->parentWorld;
+		return worldspace;
+	}
+}
+
 TerrainHeightMap* TerrainHeightMap::GetSingleton()
 {
 	static TerrainHeightMap singleton;
@@ -79,10 +89,10 @@ void TerrainHeightMap::Discover()
 		std::error_code ec;
 		for (auto const& dir_entry : std::filesystem::directory_iterator{ texture_dir, ec }) {
 			auto dir_path = dir_entry.path();
-			if (!std::filesystem::is_directory(dir_path))
+			if (!std::filesystem::is_directory(dir_path, ec))
 				continue;
 
-			for (auto const& sub_dir_entry : std::filesystem::directory_iterator{ dir_path })
+			for (auto const& sub_dir_entry : std::filesystem::directory_iterator{ dir_path, ec })
 				ParseHeightmapPath(sub_dir_entry.path(), true);
 		}
 	}
@@ -99,7 +109,7 @@ void TerrainHeightMap::Discover()
 bool TerrainHeightMap::IsReady() const
 {
 	if (auto tes = RE::TES::GetSingleton())
-		if (auto worldspace = tes->GetRuntimeData2().worldSpace)
+		if (auto worldspace = ResolveLandWorldspace(tes->GetRuntimeData2().worldSpace))
 			return cachedHeightmap && cachedHeightmap->worldspace == worldspace->GetFormEditorID();
 	return false;
 }
@@ -110,9 +120,7 @@ bool TerrainHeightMap::LoadForCurrentWorldspace()
 	if (!tes)
 		return false;
 
-	auto worldspace = tes->GetRuntimeData2().worldSpace;
-	while (worldspace && worldspace->parentWorld && worldspace->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData))
-		worldspace = worldspace->parentWorld;
+	auto worldspace = ResolveLandWorldspace(tes->GetRuntimeData2().worldSpace);
 
 	if (!worldspace)
 		return false;
@@ -151,7 +159,6 @@ bool TerrainHeightMap::LoadForCurrentWorldspace()
 			return false;
 		}
 
-		texHeightMap.release();
 		texHeightMap = std::make_unique<Texture2D>(reinterpret_cast<ID3D11Texture2D*>(pResource), "TerrainHeightMap::HeightMap");
 
 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {

@@ -21,6 +21,45 @@ std::filesystem::path TextureTypesPath()
 {
 	return Util::PathHelpers::GetCommunityShaderPath() / TextureTypesFilename;
 }
+
+bool IsNumericArray(const nlohmann::json& value, const size_t size)
+{
+	if (!value.is_array() || value.size() != size)
+		return false;
+	return std::all_of(value.begin(), value.end(), [](const auto& component) { return component.is_number(); });
+}
+
+bool IsValidGrassTypeOverride(const std::string_view key, const nlohmann::json& value)
+{
+	if (key == "SubsurfaceOpacity")
+		return IsNumericArray(value, 2);
+
+	constexpr std::array float3Keys{
+		"BaseColor"sv,
+		"TipColor"sv,
+		"ColorTipDry"sv,
+		"ColorCool"sv,
+		"ColorWarm"sv,
+		"SubsurfaceTint"sv,
+		"BaseMinTipRoughness"sv,
+		"BounceColor"sv,
+		"VeinTint"sv,
+	};
+	if (std::ranges::find(float3Keys, key) != float3Keys.end())
+		return IsNumericArray(value, 3);
+
+	return value.is_number();
+}
+
+void RemoveInvalidGrassTypeOverrides(nlohmann::json& overrides)
+{
+	for (auto it = overrides.begin(); it != overrides.end();) {
+		if (!IsValidGrassTypeOverride(it.key(), it.value()))
+			it = overrides.erase(it);
+		else
+			++it;
+	}
+}
 }
 
 void ProceduralGrass::LoadTextureTypes()
@@ -55,9 +94,12 @@ void ProceduralGrass::LoadTextureTypes()
 					continue;
 
 				Settings::GrassTypeDef def;
-				def.weight = variant.value("Weight", 1.0f);
-				if (auto overrides = variant.find("Overrides"); overrides != variant.end() && overrides->is_object())
+				if (auto weight = variant.find("Weight"); weight != variant.end() && weight->is_number())
+					def.weight = weight->get<float>();
+				if (auto overrides = variant.find("Overrides"); overrides != variant.end() && overrides->is_object()) {
 					def.overrides = *overrides;
+					RemoveInvalidGrassTypeOverrides(def.overrides);
+				}
 				defs.push_back(std::move(def));
 			}
 			if (!defs.empty())
@@ -358,7 +400,7 @@ void ProceduralGrass::DrawGrassTypeEditor()
 		}
 		ImGui::SameLine();
 		ImGui::BeginDisabled(!has);
-		float val = has ? ov[key].get<float>() : base;
+		float val = has && ov[key].is_number() ? ov[key].get<float>() : base;
 		if (ImGui::SliderFloat(label, &val, mn, mx, fmt) && has)
 			ov[key] = val;
 		ImGui::EndDisabled();
@@ -374,7 +416,9 @@ void ProceduralGrass::DrawGrassTypeEditor()
 		}
 		ImGui::SameLine();
 		ImGui::BeginDisabled(!has);
-		float2 val = has ? ov[key].get<float2>() : base;
+		float2 val = base;
+		if (has && IsNumericArray(ov[key], 2))
+			ov[key].get_to(val);
 		if (ImGui::SliderFloat2(label, &val.x, mn, mx, "%.2f") && has)
 			ov[key] = val;
 		ImGui::EndDisabled();
@@ -390,7 +434,9 @@ void ProceduralGrass::DrawGrassTypeEditor()
 		}
 		ImGui::SameLine();
 		ImGui::BeginDisabled(!has);
-		float3 val = has ? ov[key].get<float3>() : base;
+		float3 val = base;
+		if (has && IsNumericArray(ov[key], 3))
+			ov[key].get_to(val);
 		bool changed = asColor ? ImGui::ColorEdit3(label, &val.x) : ImGui::SliderFloat3(label, &val.x, mn, mx, "%.2f");
 		if (changed && has)
 			ov[key] = val;
@@ -573,6 +619,7 @@ void ProceduralGrass::DrawGrassTypeEditor()
 void ProceduralGrass::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	settings.Quality = std::clamp(settings.Quality, 0, static_cast<int32_t>(Quality::Count) - 1);
 
 	// Blade shape / material
 	settings.grassHeight = o_json.value("Height", settings.grassHeight);
