@@ -270,6 +270,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 		for (uint32_t i = 0; i < quadrants.size(); i++) {
 
 			const auto& quadrant = quadrants[i];
+			auto grassIds = quadrant.grassIds;
 			auto& quadrantData = quadrantDataArray.data[i];
 
 			quadrantData.quadWorldPos = quadrant.worldPos;
@@ -279,8 +280,8 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 			quadrantData.flags = quadrant.maxHeight > QuadrantNoHeight ? WorkHasLand : 0u;
 
 			auto* dst = quadrantGrassStaging.data() + i * QuadrantGrassSamples;  // one grass id per byte
-			if (quadrant.grassIds)
-				std::memcpy(dst, quadrant.grassIds, QuadrantGrassSamples);
+			if (grassIds)
+				std::memcpy(dst, grassIds, QuadrantGrassSamples);
 			else
 				std::memset(dst, 0, QuadrantGrassSamples);
 
