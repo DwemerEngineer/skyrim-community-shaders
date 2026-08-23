@@ -286,10 +286,10 @@ float CalculateWindNoise(float2 worldPosition)
 	return lerp(lerp(noiseLower.x, noiseLower.y, blend.x), lerp(noiseUpper.x, noiseUpper.y, blend.x), blend.y) * 2.0f - 1.0f;
 }
 
-// Vanilla grass's gust waveform with smooth world-space variation.
-float CalculateWindDisplacement(float2 worldPosition, float timer, float bladeHeight, float windNoise)
+// Vanilla grass's gust waveform with smooth field variation and stable per-blade offsets.
+float CalculateWindDisplacement(float2 worldPosition, float timer, float bladeHeight, float windNoise, float bladePhase, float bladeStrength)
 {
-	float gustAngle = 0.4f * ((worldPosition.x + worldPosition.y) * -0.0078125f + timer) + windNoise * 0.5f;
+	float gustAngle = 0.4f * ((worldPosition.x + worldPosition.y) * -0.0078125f + timer) + windNoise * 0.5f + bladePhase;
 
 	float gustSin, gustCos;
 	sincos(gustAngle, gustSin, gustCos);
@@ -297,7 +297,7 @@ float CalculateWindDisplacement(float2 worldPosition, float timer, float bladeHe
 	float gust0 = 0.2f * cos(Math::PI * gustCos);
 	float gust1 = sin(Math::PI * gustSin);
 	float gust2 = sin(Math::TAU * gustSin);
-	float gustStrength = max(0.45f, 1.0f + windNoise * 0.35f);
+	float gustStrength = max(0.35f, (1.0f + windNoise * 0.35f) * bladeStrength);
 
 	// Taller blades receive a stronger gust response. 150 units matches the maximum possible grass height.
 	float heightResponse = bladeHeight * lerp(0.55f, 1.20f, saturate(bladeHeight * (1.0f / 150.0f)));
@@ -500,8 +500,10 @@ void EmitBlade(
 	float windAdjustedAngle = clumpedAngle + clampedRotation;
 #if defined(HIGH_LOD) || defined(MID_LOD)
 	float windNoise = CalculateWindNoise(bladeWorldPos2D);
-	float windDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer, randHeight, windNoise);
-	float previousWindDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer - miscParams.w, randHeight, windNoise);
+	float bladeWindPhase = (float(hash.x) * UINT_TO_FLOAT - 0.5f) * 0.45f;
+	float bladeWindStrength = lerp(0.65f, 1.35f, float(hash.y) * UINT_TO_FLOAT);
+	float windDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer, randHeight, windNoise, bladeWindPhase, bladeWindStrength);
+	float previousWindDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer - miscParams.w, randHeight, windNoise, bladeWindPhase, bladeWindStrength);
 #else
 	float windDisplacement = 0.0f;
 	float previousWindDisplacement = 0.0f;
