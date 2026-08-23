@@ -6,8 +6,6 @@
 
 #include <limits>
 
-using namespace PGrassCommon;
-
 struct ProceduralGrass : Feature
 {
 public:
@@ -182,11 +180,11 @@ private:
 	PGrassRenderer<PGrassCommon::LowTierQuadrantCap, 1>* grassRendererLowLOD = nullptr;
 	PGrassRenderer<PGrassCommon::FarQuadrantCount, 1>* grassRendererFarLOD = nullptr;
 
-	std::vector<Quadrant> quadrantsHighLOD;
-	std::vector<Quadrant> quadrantsMidLOD;
-	std::vector<Quadrant> quadrantsLowLOD;
-	std::vector<Quadrant> quadrantsFarLOD;
-	std::vector<Quadrant> quadrantsPresence;
+	std::vector<PGrassCommon::Quadrant> quadrantsHighLOD;
+	std::vector<PGrassCommon::Quadrant> quadrantsMidLOD;
+	std::vector<PGrassCommon::Quadrant> quadrantsLowLOD;
+	std::vector<PGrassCommon::Quadrant> quadrantsFarLOD;
+	std::vector<PGrassCommon::Quadrant> quadrantsPresence;
 
 	// Far reads LAND data on workers. Near tiers use loaded cell LAND data.
 	GrassCellCache grassCellCache;
