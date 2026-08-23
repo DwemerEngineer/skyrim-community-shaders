@@ -1,3 +1,7 @@
+#define TRUE_PBR
+
+static const uint PBRFlags = 1 << 4;
+
 #include "Common/Color.hlsli"
 #include "Common/FrameBuffer.hlsli"
 #include "Common/GBuffer.hlsli"
@@ -6,7 +10,11 @@
 #include "Common/MotionBlur.hlsli"
 #include "Common/Permutation.hlsli"
 #include "Common/Random.hlsli"
+
+SamplerState SampColorSampler : register(s0);
 #define LinearSampler SampColorSampler
+#define SampNormalSampler SampColorSampler
+
 #include "Common/ShadowSampling.hlsli"
 #include "Common/SharedData.hlsli"
 
@@ -61,8 +69,6 @@
 #	define WETNESS_EFFECTS
 #endif
 
-static const uint PBRFlags = 1 << 4;
-
 struct PS_INPUT
 {
 	float4 Position : SV_POSITION;
@@ -96,8 +102,6 @@ struct PS_OUTPUT
 
 Texture2D<uint> GrassDensityTexture : register(t71);
 
-SamplerState SampColorSampler : register(s0);
-#define SampNormalSampler SampColorSampler
 SamplerState SampGlowSampler : register(s6);
 SamplerState SampShadowMaskSampler : register(s14);
 
@@ -325,7 +329,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float2 shadowUV = FrameBuffer::GetDynamicResolutionAdjustedScreenPosition(adjustedShadowUV);
 	shadowColor = TexShadowMaskSampler.Sample(SampShadowMaskSampler, shadowUV);
 
-	// Material inputs shared by direct and indirect lighting.
 	MaterialProperties material = (MaterialProperties)0;
 	material.Noise = screenNoise;
 	material.Roughness = saturate(rawRMAOS.x);
