@@ -1,6 +1,8 @@
 #define TRUE_PBR
 
-static const uint PBRFlags = 1 << 4;
+#include "Common/PBRMath.hlsli"
+
+static const uint PBRFlags = PBR::Flags::Subsurface;
 
 #include "Common/Color.hlsli"
 #include "Common/FrameBuffer.hlsli"
@@ -56,7 +58,6 @@ SamplerState SampColorSampler : register(s0);
 #define DEFERRED
 #define FRAMEBUFFER
 #define TRUE_PBR
-#define LIGHT_LIMIT_FIX
 
 #if defined(__INTELLISENSE__)
 #	define ISL

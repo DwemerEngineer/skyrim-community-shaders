@@ -202,14 +202,14 @@ void ProceduralGrass::GetVisibleQuadrants()
 	const int32_t playerCellY = static_cast<int32_t>(std::floor(playerPos.y / 4096.0f));
 
 	// Centre the terrain-darkening grass-id window on the player.
-	const int32_t presenceOriginQuadX = playerQuadrantX - LowTierQuadrantRadius;
-	const int32_t presenceOriginQuadY = playerQuadrantY - LowTierQuadrantRadius;
+	const int32_t presenceOriginQuadX = playerQuadrantX - PGrassCommon::LowTierQuadrantRadius;
+	const int32_t presenceOriginQuadY = playerQuadrantY - PGrassCommon::LowTierQuadrantRadius;
 	grassPresenceOrigin = float2{ presenceOriginQuadX * 2048.0f, presenceOriginQuadY * 2048.0f };
 
 	quadrantReject = {};
 
 	const auto cells = tes ? tes->gridCells : nullptr;
-	auto quadrant = Quadrant{};
+	auto quadrant = PGrassCommon::Quadrant{};
 	const auto cellCount = cells ? cells->length * cells->length : 0u;
 
 	for (uint32_t i = 0; i < cellCount; i++) {
@@ -254,13 +254,13 @@ void ProceduralGrass::GetVisibleQuadrants()
 							// Overlap max-distance bands so adjacent tiers cross-fade.
 							const int32_t md = std::max(xDiff, yDiff);
 
-							if (md <= LowTierQuadrantRadius)
+							if (md <= PGrassCommon::LowTierQuadrantRadius)
 								quadrantsPresence.push_back(quadrant);
-							if (md <= HighTierQuadrantRadius && quadrantsHighLOD.size() < HighTierQuadrantCap)
+							if (md <= PGrassCommon::HighTierQuadrantRadius && quadrantsHighLOD.size() < PGrassCommon::HighTierQuadrantCap)
 								quadrantsHighLOD.push_back(quadrant);
-							if (md >= HighTierQuadrantRadius - 1 && md <= MidTierQuadrantRadius && quadrantsMidLOD.size() < MidTierQuadrantCap)
+							if (md >= PGrassCommon::HighTierQuadrantRadius - 1 && md <= PGrassCommon::MidTierQuadrantRadius && quadrantsMidLOD.size() < PGrassCommon::MidTierQuadrantCap)
 								quadrantsMidLOD.push_back(quadrant);
-							if (md >= MidTierQuadrantRadius - 1 && md <= LowTierQuadrantRadius && quadrantsLowLOD.size() < LowTierQuadrantCap)
+							if (md >= PGrassCommon::MidTierQuadrantRadius - 1 && md <= PGrassCommon::LowTierQuadrantRadius && quadrantsLowLOD.size() < PGrassCommon::LowTierQuadrantCap)
 								quadrantsLowLOD.push_back(quadrant);
 						}
 					}
@@ -284,15 +284,15 @@ void ProceduralGrass::GetVisibleQuadrants()
 
 			const int32_t worldQuadrantX = presenceQuadrant.cellX * 2 + static_cast<int32_t>(presenceQuadrant.x);
 			const int32_t worldQuadrantY = presenceQuadrant.cellY * 2 + static_cast<int32_t>(presenceQuadrant.y);
-			const int32_t sx0 = (worldQuadrantX - presenceOriginQuadX) * (QuadrantGrassPitch - 1);
-			const int32_t sy0 = (worldQuadrantY - presenceOriginQuadY) * (QuadrantGrassPitch - 1);
+			const int32_t sx0 = (worldQuadrantX - presenceOriginQuadX) * (PGrassCommon::QuadrantGrassPitch - 1);
+			const int32_t sy0 = (worldQuadrantY - presenceOriginQuadY) * (PGrassCommon::QuadrantGrassPitch - 1);
 
-			if (sx0 < 0 || sy0 < 0 || sx0 + static_cast<int32_t>(QuadrantGrassPitch) > static_cast<int32_t>(grassPresenceDim) || sy0 + static_cast<int32_t>(QuadrantGrassPitch) > static_cast<int32_t>(grassPresenceDim))
+			if (sx0 < 0 || sy0 < 0 || sx0 + static_cast<int32_t>(PGrassCommon::QuadrantGrassPitch) > static_cast<int32_t>(grassPresenceDim) || sy0 + static_cast<int32_t>(PGrassCommon::QuadrantGrassPitch) > static_cast<int32_t>(grassPresenceDim))
 				continue;
 
-			for (uint32_t row = 0; row < QuadrantGrassPitch; ++row) {
+			for (uint32_t row = 0; row < PGrassCommon::QuadrantGrassPitch; ++row) {
 				uint8_t* dstRow = grassPresenceStaging.data() + static_cast<size_t>(sy0 + row) * grassPresenceDim + sx0;
-				std::memcpy(dstRow, presenceQuadrant.grassIds + row * QuadrantGrassPitch, QuadrantGrassPitch);
+				std::memcpy(dstRow, presenceQuadrant.grassIds + row * PGrassCommon::QuadrantGrassPitch, PGrassCommon::QuadrantGrassPitch);
 			}
 		}
 
@@ -330,7 +330,7 @@ void ProceduralGrass::GetVisibleQuadrants()
 					const int32_t md = std::max(std::abs(playerQuadrantX - worldQuadrantX), std::abs(playerQuadrantY - worldQuadrantY));
 
 					// Loaded quadrants inside Low's range belong to the near tiers. Far draws the rest.
-					if (inLoadedGrid && md <= LowTierQuadrantRadius)
+					if (inLoadedGrid && md <= PGrassCommon::LowTierQuadrantRadius)
 						continue;
 
 					quadrant.cellX = cx;
