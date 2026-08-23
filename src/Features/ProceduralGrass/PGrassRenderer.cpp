@@ -279,7 +279,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 			quadrantData.flags = quadrant.maxHeight > QuadrantNoHeight ? WorkHasLand : 0u;
 
 			auto* dst = quadrantGrassStaging.data() + i * QuadrantGrassSamples;  // one grass id per byte
-			if (quadrant.grassIds)
+			if (uadrant.grassIds)
 				std::memcpy(dst, uadrant.grassIds, QuadrantGrassSamples);
 			else
 				std::memset(dst, 0, QuadrantGrassSamples);
