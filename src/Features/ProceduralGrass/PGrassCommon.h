@@ -26,8 +26,8 @@ namespace PGrassCommon
 	{
 		int cellX;
 		int cellY;
-		uint quadrantX;
-		uint quadrantY;
+		uint x;
+		uint y;
 		const uint8_t* grassIds;
 		const float* heights;            // null when the LAND is unloaded
 		float2 worldPos;                 // cached lower-left world XY
