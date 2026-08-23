@@ -2,12 +2,102 @@
 
 #include "TopDownOcclusion.h"
 #include "TerrainHeightMap.h"
+#include "Utils/FileSystem.h"
 #include "Utils/Serialize.h"
+
+#include <filesystem>
+#include <fstream>
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ProceduralGrass::Settings,
 	Enabled,
 	Quality)
+
+namespace
+{
+constexpr auto TextureTypesFilename = "ProceduralGrassTypes.json";
+
+std::filesystem::path TextureTypesPath()
+{
+	return Util::PathHelpers::GetCommunityShaderPath() / TextureTypesFilename;
+}
+}
+
+void ProceduralGrass::LoadTextureTypes()
+{
+	settings.textureTypes.clear();
+
+	const auto path = TextureTypesPath();
+	std::ifstream input(path);
+	if (!input.is_open()) {
+		if (std::filesystem::exists(path))
+			logger::warn("[Procedural Grass] Failed to open texture types file: {}", path.string());
+		return;
+	}
+
+	try {
+		json textureTypesJson;
+		input >> textureTypesJson;
+		if (!textureTypesJson.is_object()) {
+			logger::warn("[Procedural Grass] Texture types file must contain an object: {}", path.string());
+			return;
+		}
+
+		for (const auto& [key, variants] : textureTypesJson.items()) {
+			if (!variants.is_array()) {
+				logger::warn("[Procedural Grass] Ignoring invalid texture type variants for {}", key);
+				continue;
+			}
+
+			std::vector<Settings::GrassTypeDef> defs;
+			for (const auto& variant : variants) {
+				if (!variant.is_object())
+					continue;
+
+				Settings::GrassTypeDef def;
+				def.weight = variant.value("Weight", 1.0f);
+				if (auto overrides = variant.find("Overrides"); overrides != variant.end() && overrides->is_object())
+					def.overrides = *overrides;
+				defs.push_back(std::move(def));
+			}
+			if (!defs.empty())
+				settings.textureTypes[key] = std::move(defs);
+		}
+	} catch (const nlohmann::json::exception& e) {
+		logger::warn("[Procedural Grass] Failed to parse texture types file {}: {}", path.string(), e.what());
+	}
+}
+
+void ProceduralGrass::SaveTextureTypes() const
+{
+	const auto path = TextureTypesPath();
+	try {
+		std::filesystem::create_directories(path.parent_path());
+	} catch (const std::filesystem::filesystem_error& e) {
+		logger::warn("[Procedural Grass] Failed to create texture types directory {}: {}", path.parent_path().string(), e.what());
+		return;
+	}
+
+	std::ofstream output(path);
+	if (!output.is_open()) {
+		logger::warn("[Procedural Grass] Failed to open texture types file for saving: {}", path.string());
+		return;
+	}
+
+	json textureTypesJson = json::object();
+	for (const auto& [key, defs] : settings.textureTypes) {
+		json variants = json::array();
+		for (const auto& def : defs)
+			variants.push_back({ { "Weight", def.weight }, { "Overrides", def.overrides } });
+		textureTypesJson[key] = std::move(variants);
+	}
+
+	try {
+		output << textureTypesJson.dump(1);
+	} catch (const nlohmann::json::exception& e) {
+		logger::warn("[Procedural Grass] Failed to save texture types file {}: {}", path.string(), e.what());
+	}
+}
 
 
 void ProceduralGrass::DrawSettings()
@@ -586,22 +676,7 @@ void ProceduralGrass::LoadSettings(json& o_json)
 	settings.debugDisableAllCulls = o_json.value("DebugDisableAllCulls", settings.debugDisableAllCulls);
 	settings.debugIgnorePreProcessedFlag = o_json.value("DebugIgnorePreProcessedFlag", settings.debugIgnorePreProcessedFlag);
 
-	// Per-texture grass types, keyed by "plugin|0xLOCALID". Each entry is an array of { Weight, Overrides }.
-	if (auto it = o_json.find("TextureTypes"); it != o_json.end() && it->is_object()) {
-		settings.textureTypes.clear();
-		for (const auto& [key, variants] : it->items()) {
-			std::vector<Settings::GrassTypeDef> defs;
-			for (const auto& variant : variants) {
-				Settings::GrassTypeDef def;
-				def.weight = variant.value("Weight", 1.0f);
-				if (auto ov = variant.find("Overrides"); ov != variant.end() && ov->is_object())
-					def.overrides = *ov;
-				defs.push_back(std::move(def));
-			}
-			settings.textureTypes[key] = std::move(defs);
-		}
-	}
-
+	LoadTextureTypes();
 	RebuildTypeAllocation();
 
 	if (grassRendererHighLOD)
@@ -620,17 +695,8 @@ void ProceduralGrass::LoadSettings(json& o_json)
 
 void ProceduralGrass::SaveSettings(json& o_json)
 {
+	SaveTextureTypes();
 	o_json = settings;
-
-	// Per-texture grass types, keyed by "plugin|0xLOCALID"; each variant carries its weight + sparse overrides.
-	nlohmann::json textureTypesJson = nlohmann::json::object();
-	for (const auto& [key, defs] : settings.textureTypes) {
-		nlohmann::json variants = nlohmann::json::array();
-		for (const auto& def : defs)
-			variants.push_back({ { "Weight", def.weight }, { "Overrides", def.overrides } });
-		textureTypesJson[key] = std::move(variants);
-	}
-	o_json["TextureTypes"] = std::move(textureTypesJson);
 
 	// Blade shape / material
 	o_json["Height"] = settings.grassHeight;
