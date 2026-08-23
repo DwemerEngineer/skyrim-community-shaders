@@ -296,7 +296,7 @@ namespace PBR
         float satVdotH = saturate(VdotH);
 
 #if defined(FAR_LOD)
-		float3 F = float3(1.0f, 1.0f, 1.0f);
+		float3 F = float3(0.0f, 0.0f, 0.0f);
 #else
 		float3 F;
 		[branch] if (doSpecular) {
@@ -312,7 +312,7 @@ namespace PBR
         lightingOutput.diffuse += context.lightColor * wrappedNdotL * BRDF::Diffuse_Lambert() * diffuseEnergy;
 
         float2 specularBRDF = BRDF::EnvBRDFApproxLazarov(material.Roughness, satNdotV);
-        lightingOutput.specular *= 1 + material.F0 * (1 / (specularBRDF.x + specularBRDF.y) - 1);
+        lightingOutput.specular *= 1 + material.F0 * (1 / max(specularBRDF.x + specularBRDF.y, 1e-4f) - 1);
 		
         float subsurfacePower = 48.936;
         float forwardScatter = exp2(saturate(-VdotL) * subsurfacePower - subsurfacePower);

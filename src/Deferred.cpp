@@ -281,6 +281,9 @@ void Deferred::StartDeferred()
 			renderTargets[i] = targets[i];                                             // We must use unused targets to be indexable
 			setRenderTargetMode[i] = RE::BSGraphics::SetRenderTargetMode::SRTM_CLEAR;  // Dirty from last frame, this calls ClearRenderTargetView once
 		}
+	} else {
+		renderTargets[7] = targets[7];
+		setRenderTargetMode[7] = RE::BSGraphics::SetRenderTargetMode::SRTM_CLEAR;
 	}
 
 	stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);  // Run OMSetRenderTargets again

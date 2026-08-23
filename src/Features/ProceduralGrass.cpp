@@ -556,6 +556,9 @@ void ProceduralGrass::CopyDepthBuffer(ID3D11DeviceContext* ctx, RE::BSGraphics::
 	mainDepth.views[0]->GetResource(&mainDepthResource);
 
 	ctx->CopyResource(zPrepassCopyResource, mainDepthResource);
+
+	zPrepassCopyResource->Release();
+	mainDepthResource->Release();
 }
 
 void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer)
@@ -872,7 +875,7 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 		ctx->PSSetConstantBuffers(3, 1, &strictLightDataCB);
 	}
 
-	if (globals::features::skylighting.loaded) {
+	if (globals::features::skylighting.loaded && globals::features::skylighting.texProbeArray) {
 		ID3D11ShaderResourceView* srv = { globals::features::skylighting.texProbeArray->srv.get() };
 		ctx->PSSetShaderResources(50, 1, &srv);
 	}
