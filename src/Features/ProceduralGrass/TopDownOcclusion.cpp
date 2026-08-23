@@ -89,7 +89,7 @@ void TopDownOcclusion::SetupResources()
 	heightMapLow->CreateRTV(rtvDesc);
 
 	// Seperate render targets for low and high, so that geometry with overhangs such as tree branches does not occlude the low map.
-	D3D11_BLEND_DESC blendDesc;
+	D3D11_BLEND_DESC blendDesc{};
 	blendDesc.IndependentBlendEnable = TRUE;
 	blendDesc.RenderTarget[0].BlendEnable = TRUE;
 	blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
@@ -102,7 +102,8 @@ void TopDownOcclusion::SetupResources()
 	blendDesc.RenderTarget[1] = blendDesc.RenderTarget[0];
 	blendDesc.RenderTarget[1].BlendOp = D3D11_BLEND_OP_MIN;
 	blendDesc.RenderTarget[1].BlendOpAlpha = D3D11_BLEND_OP_MIN;
-	device->CreateBlendState(&blendDesc, maxBlend.put());
+	if (FAILED(device->CreateBlendState(&blendDesc, maxBlend.put())))
+		logger::error("[Top Down Occlusion] Failed to create the height-range blend state");
 
 	D3D11_RASTERIZER_DESC rasterDesc{};
 	rasterDesc.FillMode = D3D11_FILL_SOLID;
