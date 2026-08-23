@@ -1,6 +1,6 @@
-#include "ProceduralGrass.h"
+#include "Features/ProceduralGrass.h"
 
-#include "ProceduralGrass/TopDownOcclusion.h"
+#include "TopDownOcclusion.h"
 #include "TerrainHeightMap.h"
 #include "Utils/Serialize.h"
 
