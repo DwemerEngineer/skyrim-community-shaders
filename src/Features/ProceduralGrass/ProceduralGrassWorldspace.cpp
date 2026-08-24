@@ -88,7 +88,7 @@ const ProceduralGrass::QuadrantGrass& ProceduralGrass::GetQuadrantCache(RE::TESO
 		return entry;
 	}
 
-	// Cache the resolved selection for repeated winning textures. Null selects the base type.
+	// Cache the resolved selection for repeated winning textures. Null follows vanilla grass presence.
 	const RE::TESLandTexture* cachedWinner = nullptr;
 	const TextureSelection* cachedSel = nullptr;
 
@@ -105,8 +105,8 @@ const ProceduralGrass::QuadrantGrass& ProceduralGrass::GetQuadrantCache(RE::TESO
 			}
 		}
 
-		if (!winner || winner->textureGrassList.empty()) {
-			entry.ids[v] = 0u;  // The dominant texture has no grass.
+		if (!winner) {
+			entry.ids[v] = 0u;
 			continue;
 		}
 
@@ -122,7 +122,8 @@ const ProceduralGrass::QuadrantGrass& ProceduralGrass::GetQuadrantCache(RE::TESO
 		}
 
 		// Use stable weighted selection so cache rebuilds preserve the grass mix.
-		uint32_t type = 1;  // base/default type for a texture with no variants
+		// Configured variants override vanilla no-grass textures while an unusable selection preserves vanilla behavior.
+		uint32_t type = winner->textureGrassList.empty() ? 0u : 1u;
 		if (cachedSel && cachedSel->total > 0.0f) {
 			const float r = (QuadrantSampleHash(cellX, cellY, quadIndex, v) * (1.0f / 4294967296.0f)) * cachedSel->total;
 			type = cachedSel->ids.back();
