@@ -612,7 +612,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	diffuseColor += directionalAmbientColor;
 
 	float skyTransmission = (1.0 - material.Thickness) * 0.5;
-	diffuseColor.xyz += directionalAmbientColor * material.SubsurfaceColor * skyTransmission * bladeType.grassTypeLightParams.y;
+	transmissionColor += directionalAmbientColor * material.SubsurfaceColor * skyTransmission * bladeType.grassTypeLightParams.y;
 
 	diffuseColor.xyz += directionalAmbientColor * bladeType.grassBounceColor.rgb * bladeType.grassTypeLightParams.x * (1.0 - canopyHeight01) * baseColor.xyz;
 	specularColor = Color::SkyrimGammaToLinear(specularColor);

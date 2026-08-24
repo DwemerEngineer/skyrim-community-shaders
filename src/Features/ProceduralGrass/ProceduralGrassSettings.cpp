@@ -295,7 +295,7 @@ void ProceduralGrass::DrawSettings()
 	ImGui::SliderFloat("Baked Min AO", &settings.ao, 0.0f, 1.0f, "%.2f");
 	DrawSettingDescription(T("feature.procedural_grass.baked_min_ao_tooltip", "Sets the minimum ambient occlusion baked into each blade."));
 	ImGui::SliderFloat2("Subsurface Opacity (Base>Tip)", reinterpret_cast<float*>(&settings.subsurfaceOpacity), 0.0f, 1.0f, "%.2f");
-	DrawSettingDescription(T("feature.procedural_grass.subsurface_opacity_tooltip", "Sets how much light passes through blade bases and tips."));
+	DrawSettingDescription(T("feature.procedural_grass.subsurface_opacity_tooltip", "Sets blade opacity at the base and tip. Higher values transmit less light."));
 	ImGui::SliderFloat3("Subsurface Color", reinterpret_cast<float*>(&settings.grassSubsurfaceTint), 0.0f, 2.0f, "%.2f");
 	DrawSettingDescription(T("feature.procedural_grass.subsurface_color_tooltip", "Tints light transmitted through blades."));
 	ImGui::SliderFloat("Specular", &settings.specular, 0.0f, 1.0f, "%.2f");
