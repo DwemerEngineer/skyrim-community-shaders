@@ -120,7 +120,7 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 
 #if defined(FAR_LOD)
 	float farWidthT = float(blade.seedAndType >> 24) * (1.0f / 255.0f);
-	randWidth *= lerp(2.5f, 32.0f, farWidthT);
+	randWidth *= lerp(2.0f, 32.0f, farWidthT);
 #elif defined(LOW_LOD)
 	randWidth *= 2.0f;
 #endif
