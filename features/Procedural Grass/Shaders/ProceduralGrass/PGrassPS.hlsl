@@ -611,8 +611,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	diffuseColor += directionalAmbientColor;
 
-	diffuseColor.xyz += transmissionColor;
-
 	float skyTransmission = (1.0 - material.Thickness) * 0.5;
 	diffuseColor.xyz += directionalAmbientColor * material.SubsurfaceColor * skyTransmission * bladeType.grassTypeLightParams.y;
 
@@ -627,6 +625,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #endif
 
 	diffuseColor.xyz *= Color::PBRLightingScale;
+	transmissionColor *= Color::PBRLightingScale;
 
 	float specOcclusion = lerp(1.0, canopyAO, bladeType.grassTypeLightParams.z);
 	specularColorPBR *= specOcclusion;
@@ -662,7 +661,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		psout.Diffuse.xyz = color.xyz;
 	}
 #else
-	psout.Diffuse.xyz = diffuseColor.xyz * baseColor.xyz;
+	psout.Diffuse.xyz = diffuseColor.xyz * baseColor.xyz + transmissionColor;
 #endif
 
 	psout.Specular = float4(specularColor, psout.Diffuse.w);
