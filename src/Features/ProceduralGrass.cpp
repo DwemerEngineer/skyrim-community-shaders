@@ -355,8 +355,9 @@ std::string ProceduralGrass::LandTextureKey(const RE::TESLandTexture* tex)
 	if (!tex)
 		return {};
 	const RE::TESFile* file = tex->GetFile(0);
-	const std::string_view name = file ? file->GetFilename() : std::string_view{};
-	return std::format("{}|0x{:06X}", name, tex->GetLocalFormID());
+	if (!file)
+		return {};
+	return std::format("{}|0x{:06X}", file->GetFilename(), tex->GetLocalFormID());
 }
 
 void ProceduralGrass::RebuildTypeAllocation()
