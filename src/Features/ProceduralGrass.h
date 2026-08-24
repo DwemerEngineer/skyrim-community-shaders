@@ -125,6 +125,7 @@ public:
 		struct GrassTypeDef
 		{
 			float weight = 1.0f;
+			bool noGrass = false;
 			nlohmann::json overrides = nlohmann::json::object();
 		};
 		// Keyed by "plugin|0xLOCALID" (LandTextureKey).

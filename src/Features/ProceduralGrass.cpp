@@ -386,12 +386,16 @@ void ProceduralGrass::RebuildTypeAllocation()
 		float acc = 0.0f;
 
 		for (uint32_t i = 0; i < defs.size(); i++) {
-			if (typeAllocation.size() + 2 >= PGrassCommon::MaxGrassTypes)
-				break;  // Remaining variants use the base type.
-			sel.ids.push_back(static_cast<uint8_t>(typeAllocation.size() + 2));
+			if (defs[i].noGrass) {
+				sel.ids.push_back(0u);
+			} else {
+				if (typeAllocation.size() + 2 >= PGrassCommon::MaxGrassTypes)
+					break;  // Remaining variants use the base type.
+				sel.ids.push_back(static_cast<uint8_t>(typeAllocation.size() + 2));
+				typeAllocation.emplace_back(key, i);
+			}
 			acc += std::max(0.0f, defs[i].weight);
 			sel.cumulative.push_back(acc);
-			typeAllocation.emplace_back(key, i);
 		}
 
 		sel.total = acc;
