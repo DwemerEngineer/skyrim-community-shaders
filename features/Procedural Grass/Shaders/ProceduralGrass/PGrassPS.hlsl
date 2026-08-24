@@ -300,6 +300,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float canopyHeight01 = saturate(sideAndBladeT.z / max(bladeType.height, 1.0));
 	float canopyAO = lerp(1.0 - grassLightParams.y, 1.0, canopyHeight01);
 	float canopyDensity = 1.0;  // Full density is the off-map default.
+
+#if defined(FAR_LOD)
+	canopyAO *= 1.0 - grassLightParams.x * (1.0 - canopyHeight01);
+#endif
 	
 #if !defined(LOW_LOD)
 	// Far lies beyond the density-map seam and retains the off-map default.
@@ -662,6 +666,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #else
 	psout.Diffuse.xyz = diffuseColor.xyz * baseColor.xyz + transmissionColor;
+#if defined(FAR_LOD)
+	psout.Diffuse.xyz *= 0.95f;
+#endif
 #endif
 
 	psout.Specular = float4(specularColor, psout.Diffuse.w);

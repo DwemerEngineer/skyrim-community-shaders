@@ -339,6 +339,7 @@ namespace PBR
 #if defined(FAR_LOD)
         lobeWeights.specular = material.F0;
         lobeWeights.diffuse *= 1.0 - material.F0;
+		lobeWeights.diffuse *= MultiBounceAO(diffuseColor, material.AO).y;
 #else
 
         float2 specularBRDF = BRDF::EnvBRDFApproxLazarov(material.Roughness, NdotV);
