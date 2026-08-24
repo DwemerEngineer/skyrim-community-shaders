@@ -129,7 +129,7 @@ namespace PGrassCommon
 		float4 grassTextureParams;  // x: blotch strength, y: blotch scale, z: speckle strength, w: speckle scale
 		float4 grassVeinParams;     // rgb: vein albedo tint, w: vein albedo strength
 		float4 grassVeinParams2;    // x: vein normal strength, y: ripple depth, z: micro-wiggle amount
-		float4 grassSubsurfaceColor;  // rgb: subsurface/translucency tint, multiplied onto the blade's base colour
+		float4 grassSubsurfaceColor;  // rgb: subsurface/translucency tint
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassType);
 	static_assert(sizeof(GrassType) == 320);
