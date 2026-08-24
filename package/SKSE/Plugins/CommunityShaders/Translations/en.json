@@ -1134,7 +1134,7 @@
     "feature.procedural_grass.specular_occlusion_tooltip": "Suppresses highlights in occluded parts of the canopy.",
     "feature.procedural_grass.specular_tooltip": "Controls the strength of blade highlights.",
     "feature.procedural_grass.subsurface_color_tooltip": "Tints light transmitted through blades.",
-    "feature.procedural_grass.subsurface_opacity_tooltip": "Sets how much light passes through blade bases and tips.",
+    "feature.procedural_grass.subsurface_opacity_tooltip": "Sets blade opacity at the base and tip. Higher values transmit less light.",
     "feature.procedural_grass.sun_self_shadow_tooltip": "Controls direct-light shadowing within the grass canopy.",
     "feature.procedural_grass.terminator_wrap_tooltip": "Wraps direct light around blades to soften the light-shadow boundary.",
     "feature.procedural_grass.terrain_shadow_density_tooltip": "Controls how quickly terrain darkening builds with grass density.",

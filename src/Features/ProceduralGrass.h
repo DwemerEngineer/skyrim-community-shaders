@@ -36,7 +36,7 @@ public:
 		float rotationalStiffness = 1.0f;
 		float ao = 0.15f;  // Minimum blade AO
 		float specular = 0.15f;
-		float2 subsurfaceOpacity = float2(0.2f, 0.05f);  // Base to tip
+		float2 subsurfaceOpacity = float2(0.8f, 0.10f);  // Base to tip
 		float3 grassSubsurfaceTint = float3(0.15f, 0.14f, 0.04f);  // Backlight tint
 		float3 baseMinTipRoughness = float3(0.85f, 0.55f, 0.75f);
 		float tipRoughnessStart = 0.75f;
