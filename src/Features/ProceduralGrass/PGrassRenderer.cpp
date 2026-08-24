@@ -574,8 +574,8 @@ ShaderT* PGrassRenderer<QuadrantCount, PatchBladeCount>::CompileShader(const wch
 	return static_cast<ShaderT*>(Util::CompileShader(path, defines, programType));
 }
 
-template <uint32_t QuadrantCount, uint32_t PatchPatchBladeCount>
-std::string PGrassRenderer<QuadrantCount, PatchPatchBladeCount>::BuildDefineList(std::span<const std::pair<const char*, const char*>> defines)
+template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
+std::string PGrassRenderer<QuadrantCount, PatchBladeCount>::BuildDefineList(std::span<const std::pair<const char*, const char*>> defines)
 {
 	std::string out;
 	out.reserve(defines.size() * 16);
