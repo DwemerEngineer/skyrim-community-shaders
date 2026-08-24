@@ -144,7 +144,7 @@ void ProceduralGrass::SetupResources()
 	// Low's md=3..5 overlap contains 96 quadrants.
 	grassRendererLowLOD = new PGrassRenderer<PGrassCommon::LowTierQuadrantCap, 1>(static_cast<uint32_t>(settings.lowGrassDensity), threadGroupSize, vertexIndicesLowBuffer, "LOW_LOD", "LOW_VERTEX", nullptr, 5, 0, sizeof(PGrassCommon::Blade), 96);
 	// Far starts at Low's seam density and thins outward. Reserve its slope extras only for the near seam.
-	grassRendererFarLOD = new PGrassRenderer<PGrassCommon::FarQuadrantCount, 1>(FarPatchDensity(), threadGroupSize, vertexIndicesFarBuffer, "LOW_LOD", "FAR_VERTEX", "FAR_LOD", 1, 512, sizeof(PGrassCommon::BladeFar), FarBladeQuadrantCapacity());
+	grassRendererFarLOD = new PGrassRenderer<PGrassCommon::FarQuadrantCount, 1>(FarPatchDensity(), threadGroupSize, vertexIndicesFarBuffer, "LOW_LOD", "FAR_VERTEX", "FAR_LOD", 2, 512, sizeof(PGrassCommon::BladeFar), FarBladeQuadrantCapacity());
 
 	D3D11_SAMPLER_DESC samplerDesc = {};
 	samplerDesc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
