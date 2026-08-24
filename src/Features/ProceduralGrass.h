@@ -16,7 +16,7 @@ public:
 
 	virtual std::pair<std::string, std::vector<std::string>> GetFeatureSummary() override
 	{
-		return { T("feature.procedural_grass.description", "Adds realistic procedural grass to the game, enhancing the visual fidelity of the environment."),
+		return { T("feature.procedural_grass.description", "Generates configurable, dynamically lit grass across loaded terrain and distant landscape."),
 			{ T("feature.procedural_grass.key_feature_1", "Dynamic grass rendering with realistic lighting and shading"),
 				T("feature.procedural_grass.key_feature_2", "Configurable grass density and distribution"),
 				T("feature.procedural_grass.key_feature_3", "Real-time grass animation with wind effects") } };
