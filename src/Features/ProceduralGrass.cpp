@@ -503,8 +503,6 @@ void ProceduralGrass::PostDepthRendering()
 		return;
 	}
 
-	globals::profiler->BeginPass("ProceduralGrass::Post Depth");
-
 	GetVisibleQuadrants();
 	TopDownOcclusion::GetSingleton()->Render();
 
@@ -546,8 +544,6 @@ void ProceduralGrass::PostDepthRendering()
 		oldBS->Release();
 		oldBS = nullptr;
 	}
-
-	globals::profiler->EndPass();
 }
 
 void ProceduralGrass::CopyDepthBuffer(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer)
