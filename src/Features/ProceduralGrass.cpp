@@ -498,7 +498,7 @@ void ProceduralGrass::PostDepthRendering()
 
 	const auto player = RE::PlayerCharacter::GetSingleton();
 
-	if (!settings.Enabled || !player) {
+	if (!settings.Enabled || !player || globals::state->isMapMenuOpen) {
 		CopyDepthBuffer(ctx, renderer);
 		return;
 	}
@@ -787,7 +787,7 @@ void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx) const
 void ProceduralGrass::DeferredRendering() const
 {
 	const auto player = RE::PlayerCharacter::GetSingleton();
-	if (!player)
+	if (!player || globals::state->isMapMenuOpen)
 		return;
 
 	const auto ctx = globals::d3d::context;
@@ -808,6 +808,24 @@ void ProceduralGrass::DeferredRendering() const
 	DeferredRenderPrep(ctx, renderer);
 
 	RenderGrass(ctx);
+
+	auto& terrainBlending = globals::features::terrainBlending;
+	if (terrainBlending.loaded && terrainBlending.settings.Enabled) {
+		// Low and Far write depth in their colour pass, after the first terrain-depth merge.
+		terrainBlending.MergeSceneDepthIntoBlend();
+
+		ID3D11RenderTargetView* rtvs[7] = {
+			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].RTV,
+			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR].RTV,
+			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_DOWNSCALED].RTV,
+			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kINDIRECT].RTV,
+			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kINDIRECT_DOWNSCALED].RTV,
+			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT].RTV,
+			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS].RTV,
+		};
+		const auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
+		ctx->OMSetRenderTargets(ARRAYSIZE(rtvs), rtvs, mainDepth.views[0]);
+	}
 
 	ctx->RSSetState(oldRS);
 	ctx->OMSetDepthStencilState(oldDSS, oldRef);
@@ -913,7 +931,7 @@ void ProceduralGrass::ClearRenderTargets(ID3D11DeviceContext* ctx, ID3D11RenderT
 
 void ProceduralGrass::DarkenTerrainUnderGrass() const
 {
-	if (!settings.Enabled || settings.grassAOStrength <= 0.0f || !densityAOVS || !densityAOPS)
+	if (!settings.Enabled || globals::state->isMapMenuOpen || settings.grassAOStrength <= 0.0f || !densityAOVS || !densityAOPS)
 		return;
 
 	const auto ctx = globals::d3d::context;
