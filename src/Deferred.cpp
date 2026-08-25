@@ -276,7 +276,8 @@ void Deferred::StartDeferred()
 	};
 
 	const auto& proceduralGrass = globals::features::proceduralGrass;
-	if (!proceduralGrass.loaded || !proceduralGrass.settings.Enabled) {
+	const bool proceduralGrassEnabled = proceduralGrass.loaded && proceduralGrass.settings.Enabled && !globals::state->isMapMenuOpen;
+	if (!proceduralGrassEnabled) {
 		for (uint i = 2; i < 8; i++) {
 			renderTargets[i] = targets[i];                                             // We must use unused targets to be indexable
 			setRenderTargetMode[i] = RE::BSGraphics::SetRenderTargetMode::SRTM_CLEAR;  // Dirty from last frame, this calls ClearRenderTargetView once
@@ -301,7 +302,7 @@ void Deferred::StartDeferred()
 
 	OverrideBlendStates();
 
-	if (proceduralGrass.loaded && proceduralGrass.settings.Enabled) {
+	if (proceduralGrassEnabled) {
 		proceduralGrass.DeferredRendering();
 	}
 }
