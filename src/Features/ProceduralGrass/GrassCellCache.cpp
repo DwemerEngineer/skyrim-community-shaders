@@ -45,7 +45,7 @@ namespace
 	RE::TESLandTexture* ResolveLandTexture(RE::TESFile* file, RE::FormID rawFormID)
 	{
 		if (!rawFormID)
-			return nullptr;
+			return PGrassCommon::GetDefaultLandTexture();
 		return RE::TESForm::LookupByID<RE::TESLandTexture>(file->GetRuntimeFormID(rawFormID));
 	}
 }
@@ -198,6 +198,8 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out)
 	std::array<RE::TESLandTexture*, 4> baseTexture{};
 	std::array<TextureGrid, 4> layerWinner{};
 	std::array<OpacityGrid, 4> bestOpacity{};
+	std::array<OpacityGrid, 4> totalOpacity{};
+	const auto defaultLandTexture = PGrassCommon::GetDefaultLandTexture();
 
 	int32_t activeQuadrant = -1;
 	RE::TESLandTexture* activeLayerTexture = nullptr;
@@ -265,8 +267,10 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out)
 
 			LandscapeTextureHeader header{};
 			file->ReadData(&header, sizeof(header));
-			activeQuadrant = header.quadrant < 4 ? header.quadrant : -1;
-			activeLayerTexture = ResolveLandTexture(file, bigEndian ? Swap32(header.landTexture) : header.landTexture);
+			const int16_t layer = bigEndian ? static_cast<int16_t>(Swap16(static_cast<uint16_t>(header.layer))) : header.layer;
+			const bool validLayer = header.quadrant < 4 && layer >= 0 && layer < 5;
+			activeQuadrant = validLayer ? header.quadrant : -1;
+			activeLayerTexture = validLayer ? ResolveLandTexture(file, bigEndian ? Swap32(header.landTexture) : header.landTexture) : nullptr;
 
 		} else if (recordType == kVTXT) {
 			if (activeQuadrant < 0 || !activeLayerTexture || recordSize < sizeof(VertexTextureAlpha))
@@ -280,7 +284,11 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out)
 				const uint16_t position = bigEndian ? Swap16(point.position) : point.position;
 				const float opacity = bigEndian ? SwapF(point.opacity) : point.opacity;
 
-				if (position < kQuadrantSamples && opacity > bestOpacity[activeQuadrant][position]) {
+				if (position >= kQuadrantSamples)
+					continue;
+
+				totalOpacity[activeQuadrant][position] += std::clamp(opacity, 0.0f, 1.0f);
+				if (opacity > bestOpacity[activeQuadrant][position]) {
 					bestOpacity[activeQuadrant][position] = opacity;
 					layerWinner[activeQuadrant][position] = activeLayerTexture;
 				}
@@ -291,7 +299,10 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out)
 	// A land texture grows grass when its grass list is non-empty, and the winning texture per vertex decides.
 	for (uint32_t quad = 0; quad < 4; ++quad) {
 		for (uint32_t v = 0; v < kQuadrantSamples; ++v) {
-			RE::TESLandTexture* winner = bestOpacity[quad][v] > 0.0f ? layerWinner[quad][v] : baseTexture[quad];
+			const float baseOpacity = std::max(1.0f - totalOpacity[quad][v], 0.0f);
+			RE::TESLandTexture* winner = bestOpacity[quad][v] > baseOpacity ? layerWinner[quad][v] : baseTexture[quad];
+			if (!winner)
+				winner = defaultLandTexture;
 			out.ids[quad][v] = (winner && !winner->textureGrassList.empty()) ? 1u : 0u;
 		}
 
