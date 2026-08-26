@@ -285,9 +285,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * tipDryTint, saturate(blotch - 0.55) * bladeType.grassTextureParams.x * detailFade);
 
 		float textureFade = saturate(1.0 - viewPosition.z * (1.0 / 2500.0));
-		// Speckle is intentionally granular, so reuse the blotch to decorrelate one cell hash.
-		float2 speckleCell = floor(bladeUV * float2(6.0, 26.0) * bladeType.grassTextureParams.w + noiseOffset * 1.7 + blotch * 11.0);
-		speckle = GrassNoiseHash(speckleCell);
+		speckle = GrassValueNoise(bladeUV * float2(6.0, 26.0) * bladeType.grassTextureParams.w + noiseOffset * 1.7);
 		speckleAmount = bladeType.grassTextureParams.z * textureFade * detailFade;
 		baseColor.rgb *= 1.0 + (speckle - 0.5) * 2.0 * speckleAmount;
 		baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * veinTint, vein * veinAlbedoStrength);
