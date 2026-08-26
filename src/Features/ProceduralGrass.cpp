@@ -810,7 +810,7 @@ void ProceduralGrass::DeferredRendering() const
 		// Low and Far write depth in their colour pass, after the first terrain-depth merge.
 		terrainBlending.MergeSceneDepthIntoBlend();
 
-		ID3D11RenderTargetView* rtvs[7] = {
+		ID3D11RenderTargetView* rtvs[8] = {
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].RTV,
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR].RTV,
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_DOWNSCALED].RTV,
@@ -818,6 +818,7 @@ void ProceduralGrass::DeferredRendering() const
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kINDIRECT_DOWNSCALED].RTV,
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT].RTV,
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS].RTV,
+			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS_DOWNSCALED].RTV,
 		};
 		const auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 		ctx->OMSetRenderTargets(ARRAYSIZE(rtvs), rtvs, mainDepth.views[0]);
@@ -849,7 +850,7 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 	const auto& mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 	const auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 
-	ID3D11RenderTargetView* rtvs[7] = {
+	ID3D11RenderTargetView* rtvs[8] = {
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].RTV,
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR].RTV,
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_DOWNSCALED].RTV,
@@ -857,6 +858,7 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kINDIRECT_DOWNSCALED].RTV,
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT].RTV,
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS].RTV,
+		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS_DOWNSCALED].RTV,
 	};
 
 	ClearRenderTargets(ctx, rtvs);
@@ -866,7 +868,7 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 
 	SetViewport(ctx, Util::ConvertToDynamic(float2((float)texDesc.Width, (float)texDesc.Height)));
 
-	ctx->OMSetRenderTargets(7, rtvs, mainDepth.views[0]);
+	ctx->OMSetRenderTargets(ARRAYSIZE(rtvs), rtvs, mainDepth.views[0]);
 
 	auto& shadowMask = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kSHADOW_MASK];
 	ctx->PSSetShaderResources(14, 1, &shadowMask.SRV);
@@ -917,10 +919,10 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 	ctx->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
 }
 
-void ProceduralGrass::ClearRenderTargets(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtvs[7])
+void ProceduralGrass::ClearRenderTargets(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtvs[8])
 {
 	constexpr float black[4] = { 0, 0, 0, 0 };
-	for (uint i = 2; i < 7; i++) {
+	for (uint i = 2; i < 8; i++) {
 		ctx->ClearRenderTargetView(rtvs[i], black);
 	}
 }
