@@ -330,7 +330,7 @@ private:
 
 	static void CopyDepthBuffer(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer);
 	static void SetViewport(ID3D11DeviceContext* ctx, float2 size);
-	static void ClearRenderTargets(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtvs[7]);
+	static void ClearRenderTargets(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtvs[8]);
 
 	void PostDepthRendering();
 	void GetVisibleQuadrants();
