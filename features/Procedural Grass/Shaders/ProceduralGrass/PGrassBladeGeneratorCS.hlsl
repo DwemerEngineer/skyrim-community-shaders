@@ -205,7 +205,7 @@ uint LoadGrassId(uint sampleIndex)
 	return (packed >> ((sampleIndex & 3u) << 3u)) & 0xFFu;
 }
 
-void ComputeGrassType(out uint type, out float bareCoverage, float2 quadLocalPos, uint quadrant, float typeRandom)
+void ComputeGrassType(out uint type, float2 quadLocalPos, uint quadrant, float typeRandom)
 {
 	float2 grassSample = clamp(quadLocalPos / QUADRANT_GRASS_SPACING, 0.0f, QUADRANT_GRASS_PITCH - 1.001f);
 
@@ -214,7 +214,6 @@ void ComputeGrassType(out uint type, out float bareCoverage, float2 quadLocalPos
 	int2 nearest = int2(grassSample + 0.5f);
 	uint id = LoadGrassId(quadrant * (QUADRANT_GRASS_PITCH * QUADRANT_GRASS_PITCH) + nearest.y * QUADRANT_GRASS_PITCH + nearest.x);
 	type = id;
-	bareCoverage = (id == 0) ? 1.0f : 0.0f;
 	return;
 #else
 	int2 baseSample = int2(grassSample);
@@ -228,13 +227,6 @@ void ComputeGrassType(out uint type, out float bareCoverage, float2 quadLocalPos
 	weights.y = frac.x * (1 - frac.y);
 	weights.z = (1 - frac.x) * frac.y;
 	weights.w = frac.x * frac.y;
-
-	bareCoverage = 0.0f;
-	[unroll] for (int i = 0; i < 4; ++i)
-	{
-		if (ids[i] == 0)
-			bareCoverage += weights[i];
-	}
 
 	float weightSum = 0;
 	type = ids[3];
@@ -350,10 +342,9 @@ void EmitBlade(
 
 	// Fetch the grass type after culling to avoid the four-sample lookup for rejected blades.
 	uint type;
-	float bareCoverage;
 
 	float2 mapSamplePos = bladeQuadPos2D + (float2(hash.xy) * UINT_TO_FLOAT * 2.0f - 1.0f) * miscParams.x;
-	ComputeGrassType(type, bareCoverage, mapSamplePos, quadrant, typeRand);
+	ComputeGrassType(type, mapSamplePos, quadrant, typeRand);
 	if (type == 0 && !cullsDisabled)
 		return;
 	type = max(type, 1u);
@@ -408,7 +399,6 @@ void EmitBlade(
 	// Generate height after culling. The frustum test uses the maximum blade height.
 	float randClumpHeight = float(clumpRand) * UINT_TO_FLOAT;
 	float unscaledHeight = (0.45f + heightRand * 0.55f) - randClumpHeight * grassType.clumpHeightFactor;
-	unscaledHeight *= 1.0f - bareCoverage;
 	float randHeight = grassType.height * unscaledHeight;
 
 	// Blade width

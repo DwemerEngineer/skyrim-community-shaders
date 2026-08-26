@@ -402,6 +402,7 @@ void ProceduralGrass::DrawSettings()
 		DrawSettingDescription(T("feature.procedural_grass.debug_ignore_preprocessed_tooltip", "Includes LAND meshes that are not marked as preprocessed."));
 		if (invalidate) {
 			grassMapCache.clear();
+			grassContentGeneration++;
 		}
 
 		size_t grassSet = 0;
