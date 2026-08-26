@@ -37,6 +37,12 @@ namespace
 
 }
 
+RE::TESLandTexture* PGrassCommon::GetDefaultLandTexture()
+{
+	static const auto defaultLandTextureAddress = REL::Relocation<RE::TESLandTexture**>(RELOCATION_ID(514783, 400936));
+	return *defaultLandTextureAddress;
+}
+
 uint64_t ProceduralGrass::QuadrantKey(int32_t cellX, int32_t cellY, uint32_t quadIndex)
 {
 	return (static_cast<uint64_t>(static_cast<uint16_t>(cellX)) << 18) |
@@ -88,20 +94,31 @@ const ProceduralGrass::QuadrantGrass& ProceduralGrass::GetQuadrantCache(RE::TESO
 		return entry;
 	}
 
-	// Cache the resolved selection for repeated winning textures. Null follows vanilla grass presence.
+	// Cache resolved selections for repeated winning textures.
 	const RE::TESLandTexture* cachedWinner = nullptr;
 	const TextureSelection* cachedSel = nullptr;
+	const RE::TESLandTexture* defaultLandTexture = PGrassCommon::GetDefaultLandTexture();
 
 	for (uint32_t v = 0; v < PGrassCommon::QuadrantGrassSamples; v++) {
-		const RE::TESLandTexture* winner = landData->defQuadTextures[quadIndex];
-		int32_t bestPercent = 0;
+		int32_t overlayTotal = 0;
+		for (uint32_t layer = 0; layer < 5; layer++) {
+			const auto texture = landData->quadTextures[quadIndex][layer];
+			if (texture && (texture->formID != 0 || defaultLandTexture))
+				overlayTotal += static_cast<uint8_t>(landData->percents[quadIndex][v][layer]);
+		}
 
-		for (uint32_t layer = 0; layer < 6; layer++) {
+		const auto baseTexture = landData->defQuadTextures[quadIndex];
+		const RE::TESLandTexture* winner = baseTexture && baseTexture->formID != 0 ? baseTexture : defaultLandTexture;
+		int32_t bestPercent = std::max(255 - overlayTotal, 0);
+
+		for (uint32_t layer = 0; layer < 5; layer++) {
 			// Stored as int8_t but represents unsigned opacity.
 			const int32_t percent = static_cast<uint8_t>(landData->percents[quadIndex][v][layer]);
-			if (percent > bestPercent) {
+			const auto texture = landData->quadTextures[quadIndex][layer];
+			const auto effectiveTexture = texture && texture->formID == 0 ? defaultLandTexture : texture;
+			if (effectiveTexture && percent > bestPercent) {
 				bestPercent = percent;
-				winner = landData->quadTextures[quadIndex][layer];
+				winner = effectiveTexture;
 			}
 		}
 

@@ -2,6 +2,9 @@
 
 namespace PGrassCommon
 {
+	/** @brief Returns the game's default landscape texture used when a LAND quadrant has no base texture. */
+	RE::TESLandTexture* GetDefaultLandTexture();
+
 	// A LAND quadrant carries a 17x17 grid of texture-blend samples, so 128 world units apart.
 	static constexpr uint32_t QuadrantGrassPitch = 17;
 	static constexpr uint32_t QuadrantGrassSamples = QuadrantGrassPitch * QuadrantGrassPitch;
