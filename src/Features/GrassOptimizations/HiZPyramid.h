@@ -36,14 +36,23 @@ public:
 	void ClearShaderCache();
 
 private:
-	struct alignas(16) Params
+	struct alignas(16) BaseParams
 	{
 		uint32_t srcWidth;
 		uint32_t srcHeight;
 		uint32_t dstWidth;
 		uint32_t dstHeight;
 	};
-	STATIC_ASSERT_ALIGNAS_16(Params);
+	STATIC_ASSERT_ALIGNAS_16(BaseParams);
+
+	struct alignas(16) SPDParams
+	{
+		uint32_t sourceWidth;
+		uint32_t sourceHeight;
+		uint32_t outputMips;
+		uint32_t totalGroups;
+	};
+	STATIC_ASSERT_ALIGNAS_16(SPDParams);
 
 	/** @brief Returns the SRV of the depth copy that is current at grass draw time. */
 	static ID3D11ShaderResourceView* GetSourceDepthSRV();

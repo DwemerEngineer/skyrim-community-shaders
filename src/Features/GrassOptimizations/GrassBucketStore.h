@@ -6,8 +6,8 @@
 struct BucketKey
 {
 	uint32_t meshId = 0;
-	// Both only key the bucket when meshId == 0. Texture and vertex format alone would let two variant
-	// .nifs share one bucket, which draws each other's instances against a single cached index count.
+	// The remaining fields only key the bucket when meshId == 0. Texture and vertex format alone would let
+	// two variant .nifs share one bucket, which draws each other's instances against a single cached index count.
 	RE::NiSourceTexture* tex = nullptr;
 	uint32_t triCount = 0;
 	uint64_t descVal = 0;
@@ -246,7 +246,7 @@ public:
 	/** @brief Applies staged removals and captures, then uploads dirty buckets. Caller holds bucketMutex. */
 	void ApplyPending(ID3D11Device* device, ID3D11DeviceContext* ctx);
 
-	/** @brief Re-runs complex-grass detection for every bucket when the threshold changes. Caller holds bucketMutex. */
+	/** @brief Re-evaluates cached complex-grass measurements for every bucket when the threshold changes. Caller holds bucketMutex. */
 	void RefreshComplexGrass(float threshold, ID3D11DeviceContext* ctx);
 
 	/** @brief Captures one GID group's instance records from the cell-load hooks. */
@@ -333,6 +333,8 @@ private:
 	struct ComplexEntry
 	{
 		RE::NiPointer<RE::NiSourceTexture> keepAlive;
+		ID3D11ShaderResourceView* resourceView = nullptr;
+		float normalLength = 0.0f;
 		bool complex = false;
 	};
 	std::unordered_map<RE::NiSourceTexture*, ComplexEntry> complexCache;

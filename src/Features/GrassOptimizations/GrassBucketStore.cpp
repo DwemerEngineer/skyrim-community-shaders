@@ -70,7 +70,6 @@ void GrassBucketStore::RefreshComplexGrass(float threshold, ID3D11DeviceContext*
 		return;
 
 	cachedComplexThreshold = threshold;
-	complexCache.clear();
 
 	for (auto& [key, b] : buckets)
 		b.isComplex = DetectComplexGrass(b.diffuseTexture.get(), ctx);
@@ -200,7 +199,7 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures)
 	for (auto& pc : captures) {
 		const uint32_t meshId = meshLibrary.ResolveMeshId(pc.shape);
 		const uint32_t triCount = meshId ? 0u : (uint32_t)pc.shape->GetTrishapeRuntimeData().triangleCount;
-		const BucketKey bk{ meshId, meshId ? nullptr : pc.diffuseTexture, triCount, pc.descVal };
+		const BucketKey bk{ meshId, meshId ? nullptr : pc.diffuseTexture, triCount, meshId ? 0u : pc.descVal };
 		auto& b = buckets[bk];
 		b.meshId = meshId;
 		b.diffuseTexture = RE::NiPointer<RE::NiSourceTexture>(pc.diffuseTexture);
@@ -829,18 +828,22 @@ void GrassBucketStore::UpdateCoarseBounds(GrassBucket& b)
 
 bool GrassBucketStore::DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11DeviceContext* ctx)
 {
-	if (auto it = complexCache.find(tex); it != complexCache.end())
+	auto* rt = tex ? tex->rendererTexture : nullptr;
+	auto* resourceView = rt ? rt->resourceView : nullptr;
+	if (auto it = complexCache.find(tex); it != complexCache.end() && it->second.resourceView == resourceView) {
+		it->second.complex = std::abs(it->second.normalLength - 1.0f) < cachedComplexThreshold;
 		return it->second.complex;
+	}
 
 	bool complex = false;
+	float normalLength = 0.0f;
 
-	auto* rt = tex ? tex->rendererTexture : nullptr;
-	if (GetDetectCS() && detectResult && detectStaging && rt && rt->resourceView) {
+	if (GetDetectCS() && detectResult && detectStaging && resourceView) {
 		UINT initialCount = 0;
 		ID3D11UnorderedAccessView* resultUAV = detectResult->uav.get();
 		ctx->CSSetUnorderedAccessViews(0, 1, &resultUAV, &initialCount);
 		ctx->CSSetShader(detectCS, nullptr, 0);
-		ctx->CSSetShaderResources(0, 1, &rt->resourceView);
+		ctx->CSSetShaderResources(0, 1, &resourceView);
 		ctx->Dispatch(1, 1, 1);
 
 		ID3D11UnorderedAccessView* nullUAV = nullptr;
@@ -853,14 +856,13 @@ bool GrassBucketStore::DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11Device
 		D3D11_MAPPED_SUBRESOURCE m{};
 		if (SUCCEEDED(ctx->Map(detectStaging->resource.get(), 0, D3D11_MAP_READ, 0, &m))) {
 			// Compare using the decoded length from the shader to avoid requring a constant buffer
-			float normalLength = 0.0f;
 			std::memcpy(&normalLength, m.pData, sizeof(float));
 			complex = std::abs(normalLength - 1.0f) < cachedComplexThreshold;
 			ctx->Unmap(detectStaging->resource.get(), 0);
 		}
 	}
 
-	complexCache.emplace(tex, ComplexEntry{ RE::NiPointer<RE::NiSourceTexture>(tex), complex });
+	complexCache.insert_or_assign(tex, ComplexEntry{ RE::NiPointer<RE::NiSourceTexture>(tex), resourceView, normalLength, complex });
 	return complex;
 }
 

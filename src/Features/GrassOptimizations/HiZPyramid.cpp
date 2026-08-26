@@ -6,7 +6,7 @@
 
 void HiZPyramid::SetupResources()
 {
-	paramsCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<Params>(), "GrassOptimizations::HiZParamsCB");
+	paramsCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<BaseParams>(), "GrassOptimizations::HiZParamsCB");
 
 	D3D11_BUFFER_DESC bd{};
 	bd.ByteWidth = sizeof(uint32_t);
@@ -156,7 +156,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	const uint32_t padW = padToTile(((uint32_t)screenSize.x + kDownsampleFactor - 1) / kDownsampleFactor);
 	const uint32_t padH = padToTile(((uint32_t)screenSize.y + kDownsampleFactor - 1) / kDownsampleFactor);
 
-	if ((padW != paddedWidth || padH != paddedHeight) && !CreateTexture(device, padW, padH))
+	if (!padW || !padH || ((padW != paddedWidth || padH != paddedHeight) && !CreateTexture(device, padW, padH)))
 		return false;
 
 	width = validW;
@@ -180,7 +180,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	}
 
 	// Threads past the rendered sub-rect read beyond it, so the base pass's out-of-bounds guard writes 1.0 there and neither the padding nor the unrendered margin can cull.
-	paramsCB->Update(Params{ srcW, srcH, padW, padH });
+	paramsCB->Update(BaseParams{ srcW, srcH, padW, padH });
 
 	ID3D11UnorderedAccessView* nullUAV = nullptr;
 	ID3D11ShaderResourceView* nullSRV = nullptr;
@@ -224,7 +224,8 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 		const uint32_t groupsX = padW / tileSize;
 		const uint32_t groupsY = padH / tileSize;
 
-		paramsCB->Update(Params{ padW, padH, outputMips, groupsX * groupsY });
+		const uint32_t totalGroups = groupsX * groupsY;
+		paramsCB->Update(SPDParams{ padW, padH, outputMips, totalGroups });
 
 		ID3D11UnorderedAccessView* spdUAVs[14]{};
 		for (uint32_t i = 0; i < outputMips; ++i)

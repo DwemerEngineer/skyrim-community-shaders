@@ -787,7 +787,7 @@ void GrassOptimizations::Hooks::BSGrassShader_SetupGeometry::thunk(RE::BSShader*
 static size_t GIDGroupBytes(const RE::BSMultiStreamInstanceTriShape::GroupHeader* header)
 {
 	if (!header || !header->numShortsPerInstance)
-		return SIZE_MAX;
+		return 0;
 	return (size_t)header->groupInstanceCount * header->numShortsPerInstance * sizeof(std::uint16_t);
 }
 
@@ -906,7 +906,7 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 
 		const uint32_t meshId = self.bucketStore.meshLibrary.ResolveMeshId(geometry);
 		const uint32_t triCount = meshId ? 0u : (uint32_t)geometry->GetTrishapeRuntimeData().triangleCount;
-		auto it = self.bucketStore.buckets.find({ meshId, meshId ? nullptr : diffuseTexture, triCount, descVal });
+		auto it = self.bucketStore.buckets.find({ meshId, meshId ? nullptr : diffuseTexture, triCount, meshId ? 0u : descVal });
 		if (it == self.bucketStore.buckets.end() || !it->second.totalInstances || !it->second.instanceBuf) {
 			VanillaDrawInstanceTriShape(geometry);
 			return;
@@ -973,17 +973,19 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	ctx->VSSetShaderResources(2, 1, &b->extrasSRV);
 	ctx->DrawIndexedInstancedIndirect(b->argsBuf, argsByteOffset);
 
+	std::array<const GrassMeshLibrary::LODMesh*, (size_t)GrassMeshLibrary::LODTier::kCount> lodMeshes{};
+	{
+		std::scoped_lock lk(self.bucketStore.bucketMutex);
+		for (uint32_t tier = 0; tier < (uint32_t)GrassMeshLibrary::LODTier::kCount; ++tier)
+			lodMeshes[tier] = self.bucketStore.meshLibrary.GetLODMesh(b->meshId, (GrassMeshLibrary::LODTier)tier);
+	}
+
 	for (uint32_t tier = 0; tier < (uint32_t)GrassMeshLibrary::LODTier::kCount; ++tier) {
 		GrassBucket::LODBin& bin = b->lodBins[tier];
 		if (!bin.active)
 			continue;
 
-		const GrassMeshLibrary::LODMesh* lod = nullptr;
-		{
-			std::scoped_lock lk(self.bucketStore.bucketMutex);
-			lod = self.bucketStore.meshLibrary.GetLODMesh(b->meshId, (GrassMeshLibrary::LODTier)tier);
-		}
-
+		const GrassMeshLibrary::LODMesh* lod = lodMeshes[tier];
 		if (!lod || !lod->vertexBuffer || !lod->indexBuffer)
 			continue;
 
