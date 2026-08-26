@@ -25,7 +25,7 @@ public:
 	struct Settings
 	{
 		bool Enabled = true;
-		int32_t Quality = 1;  // QualityDensities index
+		int32_t Quality = 2;  // QualityDensities index
 
 		// Blade shape and material
 		float grassHeight = 100.0f;
@@ -34,11 +34,11 @@ public:
 		float tipWeight = 0.54f;
 		float mid = 0.73f;
 		float rotationalStiffness = 1.0f;
-		float ao = 0.15f;  // Minimum blade AO
-		float specular = 0.15f;
+		float ao = 0.10f;  // Minimum blade AO
+		float specular = 0.10f;
 		float2 subsurfaceOpacity = float2(0.8f, 0.10f);  // Base to tip
 		float3 grassSubsurfaceTint = float3(0.15f, 0.14f, 0.04f);  // Backlight tint
-		float3 baseMinTipRoughness = float3(0.85f, 0.55f, 0.75f);
+		float3 baseMinTipRoughness = float3(0.65f, 0.45f, 0.55f);
 		float tipRoughnessStart = 0.75f;
 		float clumpAOStrength = 0.5f;
 
@@ -58,14 +58,14 @@ public:
 		float grassClumpColorStrength = 0.6f;
 		float grassMicroDetail = 0.5f;
 		float grassAmbientFlatten = 0.7f;
-		float grassCanopySkyOcclusion = 0.3f;
+		float grassCanopySkyOcclusion = 0.0f;
 		float grassDensityAO = 0.2f;
 		float grassWrap = 1.0f;
 		float grassAniso = 0.15f;
 		float grassBounceStrength = 0.35f;
 		float3 grassBounceColor = float3(0.55f, 0.42f, 0.24f);
-		float grassSunSelfShadow = 0.3f;
-		float grassSpecOcclusion = 0.7f;
+		float grassSunSelfShadow = 0.0f;
+		float grassSpecOcclusion = 0.0f;
 		float grassAmbientDesat = 0.5f;
 
 		// Surface texture
@@ -76,10 +76,10 @@ public:
 
 		// Per-type vein detail
 		float3 grassVeinTint = float3(0.70f, 0.80f, 0.66f);  // albedo tint in the vein grooves
-		float grassVeinAlbedoStrength = 0.32f;               // how strongly the tint applies
-		float grassVeinNormalStrength = 0.37f;               // vein normal-tilt amount
+		float grassVeinAlbedoStrength = 0.75f;               // how strongly the tint applies
+		float grassVeinNormalStrength = 0.60f;               // vein normal-tilt amount
 		float grassVeinRippleDepth = 0.28f;                  // along-blade ripple modulation of the veins
-		float grassVeinWiggleAmount = 0.06f;                 // fine micro-wiggle of the surface normal
+		float grassVeinWiggleAmount = 0.09f;                 // fine micro-wiggle of the surface normal
 
 		// Terrain blend and shadow
 		float grassTerrainBlendStrength = 0.9f;
