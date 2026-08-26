@@ -280,12 +280,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	[branch] if (detailFade > 0.0) {
 		float2 bladeUV = float2(across, along);
 		float2 noiseOffset = float2(bladeRand, bladeRand2) * 37.0;
-		float blotch = GrassValueNoise(bladeUV * float2(1.0, 4.0) * bladeType.grassTextureParams.y + noiseOffset);
+		float blotch = saturate((GrassValueNoise(bladeUV * float2(1.0, 4.0) * bladeType.grassTextureParams.y + noiseOffset) - 0.5) * 1.5 + 0.5);
 		baseColor.rgb *= 1.0 + (blotch - 0.5) * 2.0 * bladeType.grassTextureParams.x * detailFade;
 		baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * tipDryTint, saturate(blotch - 0.55) * bladeType.grassTextureParams.x * detailFade);
 
 		float textureFade = saturate(1.0 - viewPosition.z * (1.0 / 2500.0));
-		speckle = GrassValueNoise(bladeUV * float2(6.0, 26.0) * bladeType.grassTextureParams.w + noiseOffset * 1.7);
+		speckle = saturate((GrassValueNoise(bladeUV * float2(6.0, 26.0) * bladeType.grassTextureParams.w + noiseOffset * 1.7) - 0.5) * 2.0 + 0.5);
 		speckleAmount = bladeType.grassTextureParams.z * textureFade * detailFade;
 		baseColor.rgb *= 1.0 + (speckle - 0.5) * 2.0 * speckleAmount;
 		baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * veinTint, vein * veinAlbedoStrength);
