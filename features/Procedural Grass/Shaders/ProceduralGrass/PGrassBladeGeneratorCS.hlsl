@@ -560,6 +560,7 @@ void EmitBlade(
 	b.seedAndType = farWidthByte << 24 | (hash.z & 0xFFFFu) << 8 | (type & 0xFFu);
 #else
 	float randBend = grassType.stiffness * (float(tiltHash.y) * UINT_TO_FLOAT * 1.6f + 0.25f);
+	uint packedDetailRandom = (tiltHash.x & 0xFFu) | (tiltHash.y & 0xFFu) << 8;
 	float tiltSin, tiltCos;
 	
 	sincos(randTilt, tiltSin, tiltCos);
@@ -569,7 +570,7 @@ void EmitBlade(
 	// Store static facing as SNORM8 and animated tip displacement as f16 for smooth motion vectors.
 	int2 packedFacing = (int2)round(clamp(randFacing, -1.0f, 1.0f) * 127.0f);
 	b.facingAndWind = (uint)(packedFacing.x & 0xFF) | (uint)(packedFacing.y & 0xFF) << 8 | f32tof16(windDisplacement) << 16;
-	b.previousWind = f32tof16(previousWindDisplacement);
+	b.previousWind = packedDetailRandom << 16 | f32tof16(previousWindDisplacement);
 	b.clumpDensity = f32tof16(randBend) << 16 | f32tof16(clumpDensity);
 #if defined(HIGH_LOD)
 	// One root-position probe sample covers the blade. Use UNIT_SH outside the detail range.

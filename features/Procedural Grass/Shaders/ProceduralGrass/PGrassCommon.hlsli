@@ -119,7 +119,7 @@ struct Blade
 	uint posXY;
 	uint posZWidthHeight;
 	uint facingAndWind;        // low 16: static facing as 2x SNORM8; high 16: current wind displacement as f16
-	uint previousWind;         // low 16: previous wind displacement as f16
+	uint previousWind;         // low 16: previous wind displacement as f16; high 16: two UNORM8 blade-detail randoms
 	uint hashClumpAndGrassType;
 	uint clumpDensity;   // low 16: clump density (f16); high 16: randBend (f16), the blade's precomputed bend amount
 	uint tipDir;         // (sin, cos) of the blade tilt as 2x f16; precomputed in the generator so the VS skips the pcg hash + sincos

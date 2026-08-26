@@ -285,8 +285,11 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #	if defined(FAR_LOD)
 	o.BladeTColor = float4(t, baseToTipColor);
 #	else
+	uint packedDetailRandom = blade.previousWind >> 16;
+	float detailRand = (float(packedDetailRandom & 0xFFu) + 0.5f) * (1.0f / 256.0f);
+	float detailRand2 = (float(packedDetailRandom >> 8) + 0.5f) * (1.0f / 256.0f);
 	o.BladeParams = float4(facing, float(grassTypeIndex),
-		asfloat((f32tof16(bladeRand) << 16) | f32tof16(bladeRand2)));
+		asfloat((f32tof16(detailRand) << 16) | f32tof16(detailRand2)));
 	o.BaseToTipColor = baseToTipColor;
 #	endif
 
