@@ -247,10 +247,10 @@ void ProceduralGrass::DrawSettings()
 		}
 
 		if (ImGui::CollapsingHeader(T("feature.procedural_grass.terrain_blend_section", "Terrain Blend"))) {
-			// Blade bases dither-dissolve into the real terrain in the GBuffer, softening the hard base edge.
-			ImGui::SliderFloat(T("feature.procedural_grass.base_dissolve", "Base Dissolve"), &settings.grassTerrainBlendStrength, 0.0f, 1.0f, "%.2f");
-			DrawSettingDescription(T("feature.procedural_grass.base_dissolve_tooltip", "Dissolves blade bases into the terrain to hide their intersection."));
-			ImGui::SliderFloat(T("feature.procedural_grass.dissolve_height", "Dissolve Height (units)"), &settings.grassTerrainBlendHeight, 0.0f, 60.0f, "%.1f");
+			// Blade bases blend over the completed terrain G-buffer to soften the intersection.
+			ImGui::SliderFloat(T("feature.procedural_grass.base_dissolve", "Base Fade"), &settings.grassTerrainBlendStrength, 0.0f, 1.0f, "%.2f");
+			DrawSettingDescription(T("feature.procedural_grass.base_dissolve_tooltip", "Smoothly fades blade bases over terrain to hide their intersection."));
+			ImGui::SliderFloat(T("feature.procedural_grass.dissolve_height", "Fade Height (units)"), &settings.grassTerrainBlendHeight, 0.0f, 60.0f, "%.1f");
 			DrawSettingDescription(T("feature.procedural_grass.dissolve_height_tooltip", "Sets how far the terrain blend extends up each blade."));
 			ImGui::SliderFloat(T("feature.procedural_grass.base_normal_flatten", "Base Normal Flatten"), &settings.grassTerrainBlendNormal, 0.0f, 1.0f, "%.2f");
 			DrawSettingDescription(T("feature.procedural_grass.base_normal_flatten_tooltip", "Blends blade-base normals toward the terrain normal."));
