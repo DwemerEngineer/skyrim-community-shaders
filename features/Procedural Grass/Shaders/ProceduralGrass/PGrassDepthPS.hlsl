@@ -1,6 +1,4 @@
-// Depth-prepass PS that dither-discards a blade's base in the same way as the colour pass to maintain depth consistency for blending with the terrain
-
-#include "Common/Random.hlsli"
+// Writes depth only where the blade is fully opaque, leaving terrain depth beneath the smooth base fade.
 
 #include "ProceduralGrass/PGrassCommon.hlsli"
 
@@ -12,8 +10,7 @@ struct PS_INPUT
 
 void main(PS_INPUT input)
 {
-	float groundProximity = 1.0 - saturate(input.BladeHeight / max(grassTerrainBlend.y, 0.01));
-	float dissolve = groundProximity * grassTerrainBlend.x;
-	float dither = Random::InterleavedGradientNoise(input.Position.xy, 0);
-	clip(dither - dissolve);
+	float groundProximity = 1.0 - smoothstep(0.0, max(grassTerrainBlend.y, 0.01), input.BladeHeight);
+	float opacity = 1.0 - groundProximity * grassTerrainBlend.x;
+	clip(opacity - 0.999);
 }

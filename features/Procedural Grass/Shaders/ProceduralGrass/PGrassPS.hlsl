@@ -218,12 +218,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #if defined(LOW_LOD)
 	const float groundBlend = 0.0;
 #else
-	float groundProximity = 1.0 - saturate(sideAndBladeT.z / max(grassTerrainBlend.y, 0.01));
+	float groundProximity = 1.0 - smoothstep(0.0, max(grassTerrainBlend.y, 0.01), sideAndBladeT.z);
 	float groundBlend = groundProximity * grassTerrainBlend.x;
-
-	float terrainDither = Random::InterleavedGradientNoise(input.Position.xy, 0);
-	clip(terrainDither - groundBlend);
 #endif
+	float grassOpacity = 1.0 - groundBlend;
 
 	float3 veinTint = bladeType.grassVeinParams.rgb;
 	float veinAlbedoStrength = bladeType.grassVeinParams.w;
@@ -645,7 +643,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	color.xyz = 0;
 #endif
 
-	psout.Diffuse.w = 1.0f;
+	psout.Diffuse.w = grassOpacity;
 
 #if defined(LIGHT_LIMIT_FIX) && defined(LLFDEBUG)
 	if (SharedData::lightLimitFixSettings.EnableLightsVisualisation) {
@@ -687,6 +685,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	psout.Reflectance = float4(indirectLobeWeights.specular * specOcclusion, psout.Diffuse.w);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), pbrGlossiness, psout.Diffuse.w);
+	psout.NormalGlossiness.w = (screenNoise * screenNoise) < grassOpacity ? 1.0 : 0.0;
 
 #if defined(ENVMAP)
 #	if defined(DYNAMIC_CUBEMAPS)
@@ -711,7 +710,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float2 screenMotionVector = MotionBlur::GetSSMotionVector(float4(cameraRelativePosition, 1), float4(previousCameraRelativePosition, 1));
 	psout.MotionVectors.xy = screenMotionVector.xy;
-	psout.MotionVectors.zw = float2(0, 1);
+	psout.MotionVectors.zw = float2(0, psout.Diffuse.w);
 
 	return psout;
 }
