@@ -21,7 +21,7 @@ struct VS_OUTPUT
 {
 	float4 Position : SV_POSITION;
 #if defined(DEPTH)
-	float BladeHeight : TEXCOORD0;  // Height above the root; depth and colour use the same base dissolve.
+	float BladeHeight : TEXCOORD0;  // Height above the root used to exclude the smooth base fade from depth.
 #elif defined(FAR_LOD)
 	float4 CameraPositionSide : TEXCOORD0;  // xyz: camera-relative position; w: across-blade coordinate
 	float4 BladeTColor : TEXCOORD1;         // x: blade parameter; yzw: base-to-tip colour

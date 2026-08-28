@@ -223,6 +223,23 @@ void ProceduralGrass::SetupResources()
 		device->CreateBlendState(&bd, &defaultBlend);
 	}
 
+	if (!terrainFadeBlend) {
+		D3D11_BLEND_DESC bd = {};
+		bd.IndependentBlendEnable = TRUE;
+		for (uint32_t i = 0; i < 7; i++) {
+			auto& target = bd.RenderTarget[i];
+			target.BlendEnable = TRUE;
+			target.SrcBlend = D3D11_BLEND_SRC_ALPHA;
+			target.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+			target.BlendOp = D3D11_BLEND_OP_ADD;
+			target.SrcBlendAlpha = D3D11_BLEND_ONE;
+			target.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+			target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+			target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+		}
+		device->CreateBlendState(&bd, &terrainFadeBlend);
+	}
+
 	if (!multiplyBlend) {
 		// Multiply destination RGB by the terrain-darkening factor.
 		D3D11_BLEND_DESC bd = {};
@@ -783,7 +800,7 @@ void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx) const
 	ctx->OMSetDepthStencilState(depthWriteDS, 0);
 	ctx->OMSetBlendState(depthOnlyBlend, nullptr, 0xFFFFFFFF);
 
-	// Match base dithering in depth and colour so dissolved grass leaves no depth behind.
+	// Keep partially transparent blade bases out of depth so terrain remains available beneath the fade.
 	ID3D11Buffer* grassCB = grassGlobalsCB->CB();
 	ctx->VSSetConstantBuffers(8, 1, &grassCB);
 	ctx->PSSetConstantBuffers(8, 1, &grassCB);
@@ -828,7 +845,6 @@ void ProceduralGrass::DeferredRendering() const
 	if (terrainBlending.loaded && terrainBlending.settings.Enabled) {
 		// Low and Far write depth in their colour pass, after the first terrain-depth merge.
 		terrainBlending.MergeSceneDepthIntoBlend();
-		// Restore t17 after the UAV merge unbinds the shared depth SRV.
 		ID3D11ShaderResourceView* sceneDepthSRV = Util::GetCurrentSceneDepthSRV(true);
 		ctx->PSSetShaderResources(17, 1, &sceneDepthSRV);
 
@@ -863,8 +879,7 @@ void ProceduralGrass::DeferredRendering() const
 		oldBS = nullptr;
 	}
 
-	// Prevent the game from replacing the render targets already bound here.
-	globals::game::stateUpdateFlags->reset(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
+	ctx->OMSetRenderTargets(0, nullptr, nullptr);
 }
 
 void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const
@@ -882,8 +897,6 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS].RTV,
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS_DOWNSCALED].RTV,
 	};
-
-	ClearRenderTargets(ctx, rtvs);
 
 	D3D11_TEXTURE2D_DESC texDesc;
 	mainTex.texture->GetDesc(&texDesc);
@@ -928,7 +941,7 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 
 	ctx->OMSetDepthStencilState(depthEqualDS, 0);
 	ctx->RSSetState(noCullRS);
-	// Force opaque writes after terrain passes change the blend state.
+	// Begin from a known state. RenderGrass enables base fading for High and Mid.
 	ctx->OMSetBlendState(defaultBlend, nullptr, 0xFFFFFFFF);
 
 	ID3D11Buffer* grassBuffers[2] = { grassGlobalsCB->CB(), grassTypesArrayCB->CB() };
@@ -940,14 +953,6 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 	ctx->IASetInputLayout(nullptr);
 	ctx->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
 	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-}
-
-void ProceduralGrass::ClearRenderTargets(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtvs[8])
-{
-	constexpr float black[4] = { 0, 0, 0, 0 };
-	for (uint i = 2; i < 8; i++) {
-		ctx->ClearRenderTargetView(rtvs[i], black);
-	}
 }
 
 void ProceduralGrass::DarkenTerrainUnderGrass() const
@@ -1000,15 +1005,16 @@ void ProceduralGrass::RenderGrass(ID3D11DeviceContext* ctx) const
 {
 	globals::profiler->BeginPass("ProceduralGrass::Deferred");
 
+	ctx->OMSetBlendState(terrainFadeBlend, nullptr, 0xFFFFFFFF);
 	grassRendererHighLOD->RenderGrass(ctx);
 	grassRendererMidLOD->RenderGrass(ctx);
 
 	// Low and Far write depth here because they skip the depth prepass. Their colour pass remains early-Z.
+	ctx->OMSetBlendState(defaultBlend, nullptr, 0xFFFFFFFF);
 	ctx->OMSetDepthStencilState(depthWriteDS, 0);
 	grassRendererLowLOD->RenderGrass(ctx);
 	grassRendererFarLOD->RenderGrass(ctx);
 
-	// Unbind writable grass resources before the next frame generates into them.
 	ID3D11ShaderResourceView* nullSRV = nullptr;
 	ctx->VSSetShaderResources(0, 1, &nullSRV);
 	if (globals::features::grassCollision.loaded)
