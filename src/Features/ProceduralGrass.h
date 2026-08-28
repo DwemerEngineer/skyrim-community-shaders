@@ -187,6 +187,8 @@ private:
 	std::vector<PGrassCommon::Quadrant> quadrantsFarLOD;
 	std::vector<PGrassCommon::Quadrant> quadrantsPresence;
 
+	bool vanillaToggled = false;
+
 	// Far reads LAND data on workers. Near tiers use loaded cell LAND data.
 	GrassCellCache grassCellCache;
 

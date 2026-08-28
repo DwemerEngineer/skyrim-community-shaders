@@ -29,7 +29,10 @@ void ProceduralGrass::PostPostLoad()
 
 void ProceduralGrass::DataLoaded()
 {
-	ConsoleFunc_ToggleGrass();
+	if (!vanillaToggled) {
+		vanillaToggled = true;	
+		ConsoleFunc_ToggleGrass();
+	}
 }
 
 void ProceduralGrass::ClearShaderCache()
@@ -496,6 +499,9 @@ void ProceduralGrass::PostDepthRendering()
 	const auto ctx = globals::d3d::context;
 	const auto renderer = globals::game::renderer;
 
+	if (settings.Enabled && globals::game::grassManager && globals::game::grassManager->enableGrass)
+		ConsoleFunc_ToggleGrass();
+
 	const auto player = RE::PlayerCharacter::GetSingleton();
 
 	if (!settings.Enabled || !player || globals::state->isMapMenuOpen) {
@@ -504,7 +510,6 @@ void ProceduralGrass::PostDepthRendering()
 	}
 
 	GetVisibleQuadrants();
-	TopDownOcclusion::GetSingleton()->Render();
 
 	ID3D11RasterizerState* oldRS = nullptr;
 	ID3D11DepthStencilState* oldDSS = nullptr;
@@ -518,6 +523,8 @@ void ProceduralGrass::PostDepthRendering()
 	ctx->OMGetDepthStencilState(&oldDSS, &oldRef);
 	ctx->OMGetBlendState(&oldBS, oldBlendFactor, &oldSampleMask);
 
+	TopDownOcclusion::GetSingleton()->Render();
+
 	PostDepthRenderPrep(ctx, renderer);
 	GenerateBlades(ctx);
 	RenderDepth(ctx);
@@ -525,8 +532,12 @@ void ProceduralGrass::PostDepthRendering()
 	CopyDepthBuffer(ctx, renderer);
 
 	// Merge grass depth after terrain blending so grass does not appear transparent over terrain.
-	if (globals::features::terrainBlending.loaded)
-		globals::features::terrainBlending.MergeSceneDepthIntoBlend();
+	auto& terrainBlending = globals::features::terrainBlending;
+	if (terrainBlending.loaded && terrainBlending.settings.Enabled) {
+		terrainBlending.MergeSceneDepthIntoBlend();
+		ID3D11ShaderResourceView* sceneDepthSRV = Util::GetCurrentSceneDepthSRV(true);
+		ctx->PSSetShaderResources(17, 1, &sceneDepthSRV);
+	}
 
 	ctx->RSSetState(oldRS);
 	ctx->OMSetDepthStencilState(oldDSS, oldRef);
@@ -693,6 +704,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 
 	ctx->IASetInputLayout(nullptr);
 	ctx->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
 
 void ProceduralGrass::SetViewport(ID3D11DeviceContext* ctx, const float2 size)
@@ -750,8 +762,12 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx) const
 
 	ID3D11UnorderedAccessView* nullUAV = nullptr;
 	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-	ID3D11ShaderResourceView* nullSRV = nullptr;
-	ctx->CSSetShaderResources(0, 1, &nullSRV);
+
+	ID3D11ShaderResourceView* nullGeneratorSRVs[7]{};
+	ctx->CSSetShaderResources(0, ARRAYSIZE(nullGeneratorSRVs), nullGeneratorSRVs);
+	ID3D11ShaderResourceView* nullSkylightingSRV = nullptr;
+	ctx->CSSetShaderResources(50, 1, &nullSkylightingSRV);
+	ctx->CSSetShader(nullptr, nullptr, 0);
 
 	globals::profiler->EndPass();
 }
@@ -776,6 +792,9 @@ void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx) const
 	grassRendererHighLOD->RenderDepth(ctx);
 	grassRendererMidLOD->RenderDepth(ctx);
 	// Low and Far skip the depth prepass and write depth in their early-Z colour pass.
+
+	ID3D11ShaderResourceView* nullBladeSRV = nullptr;
+	ctx->VSSetShaderResources(0, 1, &nullBladeSRV);
 
 	globals::profiler->EndPass();
 }
@@ -809,6 +828,9 @@ void ProceduralGrass::DeferredRendering() const
 	if (terrainBlending.loaded && terrainBlending.settings.Enabled) {
 		// Low and Far write depth in their colour pass, after the first terrain-depth merge.
 		terrainBlending.MergeSceneDepthIntoBlend();
+		// Restore t17 after the UAV merge unbinds the shared depth SRV.
+		ID3D11ShaderResourceView* sceneDepthSRV = Util::GetCurrentSceneDepthSRV(true);
+		ctx->PSSetShaderResources(17, 1, &sceneDepthSRV);
 
 		ID3D11RenderTargetView* rtvs[8] = {
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].RTV,
@@ -917,6 +939,7 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 
 	ctx->IASetInputLayout(nullptr);
 	ctx->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
 
 void ProceduralGrass::ClearRenderTargets(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtvs[8])
@@ -985,9 +1008,12 @@ void ProceduralGrass::RenderGrass(ID3D11DeviceContext* ctx) const
 	grassRendererLowLOD->RenderGrass(ctx);
 	grassRendererFarLOD->RenderGrass(ctx);
 
-	// Unbind the density map so generation can use it as a UAV next frame.
-	ID3D11ShaderResourceView* nullDensitySRV = nullptr;
-	ctx->PSSetShaderResources(71, 1, &nullDensitySRV);
+	// Unbind writable grass resources before the next frame generates into them.
+	ID3D11ShaderResourceView* nullSRV = nullptr;
+	ctx->VSSetShaderResources(0, 1, &nullSRV);
+	if (globals::features::grassCollision.loaded)
+		ctx->VSSetShaderResources(100, 1, &nullSRV);
+	ctx->PSSetShaderResources(71, 1, &nullSRV);
 
 	globals::profiler->EndPass();
 }
