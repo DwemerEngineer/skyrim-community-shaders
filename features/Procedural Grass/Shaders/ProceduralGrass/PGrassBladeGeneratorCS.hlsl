@@ -279,7 +279,7 @@ float CalculateWindNoise(float2 worldPosition)
 }
 
 // Vanilla grass's gust waveform with smooth field variation and stable per-blade offsets.
-float CalculateWindDisplacement(float2 worldPosition, float timer, float bladeHeight, float windNoise, float bladePhase, float bladeStrength)
+float CalculateWindDisplacement(float2 worldPosition, float timer, float speed, float bladeHeight, float windNoise, float bladePhase, float bladeStrength)
 {
 	float gustAngle = 0.4f * ((worldPosition.x + worldPosition.y) * -0.0078125f + timer) + windNoise * 0.5f + bladePhase;
 
@@ -293,7 +293,27 @@ float CalculateWindDisplacement(float2 worldPosition, float timer, float bladeHe
 
 	// Taller blades receive a stronger gust response. 150 units matches the maximum possible grass height.
 	float heightResponse = bladeHeight * lerp(0.55f, 1.20f, saturate(bladeHeight * (1.0f / 150.0f)));
-	return heightResponse * windSpeed * gustStrength * ((gust1 + gust2) * 0.3f + gust0) * 0.5f;
+	return heightResponse * speed * gustStrength * ((gust1 + gust2) * 0.3f + gust0) * 0.5f;
+}
+
+float CalculateWindAdjustedAngle(float clumpedAngle, float2 direction, float angle, float speed, float rotationalStiffness, float scaledWidth, float bladeHeight)
+{
+	if (angle < 0.0f)
+		angle += Math::TAU;
+
+	float diff = angle - clumpedAngle;
+	if (diff > Math::PI)
+		diff -= Math::TAU;
+	else if (diff < -Math::PI)
+		diff += Math::TAU;
+
+	float2 clumpedFacing = float2(cos(clumpedAngle), sin(clumpedAngle));
+	float alignment = dot(direction, clumpedFacing) * 0.5f + 0.5f;
+	float rotationFactor = lerp(0.2f, 1.0f, alignment * 0.5f);
+	float totalRotation = rotationFactor * speed * speed * speed * 0.5f * scaledWidth * bladeHeight;
+	float reducedRotation = totalRotation * rcp(rotationalStiffness * totalRotation + 1.0f);
+	float clampedRotation = min(reducedRotation, abs(diff)) * sign(diff);
+	return clumpedAngle + clampedRotation;
 }
 
 /** Finish one base or slope-fill candidate after its terrain plane has been established. */
@@ -466,34 +486,13 @@ void EmitBlade(
 	}
 
 	// Turn toward the wind without rotating beyond it.
-	float windAngleCor = windAngle;
-	if (windAngleCor < 0.0f)
-		windAngleCor += Math::TAU;
-
-	float diff = windAngleCor - clumpedAngle;
-	if (diff > Math::PI)
-		diff -= Math::TAU;
-	else if (diff < -Math::PI)
-		diff += Math::TAU;
-
-	// Alignment ranges from 0 when facing away to 1 when facing into the wind. Side-on blades still sway.
-	float2 clumpedFacing = float2(cos(clumpedAngle), sin(clumpedAngle));
-	float alignment = dot(windDir, clumpedFacing) * 0.5f + 0.5f;
-	float rotationFactor = lerp(0.2f, 1.0f, alignment * 0.5f);
-
-	float windSpeed3 = windSpeed * windSpeed * windSpeed;
-	float totalRotation = rotationFactor * windSpeed3 * 0.5f * scaledWidth * randHeight;
-
-	float reducedRotation = totalRotation * rcp(grassType.rotationalStiffness * totalRotation + 1.0f);
-
-	float clampedRotation = min(reducedRotation, abs(diff)) * sign(diff);
-	float windAdjustedAngle = clumpedAngle + clampedRotation;
+	float windAdjustedAngle = CalculateWindAdjustedAngle(clumpedAngle, windDir, windAngle, windSpeed, grassType.rotationalStiffness, scaledWidth, randHeight);
 #if defined(HIGH_LOD) || defined(MID_LOD)
 	float windNoise = CalculateWindNoise(bladeWorldPos2D);
 	float bladeWindPhase = (float(hash.x) * UINT_TO_FLOAT - 0.5f) * 0.45f;
 	float bladeWindStrength = lerp(0.65f, 1.35f, float(hash.y) * UINT_TO_FLOAT);
-	float windDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer, randHeight, windNoise, bladeWindPhase, bladeWindStrength);
-	float previousWindDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer - miscParams.w, randHeight, windNoise, bladeWindPhase, bladeWindStrength);
+	float windDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer, windSpeed, randHeight, windNoise, bladeWindPhase, bladeWindStrength);
+	float previousWindDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer - miscParams.w, previousWindSpeed, randHeight, windNoise, bladeWindPhase, bladeWindStrength);
 #else
 	float windDisplacement = 0.0f;
 	float previousWindDisplacement = 0.0f;
@@ -552,12 +551,11 @@ void EmitBlade(
 	float randBend = grassType.stiffness * (float(tiltHash.y) * UINT_TO_FLOAT * 1.6f + 0.25f);
 	uint packedDetailRandom = (tiltHash.x & 0xFFu) | (tiltHash.y & 0xFFu) << 8;
 	float tiltSin, tiltCos;
-	
 	sincos(randTilt, tiltSin, tiltCos);
 	b.tipDir = f32tof16(tiltSin) << 16 | f32tof16(tiltCos);
 	b.hashClumpAndGrassType = hashClumpAndGrassType;
 	
-	// Store static facing as SNORM8 and animated tip displacement as f16 for smooth motion vectors.
+	// Store current facing as SNORM8 and animated tip displacement as f16.
 	int2 packedFacing = (int2)round(clamp(randFacing, -1.0f, 1.0f) * 127.0f);
 	b.facingAndWind = (uint)(packedFacing.x & 0xFF) | (uint)(packedFacing.y & 0xFF) << 8 | f32tof16(windDisplacement) << 16;
 	b.previousWind = packedDetailRandom << 16 | f32tof16(previousWindDisplacement);
