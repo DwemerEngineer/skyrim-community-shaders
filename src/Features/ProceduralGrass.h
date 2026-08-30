@@ -36,7 +36,7 @@ public:
 		float rotationalStiffness = 1.0f;
 		float ao = 0.10f;  // Minimum blade AO
 		float specular = 0.20f;
-		float2 subsurfaceOpacity = float2(0.8f, 0.10f);  // Base to tip
+		float2 subsurfaceOpacity = float2(0.6f, 0.10f);  // Base to tip
 		float3 grassSubsurfaceTint = float3(1.50f, 1.00f, 0.60f);  // Backlight tint
 		float3 baseMinTipRoughness = float3(0.65f, 0.45f, 0.55f);
 		float tipRoughnessStart = 0.75f;
@@ -46,7 +46,7 @@ public:
 		float3 baseColor = float3(0.193f, 0.141f, 0.069f);
 		float3 tipColor = float3(0.221f, 0.241f, 0.147f);
 		float grassColorHueVariation = 0.60f;                   // Per-blade hue variation
-		float grassColorValueVariation = 0.40f;                 // Per-blade brightness variation
+		float grassColorValueVariation = 0.20f;                 // Per-blade brightness variation
 		float grassColorTipDryStrength = 0.35f;                 // Tip dry-tint strength
 		float grassColorMottleStrength = 0.15f;                 // Along-blade mottle strength
 		float3 grassColorCool = float3(0.65f, 1.15f, 0.50f);    // Cool blade tint
@@ -253,6 +253,8 @@ private:
 	uint64_t grassContentGeneration = 0;
 
 	float2 windDirection = float2(1.0f, 0.0f);
+	float2 previousWindDirection = float2(1.0f, 0.0f);
+	float previousWindSpeed = 0.4f;
 	float previousShaderTimer = 0.0f;
 	float nearQuadrantFrustumPadding = 0.0f;
 	float farQuadrantFrustumPadding = 0.0f;

@@ -29,6 +29,9 @@ struct VS_OUTPUT
 #else
 	float4 CameraRelativePosition : TEXCOORD0;  // xyz: camera-relative position; w: across-blade coordinate
 	float4 PreviousCameraRelativePosition : TEXCOORD1;  // xyz: previous camera-relative position; w: Bezier t
+#	if defined(HIGH_LOD) || defined(MID_LOD)
+	nointerpolation float2 WindOffset : TEXCOORD2;  // Current tip offset used to reconstruct the wind-bent tangent.
+#	endif
 	float4 AOThicknessRoughness : TEXCOORD3;  // xyz: AO, thickness, roughness; w: root-relative height
 	nointerpolation float4 BezierTipAndMid : TEXCOORD4;  // xy: tip; zw: midpoint in facing/up space
 	nointerpolation float4 BladeParams : TEXCOORD5;  // xy: facing; z: type; w: two f16 randoms
@@ -180,9 +183,9 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #endif
 
 #if defined(HIGH_LOD) || defined(MID_LOD)
-	pos.xy += windDir * windDisplacement * windWeight;
-	// Keep motion vectors consistent with the current wind displacement.
-	previousPos.xy += windDir * previousWindDisplacement * windWeight;
+	float2 windOffset = windDir * windDisplacement;
+	pos.xy += windOffset * windWeight;
+	previousPos.xy += previousWindDir * previousWindDisplacement * windWeight;
 #endif
 
 	float4 viewPos = float4(originalViewPos + pos, 1.0f);  // The stored root offset is already camera-relative.
@@ -228,6 +231,9 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	// Pack side, Bezier t, and root-relative height into unused w components.
 	o.CameraRelativePosition = float4(viewPos.xyz, (sideSign + 1.0f) * 0.5f);
 	o.PreviousCameraRelativePosition = float4(previousViewPos.xyz, t);
+#		if defined(HIGH_LOD) || defined(MID_LOD)
+	o.WindOffset = windOffset;
+#		endif
 	o.BezierTipAndMid = float4(tip, midPoint);
 	// Mid evaluates three t values, so this polynomial preserves the authored curve at each rung.
 #		if defined(MID_VERTEX)
