@@ -66,13 +66,14 @@ namespace PGrassCommon
 		float2 dynamicResolutionInverted;
 
 		float windSpeed;
-		float windTimer;
+		float previousWindSpeed;
 		float2 windDir;
 		float windAngle;
 
 		float occlusionHalfExtent;
 		float occlusionInvExtent;  // 1 / (2 * half extent), used by the generator's top-down-map UV transform
-		float3 _occlusionPadding;
+		float2 previousWindDir;
+		float _occlusionPadding;
 		float4 occlusionParams;  // xy: window centre in world space, z: underside clearance, w: top-height bias (world units)
 
 		float4 grassAOParams;     // x: density map dim, y: darken strength, z: blades-per-texel for full dark, w: canopy height (world units)
@@ -172,11 +173,11 @@ namespace PGrassCommon
 	{
 		uint posXY;
 		uint posZWidthHeight;
-		uint facingAndWind;  // low 16: static facing as 2x SNORM8; high 16: current wind displacement as f16
-		uint previousWind;   // low 16: previous wind displacement as f16
+		uint facingAndWind;  // low 16: current facing as 2x SNORM8; high 16: current wind displacement as f16
+		uint previousWind;   // low 16: previous wind displacement as f16; high 16: two UNORM8 blade-detail randoms
 		uint hashClumpAndGrassType;
 		uint clumpDensity;
-		uint tipDir;
+		uint tipDir;  // (sin, cos) of the blade tilt as 2x f16
 	};
 	static_assert(sizeof(Blade) == 28);
 

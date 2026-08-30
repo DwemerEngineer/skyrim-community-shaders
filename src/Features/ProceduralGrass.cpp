@@ -616,10 +616,19 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	// Convert viewport-space SV_Position to normalized coordinates before dynamic-resolution adjustment.
 	grassGlobals.dynamicResolutionInverted = float2(1.0f / renderSize.x, 1.0f / renderSize.y);
 
+	const float shaderTimer = globals::state->timer;
+	float timerDelta = shaderTimer - previousShaderTimer;
+	if (timerDelta < 0.0f || timerDelta > 0.1f) {
+		timerDelta = 0.0f;
+		previousWindDirection = windDirection;
+		previousWindSpeed = settings.windSpeed;
+	}
+
 	grassGlobals.windSpeed = settings.windSpeed;
-	grassGlobals.windTimer = std::fmod(globals::state->timer, 1.0f);
+	grassGlobals.previousWindSpeed = previousWindSpeed;
 	grassGlobals.windDir = windDirection;
 	grassGlobals.windAngle = atan2(windDirection.y, windDirection.x);
+	grassGlobals.previousWindDir = previousWindDirection;
 
 	const auto topDown = TopDownOcclusion::GetSingleton();
 	topDown->SetPaddingWorld(settings.occlusionPadding);  // Pre-pad the map for one generator centre tap.
@@ -637,9 +646,9 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	const float farEnd = std::max(farStart + 4096.0f, settings.grassCellRadius * 4096.0f);
 	grassGlobals.farParams = float4(farStart, 1.0f / (farEnd - farStart), settings.farDensityFalloff, 0.0f);
 
-	const float shaderTimer = globals::state->timer;
-	const float timerDelta = std::max(0.0f, shaderTimer - previousShaderTimer);
 	previousShaderTimer = shaderTimer;
+	previousWindDirection = windDirection;
+	previousWindSpeed = settings.windSpeed;
 	grassGlobals.miscParams = float4(settings.grassMapEdgeNoise, settings.grassSlopeFacing, settings.grassViewThicken, timerDelta);
 	grassGlobals.grassTerrainBlend = float4(settings.grassTerrainBlendStrength, settings.grassTerrainBlendHeight, settings.grassTerrainBlendNormal, settings.grassTerrainBlendRough);
 

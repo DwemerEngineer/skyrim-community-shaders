@@ -1,3 +1,6 @@
+#define PSHADER
+#define DEFERRED
+#define FRAMEBUFFER
 #define TRUE_PBR
 
 #include "Common/PBRMath.hlsli"
@@ -54,11 +57,6 @@ SamplerState SampColorSampler : register(s0);
 #	include "Skylighting/Skylighting.hlsli"
 #endif
 
-#define PSHADER
-#define DEFERRED
-#define FRAMEBUFFER
-#define TRUE_PBR
-
 #if defined(__INTELLISENSE__)
 #	define ISL
 #	define DYNAMIC_CUBEMAPS
@@ -80,6 +78,9 @@ struct PS_INPUT
 #else
 	float4 CameraRelativePosition : TEXCOORD0;  // xyz: camera-relative position; w: across-blade coordinate
 	float4 PreviousCameraRelativePosition : TEXCOORD1;  // xyz: previous camera-relative position; w: Bezier t
+#if defined(HIGH_LOD) || defined(MID_LOD)
+	nointerpolation float2 WindOffset : TEXCOORD2;  // Current tip offset used to reconstruct the wind-bent tangent.
+#endif
 	float4 AOThicknessRoughness : TEXCOORD3;  // xyz: AO, thickness, roughness; w: root-relative height
 	nointerpolation float4 BezierTipAndMid : TEXCOORD4;  // xy: tip; zw: midpoint in facing/up space
 	nointerpolation float4 BladeParams : TEXCOORD5;  // xy: facing; z: type; w: two f16 randoms
@@ -200,13 +201,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float3 worldSpaceViewDirection = -normalize(cameraRelativePosition);
 
-	float4 rawBaseColor = float4(baseToTipColor, 1.0f);
-	float4 baseColor = rawBaseColor;
+	float4 baseColor = float4(baseToTipColor, 1.0f);
 	float4 rawRMAOS = float4(aoThicknessRoughness.z, 0.0f, aoThicknessRoughness.x, bladeType.specular);
 
 	// Reconstruct the blade basis and curve its normal toward the visible edge.
 	float3 bitangent = float3(-facing.y, facing.x, 0.0f);
-	float3 tangent = normalize(float3(facing * derivative.x, derivative.y));
+	float3 tangent = float3(facing * derivative.x, derivative.y);
+#if defined(HIGH_LOD) || defined(MID_LOD)
+	// Position uses windOffset * t^2, so its tangent gains the derivative 2t * windOffset.
+	tangent.xy += input.WindOffset * (2.0f * along);
+#endif
+	tangent = normalize(tangent);
 	float3 normal = cross(-bitangent, tangent);
 	float side = across * 2.0f - 1.0f;
 
@@ -290,6 +295,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #endif
 
+	// Determine the authored color in display space, then convert it once for Linear Lighting.
+	baseColor.rgb = Color::ColorToLinear(baseColor.rgb);
+
 	// Flatten ambient normals toward world-up to reduce per-blade noise.
 	float3 ambientNormal = normalize(lerp(worldSpaceNormal, float3(0.0, 0.0, 1.0), bladeType.grassSurfParams.y));
 
@@ -344,11 +352,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	material.Roughness = saturate(lerp(material.Roughness, 1.0, groundBlend * grassTerrainBlend.w));
 	material.Metallic = saturate(rawRMAOS.y);
 	material.AO = rawRMAOS.z;
-	material.F0 = lerp(saturate(rawRMAOS.w), Color::SkyrimGammaToLinear(baseColor.xyz), material.Metallic);
+	material.F0 = lerp(saturate(rawRMAOS.w), Color::IrradianceToLinear(baseColor.xyz), material.Metallic);
 	material.F0 = lerp(material.F0, material.F0 * 1.12, vein * 0.25);
 	baseColor.xyz *= 1 - material.Metallic;
 	material.BaseColor = baseColor.xyz;
-	material.SubsurfaceColor = saturate(bladeType.grassSubsurfaceColor.rgb);
+	material.SubsurfaceColor = saturate(Color::ColorToLinear(bladeType.grassSubsurfaceColor.rgb));
 	material.Thickness = aoThicknessRoughness.y;
 
 	float3 specularColorPBR = 0;
@@ -460,7 +468,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	waterRoughnessSpecular = 1.0 - wetnessGlossinessSpecular * 0.9;
 #endif
 
-	float3 dirLightColor = Color::Light(SharedData::DirLightColor.xyz);
+	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
+	float3 dirLightColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
 	float3 dirLightColorMultiplier = 1;
 
 	float3 dirLightDirection = SharedData::DirLightDirection.xyz;
@@ -539,7 +548,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float3 normalizedLightDirection = lightDirection * rsqrt(max(distSq, 1e-10));
 #		endif
 
-		float3 lightColor = Color::Light(light.color.xyz) * intensityMultiplier;
+		const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
+		float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * light.fade;
 		float lightShadow = 1.0;
 
 		float shadowComponent = 1.0;
@@ -568,8 +578,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	specularColor += lightsSpecularColor;
 
 	float3 directionalAmbientColor = Color::Ambient(max(0, SharedData::GetAmbient(ambientNormal)));
-	float ambientLuma = dot(directionalAmbientColor, float3(0.2126, 0.7152, 0.0722));
-	directionalAmbientColor = lerp(directionalAmbientColor, ambientLuma, bladeType.grassTypeLightParams.w);
+	float3 ambientDisplayColor = Color::LLLinearToGamma(directionalAmbientColor);
+	float ambientLuma = dot(ambientDisplayColor, float3(0.2126, 0.7152, 0.0722));
+	ambientDisplayColor = lerp(ambientDisplayColor, ambientLuma, bladeType.grassTypeLightParams.w);
+	directionalAmbientColor = Color::LLGammaToLinear(ambientDisplayColor);
 
 	#if defined(SKYLIGHTING) && defined(HIGH_LOD)
 	float skylightingDiffuse = Skylighting::GetSkylightingDiffuse(skylightingSH, positionMSSkylight, ambientNormal);
@@ -588,7 +600,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	[branch] if (wetnessGlossinessAlbedo > 0.0) {
 		porosity = lerp(porosity, 0.0, saturate(sqrt(material.Metallic)));
 		float wetnessDarkeningAmount = porosity * wetnessGlossinessAlbedo;
-		baseColor.xyz = lerp(baseColor.xyz, pow(abs(baseColor.xyz), 1.0 + wetnessDarkeningAmount), 0.8);
+		float3 wetBaseColor = Color::LLLinearToGamma(baseColor.xyz);
+		wetBaseColor = lerp(wetBaseColor, pow(abs(wetBaseColor), 1.0 + wetnessDarkeningAmount), 0.8);
+		baseColor.xyz = Color::LLGammaToLinear(wetBaseColor);
 	}
 #endif
 
@@ -614,7 +628,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float skyTransmission = (1.0 - material.Thickness) * 0.5;
 	transmissionColor += directionalAmbientColor * material.SubsurfaceColor * skyTransmission * bladeType.grassTypeLightParams.y;
 
-	diffuseColor.xyz += directionalAmbientColor * bladeType.grassBounceColor.rgb * bladeType.grassTypeLightParams.x * (1.0 - canopyHeight01) * baseColor.xyz;
+	diffuseColor.xyz += directionalAmbientColor * Color::ColorToLinear(bladeType.grassBounceColor.rgb) * bladeType.grassTypeLightParams.x * (1.0 - canopyHeight01) * baseColor.xyz;
 	specularColor = Color::SkyrimGammaToLinear(specularColor);
 
 #if defined(ENVMAP)
@@ -624,12 +638,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		specularColor += envColor * Color::SkyrimGammaToLinear(diffuseColor);
 #endif
 
-	diffuseColor.xyz *= Color::PBRLightingScale;
-	transmissionColor *= Color::PBRLightingScale;
+	// Keep the same perceptual grass brightness in both lighting modes.
+	float grassLightingScale = Color::ColorToLinear(0.65f.xxx).x;
+	diffuseColor.xyz *= grassLightingScale;
+	transmissionColor *= grassLightingScale;
 
 	float specOcclusion = lerp(1.0, canopyAO, bladeType.grassTypeLightParams.z);
 	specularColorPBR *= specOcclusion;
-	specularColorPBR *= Color::PBRLightingScale;
+	specularColorPBR *= grassLightingScale;
+	// Deferred removes PBRLightingScale from the albedo buffer, so retain its matching scale here.
 	indirectLobeWeights.diffuse *= Color::PBRLightingScale;
 	specularColor = specularColorPBR;
 
@@ -685,7 +702,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	psout.Reflectance = float4(indirectLobeWeights.specular * specOcclusion, psout.Diffuse.w);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), pbrGlossiness, psout.Diffuse.w);
-	psout.NormalGlossiness.w = (screenNoise * screenNoise) < grassOpacity ? 1.0 : 0.0;
 
 #if defined(ENVMAP)
 #	if defined(DYNAMIC_CUBEMAPS)
