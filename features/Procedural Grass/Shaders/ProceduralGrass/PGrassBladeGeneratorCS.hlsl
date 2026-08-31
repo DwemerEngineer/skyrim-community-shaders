@@ -408,7 +408,14 @@ void EmitBlade(
 		float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodDist - lodFadeOut.x) * lodFadeOut.y));
 		float keep = min(inRamp, outRamp);
 		float dither = float(Random::pcg3d(uint3(asuint(bladeWorldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
+#if defined(MID_LOD)
+		// High keeps the lower random values. Mid takes the rest during their shared transition.
+		if ((inRamp < 1.0f && dither <= 1.0f - inRamp) || dither > outRamp)
+#elif defined(HIGH_LOD)
+		if (keep <= 0.0f || dither > keep)
+#else
 		if (dither > keep)
+#endif
 			return;
 	}
 #endif
