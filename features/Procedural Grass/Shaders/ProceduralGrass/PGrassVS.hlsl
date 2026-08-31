@@ -19,7 +19,7 @@ StructuredBuffer<Blade> Blades : register(t0);
 
 struct VS_OUTPUT
 {
-	float4 Position : SV_POSITION;
+	precise float4 Position : SV_POSITION;
 #if defined(DEPTH)
 	float BladeHeight : TEXCOORD0;  // Height above the root used to exclude the smooth base fade from depth.
 #elif defined(FAR_LOD)
@@ -219,7 +219,6 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	clipPos.x += FrameBuffer::CameraProj._m00 * viewThicken * sideSign * taper * miscParams.z;
 #endif
 
-	// Pack only the data required by the selected pixel-shader tier.
 	o.Position = clipPos;
 #if defined(DEPTH)
 	o.BladeHeight = pos2d.y;
@@ -240,7 +239,7 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	float roughnessT2 = t * t;
 	float roughness = mad(mad(bladeType.midRoughnessPolynomial.x, t, bladeType.midRoughnessPolynomial.y), roughnessT2, bladeType.midRoughnessPolynomial.z);
 #		else
-	// Blend from base roughness through the configured midpoint to the tip.
+
 	float roughness = lerp(bladeType.baseMinTipRoughnessStart.x, bladeType.baseMinTipRoughnessStart.y, smoothstep(0.0f, bladeType.baseMinTipRoughnessStart.w, t));
 	roughness = lerp(roughness, bladeType.baseMinTipRoughnessStart.z, smoothstep(bladeType.baseMinTipRoughnessStart.x, 1.0f, t));
 #		endif
@@ -250,7 +249,6 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	o.AOThicknessRoughness = float4(bladeAO * clumpAO, lerp(bladeType.minMaxSubsurfaceOpacity.x, bladeType.minMaxSubsurfaceOpacity.y, t), roughness, pos2d.y);
 #	endif
 
-	// Decode the generator's packed per-blade random values.
 #	if defined(FAR_LOD)
 	float bladeRand = (float(bladeSeed & 0xFFu) + 0.5f) * (1.0f / 256.0f);
 	float bladeRand2 = (float(bladeSeed >> 8) + 0.5f) * (1.0f / 256.0f);
