@@ -5,6 +5,7 @@
 #include "Buffer.h"
 #include "GrassOptimizations/GrassBucketStore.h"
 #include "GrassOptimizations/HiZPyramid.h"
+#include "Utils/VersionedRelocation.h"
 
 /** @brief Rewrites vanilla grass rendering with a bucket based system utilizing indirect draws and compute shader per instance culling. */
 struct GrassOptimizations : Feature
@@ -278,17 +279,17 @@ public:
 			stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
 
 			// Capture raw instance data for cached grass.
-			stl::write_thunk_call<AddQueuedGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x7FF, 0x756));
-			stl::write_thunk_call<AddGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x806, 0x75D));
-			stl::write_thunk_call<ReadGroupHeaderStreamTraits>(REL::RelocationID(74599, 76327).address() + REL::Relocate(0x36, 0x36));
-			stl::write_thunk_call<ReadGroupHeaderStreamTraits>(REL::RelocationID(74596, 76324).address() + REL::Relocate(0x2F, 0x33));
+			stl::write_thunk_call<AddQueuedGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + Util::VersionedRelocation::Select(0x7FF, 0x756, 0x768));
+			stl::write_thunk_call<AddGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + Util::VersionedRelocation::Select(0x806, 0x75D, 0x76F));
+			stl::write_thunk_call<ReadGroupHeaderStreamTraits>(REL::RelocationID(74599, 76327).address() + Util::VersionedRelocation::Select(0x36, 0x36, 0x45));
+			stl::write_thunk_call<ReadGroupHeaderStreamTraits>(REL::RelocationID(74596, 76324).address() + Util::VersionedRelocation::Select(0x2F, 0x33, 0x42));
 			stl::write_thunk_call<ReadInstanceGroupStreamTraits>(REL::RelocationID(74607, 76339).address() + REL::Relocate(0xCF, 0xCF));
 			stl::write_thunk_call<AddGroupQueuedGIDFile>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x394, 0x384));
 			stl::write_thunk_call<AddGroupGIDFile>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x39B, 0x38B));
 
 			// Record each grass type's source .nif path alongside its shape.
-			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15204, 15372).address() + REL::Relocate(0x2F5, 0x2F5));
-			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15205, 15373).address() + REL::Relocate(0x62B, 0x597));
+			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15204, 15372).address() + Util::VersionedRelocation::Select(0x2F5, 0x2F5, 0x305));
+			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15205, 15373).address() + Util::VersionedRelocation::Select(0x62B, 0x597, 0x590));
 			stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x25C, 0x25C));
 
 			std::uint8_t patch[] = { 0x4C, 0x89, 0xF2 };  // mov rdx, r14
@@ -298,7 +299,10 @@ public:
 
 			// Skip mapping the vanilla dynamic fade buffer.
 			if (REL::Module::IsAE()) {
-				trampoline.write_branch<5>(REL::RelocationID(99996, 106685).address() + 0x595, REL::RelocationID(99996, 106685).address() + 0x6C6);
+				// 1.7.99 uploads PS PerGeometry at +0x66C..+0x69C; retain it before bypassing fade work.
+				trampoline.write_branch<5>(
+					REL::RelocationID(99996, 106685).address() + Util::VersionedRelocation::Select(0x595, 0x595, 0x6A2),
+					REL::RelocationID(99996, 106685).address() + Util::VersionedRelocation::Select(0x6C6, 0x6C6, 0x7D6));
 			} else {
 				REL::safe_write(REL::RelocationID(99996, 106685).address() + 0x54D, REL::NOP5);
 			}

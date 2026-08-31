@@ -36,7 +36,9 @@ struct VS_OUTPUT
 	float2 TexCoord: TEXCOORD0;
 #if defined(RENDER_DEPTH)
 	float Fade: TEXCOORD2;
+#	ifndef GRASS_OPTIMIZATIONS
 	float2 Depth: TEXCOORD4;
+#	endif
 #else
 	// Fade shares the otherwise unused color alpha component.
 	float4 Color: COLOR0;
@@ -195,7 +197,6 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.HPosition = projSpacePosition;
 
 #		if defined(RENDER_DEPTH)
-	vsout.Depth = projSpacePosition.zw;
 	vsout.Fade = e1.z;
 #		else
 	previousMsPosition.xyz += float3(WindVector.xy, 0) * (e1.y * vertexTerm);
@@ -405,6 +406,22 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	bool complex = abs(complexLength - 1.0) < SharedData::grassLightingSettings.ComplexGrassThreshold;
 #		endif
 
+#		if defined(RENDER_DEPTH)
+	// Alpha is the only texture channel needed here; select the atlas half without a sample branch.
+	const float2 alphaUV = float2(input.TexCoord.x, input.TexCoord.y * (complex ? 0.5 : 1.0));
+	const float baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, alphaUV, SharedData::MipBias).w;
+	const float diffuseAlpha = input.Fade * baseAlpha;
+	if ((diffuseAlpha - AlphaTestRefRS) < 0)
+		discard;
+
+#			ifdef GRASS_OPTIMIZATIONS
+	// The optimized main-view pass uses the rasterizer's depth directly, with no extra interpolator.
+	psout.PS.xyz = input.HPosition.zzz;
+#			else
+	psout.PS.xyz = input.Depth.xxx / input.Depth.yyy;
+#			endif
+	psout.PS.w = diffuseAlpha;
+#		else
 	float4 baseColor;
 	if (complex) {
 		baseColor = TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, input.TexCoord.y * 0.5), SharedData::MipBias);
@@ -412,24 +429,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
 	}
 
-	baseColor.xyz = Color::Diffuse(baseColor.xyz);
-
-#		if defined(RENDER_DEPTH) || defined(DO_ALPHA_TEST)
-#			if defined(RENDER_DEPTH)
-	float diffuseAlpha = input.Fade * baseColor.w;
-#			else
+#			if defined(DO_ALPHA_TEST)
 	float diffuseAlpha = input.Color.w * baseColor.w;
-#			endif
 	if ((diffuseAlpha - AlphaTestRefRS) < 0) {
 		discard;
 	}
-#		endif  // RENDER_DEPTH || DO_ALPHA_TEST
+#			endif
 
-#		if defined(RENDER_DEPTH)
-	// Depth
-	psout.PS.xyz = input.Depth.xxx / input.Depth.yyy;
-	psout.PS.w = diffuseAlpha;
-#		else
+	baseColor.xyz = Color::Diffuse(baseColor.xyz);
+
 	if (SharedData::lodBlendingSettings.DisableTerrainVertexColors)
 		input.Color.xyz = 1;
 
@@ -673,24 +681,27 @@ PS_OUTPUT main(PS_INPUT input)
 	float skylightingShadowVisibility = 1.0;
 #		endif
 
-	float4 baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
-
-#		if defined(RENDER_DEPTH) || defined(DO_ALPHA_TEST)
-#			if defined(RENDER_DEPTH)
-	float diffuseAlpha = input.Fade * baseColor.w;
-#			else
-	float diffuseAlpha = input.Color.w * baseColor.w;
-#			endif
+#		if defined(RENDER_DEPTH)
+	const float baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias).w;
+	const float diffuseAlpha = input.Fade * baseAlpha;
 	if ((diffuseAlpha - AlphaTestRefRS) < 0) {
 		discard;
 	}
-#		endif  // RENDER_DEPTH || DO_ALPHA_TEST
 
-#		if defined(RENDER_DEPTH)
-	// Depth
+#			ifdef GRASS_OPTIMIZATIONS
+	psout.PS.xyz = input.HPosition.zzz;
+#			else
 	psout.PS.xyz = input.Depth.xxx / input.Depth.yyy;
+#			endif
 	psout.PS.w = diffuseAlpha;
 #		else
+	float4 baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
+#			if defined(DO_ALPHA_TEST)
+	const float diffuseAlpha = input.Color.w * baseColor.w;
+	if ((diffuseAlpha - AlphaTestRefRS) < 0)
+		discard;
+#			endif
+
 #			ifdef GRASS_OPTIMIZATIONS
 	const float lodBrightness = input.LodTier > 1.5 ? SharedData::grassLightingSettings.FarLODBrightness : SharedData::grassLightingSettings.MidLODBrightness;
 	baseColor.xyz *= lerp(1.0, lodBrightness, saturate(input.LodTier));
