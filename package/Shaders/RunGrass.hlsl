@@ -29,63 +29,40 @@ struct VS_INPUT
 	float4 InstanceData4: TEXCOORD7;
 };
 
-#ifdef GRASS_LIGHTING
+// Both paths use upstream's vertex inputs. Only outputs consumed by this pass are interpolated.
 struct VS_OUTPUT
 {
 	float4 HPosition: SV_POSITION0;
+	float2 TexCoord: TEXCOORD0;
 #if defined(RENDER_DEPTH)
-	float Alpha: COLOR0;
-	float2 TexCoord: TEXCOORD0;
-	// No Depth interpolator: the rasterizer already divides, so SV_POSITION.z carries z/w for free.
+	float Fade: TEXCOORD2;
+	float2 Depth: TEXCOORD4;
 #else
+	// Fade shares the otherwise unused color alpha component.
 	float4 Color: COLOR0;
-	float2 TexCoord: TEXCOORD0;
-	float4 WorldPosition: POSITION1;
-	float4 PreviousWorldPosition: POSITION2;
+	float3 WorldPosition: POSITION1;
+	float3 PreviousWorldPosition: POSITION2;
+#	ifdef GRASS_LIGHTING
 	float4 VertexNormal: POSITION4;
-#endif
-#	ifdef GRASS_OPTIMIZATIONS
-	nointerpolation float IsComplex: TEXCOORD8;
-#	if !defined(RENDER_DEPTH)
-	// Only gates pixel shader work, so the depth pass has no use for it.
-	nointerpolation float IsFar: TEXCOORD9;
-	// 0 = full mesh, 1 = middle LOD mesh, 2 = far LOD mesh.
-	nointerpolation float LodTier: TEXCOORD10;
+#	else
+	float DirLightAngle: TEXCOORD1;
+#		ifndef GRASS_OPTIMIZATIONS
+	// Preserve the engine's WorldView transform for standard-path geometric normals.
+	float3 ViewSpacePosition: TEXCOORD3;
+#		endif
 #	endif
-#	endif
-};
-#else
-struct VS_OUTPUT
-{
-	float4 HPosition: SV_POSITION0;
-#if defined(RENDER_DEPTH)
-	float Alpha: COLOR0;
-	float2 TexCoord: TEXCOORD0;
-	// No Depth interpolator, as above.
-#else
-	float4 Color: COLOR0;
-	float2 TexCoord: TEXCOORD0;
-	float4 WorldPosition: POSITION1;
-	float4 PreviousWorldPosition: POSITION2;
 #endif
-#	ifdef GRASS_OPTIMIZATIONS
+#ifdef GRASS_OPTIMIZATIONS
 	nointerpolation float IsComplex: TEXCOORD8;
 #	if !defined(RENDER_DEPTH)
 	nointerpolation float IsFar: TEXCOORD9;
 	// 0 = full mesh, 1 = middle LOD mesh, 2 = far LOD mesh.
 	nointerpolation float LodTier: TEXCOORD10;
 #	endif
-#	endif
-};
 #endif
+};
 
-cbuffer PerGeometry : register(
-#ifdef VSHADER
-						  b2
-#else
-						  b3
-#endif
-					  )
+cbuffer PerGeometry : register(b2)
 {
 	row_major float4x4 WorldViewProj : packoffset(c0);
 	row_major float4x4 WorldView : packoffset(c4);
@@ -168,66 +145,42 @@ float4 GetMSPosition(VS_INPUT input)
 	return msPosition;
 }
 
-#	ifdef GRASS_LIGHTING
+#	ifdef GRASS_OPTIMIZATIONS
+// Captured instances retain upstream's vertex input layout.
 VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 {
-	VS_OUTPUT vsout;
+	VS_OUTPUT vsout = (VS_OUTPUT)0;
 
-#		ifdef GRASS_OPTIMIZATIONS
 	const float4 e0 = InstanceExtras[instanceID * 2 + 0];
 	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
 	vsout.IsComplex = e0.w;
+	vsout.TexCoord = input.TexCoord.xy;
 
-	// e1.w packs 4.0 per LOD tier, 2.0 = far and 1.0 = in collision range. Unpack before testing, or a far instance out of collision range reads as colliding.
+	// e1.w packs 4.0 per LOD tier, 2.0 = far and 1.0 = in collision range.
 	const float lodTier = floor(e1.w * 0.25);
 	const float packedFlags = e1.w - 4.0 * lodTier;
 	const float isFarFlag = (packedFlags >= 2.0) ? 1.0 : 0.0;
 	const float collisionFlag = packedFlags - 2.0 * isFarFlag;
-#			if !defined(RENDER_DEPTH)
-	vsout.IsFar = isFarFlag;
-	vsout.LodTier = lodTier;
-#			endif
-#		endif
 
+#		ifdef GRASS_LIGHTING
 	float3x3 world3x3 = float3x3(input.InstanceData2.xyz, input.InstanceData3.xyz, float3(input.InstanceData4.x, input.InstanceData2.w, input.InstanceData3.w));
-
 	float4 msPosition = GetMSPosition(input, world3x3);
-
-#		ifdef GRASS_OPTIMIZATIONS
-	msPosition.xyz += e0.xyz;
+#		else
+	float4 msPosition = GetMSPosition(input);
 #		endif
+	msPosition.xyz += e0.xyz;
 
 #		if !defined(RENDER_DEPTH)
 	float4 previousMsPosition = msPosition;
 #		endif
 
-#		ifdef GRASS_OPTIMIZATIONS
-	const float vertexTerm = WindVector.z * (0.5 * (input.Color.w * input.Color.w));
-	const float3 windDisplacement = float3(WindVector.xy, 0) * (e1.x * vertexTerm);
-#			if !defined(RENDER_DEPTH)
-	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (e1.y * vertexTerm);
-#			endif
-#		else
-	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
-#			if !defined(RENDER_DEPTH)
-	float3 previousWindDisplacement = CalculateWindDisplacement(input, PreviousWindTimer);
-#			endif
-#		endif
-
 #		ifdef GRASS_COLLISION
-#			ifdef GRASS_OPTIMIZATIONS
-	[branch] if (collisionFlag > 0.5)
-#			endif
-	{
-		float3 displacement, previousDisplacement;
-#			ifdef GRASS_OPTIMIZATIONS
-		// msPosition is already absolute world, so only the camera offset is left to apply.
+	[branch] if (collisionFlag > 0.5) {
+		// Captured instances already include the cell origin; do not apply World a second time.
 		const float3 collisionPos = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
 		const float3 collisionCentre = input.InstanceData1.xyz + e0.xyz - FrameBuffer::CameraPosAdjust.xyz;
+		float3 displacement, previousDisplacement;
 		GrassCollision::GetDisplacedPosition(input, collisionPos, collisionCentre, displacement, previousDisplacement);
-#			else
-		GrassCollision::GetDisplacedPosition(input, msPosition.xyz, displacement, previousDisplacement);
-#			endif
 		msPosition.xyz += displacement;
 #			if !defined(RENDER_DEPTH)
 		previousMsPosition.xyz += previousDisplacement;
@@ -235,176 +188,95 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	}
 #		endif
 
-	msPosition.xyz += windDisplacement;
-#		if !defined(RENDER_DEPTH)
-	previousMsPosition.xyz += previousWindDisplacement;
-#		endif
-
-#		ifdef GRASS_OPTIMIZATIONS
-	float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
-	float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
+	const float vertexTerm = WindVector.z * (0.5 * (input.Color.w * input.Color.w));
+	msPosition.xyz += float3(WindVector.xy, 0) * (e1.x * vertexTerm);
+	const float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
+	const float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
 	vsout.HPosition = projSpacePosition;
-#			if !defined(RENDER_DEPTH)
-	float3 prevEyeRel = previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz;
-	vsout.PreviousWorldPosition = float4(prevEyeRel, 1.0);
-#			endif
-#		else
-	float4 projSpacePosition = mul(WorldViewProj, msPosition);
-	vsout.HPosition = projSpacePosition;
-#			if !defined(RENDER_DEPTH)
-	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
-#			endif
-#		endif
-
 
 #		if defined(RENDER_DEPTH)
-#			ifdef GRASS_OPTIMIZATIONS
-	vsout.Alpha = e1.z;
-#			else
-	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
-	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
-	vsout.Alpha = distanceFade * perInstanceFade;
-#			endif
+	vsout.Depth = projSpacePosition.zw;
+	vsout.Fade = e1.z;
 #		else
-	vsout.Color.xyz = input.Color.xyz;
-#			ifdef GRASS_OPTIMIZATIONS
-	vsout.Color.w = e1.z;
-#			else
-	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
-	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
-	vsout.Color.w = distanceFade * perInstanceFade;
+	previousMsPosition.xyz += float3(WindVector.xy, 0) * (e1.y * vertexTerm);
+	vsout.Color = float4(input.InstanceData1.www * input.Color.xyz, e1.z);
+#			ifndef GRASS_LIGHTING
+	float3 instanceNormal = float3(input.InstanceData2.z, input.InstanceData3.zw);
+	vsout.DirLightAngle = saturate(dot(DirLightDirection.xyz, instanceNormal));
 #			endif
-#		endif
-
-	vsout.TexCoord.xy = input.TexCoord.xy;
-
-#		if !defined(RENDER_DEPTH)
-#			ifdef GRASS_OPTIMIZATIONS
-	vsout.WorldPosition = float4(eyeRel, 1.0);
-#			else
-	vsout.WorldPosition = mul(World, msPosition);
-#			endif
-
+	vsout.WorldPosition = eyeRel;
+	vsout.PreviousWorldPosition = previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz;
+	vsout.IsFar = isFarFlag;
+	vsout.LodTier = lodTier;
+#			ifdef GRASS_LIGHTING
 	vsout.VertexNormal.xyz = mul(world3x3, input.Normal.xyz * 2.0 - 1.0);
 	vsout.VertexNormal.w = input.Color.w;
+#			endif
 #		endif
 
 	return vsout;
 }
-#	else
-VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
+#	else  // GRASS_OPTIMIZATIONS
+
+VS_OUTPUT main(VS_INPUT input)
 {
 	VS_OUTPUT vsout;
 
-#		ifdef GRASS_OPTIMIZATIONS
-	const float4 e0 = InstanceExtras[instanceID * 2 + 0];
-	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
-	vsout.IsComplex = e0.w;
-
-	// e1.w packs the flags, as above.
-	const float lodTier = floor(e1.w * 0.25);
-	const float packedFlags = e1.w - 4.0 * lodTier;
-	const float isFarFlag = (packedFlags >= 2.0) ? 1.0 : 0.0;
-	const float collisionFlag = packedFlags - 2.0 * isFarFlag;
-#			if !defined(RENDER_DEPTH)
-	vsout.IsFar = isFarFlag;
-	vsout.LodTier = lodTier;
-#			endif
-#		endif
-
+#		ifdef GRASS_LIGHTING
+	float3x3 world3x3 = float3x3(input.InstanceData2.xyz, input.InstanceData3.xyz, float3(input.InstanceData4.x, input.InstanceData2.w, input.InstanceData3.w));
+	float4 msPosition = GetMSPosition(input, world3x3);
+#		else
 	float4 msPosition = GetMSPosition(input);
-
-#		ifdef GRASS_OPTIMIZATIONS
-	msPosition.xyz += e0.xyz;
 #		endif
 
 #		if !defined(RENDER_DEPTH)
+	// Save the undisplaced position instead of repeating the instance transform.
 	float4 previousMsPosition = msPosition;
 #		endif
 
-#		ifdef GRASS_OPTIMIZATIONS
-	const float vertexTerm = WindVector.z * (0.5 * (input.Color.w * input.Color.w));
-	const float3 windDisplacement = float3(WindVector.xy, 0) * (e1.x * vertexTerm);
-#			if !defined(RENDER_DEPTH)
-	const float3 previousWindDisplacement = float3(WindVector.xy, 0) * (e1.y * vertexTerm);
-#			endif
-#		else
-	float3 windDisplacement = CalculateWindDisplacement(input, WindTimer);
-#			if !defined(RENDER_DEPTH)
-	float3 previousWindDisplacement = CalculateWindDisplacement(input, PreviousWindTimer);
-#			endif
-#		endif
-
 #		ifdef GRASS_COLLISION
-#			ifdef GRASS_OPTIMIZATIONS
-	[branch] if (collisionFlag > 0.5)
-#			endif
-	{
-		float3 displacement, previousDisplacement;
-#			ifdef GRASS_OPTIMIZATIONS
-		// msPosition is already absolute world, so only the camera offset is left to apply.
-		const float3 collisionPos = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
-		const float3 collisionCentre = input.InstanceData1.xyz + e0.xyz - FrameBuffer::CameraPosAdjust.xyz;
-		GrassCollision::GetDisplacedPosition(input, collisionPos, collisionCentre, displacement, previousDisplacement);
-#			else
-		GrassCollision::GetDisplacedPosition(input, msPosition.xyz, displacement, previousDisplacement);
-#			endif
-		msPosition.xyz += displacement;
-#			if !defined(RENDER_DEPTH)
-		previousMsPosition.xyz += previousDisplacement;
-#			endif
-	}
-#		endif
+	float3 displacement, previousDisplacement;
+	GrassCollision::GetDisplacedPosition(input, msPosition.xyz, displacement, previousDisplacement);
+	msPosition.xyz += displacement;
+#		endif  // GRASS_COLLISION
 
-	msPosition.xyz += windDisplacement;
-#		if !defined(RENDER_DEPTH)
-	previousMsPosition.xyz += previousWindDisplacement;
-#		endif
+	msPosition.xyz += CalculateWindDisplacement(input, WindTimer);
 
-#		ifdef GRASS_OPTIMIZATIONS
-	float3 eyeRel = msPosition.xyz - FrameBuffer::CameraPosAdjust.xyz;
-	float4 projSpacePosition = mul(FrameBuffer::CameraViewProj, float4(eyeRel, 1.0));
-	vsout.HPosition = projSpacePosition;
-#		else
 	float4 projSpacePosition = mul(WorldViewProj, msPosition);
 	vsout.HPosition = projSpacePosition;
-#		endif
+	vsout.TexCoord = input.TexCoord.xy;
 
+	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
+	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
 
 #		if defined(RENDER_DEPTH)
-#			ifdef GRASS_OPTIMIZATIONS
-	vsout.Alpha = e1.z;
-#			else
-	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
-	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
-	vsout.Alpha = distanceFade * perInstanceFade;
-#			endif
+	vsout.Depth = projSpacePosition.zw;
+	vsout.Fade = distanceFade * perInstanceFade;
 #		else
-	vsout.Color.xyz = input.Color.xyz;
-#			ifdef GRASS_OPTIMIZATIONS
-	vsout.Color.w = e1.z;
-#			else
-	float perInstanceFade = dot(cb8[(asuint(cb7[0].x) >> 2)].xyzw, Math::IdentityMatrix[(asint(cb7[0].x) & 3)].xyzw);
-	float distanceFade = 1 - saturate((length(projSpacePosition.xyz) - AlphaParam1) / AlphaParam2);
-	vsout.Color.w = distanceFade * perInstanceFade;
-#			endif
-#		endif
+	vsout.Color = float4(input.InstanceData1.www * input.Color.xyz, distanceFade * perInstanceFade);
+	vsout.WorldPosition = mul(World, msPosition).xyz;
 
-	vsout.TexCoord.xy = input.TexCoord.xy;
+#			ifdef GRASS_COLLISION
+	previousMsPosition.xyz += previousDisplacement;
+#			endif  // GRASS_COLLISION
+	previousMsPosition.xyz += CalculateWindDisplacement(input, PreviousWindTimer);
+	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition).xyz;
 
-#		if !defined(RENDER_DEPTH)
-#			ifdef GRASS_OPTIMIZATIONS
-	vsout.WorldPosition = float4(eyeRel, 1.0);
-	vsout.PreviousWorldPosition = float4(previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz, 1.0);
+#			ifdef GRASS_LIGHTING
+	// Vertex normal needs to be transformed to world-space for lighting calculations.
+	vsout.VertexNormal.xyz = mul(world3x3, input.Normal.xyz * 2.0 - 1.0);
+	vsout.VertexNormal.w = input.Color.w;
 #			else
-	vsout.WorldPosition = mul(World, msPosition);
-	vsout.PreviousWorldPosition = mul(PreviousWorld, previousMsPosition);
+	float3 instanceNormal = float3(input.InstanceData2.z, input.InstanceData3.zw);
+	vsout.DirLightAngle = saturate(dot(DirLightDirection.xyz, instanceNormal));
+	vsout.ViewSpacePosition = mul(WorldView, msPosition).xyz;
 #			endif
 #		endif
 
 	return vsout;
 }
-#	endif
+
+#	endif  // GRASS_OPTIMIZATIONS
 
 #endif  // VSHADER
 
@@ -428,16 +300,16 @@ struct PS_OUTPUT
 #else
 struct PS_OUTPUT
 {
-#if defined(RENDER_DEPTH)
+#	if defined(RENDER_DEPTH)
 	float4 PS: SV_Target0;
-#else
+#	else
 	float4 Diffuse: SV_Target0;
 	float2 MotionVectors: SV_Target1;
 	float4 Normal: SV_Target2;
 	float4 Albedo: SV_Target3;
 	float4 Masks: SV_Target6;
 	float4 Masks2: SV_Target7;
-#endif
+#	endif
 };
 #endif
 
@@ -533,19 +405,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	bool complex = abs(complexLength - 1.0) < SharedData::grassLightingSettings.ComplexGrassThreshold;
 #		endif
 
-#		if defined(RENDER_DEPTH)
-	// Complex grass packs two layers, so scale the coord to the top half rather than branching.
-	const float2 alphaUV = float2(input.TexCoord.x, input.TexCoord.y * (complex ? 0.5 : 1.0));
-	const float baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, alphaUV, SharedData::MipBias).w;
-
-	float diffuseAlpha = input.Alpha * baseAlpha;
-	if ((diffuseAlpha - AlphaTestRefRS) < 0) {
-		discard;
-	}
-
-	psout.PS.xyz = input.HPosition.zzz;
-	psout.PS.w = diffuseAlpha;
-#		else
 	float4 baseColor;
 	if (complex) {
 		baseColor = TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, input.TexCoord.y * 0.5), SharedData::MipBias);
@@ -555,20 +414,34 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	baseColor.xyz = Color::Diffuse(baseColor.xyz);
 
+#		if defined(RENDER_DEPTH) || defined(DO_ALPHA_TEST)
+#			if defined(RENDER_DEPTH)
+	float diffuseAlpha = input.Fade * baseColor.w;
+#			else
+	float diffuseAlpha = input.Color.w * baseColor.w;
+#			endif
+	if ((diffuseAlpha - AlphaTestRefRS) < 0) {
+		discard;
+	}
+#		endif  // RENDER_DEPTH || DO_ALPHA_TEST
+
+#		if defined(RENDER_DEPTH)
+	// Depth
+	psout.PS.xyz = input.Depth.xxx / input.Depth.yyy;
+	psout.PS.w = diffuseAlpha;
+#		else
 	if (SharedData::lodBlendingSettings.DisableTerrainVertexColors)
 		input.Color.xyz = 1;
 
-	// Gates unresolvable detail only. `complex` still picks the atlas half and must not change.
 #			ifdef GRASS_OPTIMIZATIONS
-	const bool isFar = input.IsFar > 0.5;
-#			else
-	const bool isFar = false;
-#			endif
-	const bool complexDetail = complex && !isFar;
-
+	// Keep the atlas selection above independent of the distant-detail cutoff.
+	const bool complexDetail = complex && input.IsFar <= 0.5;
 	float4 specColor = complexDetail ? TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, 0.5 + input.TexCoord.y * 0.5), SharedData::MipBias) : 1;
+#			else
+	float4 specColor = complex ? TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, 0.5 + input.TexCoord.y * 0.5), SharedData::MipBias) : 1;
+#			endif
 
-	psout.MotionVectors = MotionBlur::GetSSMotionVector(input.WorldPosition, input.PreviousWorldPosition);
+	psout.MotionVectors = MotionBlur::GetSSMotionVector(float4(input.WorldPosition, 1), float4(input.PreviousWorldPosition, 1));
 
 	float3 viewDirection = -normalize(input.WorldPosition.xyz);
 	float3 normal = normalize(input.VertexNormal.xyz);
@@ -584,7 +457,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float3x3 tbn = 0;
 
+#			ifdef GRASS_OPTIMIZATIONS
 	if (complexDetail)
+#			else
+	if (complex)
+#			endif
 	{
 		float3 normalColor = GrassLighting::TransformNormal(specColor.xyz);
 		// world-space -> tangent-space -> world-space.
@@ -623,9 +500,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	if (!SharedData::InInterior)
 		dirDetailedShadow *= shadowColor.x;
+	dirDetailedShadow += ShadowClampValue * (1.0 - dirDetailedShadow);
 
 #			if defined(SCREEN_SPACE_SHADOWS)
-	if (!SharedData::InInterior && dirLightAngle >= 0.0 && !isFar)
+#				ifdef GRASS_OPTIMIZATIONS
+	if (!SharedData::InInterior && dirLightAngle >= 0.0 && input.IsFar <= 0.5)
+#				else
+	if (!SharedData::InInterior && dirLightAngle >= 0.0)
+#				endif
 		dirDetailedShadow *= ScreenSpaceShadows::GetScreenSpaceShadow(input.HPosition.xyz, screenUV, screenNoise);
 #			endif  // SCREEN_SPACE_SHADOWS
 
@@ -664,8 +546,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float3 subsurfaceColor = dirLightColor * dirSoftShadow * (GetSoftLightMultiplier(dirLightAngle, softLightRolloff)) * Color::VanillaNormalization();
 
-	// Specular highlights are sub-pixel at this size.
+#			ifdef GRASS_OPTIMIZATIONS
 	if (complexDetail)
+#			else
+	if (complex)
+#			endif
 		lightsSpecularColor += dirDetailedShadow * GrassLighting::GetLightSpecularInput(SharedData::DirLightDirection.xyz, viewDirection, normal, dirLightColor, SharedData::grassLightingSettings.Glossiness) * Color::VanillaNormalization();
 
 #			if defined(LIGHT_LIMIT_FIX)
@@ -720,7 +605,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 				lightsDiffuseColor += lightDiffuseColor * Color::VanillaNormalization();
 
+#				ifdef GRASS_OPTIMIZATIONS
 				if (complexDetail)
+#				else
+				if (complex)
+#				endif
 					lightsSpecularColor += GrassLighting::GetLightSpecularInput(normalizedLightDirection, viewDirection, normal, lightColor, SharedData::grassLightingSettings.Glossiness) * Color::VanillaNormalization();
 			}
 		}
@@ -762,7 +651,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		psout.Diffuse = float4(diffuseColor, 1);
 	}
 #			else
-	psout.Diffuse.xyz = diffuseColor;
+	psout.Diffuse.xyz = FogNearColor.w * diffuseColor;
 #			endif
 
 	float3 normalVS = normalize(FrameBuffer::WorldToView(normal, false));
@@ -773,31 +662,35 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	psout.Masks = float4(0, 0, Color::RGBToYCoCg(directionalAmbientColor).x, 0);
 	psout.Masks2 = float4(1.0 - vertexAO, 0, 0, 0);
 #		endif
-
 	return psout;
 }
 #	else
 PS_OUTPUT main(PS_INPUT input)
 {
-	PS_OUTPUT psout = (PS_OUTPUT)0;
+	PS_OUTPUT psout;
 
 #		if defined(SKYLIGHTING_SHADOW_VIS)
 	float skylightingShadowVisibility = 1.0;
 #		endif
 
-#		if defined(RENDER_DEPTH)
-	float baseAlpha = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias).w;
+	float4 baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
 
-	float diffuseAlpha = input.Alpha * baseAlpha;
+#		if defined(RENDER_DEPTH) || defined(DO_ALPHA_TEST)
+#			if defined(RENDER_DEPTH)
+	float diffuseAlpha = input.Fade * baseColor.w;
+#			else
+	float diffuseAlpha = input.Color.w * baseColor.w;
+#			endif
 	if ((diffuseAlpha - AlphaTestRefRS) < 0) {
 		discard;
 	}
+#		endif  // RENDER_DEPTH || DO_ALPHA_TEST
 
-	psout.PS.xyz = input.HPosition.zzz;
+#		if defined(RENDER_DEPTH)
+	// Depth
+	psout.PS.xyz = input.Depth.xxx / input.Depth.yyy;
 	psout.PS.w = diffuseAlpha;
 #		else
-	float4 baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
-
 #			ifdef GRASS_OPTIMIZATIONS
 	const float lodBrightness = input.LodTier > 1.5 ? SharedData::grassLightingSettings.FarLODBrightness : SharedData::grassLightingSettings.MidLODBrightness;
 	baseColor.xyz *= lerp(1.0, lodBrightness, saturate(input.LodTier));
@@ -813,7 +706,7 @@ PS_OUTPUT main(PS_INPUT input)
 	float4 shadowColor = TexShadowMaskSampler.Load(int3(input.HPosition.xy, 0));
 
 	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
-	float3 dirLightColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
+	float3 dirLightColor = Color::DirectionalLight(DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
 
 	// Apply world shadow (terrain shadows, cloud shadows) directly to light color
 	if (!SharedData::InInterior)
@@ -823,18 +716,18 @@ PS_OUTPUT main(PS_INPUT input)
 
 	if (!SharedData::InInterior)
 		dirDetailedShadow = shadowColor.x;
+	dirDetailedShadow += ShadowClampValue * (1.0 - dirDetailedShadow);
 
 #			if defined(SCREEN_SPACE_SHADOWS)
 #				ifdef GRASS_OPTIMIZATIONS
-	const bool isFar = input.IsFar > 0.5;
+	if (!SharedData::InInterior && input.IsFar <= 0.5)
 #				else
-	const bool isFar = false;
+	if (!SharedData::InInterior)
 #				endif
-	if (!SharedData::InInterior && !isFar)
 		dirDetailedShadow *= ScreenSpaceShadows::GetScreenSpaceShadow(input.HPosition.xyz, screenUV, screenNoise);
 #			endif  // SCREEN_SPACE_SHADOWS
 
-	float3 diffuseColor = dirLightColor * dirDetailedShadow;
+	float3 diffuseColor = dirLightColor * dirDetailedShadow * input.DirLightAngle;
 
 #			if defined(LIGHT_LIMIT_FIX)
 	uint clusterIndex = 0;
@@ -884,9 +777,15 @@ PS_OUTPUT main(PS_INPUT input)
 	}
 #			endif  // LIGHT_LIMIT_FIX
 
-	float3 ddx = ddx_coarse(input.WorldPosition);
-	float3 ddy = ddy_coarse(input.WorldPosition);
-	float3 normal = -normalize(cross(ddx, ddy));
+#			ifdef GRASS_OPTIMIZATIONS
+	float3 ddx = ddx_coarse(viewPosition);
+	float3 ddy = ddy_coarse(viewPosition);
+#			else
+	float3 ddx = ddx_coarse(input.ViewSpacePosition);
+	float3 ddy = ddy_coarse(input.ViewSpacePosition);
+#			endif
+	float3 normalVS = -normalize(cross(ddx, ddy));
+	float3 normal = normalize(FrameBuffer::ViewToWorld(normalVS, false));
 
 	float3 vertexColor = Color::ColorToLinear(input.Color.xyz);
 	float vertexAO = max(max(vertexColor.r, vertexColor.g), vertexColor.b);
@@ -902,7 +801,7 @@ PS_OUTPUT main(PS_INPUT input)
 	float skylightingDiffuse = Skylighting::GetSkylightingDiffuse(skylightingSH, positionMSSkylight, normal, vertexAO);
 #			endif  // SKYLIGHTING
 
-	float3 directionalAmbientColor = Color::Ambient(max(0, SharedData::GetAmbient(normal)));
+	float3 directionalAmbientColor = Color::Ambient(max(0, AmbientColor.xyz));
 
 #			if defined(IBL)
 	if (SharedData::iblSettings.EnableIBL)
@@ -920,12 +819,12 @@ PS_OUTPUT main(PS_INPUT input)
 	Skylighting::ApplySkylighting(diffuseColor, directionalAmbientColor, albedo, skylightingDiffuse);
 #			endif
 
-	psout.Diffuse.xyz = diffuseColor;
+	psout.Diffuse.xyz = FogNearColor.w * diffuseColor;
 
 	psout.Diffuse.w = 1;
 
-	psout.MotionVectors = MotionBlur::GetSSMotionVector(input.WorldPosition, input.PreviousWorldPosition);
-	psout.Normal.xy = GBuffer::EncodeNormal(FrameBuffer::WorldToView(normal, false));
+	psout.MotionVectors = MotionBlur::GetSSMotionVector(float4(input.WorldPosition, 1), float4(input.PreviousWorldPosition, 1));
+	psout.Normal.xy = GBuffer::EncodeNormal(normalVS);
 	psout.Normal.zw = 0;
 
 	psout.Albedo = float4(albedo, 1);
