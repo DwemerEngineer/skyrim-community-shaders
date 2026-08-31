@@ -38,7 +38,7 @@ public:
 		float specular = 0.20f;
 		float2 subsurfaceOpacity = float2(0.6f, 0.10f);  // Base to tip
 		float3 grassSubsurfaceTint = float3(1.50f, 1.00f, 0.60f);  // Backlight tint
-		float3 baseMinTipRoughness = float3(0.65f, 0.45f, 0.55f);
+		float3 baseMinTipRoughness = float3(0.55f, 0.45f, 0.55f);
 		float tipRoughnessStart = 0.75f;
 		float clumpAOStrength = 0.5f;
 
