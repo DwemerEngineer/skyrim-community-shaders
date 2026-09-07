@@ -277,6 +277,70 @@ namespace PBR
 		float alpha = material.Roughness * material.Roughness;
 		lobeWeights.specular *= SpecularOcclusion(NdotV, alpha, material.AO);
 	}
+
+#if defined(GRASS_LIGHTING)
+	void GetDirectLightInputGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material)
+	{
+		lightingOutput = (DirectLightingOutput)0;
+		const float3 detailedLightColor = context.lightColor * context.detailedShadow;
+		const float3 softLightColor = context.lightColor * context.softShadow;
+
+		const float3 N = context.worldNormal;
+		const float3 V = context.viewDir;
+		const float3 L = context.lightDir;
+		const float3 H = context.halfVector;
+
+		float NdotL = dot(N, L);
+		float NdotV = dot(N, V);
+		float VdotL = dot(V, L);
+		float NdotH = dot(N, H);
+		float VdotH = dot(V, H);
+
+		float satNdotL = clamp(NdotL, EPSILON_DOT_CLAMP, 1);
+		float satNdotV = saturate(abs(NdotV) + EPSILON_DOT_CLAMP);
+		float satNdotH = saturate(NdotH);
+		float satVdotH = saturate(VdotH);
+
+		float3 F;
+		float3 Fr = SpecularMicrofacet(material.Roughness, material.F0, satNdotL, satNdotV, satNdotH, satVdotH, F);
+		float3 kD = 1 - F;
+
+		const float diffuseWrap = 0.5;
+		float wrappedNdotL = saturate((abs(NdotL) + diffuseWrap) / (1.0 + diffuseWrap));
+		lightingOutput.diffuse += detailedLightColor * wrappedNdotL * BRDF::Diffuse_Lambert() * kD;
+		lightingOutput.specular += Fr * detailedLightColor * satNdotL;
+
+		[branch] if ((PBRFlags & Flags::Subsurface) != 0)
+		{
+			const float subsurfacePower = 12.234;
+			float forwardScatter = exp2(saturate(-VdotL) * subsurfacePower - subsurfacePower);
+			float backScatter = saturate(satNdotL * material.Thickness + (1.0 - material.Thickness)) * 0.5;
+			float subsurface = lerp(backScatter, 1, forwardScatter) * (1.0 - material.Thickness);
+			lightingOutput.transmission += material.SubsurfaceColor * subsurface * softLightColor * BRDF::Diffuse_Lambert() * kD;
+		}
+	}
+
+	void GetIndirectLobeWeightsGrass(out IndirectLobeWeights lobeWeights, IndirectContext context, MaterialProperties material)
+	{
+		lobeWeights = (IndirectLobeWeights)0;
+
+		float NdotV = saturate(dot(context.worldNormal, context.viewDir));
+		lobeWeights.diffuse = material.BaseColor;
+
+		[branch] if ((PBRFlags & Flags::Subsurface) != 0)
+		{
+			lobeWeights.diffuse += material.SubsurfaceColor * (1 - material.Thickness) / Math::PI;
+		}
+
+		float2 specularBRDF = BRDF::EnvBRDF(material.Roughness, NdotV);
+		lobeWeights.specular = material.F0 * specularBRDF.x + specularBRDF.y;
+		lobeWeights.diffuse *= 1 - lobeWeights.specular;
+
+		lobeWeights.diffuse *= MultiBounceAO(material.BaseColor, material.AO);
+		float alpha = material.Roughness * material.Roughness;
+		lobeWeights.specular *= SpecularOcclusion(NdotV, alpha, material.AO);
+	}
+#endif
 }
 
 #endif  // __PBR_DEPENDENCY_HLSL__
