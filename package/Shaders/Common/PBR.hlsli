@@ -343,6 +343,7 @@ namespace PBR
 			lobeWeights.specular *= SpecularOcclusion(NdotV, alpha, material.AO);
 		}
 
+		lobeWeights.diffuse *= MultiBounceAO(material.BaseColor, material.AO);
 	}
 #endif
 }

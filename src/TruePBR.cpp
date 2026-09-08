@@ -1304,6 +1304,16 @@ void TruePBR::SetupGrassMaterial(RE::BSLightingShaderProperty* sourceProperty, R
 		grassMaterial.diffuseTexture = generatedMaterial->diffuseTexture;
 		grassMaterial.textureClampMode = generatedMaterial->textureClampMode;
 	}
+	const auto& stateData = globals::game::graphicsState->GetRuntimeData();
+	if (grassMaterial.diffuseTexture == nullptr) {
+		grassMaterial.diffuseTexture = stateData.defaultTextureWhite;
+	}
+	if (grassMaterial.normalTexture == nullptr) {
+		grassMaterial.normalTexture = stateData.defaultTextureNormalMap;
+	}
+	if (grassMaterial.rmaosTexture == nullptr) {
+		grassMaterial.rmaosTexture = stateData.defaultTextureWhite;
+	}
 
 	grassProperty->SetMaterial(&grassMaterial, true);
 	grassProperty->SetFlags(RE::BSShaderProperty::EShaderPropertyFlag8::kMenuScreen, true);
