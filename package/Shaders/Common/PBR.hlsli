@@ -279,7 +279,7 @@ namespace PBR
 	}
 
 #if defined(GRASS_LIGHTING)
-	void GetDirectLightInputGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material)
+	void GetDirectLightInputGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, bool doSpecular)
 	{
 		lightingOutput = (DirectLightingOutput)0;
 		const float3 detailedLightColor = context.lightColor * context.detailedShadow;
@@ -288,21 +288,22 @@ namespace PBR
 		const float3 N = context.worldNormal;
 		const float3 V = context.viewDir;
 		const float3 L = context.lightDir;
-		const float3 H = context.halfVector;
 
 		float NdotL = dot(N, L);
-		float NdotV = dot(N, V);
 		float VdotL = dot(V, L);
-		float NdotH = dot(N, H);
-		float VdotH = dot(V, H);
 
 		float satNdotL = clamp(NdotL, EPSILON_DOT_CLAMP, 1);
-		float satNdotV = saturate(abs(NdotV) + EPSILON_DOT_CLAMP);
-		float satNdotH = saturate(NdotH);
-		float satVdotH = saturate(VdotH);
 
-		float3 F;
-		float3 Fr = SpecularMicrofacet(material.Roughness, material.F0, satNdotL, satNdotV, satNdotH, satVdotH, F);
+		float3 F = 0;
+		float3 Fr = 0;
+		[branch] if (doSpecular)
+		{
+			const float3 H = context.halfVector;
+			float satNdotV = saturate(abs(dot(N, V)) + EPSILON_DOT_CLAMP);
+			float satNdotH = saturate(dot(N, H));
+			float satVdotH = saturate(dot(V, H));
+			Fr = SpecularMicrofacet(material.Roughness, material.F0, satNdotL, satNdotV, satNdotH, satVdotH, F);
+		}
 		float3 kD = 1 - F;
 
 		const float diffuseWrap = 0.5;
@@ -320,11 +321,10 @@ namespace PBR
 		}
 	}
 
-	void GetIndirectLobeWeightsGrass(out IndirectLobeWeights lobeWeights, IndirectContext context, MaterialProperties material)
+	void GetIndirectLobeWeightsGrass(out IndirectLobeWeights lobeWeights, IndirectContext context, MaterialProperties material, bool doSpecular)
 	{
 		lobeWeights = (IndirectLobeWeights)0;
 
-		float NdotV = saturate(dot(context.worldNormal, context.viewDir));
 		lobeWeights.diffuse = material.BaseColor;
 
 		[branch] if ((PBRFlags & Flags::Subsurface) != 0)
@@ -332,13 +332,17 @@ namespace PBR
 			lobeWeights.diffuse += material.SubsurfaceColor * (1 - material.Thickness) / Math::PI;
 		}
 
-		float2 specularBRDF = BRDF::EnvBRDF(material.Roughness, NdotV);
-		lobeWeights.specular = material.F0 * specularBRDF.x + specularBRDF.y;
-		lobeWeights.diffuse *= 1 - lobeWeights.specular;
+		[branch] if (doSpecular)
+		{
+			float NdotV = saturate(dot(context.worldNormal, context.viewDir));
+			float2 specularBRDF = BRDF::EnvBRDF(material.Roughness, NdotV);
+			lobeWeights.specular = material.F0 * specularBRDF.x + specularBRDF.y;
+			lobeWeights.diffuse *= 1 - lobeWeights.specular;
 
-		lobeWeights.diffuse *= MultiBounceAO(material.BaseColor, material.AO);
-		float alpha = material.Roughness * material.Roughness;
-		lobeWeights.specular *= SpecularOcclusion(NdotV, alpha, material.AO);
+			float alpha = material.Roughness * material.Roughness;
+			lobeWeights.specular *= SpecularOcclusion(NdotV, alpha, material.AO);
+		}
+
 	}
 #endif
 }
