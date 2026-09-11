@@ -16,27 +16,10 @@ ID3D11ShaderResourceView* HiZPyramid::GetSRV() const
 
 void HiZPyramid::SetupResources()
 {
-	if (paramsCB && spdCounter)
+	if (paramsCB)
 		return;
 
 	paramsCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<BaseParams>(), "HiZPyramid::ParamsCB");
-
-	D3D11_BUFFER_DESC bd{};
-	bd.ByteWidth = sizeof(uint32_t);
-	bd.Usage = D3D11_USAGE_DEFAULT;
-	bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-	bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-	const uint32_t zero = 0;
-	D3D11_SUBRESOURCE_DATA init{ &zero, 0, 0 };
-	spdCounter = std::make_unique<Buffer>(bd, &init, "HiZPyramid::SpdCounter");
-
-	D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
-	uav.Format = DXGI_FORMAT_R32_TYPELESS;
-	uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-	uav.Buffer.FirstElement = 0;
-	uav.Buffer.NumElements = 1;
-	uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
-	spdCounter->CreateUAV(uav);
 }
 
 void HiZPyramid::ClearShaderCache()
@@ -108,7 +91,7 @@ bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dst
 		// A mip-0-only SRV lets SPD read mip 0 without overlapping the output UAVs.
 		sd.Texture2D.MipLevels = 1;
 		DX::ThrowIfFailed(device->CreateShaderResourceView(texture->resource.get(), &sd, mip0SRV.put()));
-		Util::SetResourceName(mip0SRV.get(), "GrassOptimizations::HiZ Mip0 SRV");
+		Util::SetResourceName(mip0SRV.get(), "HiZPyramid::Mip0 SRV");
 	} catch (...) {
 		logger::error("[HI-Z PYRAMID] Texture create failed");
 		texture.reset();
@@ -240,7 +223,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx, bool forc
 
 	// Each level is the exact max of the one above, so an instance of any on-screen size is testable against a fixed number of texels.
 	// One dispatch for the whole chain, every group reducing its own tile from LDS.
-	if (spdCS && spdCounter && GetMipCount() > 1) {
+	if (spdCS && GetMipCount() > 1) {
 		globals::profiler->BeginPass("HiZPyramid::Mips");
 
 		const uint32_t outputMips = GetMipCount() - 1;
