@@ -197,7 +197,7 @@ void TerrainShadows::DrawSettings()
 			}
 		}
 		ImGui::Text(fmt::format("Current worldspace: {} ({})", curr_worldspace, curr_worldspace_name).c_str());
-		ImGui::Text(fmt::format("Has height map: {}", TerrainHeightMap::GetSingleton()->Contains(curr_worldspace)).c_str());
+		ImGui::Text(fmt::format("Has height map: {}", globals::terrainHeightMap->Contains(curr_worldspace)).c_str());
 
 		ImGui::Separator();
 
@@ -235,7 +235,7 @@ void TerrainShadows::ClearShaderCache()
 
 void TerrainShadows::SetupResources()
 {
-	TerrainHeightMap::GetSingleton()->Discover();
+	globals::terrainHeightMap->Discover();
 
 	logger::debug("Creating constant buffers...");
 	{
@@ -257,12 +257,12 @@ void TerrainShadows::CompileComputeShaders()
 
 bool TerrainShadows::IsHeightMapReady()
 {
-	return TerrainHeightMap::GetSingleton()->IsReady();
+	return globals::terrainHeightMap->IsReady();
 }
 
 TerrainShadows::PerFrame TerrainShadows::GetCommonBufferData()
 {
-	auto heightMap = TerrainHeightMap::GetSingleton();
+	auto heightMap = globals::terrainHeightMap;
 	bool isHeightmapReady = IsHeightMapReady();
 
 	PerFrame data = {
@@ -280,7 +280,7 @@ TerrainShadows::PerFrame TerrainShadows::GetCommonBufferData()
 
 void TerrainShadows::Precompute()
 {
-	if (!TerrainHeightMap::GetSingleton()->GetCached())
+	if (!globals::terrainHeightMap->GetCached())
 		return;
 
 	logger::info("Creating shadow texture...");
@@ -295,7 +295,7 @@ void TerrainShadows::Precompute()
 
 		texShadowHeight.release();
 
-		auto texHeightMap = TerrainHeightMap::GetSingleton()->GetTexture();
+		auto texHeightMap = globals::terrainHeightMap->GetTexture();
 
 		D3D11_TEXTURE2D_DESC texDesc = {
 			.Width = texHeightMap->desc.Width,
@@ -358,7 +358,7 @@ bool TerrainShadows::UpdateShadow(bool a_refreshImmediately)
 	TracyD3D11Zone(globals::state->tracyCtx, "Terrain Occlusion - Update Shadows");
 
 	/* ---- UPDATE CB ---- */
-	auto heightMap = TerrainHeightMap::GetSingleton();
+	auto heightMap = globals::terrainHeightMap;
 	auto texHeightMap = heightMap->GetTexture();
 	auto cachedHeightmap = heightMap->GetCached();
 
@@ -465,7 +465,7 @@ void TerrainShadows::ReflectionsPrepass()
 
 void TerrainShadows::EarlyPrepass()
 {
-	if (TerrainHeightMap::GetSingleton()->LoadForCurrentWorldspace()) {
+	if (globals::terrainHeightMap->LoadForCurrentWorldspace()) {
 		shadowUpdateIdx = 0;
 		needPrecompute = true;
 	}

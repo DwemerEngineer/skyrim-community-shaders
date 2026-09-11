@@ -23,8 +23,6 @@ public:
 		float2 zRange;
 	};
 
-	static TerrainHeightMap* GetSingleton();
-
 	/** @brief Scans the heightmap folders for DDS files. Only the first call does work. */
 	void Discover();
 
