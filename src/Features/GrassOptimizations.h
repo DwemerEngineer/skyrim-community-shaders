@@ -4,7 +4,7 @@
 
 #include "Buffer.h"
 #include "GrassOptimizations/GrassBucketStore.h"
-#include "GrassOptimizations/HiZPyramid.h"
+#include "HiZPyramid.h"
 #include "Utils/VersionedRelocation.h"
 
 /** @brief Rewrites vanilla grass rendering with a bucket based system utilizing indirect draws and compute shader per instance culling. */
@@ -165,7 +165,6 @@ public:
 	bool EnsureCullBucketCapacity(uint32_t slots, ID3D11Device* device);
 
 	GrassBucketStore bucketStore;
-	HiZPyramid hiZ;
 
 	uint32_t lastFrame = UINT32_MAX;
 

@@ -298,10 +298,9 @@ void GrassOptimizations::UpdateGrass()
 	FrustumSoA frustumSoA;
 	BuildFrustumSoA(frustumSoA, frustum);
 
+	auto* hiZ = globals::hiZPyramid;
 	if (settings.EnableOcclusionCulling)
-		hiZ.Build(device, ctx);
-	else
-		hiZ.Invalidate();
+		hiZ->Build(device, ctx);
 
 	{
 		CullParamsCB cp{};
@@ -337,12 +336,12 @@ void GrassOptimizations::UpdateGrass()
 		cp.farLODPixelSize = settings.EnableMidLOD ? std::min(settings.FarLODPixelSize, settings.MidLODPixelSize) : settings.FarLODPixelSize;
 
 		cp.meshLODBandPx = std::max(0.0f, settings.MeshLODBandPixels);
-		cp.hiZEnabled = hiZ.IsValid() ? 1.0f : 0.0f;
-		cp.hiZSizeX = (float)hiZ.GetWidth();
-		cp.hiZSizeY = (float)hiZ.GetHeight();
+		cp.hiZEnabled = settings.EnableOcclusionCulling && hiZ->IsValid() ? 1.0f : 0.0f;
+		cp.hiZSizeX = (float)hiZ->GetWidth();
+		cp.hiZSizeY = (float)hiZ->GetHeight();
 
-		cp.hiZTexelPixels = hiZ.GetTexelPixels();
-		cp.hiZMipCount = (float)hiZ.GetMipCount();
+		cp.hiZTexelPixels = hiZ->GetTexelPixels();
+		cp.hiZMipCount = (float)hiZ->GetMipCount();
 		cp.occlusionBias = std::max(0.0f, settings.OcclusionBias);
 		cp.costBiasStartDist = std::max(0.0f, settings.CostBiasStartDistance);
 
@@ -640,7 +639,6 @@ bool GrassOptimizations::AabbVisible(const FrustumSoA& f, __m128 lo, __m128 hi)
 void GrassOptimizations::SetupResources()
 {
 	cullParamsCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<CullParamsCB>(), "GrassOptimizations::CullParamsCB");
-	hiZ.SetupResources();
 	bucketStore.SetupResources();
 
 	if (FAILED(globals::d3d::context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1))) || !ctx1) {
@@ -657,7 +655,6 @@ void GrassOptimizations::ClearShaderCache()
 		shader = nullptr;
 	};
 	release(cullCS);
-	hiZ.ClearShaderCache();
 	bucketStore.ClearShaderCache();
 }
 
@@ -694,7 +691,7 @@ void GrassOptimizations::CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
 
 	ID3D11ShaderResourceView* sliceTableSRV = sliceTable ? sliceTable->srv.get() : nullptr;
 	ID3D11ShaderResourceView* srvs[4] = { b.instanceSRV, b.originSRV,
-		hiZ.GetSRV(), sliceTableSRV };
+		globals::hiZPyramid->GetSRV(), sliceTableSRV };
 	ctx->CSSetShaderResources(0, 4, srvs);
 
 	ID3D11Buffer* bucketCB = cullBucketCB->CB();

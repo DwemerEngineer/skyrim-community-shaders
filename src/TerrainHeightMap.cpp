@@ -16,12 +16,6 @@ namespace
 	}
 }
 
-TerrainHeightMap* TerrainHeightMap::GetSingleton()
-{
-	static TerrainHeightMap singleton;
-	return &singleton;
-}
-
 void TerrainHeightMap::ParseHeightmapPath(std::filesystem::path p, bool xlodgen_style)
 {
 	auto filename = p.filename();

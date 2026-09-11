@@ -50,6 +50,9 @@ class RemoteControl;
 class Menu;
 class WeatherManager;
 class SceneSettingsManager;
+class TerrainHeightMap;
+class TopDownOcclusion;
+class HiZPyramid;
 
 namespace SIE
 {
@@ -251,6 +254,9 @@ namespace globals
 	extern Menu* menu;
 	extern SIE::ShaderCache* shaderCache;
 	extern Profiler* profiler;
+	extern TerrainHeightMap* terrainHeightMap;
+	extern TopDownOcclusion* topDownOcclusion;
+	extern HiZPyramid* hiZPyramid;
 	extern WeatherManager* weatherManager;
 	extern SceneSettingsManager* sceneSettingsManager;
 

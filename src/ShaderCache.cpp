@@ -10,6 +10,7 @@
 #include <d3dcompiler.h>
 
 #include "Deferred.h"
+#include "HiZPyramid.h"
 #include "State.h"
 
 #include "Features/DynamicCubemaps.h"
@@ -2058,6 +2059,7 @@ namespace SIE
 		}
 		compilationSet.Clear();
 		globals::deferred->ClearShaderCache();
+		globals::hiZPyramid->ClearShaderCache();
 		for (auto* feature : Feature::GetFeatureList()) {
 			if (feature->loaded) {
 				feature->ClearShaderCache();

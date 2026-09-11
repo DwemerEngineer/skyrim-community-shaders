@@ -1,5 +1,5 @@
-// Always kPOST_ZPREPASS_COPY, never TerrainBlending's blendedDepthTexture: that one is produced at
-// end of frame and would be a frame stale here, which made grass flicker on fast camera movement.
+// Scene depth source selected by HiZPyramid. The live main depth is preferred; the post-Z-prepass
+// copy is used only as a fallback when the live target is unavailable.
 Texture2D<unorm float> SrcDepth : register(t0);
 
 RWTexture2D<float> HiZ : register(u0);

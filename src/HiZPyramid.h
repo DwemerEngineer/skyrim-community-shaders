@@ -12,15 +12,12 @@ public:
 	 * @param ctx Immediate context the reduction dispatches are issued on.
 	 * @return True when the pyramid is valid for this frame.
 	 */
-	bool Build(ID3D11Device* device, ID3D11DeviceContext* ctx);
-
-	/** @brief Marks the pyramid unusable for this frame without releasing anything. */
-	void Invalidate() { valid = false; }
+	bool Build(ID3D11Device* device, ID3D11DeviceContext* ctx, bool forceRefresh = false);
 
 	/** @brief Returns the full-chain SRV, or nullptr when the pyramid is not valid this frame. */
-	ID3D11ShaderResourceView* GetSRV() const { return valid && texture ? texture->srv.get() : nullptr; }
+	ID3D11ShaderResourceView* GetSRV() const;
 	/** @brief Returns true when Build succeeded for the current frame. */
-	bool IsValid() const { return valid; }
+	bool IsValid() const;
 	/** @brief Returns the base level width in texels. */
 	uint32_t GetWidth() const { return width; }
 	/** @brief Returns the base level height in texels. */
@@ -30,7 +27,7 @@ public:
 	/** @brief Returns how many nominal screen pixels one base-level texel covers, scaled by dynamic resolution. */
 	float GetTexelPixels() const { return texelPixels; }
 
-	/** @brief Creates the parameter constant buffer. Called from the feature's SetupResources. */
+	/** @brief Creates the shared parameter resources. Safe to call from each consumer's setup. */
 	void SetupResources();
 	/** @brief Releases the cached compute shaders so they recompile on next use. */
 	void ClearShaderCache();
@@ -85,6 +82,7 @@ private:
 	uint32_t paddedHeight = 0;
 	uint32_t mipCount = 1;
 	bool valid = false;
+	uint32_t builtFrame = UINT32_MAX;
 
 	static constexpr uint32_t kDownsampleFactor = 4;
 	// SPD reduces a 64x64 tile wholly in LDS, so a base padded to that granularity halves exactly for

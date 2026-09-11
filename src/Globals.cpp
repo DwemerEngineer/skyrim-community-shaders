@@ -21,6 +21,7 @@
 #include "Features/LinearLighting.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/ProceduralGrass.h"
+#include "Features/ProceduralGrass/TopDownOcclusion.h"
 #include "Features/RemoteControl.h"
 #include "Features/RenderDoc.h"
 #include "Features/ScreenSpaceGI.h"
@@ -42,9 +43,11 @@
 #include "Features/CSEditor.h"
 #include "Features/WetnessEffects.h"
 #include "Menu.h"
+#include "HiZPyramid.h"
 #include "SceneSettingsManager.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "TerrainHeightMap.h"
 #include "TruePBR.h"
 #include "Utils/Game.h"
 #include "WeatherManager.h"
@@ -175,6 +178,12 @@ namespace globals
 
 	static Profiler profilerInstance;
 	Profiler* profiler = &profilerInstance;
+	static TerrainHeightMap terrainHeightMapInstance;
+	TerrainHeightMap* terrainHeightMap = &terrainHeightMapInstance;
+	static TopDownOcclusion topDownOcclusionInstance;
+	TopDownOcclusion* topDownOcclusion = &topDownOcclusionInstance;
+	static HiZPyramid hiZPyramidInstance;
+	HiZPyramid* hiZPyramid = &hiZPyramidInstance;
 
 	void OnInit()
 	{

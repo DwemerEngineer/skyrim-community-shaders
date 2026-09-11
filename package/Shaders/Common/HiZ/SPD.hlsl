@@ -1,4 +1,4 @@
-// FidelityFX Single Pass Downsampler (SPD)
+// Shared Hi-Z reduction using FidelityFX Single Pass Downsampler (SPD).
 // Based on https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/main/Kits/FidelityFX/upscalers/fsr3/include/gpu/spd/ffx_spd.h
 //
 // Copyright (C) 2026 Advanced Micro Devices, Inc.
@@ -34,8 +34,7 @@ globallycoherent RWTexture2D<float> SpdMip10 : register(u9);
 globallycoherent RWTexture2D<float> SpdMip11 : register(u10);
 globallycoherent RWTexture2D<float> SpdMip12 : register(u11);
 globallycoherent RWByteAddressBuffer SpdCounter : register(u12);
-// Mip 0 is read through a UAV rather than an SRV: binding it as a shader resource while the levels
-// below it are UAVs on the same texture lets the runtime null the SRV slot for an overlapping view.
+// Read mip 0 through a UAV because the full-chain SRV overlaps the output UAVs and D3D11 would null it.
 RWTexture2D<float> SpdSource : register(u13);
 
 cbuffer SpdParams : register(b0)
