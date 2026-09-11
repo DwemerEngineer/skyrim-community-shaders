@@ -74,6 +74,7 @@ ID3D11ShaderResourceView* HiZPyramid::GetLiveDepthSRV()
 bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dstH)
 {
 	mipUAVs.clear();
+	mip0SRV = nullptr;
 	texture.reset();
 	paddedWidth = 0;
 	paddedHeight = 0;
@@ -103,6 +104,11 @@ bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dst
 		sd.Texture2D.MostDetailedMip = 0;
 		sd.Texture2D.MipLevels = mips;
 		texture->CreateSRV(sd);
+
+		// A mip-0-only SRV lets SPD read mip 0 without overlapping the output UAVs.
+		sd.Texture2D.MipLevels = 1;
+		DX::ThrowIfFailed(device->CreateShaderResourceView(texture->resource.get(), &sd, mip0SRV.put()));
+		Util::SetResourceName(mip0SRV.get(), "GrassOptimizations::HiZ Mip0 SRV");
 	} catch (...) {
 		logger::error("[HI-Z PYRAMID] Texture create failed");
 		texture.reset();
@@ -244,18 +250,19 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx, bool forc
 		const uint32_t totalGroups = groupsX * groupsY;
 		paramsCB->Update(SPDParams{ padW, padH, outputMips, totalGroups });
 
-		ID3D11UnorderedAccessView* spdUAVs[14]{};
+		ID3D11UnorderedAccessView* spdUAVs[6]{};
 		for (uint32_t i = 0; i < outputMips; ++i)
 			spdUAVs[i] = mipUAVs[i + 1].get();
-		spdUAVs[12] = spdCounter->uav.get();
-		spdUAVs[13] = mipUAVs[0].get();
+		ID3D11ShaderResourceView* spdSourceSRV = mip0SRV.get();
 
 		ctx->CSSetShader(spdCS, nullptr, 0);
-		ctx->CSSetUnorderedAccessViews(0, 14, spdUAVs, nullptr);
+		ctx->CSSetShaderResources(0, 1, &spdSourceSRV);
+		ctx->CSSetUnorderedAccessViews(0, 6, spdUAVs, nullptr);
 		ctx->Dispatch(groupsX, groupsY, 1);
 
-		ID3D11UnorderedAccessView* spdNulls[14]{};
-		ctx->CSSetUnorderedAccessViews(0, 14, spdNulls, nullptr);
+		ID3D11UnorderedAccessView* spdNulls[6]{};
+		ctx->CSSetUnorderedAccessViews(0, 6, spdNulls, nullptr);
+		ctx->CSSetShaderResources(0, 1, &nullSRV);
 		globals::profiler->EndPass();
 	}
 
