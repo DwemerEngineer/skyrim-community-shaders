@@ -84,6 +84,9 @@ struct GrassBucket
 	ID3D11Buffer* argsBuf = nullptr;
 	// Windows onto args[1] alone, so the cull CS adds survivors straight into the indirect args.
 	ID3D11UnorderedAccessView* argsUAV = nullptr;
+	// Holds the middle and far LOD counts in one UAV; copied into their indirect args after culling.
+	ID3D11Buffer* lodCounterBuf = nullptr;
+	ID3D11UnorderedAccessView* lodCounterUAV = nullptr;
 
 	/** @brief A compaction bin and indirect draw for one LOD tier, allocated only when that tier's mesh loaded. */
 	struct LODBin
@@ -94,7 +97,6 @@ struct GrassBucket
 		ID3D11UnorderedAccessView* extrasUAV = nullptr;
 		ID3D11ShaderResourceView* extrasSRV = nullptr;
 		ID3D11Buffer* argsBuf = nullptr;
-		ID3D11UnorderedAccessView* argsUAV = nullptr;
 		bool argsIndexCountWritten = false;
 		uint32_t capacityInstances = 0;
 		bool active = false;
@@ -108,7 +110,6 @@ struct GrassBucket
 			rel(extrasSRV);
 			rel(extrasUAV);
 			rel(extrasBuf);
-			rel(argsUAV);
 			rel(argsBuf);
 			capacityInstances = 0;
 			argsIndexCountWritten = false;
@@ -205,6 +206,8 @@ struct GrassBucket
 		rel(extrasSRV);
 		rel(argsUAV);
 		rel(argsBuf);
+		rel(lodCounterUAV);
+		rel(lodCounterBuf);
 		for (LODBin& bin : lodBins)
 			bin.Release();
 		capacityInstances = 0;
