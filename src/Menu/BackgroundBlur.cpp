@@ -653,7 +653,8 @@ namespace BackgroundBlur
 			hdr->SnapshotCleanScene();
 		}
 
-		const bool allowUIBufferClear = !globals::game::ui || !globals::game::ui->GameIsPaused();
+		const bool allowUIBufferClear =
+			!globals::state || !globals::state->IsPausedOrMenuOpen(globals::game::ui);
 		// CS editor mode: single fullscreen blur pass (better perf than per-window)
 		if (csEditorActive) {
 			ImVec2 screenMin = { 0, 0 };
