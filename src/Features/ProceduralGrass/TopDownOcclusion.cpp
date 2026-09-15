@@ -45,6 +45,8 @@ void TopDownOcclusion::SetupResources()
 	if (heightMapHigh && heightMapLow)
 		return;
 
+	renderCacheValid = false;
+
 	auto device = globals::d3d::device;
 
 	D3D11_TEXTURE2D_DESC texDesc{};
@@ -88,7 +90,7 @@ void TopDownOcclusion::SetupResources()
 	heightMapHigh->CreateRTV(rtvDesc);
 	heightMapLow->CreateRTV(rtvDesc);
 
-	// Seperate render targets for low and high, so that geometry with overhangs such as tree branches does not occlude the low map.
+	// Separate maps keep overhead geometry out of the low occlusion layer.
 	D3D11_BLEND_DESC blendDesc{};
 	blendDesc.IndependentBlendEnable = TRUE;
 	blendDesc.RenderTarget[0].BlendEnable = TRUE;
@@ -161,10 +163,17 @@ void TopDownOcclusion::ClearShaderCache()
 	}
 	heightVSBlob = nullptr;
 
-	captured.clear();
-	capturedCentre = { 1.0e30f, 1.0e30f };
+	Invalidate();
 	inputLayouts.clear();
 	CompileShaders();
+}
+
+void TopDownOcclusion::Invalidate()
+{
+	captured.clear();
+	capturedWorldspace = nullptr;
+	capturedGeometryValid = false;
+	renderCacheValid = false;
 }
 
 ID3D11ShaderResourceView* TopDownOcclusion::GetHighSRV() const
@@ -243,7 +252,8 @@ void TopDownOcclusion::CollectFrom(RE::NiAVObject* a_object)
 				auto bsxFlags = (RE::BSXFlags*)extraData;
 				auto value = static_cast<int32_t>(bsxFlags->value);
 
-				if (value & (static_cast<int32_t>(RE::BSXFlags::Flag::kRagdoll) |
+				if (value & (static_cast<int32_t>(RE::BSXFlags::Flag::kAnimated) |
+								static_cast<int32_t>(RE::BSXFlags::Flag::kRagdoll) |
 								static_cast<int32_t>(RE::BSXFlags::Flag::kEditorMarker) |
 								static_cast<int32_t>(RE::BSXFlags::Flag::kDynamic) |
 								static_cast<int32_t>(RE::BSXFlags::Flag::kAddon) |
@@ -300,6 +310,8 @@ void TopDownOcclusion::CollectFrom(RE::NiAVObject* a_object)
 void TopDownOcclusion::GatherGeometry()
 {
 	captured.clear();
+	renderCacheValid = false;
+	++capturedGeometryRevision;
 
 	const auto player = RE::PlayerCharacter::GetSingleton();
 	const auto tes = RE::TES::GetSingleton();
@@ -325,15 +337,41 @@ void TopDownOcclusion::GatherGeometry()
 	});
 }
 
+bool TopDownOcclusion::CanReuseRenderedMaps() const
+{
+	return renderCacheValid && renderCacheState == GetRenderCacheState();
+}
+
+TopDownOcclusion::RenderCacheState TopDownOcclusion::GetRenderCacheState() const
+{
+	return { windowCentre, halfExtent, paddingWorld, mapDim, snapDim, capturedGeometryRevision };
+}
+
+void TopDownOcclusion::CommitRenderedMaps()
+{
+	renderCacheState = GetRenderCacheState();
+	renderCacheValid = true;
+}
+
 void TopDownOcclusion::Render()
 {
 	if (!heightMapHigh || !heightMapLow || !heightVS || !heightPS)
 		return;
 
-	if (Util::IsInterior())
+	if (Util::IsInterior()) {
+		// Exterior references may change while an interior is loaded.
+		Invalidate();
 		return;
+	}
 
 	auto context = globals::d3d::context;
+	const auto tes = globals::game::tes;
+	const auto worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+	if (worldspace != capturedWorldspace) {
+		// Worldspaces can share coordinates but not captured geometry.
+		Invalidate();
+		capturedWorldspace = worldspace;
+	}
 
 	// Snap the window to the texel grid so it jumps in whole texels instead of sliding and re-quantising silhouette edges each frame.
 	// Snapping to the coarsest consumer (snapDim) keeps both maps stable.
@@ -345,10 +383,15 @@ void TopDownOcclusion::Render()
 	};
 
 	const float captureRefreshDistance = std::max(texel, halfExtent * 0.25f);
-	if (std::abs(windowCentre.x - capturedCentre.x) >= captureRefreshDistance || std::abs(windowCentre.y - capturedCentre.y) >= captureRefreshDistance) {
+	if (!capturedGeometryValid || std::abs(windowCentre.x - capturedCentre.x) >= captureRefreshDistance || std::abs(windowCentre.y - capturedCentre.y) >= captureRefreshDistance) {
 		GatherGeometry();
 		capturedCentre = windowCentre;
+		capturedGeometryValid = true;
 	}
+
+	// Reuse maps while their projection and captured geometry are unchanged.
+	if (CanReuseRenderedMaps())
+		return;
 
 	ID3D11RenderTargetView* previousRTVs[8]{};
 	ID3D11DepthStencilView* previousDSV = nullptr;
@@ -395,7 +438,7 @@ void TopDownOcclusion::Render()
 		context->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
 		context->IASetIndexBuffer(entry.indexBuffer.get(), DXGI_FORMAT_R16_UINT, 0);
 
-		const auto& transform = geometry->world;
+		const auto& transform = entry.world;
 		const auto& rotate = transform.rotate;
 		const float scale = transform.scale;
 
@@ -414,7 +457,7 @@ void TopDownOcclusion::Render()
 	ID3D11RenderTargetView* nullRTVs[2] = { nullptr, nullptr };
 	context->OMSetRenderTargets(2, nullRTVs, nullptr);
 
-	PadMaps(context);
+	const bool paddingComplete = PadMaps(context);
 
 	context->OMSetRenderTargets(8, previousRTVs, previousDSV);
 	for (auto* view : previousRTVs) {
@@ -426,18 +469,21 @@ void TopDownOcclusion::Render()
 
 	if (previousViewportCount)
 		context->RSSetViewports(previousViewportCount, &previousViewport);
+
+	if (paddingComplete)
+		CommitRenderedMaps();
 }
 
-void TopDownOcclusion::PadMaps(ID3D11DeviceContext* context)
+bool TopDownOcclusion::PadMaps(ID3D11DeviceContext* context)
 {
-	if (!padCS || !heightMapTmp || !heightMapLowTmp || !padCB)
-		return;
-
 	// Convert world-space padding to texels. Skip padding if less than one texel.
 	const float texel = halfExtent * 2.0f / mapDim;
 	const int radius = static_cast<int>(std::lround(paddingWorld / texel));
 	if (radius <= 0)
-		return;
+		return true;
+
+	if (!padCS || !heightMapTmp || !heightMapLowTmp || !padCB)
+		return false;
 
 	context->CSSetShader(padCS, nullptr, 0);
 	auto* cbuf = padCB->CB();
@@ -470,4 +516,5 @@ void TopDownOcclusion::PadMaps(ID3D11DeviceContext* context)
 	context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
 
 	context->CSSetShader(nullptr, nullptr, 0);
+	return true;
 }
