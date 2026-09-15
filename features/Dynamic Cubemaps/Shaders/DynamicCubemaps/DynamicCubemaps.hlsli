@@ -72,9 +72,9 @@ namespace DynamicCubemaps
 				skySpecular *= skylightingSpecular;
 #			endif
 			} else {
-				// Mode 0/1: IBL ratio-based
-				float3 ratio = ImageBasedLighting::GetIBLRatio();
-				envSpecular = Color::IrradianceToLinear(envSample * ratio) * SharedData::iblSettings.EnvIBLScale;
+				// Mode 0/1: environment lighting with the cached IBL ratio.
+				float3 iblRatio = ImageBasedLighting::GetCachedIBLRatio();
+				envSpecular = Color::IrradianceToLinear(envSample * iblRatio) * SharedData::iblSettings.EnvIBLScale;
 				skySpecular = Color::IrradianceToLinear(max(0, fullSample - envSample)) * SharedData::iblSettings.SkyIBLScale;
 #			if defined(SKYLIGHTING)
 				skySpecular *= skylightingSpecular;

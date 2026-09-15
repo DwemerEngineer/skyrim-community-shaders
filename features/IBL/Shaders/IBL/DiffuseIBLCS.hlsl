@@ -68,5 +68,24 @@ groupshared sh2 sharedB[TOTAL_SAMPLES];
 		IBLTexture[int2(0, 0)] = sharedR[0];
 		IBLTexture[int2(1, 0)] = sharedG[0];
 		IBLTexture[int2(2, 0)] = sharedB[0];
+
+		// Cache the DALC-to-IBL ratio alongside the SH coefficients.
+		float3 dalcReference = SharedData::GetAmbient(0.0f);
+		if (SharedData::linearLightingSettings.enableLinearLighting)
+			dalcReference = pow(abs(dalcReference), SharedData::linearLightingSettings.ambientGamma) * SharedData::linearLightingSettings.ambientMult;
+		float3 iblReference = float3(
+			SphericalHarmonics::SHHallucinateZH3Irradiance(sharedR[0], 0.0f),
+			SphericalHarmonics::SHHallucinateZH3Irradiance(sharedG[0], 0.0f),
+			SphericalHarmonics::SHHallucinateZH3Irradiance(sharedB[0], 0.0f)) / Math::PI;
+
+		float3 iblRatio;
+		if (SharedData::iblSettings.DALCMode == 1) {
+			iblRatio = dalcReference / max(iblReference, 0.001f);
+		} else {
+			float dalcLuminance = Color::RGBToLuminance(dalcReference);
+			float iblLuminance = Color::RGBToLuminance(iblReference);
+			iblRatio = (iblLuminance > 0.001f) ? dalcLuminance / iblLuminance : 1.0f;
+		}
+		IBLTexture[int2(3, 0)] = float4(lerp(1.0f, iblRatio, SharedData::iblSettings.DALCAmount), 1.0f);
 	}
 }
