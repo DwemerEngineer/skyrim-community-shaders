@@ -354,7 +354,7 @@ void ProceduralGrass::GetVisibleQuadrants()
 			}
 		}
 
-		// Match the generator's single-sample, non-propagating dilation.
+		// Use the generator's one-neighbour fill. Read only the original map so the fill cannot spread farther.
 		const auto sourcePresence = grassPresenceStaging;
 		const int32_t worldSampleBaseX = presenceOriginQuadX * static_cast<int32_t>(PGrassCommon::QuadrantGrassPitch - 1);
 		const int32_t worldSampleBaseY = presenceOriginQuadY * static_cast<int32_t>(PGrassCommon::QuadrantGrassPitch - 1);

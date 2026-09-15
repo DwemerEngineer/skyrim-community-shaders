@@ -407,6 +407,9 @@ void Deferred::DeferredPasses()
 		context->CSSetShader(nullptr, nullptr, 0);
 	}
 
+	if (proceduralGrass.loaded)
+		proceduralGrass.ForwardRenderFar();
+
 	if (dynamicCubemaps.loaded)
 		dynamicCubemaps.PostDeferred();
 

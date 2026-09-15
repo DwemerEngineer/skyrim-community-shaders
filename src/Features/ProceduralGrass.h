@@ -212,10 +212,8 @@ private:
 	mutable uint32_t distantAmbientLUTFrame = UINT32_MAX;
 	ID3D11VertexShader* densityAOVS = nullptr;
 	ID3D11PixelShader* densityAOPS = nullptr;
-	/** @brief Restricts High/Mid depth writes to the fully opaque portion above the terrain fade. */
+	/** @brief Restricts High depth writes to the fully opaque portion above the terrain fade. */
 	ID3D11PixelShader* depthClipPS = nullptr;
-	/** Whether High can use the split depth path. */
-	bool highDepthSplitSafe = false;
 	static constexpr uint32_t grassDensityDim = 256;
 	static constexpr uint32_t distantAmbientLUTDim = 32;
 
@@ -242,8 +240,6 @@ private:
 	bool resolvedTypeColorsLinear = false;
 	float resolvedTypeColorGamma = 1.0f;
 	Buffer* vertexIndicesHighBuffer = nullptr;
-	Buffer* vertexIndicesHighOpaqueBuffer = nullptr;
-	Buffer* vertexIndicesHighFadeBuffer = nullptr;
 	Buffer* vertexIndicesMidBuffer = nullptr;  // 9-index, five-vertex Mid blade
 	Buffer* vertexIndicesLowBuffer = nullptr;
 	Buffer* vertexIndicesFarBuffer = nullptr;  // 3-index single-triangle far blade

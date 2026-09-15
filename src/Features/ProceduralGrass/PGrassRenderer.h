@@ -10,6 +10,8 @@ namespace PGrassRendererQuads
 	inline constexpr uint32_t WorkHasLand = 1u << 16;
 	inline constexpr uint32_t WorkInsideFrustum = 1u << 17;
 	inline constexpr uint32_t WorkAllowSlopeExtras = 1u << 18;
+	inline constexpr uint32_t WorkNearCovered = 1u << 19;
+	inline constexpr uint32_t WorkCompactFar = 1u << 20;
 
 	/** Stable quadrant identity hash, generated once on the CPU for all patches in that quadrant. */
 	uint32_t QuadrantHash(uint32_t x, uint32_t y);
@@ -30,45 +32,43 @@ class PGrassRenderer
 {
 public:
 	/**
-	 * @brief Creates the renderer and sizes its blade buffers for the requested LOD and optional slope-fill capacity.
+	 * @brief Creates a tier renderer with a lazily sized append buffer.
 	 *
 	 * @param slopeExtraBlades Extra candidate blade slots per patch for filling sloped ground. Keep this small because it enlarges the
 	 *						   blade buffer and the base thread's candidate loop.
-	 * @param slopeExtraQuadrants Number of quadrants for which the buffer reserves slope extras; 0 means every
-	 *                            quadrant. Far uses only its near-seam ring, so it reserves fewer than all 4,000.
 	 */
-	PGrassRenderer(uint32_t grassDensity, uint32_t tgSize, Buffer* vertexIndicesBuf, const char* lodDef, const char* vertCountDef, const char* extraDef = nullptr, 
-		uint32_t slopeExtraBlades = 0, uint32_t slopeExtraQuadrants = 0, uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade), uint32_t bladeQuadrantCapacity = QuadrantCount);
+	PGrassRenderer(uint32_t grassDensity, uint32_t tgSize, Buffer* vertexIndicesBuf, const char* lodDef, const char* vertCountDef, const char* extraDef = nullptr,
+		uint32_t slopeExtraBlades = 0, uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade));
 
 	void SetDensity(uint32_t grassDensity);
-	/** @brief Adjusts the output-buffer budget without changing the cbuffer's fixed quadrant capacity. Far tracks its radius this way. */
-	void SetBladeQuadrantCapacity(uint32_t quadrantCapacity);
+	/** Discards the retained append-buffer capacity. */
+	void ResetBladeCapacity();
 	void SetThreadGroupSize(uint32_t tgSize);
-	
+
 	void ClearShaderCache();
-	
-	void GenerateBlades(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, int32_t cellXOffset, int32_t cellYOffset, const float4& lodFadeIn, 
-		const float4& lodFadeOut, uint64_t contentGeneration, float frustumPadding, bool disableGeneratorCulls);
-	void RenderDepth(ID3D11DeviceContext* ctx);
+
+	void GenerateBlades(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, int32_t cellXOffset, int32_t cellYOffset, const float2& lodOrigin, const float4& lodFadeIn,
+		const float4& lodFadeOut, float frustumPadding, bool disableGeneratorCulls, float compactStartDistance = -1.0f, float compactKeep = 1.0f);
+	void RenderDepth(ID3D11DeviceContext* ctx, ID3D11PixelShader* depthClipPS);
 	void RenderGrass(ID3D11DeviceContext* ctx);
 
 	/** @brief Reads back the instance count the generator appended last frame. Debug only; stalls. */
 	uint32_t ReadBladeCount() const;
 
 private:
+	using ShaderDefines = std::vector<std::pair<const char*, const char*>>;
+
 	const char* lodDefine;
 	const char* vertCountDefine;
 	const char* extraDefine;
 	uint32_t density;
-	uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade);  // High stores two extra f16x2 skylight words; Mid/Low retain two wind poses and Far is 20 bytes
-	uint32_t bladeQuadrantCapacity = QuadrantCount;
+	uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade);  // High may include skylighting/collision, Mid may include collision, and Far is 16 bytes.
 	std::string densityString;
 	uint32_t slopeExtraBlades = 0;
-	uint32_t slopeExtraQuadrants = QuadrantCount;
 	std::string patchBladeCountString = std::to_string(PatchBladeCount);
 	std::string slopeExtraBladesString = "0";
 	uint32_t patchesPerQuadrant;
-	uint32_t totalBladeCount;
+	uint32_t bladeBufferCapacity = 0;
 	uint32_t threadGroupSize;
 	std::string threadGroupSizeString;
 	std::string quadrantCountString = std::to_string(QuadrantCount);
@@ -76,10 +76,8 @@ private:
 	ID3D11ComputeShader* bladeGeneratorCS = nullptr;
 	ID3D11VertexShader* depthVS = nullptr;
 	ID3D11VertexShader* vs = nullptr;
-	ID3D11PixelShader* ps = nullptr;
-	ID3D11PixelShader* noWetnessPS = nullptr;
-	ID3D11PixelShader* noLocalLightsPS = nullptr;
-	ID3D11PixelShader* noWetnessNoLocalLightsPS = nullptr;
+	// Feature variants for wetness and local-light availability.
+	std::array<ID3D11PixelShader*, 4> pixelShaders{};
 
 	StructuredBuffer* bladesSB = nullptr;
 	StructuredBuffer* quadrantGrassSB = nullptr;
@@ -89,7 +87,9 @@ private:
 	StructuredBuffer* quadrantHeightSB = nullptr;
 	std::vector<float> quadrantHeightStaging;
 	StructuredBuffer* visibleWorkSB = nullptr;
+	StructuredBuffer* visibleCompactWorkSB = nullptr;
 	std::vector<uint32_t> visibleWorkStaging;
+	std::vector<uint32_t> visibleCompactWorkStaging;
 	ConstantBuffer* quadrantsCB = nullptr;
 
 	// Skip the staging rebuild + uploads on frames where the quadrant data is unchanged
@@ -100,17 +100,21 @@ private:
 	Buffer* vertexIndicesBuffer = nullptr;
 
 	void CreateArgsBuffer();
+	/** Grow the append buffer for this frame's visible candidate work. */
+	void EnsureBladeCapacity(uint64_t requiredBladeCount);
 	bool UsesGrassCollision(bool grassCollisionLoaded) const
 	{
 		const auto lod = std::string_view(lodDefine);
 		return grassCollisionLoaded && (lod == "HIGH_LOD" || lod == "MID_LOD");
 	}
-	
+	bool UsesSimpleLighting() const;
+	void AppendVertexShaderDefines(ShaderDefines& defines) const;
+
 	ID3D11ComputeShader* GetBladeGeneratorCS();
 	ID3D11VertexShader* GetDepthVS();
 	ID3D11VertexShader* GetVS();
 	ID3D11PixelShader* GetPS(bool noWetness = false, bool noLocalLights = false);
-	
+
 	static std::string BuildDefineList(std::span<const std::pair<const char*, const char*>> defines);
 
 	template <class ShaderT>

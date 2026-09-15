@@ -38,7 +38,7 @@ namespace PGrassCommon
 	static constexpr uint32_t QuadrantGrassPitch = 17;
 	static constexpr uint32_t QuadrantGrassSamples = QuadrantGrassPitch * QuadrantGrassPitch;
 
-	/** @brief Selects an adjacent grass id for one-sample, non-propagating map dilation. */
+	/** @brief Returns one neighbouring grass id for a bare sample; reads use the original map so the fill cannot spread farther. */
 	inline uint8_t FindAdjacentGrassId(const uint8_t* ids, uint32_t width, uint32_t height, uint32_t x, uint32_t y, int32_t worldSampleX, int32_t worldSampleY)
 	{
 		static constexpr int8_t offsets[8][2] = {
@@ -143,7 +143,7 @@ namespace PGrassCommon
 		float2 heightMapOffset;  // -pos0.xy * heightMapScale
 		float2 heightMapZRange;  // {pos0.z, pos1.z}; texels are normalised and lerp between these
 
-		float2 debugFlags;           // x: bypass every cull in the generator, y: High body depth-clip height (-1 disables clipping)
+		float2 debugFlags;           // x: bypass every cull in the generator
 		float4 grassPresenceParams;  // xy: world min-corner of the grass-id texture, z: 1/sample spacing, w: texture dim (density gather)
 		float4 grassHiZParams;       // xy: valid base extent, z: nominal pixels/texel, w: trustworthy mip count; zero disables
 		float2 grassLodOrigin;       // camera XY with a small dead zone, preventing stationary camera sway from moving LOD bands
