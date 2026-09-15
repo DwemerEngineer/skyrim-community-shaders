@@ -236,6 +236,18 @@ void GrassCollision::BindGrassShaderResources(ID3D11DeviceContext* context) cons
 	context->VSSetShaderResources(100, 1, &srv);
 }
 
+void GrassCollision::BindProceduralGrassGenerationResources(ID3D11DeviceContext* context) const
+{
+	if (!context || !perFrame || !collisionTexture)
+		return;
+
+	// b5 is occupied by SharedData in the generator.
+	ID3D11Buffer* buffer = perFrame->CB();
+	context->CSSetConstantBuffers(11, 1, &buffer);
+	ID3D11ShaderResourceView* srv = collisionTexture->srv.get();
+	context->CSSetShaderResources(100, 1, &srv);
+}
+
 void GrassCollision::LoadSettings(json& o_json)
 {
 	settings = o_json;

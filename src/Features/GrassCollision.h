@@ -29,6 +29,8 @@ public:
 	void UpdateCollisionTexture();
 	/** @brief Binds the collision cbuffer/texture expected by GrassCollision.hlsli to the vertex stage. */
 	void BindGrassShaderResources(ID3D11DeviceContext* context) const;
+	/** @brief Binds collision data to the procedural blade generator. */
+	void BindProceduralGrassGenerationResources(ID3D11DeviceContext* context) const;
 
 	struct Settings
 	{
