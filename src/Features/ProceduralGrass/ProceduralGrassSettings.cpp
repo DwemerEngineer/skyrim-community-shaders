@@ -1,7 +1,7 @@
 #include "Features/ProceduralGrass.h"
 
-#include "TopDownOcclusion.h"
 #include "TerrainHeightMap.h"
+#include "TopDownOcclusion.h"
 #include "Utils/FileSystem.h"
 #include "Utils/Serialize.h"
 
@@ -15,57 +15,57 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 
 namespace
 {
-constexpr auto TextureTypesFilename = "ProceduralGrassTypes.json";
+	constexpr auto TextureTypesFilename = "ProceduralGrassTypes.json";
 
-std::filesystem::path TextureTypesPath()
-{
-	return Util::PathHelpers::GetCommunityShaderPath() / TextureTypesFilename;
-}
-
-bool IsNumericArray(const nlohmann::json& value, const size_t size)
-{
-	if (!value.is_array() || value.size() != size)
-		return false;
-	return std::all_of(value.begin(), value.end(), [](const auto& component) { return component.is_number(); });
-}
-
-bool IsValidGrassTypeOverride(const std::string_view key, const nlohmann::json& value)
-{
-	if (key == "SubsurfaceOpacity")
-		return IsNumericArray(value, 2);
-
-	constexpr std::array float3Keys{
-		"BaseColor"sv,
-		"TipColor"sv,
-		"ColorTipDry"sv,
-		"ColorCool"sv,
-		"ColorWarm"sv,
-		"SubsurfaceTint"sv,
-		"BaseMinTipRoughness"sv,
-		"BounceColor"sv,
-		"VeinTint"sv,
-	};
-	if (std::ranges::find(float3Keys, key) != float3Keys.end())
-		return IsNumericArray(value, 3);
-
-	return value.is_number();
-}
-
-void RemoveInvalidGrassTypeOverrides(nlohmann::json& overrides)
-{
-	for (auto it = overrides.begin(); it != overrides.end();) {
-		if (!IsValidGrassTypeOverride(it.key(), it.value()))
-			it = overrides.erase(it);
-		else
-			++it;
+	std::filesystem::path TextureTypesPath()
+	{
+		return Util::PathHelpers::GetCommunityShaderPath() / TextureTypesFilename;
 	}
-}
 
-void DrawSettingDescription(const char* description)
-{
-	if (auto tooltip = Util::HoverTooltipWrapper())
-		ImGui::TextUnformatted(description);
-}
+	bool IsNumericArray(const nlohmann::json& value, const size_t size)
+	{
+		if (!value.is_array() || value.size() != size)
+			return false;
+		return std::all_of(value.begin(), value.end(), [](const auto& component) { return component.is_number(); });
+	}
+
+	bool IsValidGrassTypeOverride(const std::string_view key, const nlohmann::json& value)
+	{
+		if (key == "SubsurfaceOpacity")
+			return IsNumericArray(value, 2);
+
+		constexpr std::array float3Keys{
+			"BaseColor"sv,
+			"TipColor"sv,
+			"ColorTipDry"sv,
+			"ColorCool"sv,
+			"ColorWarm"sv,
+			"SubsurfaceTint"sv,
+			"BaseMinTipRoughness"sv,
+			"BounceColor"sv,
+			"VeinTint"sv,
+		};
+		if (std::ranges::find(float3Keys, key) != float3Keys.end())
+			return IsNumericArray(value, 3);
+
+		return value.is_number();
+	}
+
+	void RemoveInvalidGrassTypeOverrides(nlohmann::json& overrides)
+	{
+		for (auto it = overrides.begin(); it != overrides.end();) {
+			if (!IsValidGrassTypeOverride(it.key(), it.value()))
+				it = overrides.erase(it);
+			else
+				++it;
+		}
+	}
+
+	void DrawSettingDescription(const char* description)
+	{
+		if (auto tooltip = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(description);
+	}
 }
 
 void ProceduralGrass::LoadTextureTypes()
@@ -152,7 +152,6 @@ void ProceduralGrass::SaveTextureTypes() const
 		logger::warn("[Procedural Grass] Failed to save texture types file {}: {}", path.string(), e.what());
 	}
 }
-
 
 void ProceduralGrass::DrawSettings()
 {
@@ -362,7 +361,7 @@ void ProceduralGrass::DrawSettings()
 		DrawSettingDescription(T("feature.procedural_grass.low_density_tooltip", "Sets blade density in the low-detail grass tier and scales far-tier density."));
 
 		if (ImGui::SliderInt(T("feature.procedural_grass.far_radius", "Far Grass Radius (cells)"), &settings.grassCellRadius, 0, 15, "%d", ImGuiSliderFlags_AlwaysClamp))
-			grassRendererFarLOD->SetBladeQuadrantCapacity(FarBladeQuadrantCapacity());
+			grassRendererFarLOD->ResetBladeCapacity();
 		DrawSettingDescription(T("feature.procedural_grass.far_radius_tooltip", "Sets how many exterior cells beyond loaded grass receive the far grass tier."));
 		if (ImGui::SliderInt(T("feature.procedural_grass.far_density", "Far Grass Density"), &settings.farGrassDensity, 8, 160, "%d", ImGuiSliderFlags_AlwaysClamp))
 			grassRendererFarLOD->SetDensity(FarPatchDensity());
@@ -386,10 +385,10 @@ void ProceduralGrass::DrawSettings()
 		ImGui::SliderFloat("Grass map edge noise (units)", &settings.grassMapEdgeNoise, 0.0f, 256.0f, "%.0f");
 		DrawSettingDescription(T("feature.procedural_grass.debug_edge_noise_tooltip", "Jitters grass-map sampling near texture boundaries to soften distribution edges."));
 		if (ImGui::SliderFloat("Occlusion half extent", &settings.occlusionHalfExtent, 1024.0f, 16384.0f, "%.0f"))
-			TopDownOcclusion::GetSingleton()->SetHalfExtent(settings.occlusionHalfExtent);
+			globals::topDownOcclusion->SetHalfExtent(settings.occlusionHalfExtent);
 		DrawSettingDescription(T("feature.procedural_grass.debug_occlusion_extent_tooltip", "Sets the half-width of the world-space object-occlusion window."));
 		{
-			const auto td = TopDownOcclusion::GetSingleton();
+			const auto td = globals::topDownOcclusion;
 			const auto centre = td->GetWindowCentre();
 			ImGui::Text("Occlusion map: %s   %u x %u", td->IsReady() ? "ready" : "NOT READY", td->GetMapDim(), td->GetMapDim());
 			ImGui::Text("Window centre: %.0f, %.0f   half extent %.0f   %.1f units/texel",
@@ -402,18 +401,18 @@ void ProceduralGrass::DrawSettings()
 		DrawSettingDescription(T("feature.procedural_grass.debug_ignore_preprocessed_tooltip", "Includes LAND meshes that are not marked as preprocessed."));
 		if (invalidate) {
 			grassMapCache.clear();
-			grassContentGeneration++;
 		}
 
 		size_t grassSet = 0;
 		size_t grassTotal = 0;
-		for (const auto& entry : grassMapCache) {
-			grassTotal += entry.second.ids.size();
-			for (const auto id : entry.second.ids)
-				grassSet += id != 0;
-		}
+		for (const auto& entry : grassMapCache)
+			for (const auto& quadrant : entry.second.quadrants) {
+				grassTotal += quadrant.ids.size();
+				for (const auto id : quadrant.ids)
+					grassSet += id != 0;
+			}
 
-		const auto heightMap = TerrainHeightMap::GetSingleton();
+		const auto heightMap = globals::terrainHeightMap;
 		const auto cached = heightMap->GetCached();
 		ImGui::Text("Height map ready: %s", heightMap->IsReady() ? "yes" : "NO");
 		ImGui::Text("Height map worldspace: %s", cached ? cached->worldspace.c_str() : "<none>");
@@ -641,7 +640,7 @@ void ProceduralGrass::DrawGrassTypeEditor()
 
 			ImGui::TextDisabled("%s", key.c_str());
 
-			auto& defs = settings.textureTypes[key]; 
+			auto& defs = settings.textureTypes[key];
 			float totalWeight = 0.0f;
 			for (const auto& d : defs)
 				totalWeight += std::max(0.0f, d.weight);
@@ -714,7 +713,6 @@ void ProceduralGrass::DrawGrassTypeEditor()
 
 	if (typesChanged) {
 		RebuildTypeAllocation();
-		grassContentGeneration++;
 		grassMapCache.clear();
 	}
 }
@@ -836,11 +834,10 @@ void ProceduralGrass::LoadSettings(json& o_json)
 	if (grassRendererLowLOD)
 		grassRendererLowLOD->SetDensity(static_cast<uint32_t>(settings.lowGrassDensity));
 	if (grassRendererFarLOD) {
-		grassRendererFarLOD->SetBladeQuadrantCapacity(FarBladeQuadrantCapacity());
 		grassRendererFarLOD->SetDensity(FarPatchDensity());
 	}
 
-	TopDownOcclusion::GetSingleton()->SetHalfExtent(settings.occlusionHalfExtent);
+	globals::topDownOcclusion->SetHalfExtent(settings.occlusionHalfExtent);
 }
 
 void ProceduralGrass::SaveSettings(json& o_json)
@@ -953,9 +950,8 @@ void ProceduralGrass::SaveSettings(json& o_json)
 void ProceduralGrass::RestoreDefaultSettings()
 {
 	settings = {};
-	RebuildTypeAllocation(); 
+	RebuildTypeAllocation();
 	grassMapCache.clear();
-	grassContentGeneration++;
 
 	windDirection = float2(std::cos(settings.windAngle), std::sin(settings.windAngle));
 	if (grassRendererMidLOD)
@@ -963,10 +959,9 @@ void ProceduralGrass::RestoreDefaultSettings()
 	if (grassRendererLowLOD)
 		grassRendererLowLOD->SetDensity(static_cast<uint32_t>(settings.lowGrassDensity));
 	if (grassRendererFarLOD) {
-		grassRendererFarLOD->SetBladeQuadrantCapacity(FarBladeQuadrantCapacity());
 		grassRendererFarLOD->SetDensity(FarPatchDensity());
 	}
 	if (grassRendererHighLOD)
 		grassRendererHighLOD->SetDensity(QualityDensities[settings.Quality]);
-	TopDownOcclusion::GetSingleton()->SetHalfExtent(settings.occlusionHalfExtent);
+	globals::topDownOcclusion->SetHalfExtent(settings.occlusionHalfExtent);
 }
