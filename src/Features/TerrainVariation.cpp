@@ -83,7 +83,6 @@ void TerrainVariation::DataLoaded()
 	const std::unique_lock lock(meshTextureMutex);
 
 	landscapeDiffusePaths.clear();
-	landscapeDiffusePathsAvailable = true;
 	meshTextureCache.clear();
 	meshTextureKeepAlive.clear();
 
@@ -128,7 +127,7 @@ bool TerrainVariation::IsLandscapeDiffuseTexture(const RE::BSFixedString& a_name
 	auto [it, inserted] = meshTextureCache.try_emplace(key, false);
 	if (inserted) {
 		const auto canonical = CanonicaliseTexturePath(key);
-		it->second = landscapeDiffusePathsAvailable ? landscapeDiffusePaths.contains(canonical) : canonical.starts_with(LandscapeDirectory);
+		it->second = canonical.starts_with(LandscapeDirectory) && canonical.find('/', LandscapeDirectory.size()) == std::string::npos;
 		meshTextureKeepAlive.push_back(a_name);
 	}
 

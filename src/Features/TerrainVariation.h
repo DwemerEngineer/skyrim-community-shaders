@@ -65,10 +65,9 @@ public:
 	/** @brief Initializes the feature and applies shader settings after plugin load. */
 	virtual void PostPostLoad() override;
 
-	// Guards landscapeDiffusePaths, landscapeDiffusePathsAvailable, meshTextureCache and meshTextureKeepAlive.
+	// Guards landscapeDiffusePaths, meshTextureCache and meshTextureKeepAlive.
 	std::shared_mutex meshTextureMutex;
 	std::unordered_set<std::string> landscapeDiffusePaths;
-	bool landscapeDiffusePathsAvailable = false;
 	// Keyed on the interned BSFixedString pointer of a diffuse texture name.
 	std::unordered_map<const char*, bool> meshTextureCache;
 	// Keeps every cached key interned so its pointer cannot be recycled.
