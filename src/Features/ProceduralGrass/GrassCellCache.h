@@ -19,6 +19,7 @@
  */
 struct CellGrass
 {
+	std::array<uint64_t, 4> quadrantCacheVersions{};
 	std::array<std::array<uint8_t, PGrassCommon::QuadrantGrassSamples>, 4> ids{};
 	std::array<std::array<float, PGrassCommon::QuadrantGrassSamples>, 4> heights{};
 	std::array<float, 4> minHeights{};
@@ -51,7 +52,6 @@ public:
 	void Shutdown();
 
 private:
-	static uint64_t Key(int32_t cellX, int32_t cellY);
 	static std::unique_ptr<CellGrass> ReadCell(RE::TESWorldSpace* worldSpace, RE::TESFileArray* files, int32_t cellX, int32_t cellY);
 	static void ParseLandscape(RE::TESFile* file, CellGrass& out);
 
@@ -67,4 +67,5 @@ private:
 	RE::TESFileArray* files = nullptr;
 	std::atomic<uint64_t> generation{ 0 };  // bumped on worldspace change, stale results dropped
 	uint64_t frame = 0;
+	uint64_t nextCacheVersion = 1;
 };

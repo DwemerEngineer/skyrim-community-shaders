@@ -50,11 +50,6 @@ namespace
 	}
 }
 
-uint64_t GrassCellCache::Key(int32_t cellX, int32_t cellY)
-{
-	return (static_cast<uint64_t>(static_cast<uint32_t>(cellX)) << 32) | static_cast<uint32_t>(cellY);
-}
-
 void GrassCellCache::BeginFrame(RE::TESWorldSpace* landWorldSpace)
 {
 	frame++;
@@ -94,6 +89,8 @@ void GrassCellCache::DrainCompleted()
 		pending.erase(key);
 		if (taskGen != gen)
 			continue;  // read belongs to a previous worldspace
+		for (auto& cacheVersion : data->quadrantCacheVersions)
+			cacheVersion = nextCacheVersion++;
 		lastTouched[key] = frame;
 		ready[key] = std::move(data);
 	}
@@ -101,7 +98,7 @@ void GrassCellCache::DrainCompleted()
 
 const CellGrass* GrassCellCache::GetOrRequest(int32_t cellX, int32_t cellY)
 {
-	const uint64_t key = Key(cellX, cellY);
+	const uint64_t key = PGrassCommon::GrassCellKey(cellX, cellY);
 
 	if (const auto it = ready.find(key); it != ready.end()) {
 		lastTouched[key] = frame;
