@@ -17,6 +17,18 @@ void HiZPyramid::ClearShaderCache()
 	if (spdCS)
 		spdCS->Release();
 	spdCS = nullptr;
+	valid = false;
+	builtFrame = UINT32_MAX;
+}
+
+ID3D11ShaderResourceView* HiZPyramid::GetSRV() const
+{
+	return IsValid() && texture ? texture->srv.get() : nullptr;
+}
+
+bool HiZPyramid::IsValid() const
+{
+	return valid && builtFrame == globals::state->frameCount;
 }
 
 ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
@@ -105,8 +117,12 @@ bool HiZPyramid::CreateTexture(ID3D11Device* device, uint32_t dstW, uint32_t dst
 	return true;
 }
 
-bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
+bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx, bool forceRefresh)
 {
+	const uint32_t currentFrame = globals::state->frameCount;
+	if (!forceRefresh && builtFrame == currentFrame)
+		return valid;
+
 	valid = false;
 
 	if (!paramsCB || !globals::game::renderer)
@@ -247,5 +263,6 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	}
 
 	valid = true;
+	builtFrame = currentFrame;
 	return true;
 }

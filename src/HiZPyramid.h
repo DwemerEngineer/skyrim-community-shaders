@@ -10,6 +10,7 @@ public:
 	 * @brief Rebuilds the pyramid from the current scene depth copy.
 	 * @param device Device used to create the per-mip views when the size changes.
 	 * @param ctx Immediate context the reduction dispatches are issued on.
+	 * @param forceRefresh Rebuild even when the pyramid was already produced this frame.
 	 * @return True when the pyramid is valid for this frame.
 	 */
 	bool Build(ID3D11Device* device, ID3D11DeviceContext* ctx, bool forceRefresh = false);
