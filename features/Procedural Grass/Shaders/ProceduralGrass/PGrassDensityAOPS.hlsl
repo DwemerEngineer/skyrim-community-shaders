@@ -2,6 +2,7 @@
 
 #define FRAMEBUFFER
 #include "Common/FrameBuffer.hlsli"
+#include "Common/Random.hlsli"
 
 #include "ProceduralGrass/PGrassCommon.hlsli"
 
@@ -25,6 +26,25 @@ float SampleDensity(float2 densityUV)
 	return lerp(lerp(d00, d10, frac.x), lerp(d01, d11, frac.x), frac.y);
 }
 
+float StableFarDensity(float2 worldPosition)
+{
+	// A low-frequency world-space field is stable as the camera-centred density window moves.
+	float2 p = worldPosition * (1.0f / 4096.0f);
+	int2 cell = int2(floor(p));
+	float2 blend = frac(p);
+	float2 blend2 = blend * blend;
+	blend = blend2 * blend * (blend * (blend * 6.0f - 15.0f) + 10.0f);
+
+	float n00 = float(Random::iqint3(asuint(cell))) * (1.0f / 4294967296.0f);
+	float n10 = float(Random::iqint3(asuint(cell + int2(1, 0)))) * (1.0f / 4294967296.0f);
+	float n01 = float(Random::iqint3(asuint(cell + int2(0, 1)))) * (1.0f / 4294967296.0f);
+	float n11 = float(Random::iqint3(asuint(cell + int2(1, 1)))) * (1.0f / 4294967296.0f);
+	float noise = lerp(lerp(n00, n10, blend.x), lerp(n01, n11, blend.x), blend.y);
+
+	// Keep the approximation consistently dark while retaining broad natural variation.
+	return grassAOParams.z * lerp(0.75f, 1.0f, noise);
+}
+
 float4 main(float4 position : SV_POSITION) : SV_Target0
 {
 	float depth = DepthTexture.Load(int3(position.xy, 0));
@@ -39,20 +59,32 @@ float4 main(float4 position : SV_POSITION) : SV_Target0
 	cr.xyz /= cr.w;
 	float3 world = cr.xyz + FrameBuffer::CameraPosAdjust.xyz;
 
-    float2 densityUV = (world.xy - occlusionParams.xy) / (occlusionHalfExtent * 2.0f) + 0.5f;
-	if (densityUV.x != saturate(densityUV.x) || densityUV.y != saturate(densityUV.y))
+	float2 worldOffset = world.xy - occlusionParams.xy;
+	float radialDistance = length(worldOffset);
+	float farRange = 1.0f / max(farParams.y, 1.0e-6f);
+	float farEnd = farParams.x + farRange;
+	if (radialDistance >= farEnd)
 		return 1.0f;
 
-	float density = SampleDensity(densityUV);
+	// Radially blend the local density window into Far's approximation and stop sampling after the handoff point
+	float handoffStart = occlusionHalfExtent * 0.8f;
+	float handoffT = saturate((radialDistance - handoffStart) / max(farParams.x - handoffStart, 1.0f));
+	float handoffT2 = handoffT * handoffT;
+	handoffT = handoffT2 * handoffT * (handoffT * (handoffT * 6.0f - 15.0f) + 10.0f);
+	float density = StableFarDensity(world.xy);
+	[branch] if (handoffT < 1.0f)
+	{
+		float2 densityUV = worldOffset * occlusionInvExtent + 0.5f;
+		density = lerp(SampleDensity(densityUV), density, handoffT);
+	}
 	float ao = saturate(density / max(grassAOParams.z, 1.0f)) * grassAOParams.y;
 
-	// Fades the last ~10% of the occlusion radius to avoid a hard edge at the edge
-	float2 radialPosition = (world.xy - occlusionParams.xy) / occlusionHalfExtent;
-	float radius2 = dot(radialPosition, radialPosition);
-	float edgeT = saturate((radius2 - 0.81f) * (1.0f / 0.19f));  // full through r=0.9, neutral at r=1
-	float edgeT2 = edgeT * edgeT;
-	float edgeFade = 1.0f - edgeT2 * edgeT * (edgeT * (edgeT * 6.0f - 15.0f) + 10.0f);
-	ao *= edgeFade;
+	// Hold Far terrain darkening steady, then retire it only over the outer 4096 units.
+	float outerFadeStart = max(farParams.x, farEnd - 4096.0f);
+	float outerT = saturate((radialDistance - outerFadeStart) / max(farEnd - outerFadeStart, 1.0f));
+	float outerT2 = outerT * outerT;
+	float outerFade = 1.0f - outerT2 * outerT * (outerT * (outerT * 6.0f - 15.0f) + 10.0f);
+	ao *= outerFade;
 
 	float terrainZ = lerp(heightMapZRange.x, heightMapZRange.y, TerrainHeightTexture.SampleLevel(LinearSampler, world.xy * heightMapScale + heightMapOffset, 0));
 	float heightFraction = saturate((world.z - terrainZ) / max(grassAOParams.w, 1.0f));
