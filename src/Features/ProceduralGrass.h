@@ -49,7 +49,7 @@ public:
 		float grassColorValueVariation = 0.20f;                 // Per-blade brightness variation
 		float grassColorTipDryStrength = 0.35f;                 // Tip dry-tint strength
 		float grassColorMottleStrength = 0.15f;                 // Along-blade mottle strength
-		float3 grassColorCool = float3(0.72f, 1.08f, 0.70f);    // Cool blade tint
+		float3 grassColorCool = float3(0.72f, 0.80f, 0.70f);    // Cool blade tint
 		float3 grassColorWarm = float3(1.08f, 1.00f, 0.68f);    // Warm blade tint
 		float3 grassColorTipDry = float3(1.08f, 1.00f, 0.76f);  // Dry tip tint
 
@@ -97,7 +97,7 @@ public:
 
 		// Slope
 		float grassMinSlope = 0.0f;
-		float grassMaxSlope = 60.0f;    // Degrees. 90 never culls grass.
+		float grassMaxSlope = 40.0f;    // Degrees. 90 never culls grass.
 		float grassSlopeFacing = 0.2f;  // Downhill lean strength
 
 		// Wind / animation

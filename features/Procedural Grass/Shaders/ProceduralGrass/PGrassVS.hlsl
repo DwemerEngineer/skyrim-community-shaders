@@ -156,12 +156,7 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 
 	float level = abs(rung - doubleBlade * MID_LEVEL);
 	float t = level * invBladeLevels;
-#if defined(FAR_LOD) || defined(MID_LOD) || defined(LOW_LOD)
 	static const float appearanceStability = 1.0f;
-#else
-	// Fade High to the representative sample before individual blades become sub-pixel.
-	float appearanceStability = smoothstep(512.0f, 1536.0f, rootDistance);
-#endif
 	// Keep some authored height variation around a tapered blade's area-weighted mean.
 	static const float STABLE_APPEARANCE_T = 1.0f / 3.0f;
 	static const float DISTANT_APPEARANCE_DETAIL = 0.25f;

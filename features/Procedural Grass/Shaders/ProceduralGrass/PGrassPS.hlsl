@@ -119,12 +119,11 @@ float GrassValueNoise(float2 p)
 	return lerp(lerp(a, b, fr.x), lerp(c, d, fr.x), fr.y);
 }
 
-float GetProcGrassDiffuseNdotL(float3 geometricNormal, float3 lightDirection, float stability)
+float GetProcGrassCanopyNdotL(float3 lightDirection)
 {
 	float verticalBladeResponse = length(lightDirection.xy) * (2.0f / Math::PI);
 	float bentTipResponse = saturate(lightDirection.z);
-	float canopyResponse = lerp(verticalBladeResponse, bentTipResponse, 0.25f);
-	return lerp(dot(geometricNormal, lightDirection), canopyResponse, stability);
+	return lerp(verticalBladeResponse, bentTipResponse, 0.25f);
 }
 
 float GetProcGrassFiberSpecularMask(float3 tangent, float3 halfVector, float roughness, float anisotropy)
@@ -160,19 +159,20 @@ void GetProcGrassCanopyDirect(out DirectLightingOutput lightingOutput, DirectCon
 		lightingOutput.transmission = PBR::GetGrassTransmission(context, material, diffuseNdotL, 1.0);
 }
 
-void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, float diffuseNdotL, float diffuseWrap, float3 tangent, float anisotropy, float detailWeight)
+void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, float diffuseNdotL, float diffuseWrap, float3 tangent, float anisotropy, float specularDetailWeight)
 {
 	DirectLightingOutput detailedLighting;
-	PBR::GetDirectLightInputGrass(detailedLighting, context, material, detailWeight > 0.0, diffuseNdotL, diffuseNdotL, diffuseWrap);
+	PBR::GetDirectLightInputGrass(detailedLighting, context, material, specularDetailWeight > 0.0, diffuseNdotL, diffuseNdotL, diffuseWrap);
 	detailedLighting.diffuse *= MultiBounceAO(material.BaseColor, material.AO).y;
 	detailedLighting.specular *= GetProcGrassFiberSpecularMask(tangent, context.halfVector, material.Roughness, anisotropy) * 0.65;
 
 	DirectLightingOutput canopyLighting;
 	GetProcGrassCanopyDirect(canopyLighting, context, material, diffuseNdotL, diffuseWrap, tangent, anisotropy);
 
-	lightingOutput.diffuse = lerp(canopyLighting.diffuse, detailedLighting.diffuse, detailWeight);
-	lightingOutput.specular = lerp(canopyLighting.specular, detailedLighting.specular, detailWeight);
-	lightingOutput.transmission = lerp(canopyLighting.transmission, detailedLighting.transmission, detailWeight);
+	// Keep broad lighting identical between tiers. Only the directional highlight gains blade detail nearby.
+	lightingOutput.diffuse = canopyLighting.diffuse;
+	lightingOutput.specular = lerp(canopyLighting.specular, detailedLighting.specular, specularDetailWeight);
+	lightingOutput.transmission = canopyLighting.transmission;
 	lightingOutput.coatDiffuse = 0.0;
 }
 
@@ -565,7 +565,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float3 dirLightColor = grassFrameLight.xyz;
 	float3 dirLightDirection = SharedData::DirLightDirection.xyz;
-	float dirDiffuseNdotL = GetProcGrassDiffuseNdotL(worldSpaceNormal, dirLightDirection, directLightingStability);
+	float dirDiffuseNdotL = GetProcGrassCanopyNdotL(dirLightDirection);
 
 	float dirDetailShadow = 1.0;
 #if defined(SCREEN_SPACE_SHADOWS) && !defined(LOW_LOD)
@@ -600,9 +600,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #if defined(LIGHT_LIMIT_FIX) && !defined(LOW_LOD)
 	uint numClusteredLights = 0;
 #	if !defined(PGRASS_NO_LOCAL_LIGHTS)
-#		if defined(MID_LOD)
 	if (detailedSpecularWeight > 0.0) {
-#		endif
 	uint totalLightCount = LightLimitFix::NumStrictLights;
 	uint clusterIndex = 0;
 	uint lightOffset = 0;
@@ -652,7 +650,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		DirectContext pointContext = CreateDirectLightingContext(directLightingNormal, directLightingNormal, directLightingNormal, worldSpaceViewDirection, worldSpaceViewDirection, normalizedLightDirection, normalizedLightDirection, lightColor, lightShadow, lightShadow);
 
 		DirectLightingOutput pointLighting = (DirectLightingOutput)0;
-		float pointDiffuseNdotL = GetProcGrassDiffuseNdotL(worldSpaceNormal, normalizedLightDirection, directLightingStability);
+		float pointDiffuseNdotL = GetProcGrassCanopyNdotL(normalizedLightDirection);
 
 		PBR::GetDirectLightInputGrass(pointLighting, pointContext, material, false, pointDiffuseNdotL, pointDiffuseNdotL, bladeType.grassSurfParams.z);
 		pointLighting.diffuse *= MultiBounceAO(material.BaseColor, material.AO).y;
@@ -660,19 +658,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		if (waterRoughnessSpecular < 1.0)
 			EvaluateWetnessLighting(wetnessNormal, pointContext, waterRoughnessSpecular, pointLighting);
 #		endif
-#		if defined(MID_LOD)
 		diffuseColor += pointLighting.diffuse * detailedSpecularWeight;
 		transmissionColor += pointLighting.transmission * detailedSpecularWeight;
 		specularColorPBR += pointLighting.specular * detailedSpecularWeight;
-#		else
-		diffuseColor += pointLighting.diffuse;
-		transmissionColor += pointLighting.transmission;
-		specularColorPBR += pointLighting.specular;
-#		endif
 	}
-#		if defined(MID_LOD)
 	}
-#		endif
 #	endif
 #endif
 
@@ -752,11 +742,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #else
 	psout.Diffuse.xyz = shadedDiffuseColor;
 #	if defined(FAR_LOD)
-	// Far runs after deferred composite and therefore resolves specular here.
-	psout.Diffuse.xyz += specularColor;
-#	endif
-#	if defined(FAR_LOD)
-	// Approximate the density-shadow pass without its four integer density reads.
+	// Match the deferred density shadow without its four integer density reads.
 	float densityShadowOuterStart = saturate(1.0f - 4096.0f * farParams.y);
 	float densityShadowOuterFade = 1.0f - smoothstep(densityShadowOuterStart, 1.0f, farWidthT);
 	float densityShadow = lerp(1.0f, 0.875f, smoothstep(0.0f, 0.2f, farWidthT)) * densityShadowOuterFade;
@@ -767,10 +753,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			TerrainHeightTexture.SampleLevel(LinearSampler, worldPosition.xy * heightMapScale + heightMapOffset, 0));
 		densityShadowHeight = 1.0f - 0.75f * saturate((worldPosition.z - terrainZ) / max(grassAOParams.w, 1.0f));
 	}
-	// Combine the authored canopy and terrain-occupancy darkening controls.
-	float farDensityDarkenStrength = 1.0f -
-		(1.0f - saturate(grassLightParams.x)) * (1.0f - 0.5f * saturate(grassAOParams.y));
-	psout.Diffuse.xyz *= saturate(1.0f - densityShadow * farDensityDarkenStrength * densityShadowHeight);
+	psout.Diffuse.xyz *= saturate(1.0f - densityShadow * saturate(grassAOParams.y) * densityShadowHeight);
+
+	// Far runs after deferred composite, so resolve diffuse and specular in the same order here.
+	psout.Diffuse.xyz = Color::IrradianceToGamma(Color::IrradianceToLinear(psout.Diffuse.xyz) + specularColor);
 #	endif
 #endif
 

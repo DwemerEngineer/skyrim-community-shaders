@@ -608,10 +608,15 @@ ID3D11PixelShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetPS(bool no
 		ShaderDefines defines;
 
 		for (auto* feature : Feature::GetFeatureList()) {
+			const auto featureName = feature->GetShaderDefineName();
+			const bool requiredSimpleLightingFeature =
+				featureName == "LINEAR_LIGHTING" ||
+				featureName == "TERRAIN_SHADOWS" ||
+				featureName == "CLOUD_SHADOWS";
 			if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting) &&
-				(!simpleLighting || feature == &globals::features::linearLighting) &&
-				(feature != &globals::features::skylighting || globals::features::skylighting.texProbeArray))
-				defines.push_back({ feature->GetShaderDefineName().data(), nullptr });
+				(!simpleLighting || requiredSimpleLightingFeature) &&
+				(featureName != "SKYLIGHTING" || globals::features::skylighting.texProbeArray))
+				defines.push_back({ featureName.data(), nullptr });
 		}
 
 		defines.push_back({ lodDefine, nullptr });
