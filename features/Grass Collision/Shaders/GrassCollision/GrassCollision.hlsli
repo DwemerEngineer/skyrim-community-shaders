@@ -81,8 +81,10 @@ namespace GrassCollision
 				collisionHeights += collisionSample.x * w;
 				collisionAmount += max(0, min(maximumDepth, worldPosition.z - collisionSample.x)) * ProceduralAnimation(collisionSample.y - collisionSample.x, distanceFromCenter, smoothRecovery, recoveryRate) * w;
 
+#if !defined(GRASS_COLLISION_CURRENT_ONLY)
 				previousCollisionHeights += collisionSample.z * w;
 				previousCollisionAmount += max(0, min(maximumDepth, worldPosition.z - collisionSample.z)) * ProceduralAnimation(collisionSample.w - collisionSample.z, distanceFromCenter, smoothRecovery, recoveryRate) * w;
+#endif
 
 				wsum += w;
 			}
@@ -90,13 +92,17 @@ namespace GrassCollision
 		if (wsum > 0.0) {
 			collisionHeights /= wsum;
 			collisionAmount /= wsum;
+#if !defined(GRASS_COLLISION_CURRENT_ONLY)
 			previousCollisionHeights /= wsum;
 			previousCollisionAmount /= wsum;
+#endif
 		} else {
 			collisionHeights = TEXTURE_SIZE;
 			collisionAmount = 0.0;
+#if !defined(GRASS_COLLISION_CURRENT_ONLY)
 			previousCollisionHeights = TEXTURE_SIZE;
 			previousCollisionAmount = 0.0;
+#endif
 		}
 	}
 
@@ -138,10 +144,14 @@ namespace GrassCollision
 		float avgCurrentAmount = dot(currentAmounts, float3(1.0, 1.0, 1.0)) / 3.0;
 		collision = ComputeNormalFromHeights(collisionCenter, collisionX, collisionY, delta) * avgCurrentAmount;
 
+#if !defined(GRASS_COLLISION_CURRENT_ONLY)
 		// Process previous collision
 		float3 previousAmounts = float3(previousCollisionCenterAmount, previousCollisionXAmount, previousCollisionYAmount);
 		float avgPreviousAmount = dot(previousAmounts, float3(1.0, 1.0, 1.0)) / 3.0;
 		previousCollision = ComputeNormalFromHeights(previousCollisionCenter, previousCollisionX, previousCollisionY, delta) * avgPreviousAmount;
+#else
+		previousCollision = 0.0;
+#endif
 	}
 
 	void GetDisplacedPosition(float3 worldPosition, float3 worldPositionCentre, float alpha, float maximumDistance, bool smoothRecovery, float recoveryRate, out float3 displacement, out float3 previousDisplacement)
@@ -164,10 +174,16 @@ namespace GrassCollision
 
 			// Do not let collision move upwards
 			collision.z = -abs(collision.z);
+#if !defined(GRASS_COLLISION_CURRENT_ONLY)
 			previousCollision.z = -abs(previousCollision.z);
+#endif
 
 			displacement = collision * alpha * nearFactor * 0.75;
+#if defined(GRASS_COLLISION_CURRENT_ONLY)
+			previousDisplacement = 0.0;
+#else
 			previousDisplacement = previousCollision * alpha * nearFactor * 0.75;
+#endif
 		} else {
 			displacement = 0.0;
 			previousDisplacement = 0.0;

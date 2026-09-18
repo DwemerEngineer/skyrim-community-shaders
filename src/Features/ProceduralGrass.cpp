@@ -1,6 +1,7 @@
-﻿#include "ProceduralGrass.h"
+#include "ProceduralGrass.h"
 
 #include "GrassCollision.h"
+#include "DynamicCubemaps.h"
 #include "HiZPyramid.h"
 #include "IBL.h"
 #include "LightLimitFix.h"
@@ -22,6 +23,50 @@ namespace
 {
 	// Preserve full density at the Low/Far handoff, then retain this fraction in distant Far regions.
 	constexpr float FarPerformanceKeep = 0.55f;
+	constexpr uint32_t GrassMaterialDetailDim = 64;
+	constexpr uint32_t GrassMaterialDetailVariants = 4;
+	constexpr float GrassMaterialDetailNormalRange = 1.25f;
+
+	uint32_t GrassMaterialDetailHash(uint32_t x, uint32_t y)
+	{
+		x ^= y * 0x9E3779B9u;
+		x ^= x >> 16;
+		x *= 0x7FEB352Du;
+		x ^= x >> 15;
+		x *= 0x846CA68Bu;
+		return x ^ (x >> 16);
+	}
+
+	float GrassMaterialDetailTexel(int32_t x, int32_t y, bool grain)
+	{
+		const uint32_t wrappedX = static_cast<uint32_t>(x) & (GrassMaterialDetailDim - 1u);
+		const uint32_t wrappedY = static_cast<uint32_t>(y) & (GrassMaterialDetailDim - 1u);
+		const uint32_t hash = grain ?
+			GrassMaterialDetailHash(wrappedX, wrappedY) :
+			GrassMaterialDetailHash(wrappedX / 8u, wrappedY / 8u);
+		return static_cast<float>(hash >> 24) * (1.0f / 255.0f);
+	}
+
+	float SampleGrassMaterialDetail(float u, float v, bool grain)
+	{
+		const float x = u * GrassMaterialDetailDim - 0.5f;
+		const float y = v * GrassMaterialDetailDim - 0.5f;
+		const int32_t x0 = static_cast<int32_t>(std::floor(x));
+		const int32_t y0 = static_cast<int32_t>(std::floor(y));
+		const float fx = x - x0;
+		const float fy = y - y0;
+		const float a = GrassMaterialDetailTexel(x0, y0, grain);
+		const float b = GrassMaterialDetailTexel(x0 + 1, y0, grain);
+		const float c = GrassMaterialDetailTexel(x0, y0 + 1, grain);
+		const float d = GrassMaterialDetailTexel(x0 + 1, y0 + 1, grain);
+		return std::lerp(std::lerp(a, b, fx), std::lerp(c, d, fx), fy);
+	}
+
+	float Smoothstep(float edge0, float edge1, float value)
+	{
+		const float t = std::clamp((value - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+		return t * t * (3.0f - 2.0f * t);
+	}
 
 	template <class T>
 	void ReleaseAndNull(T*& resource)
@@ -122,6 +167,8 @@ void ProceduralGrass::SetupResources()
 
 	auto vertexIndicesHigh = CreateVertexIndicesArray(15);
 	vertexIndicesHighBuffer = makeIndexBuffer(vertexIndicesHigh, "PGrass::HighIndices");
+	auto vertexIndicesHighOuter = CreateVertexIndicesArray(7);
+	vertexIndicesHighOuterBuffer = makeIndexBuffer(vertexIndicesHighOuter, "PGrass::HighOuterIndices");
 
 	auto vertexIndicesLow = CreateVertexIndicesArray(7);
 	D3D11_BUFFER_DESC lowIbd{};
@@ -157,7 +204,8 @@ void ProceduralGrass::SetupResources()
 	const bool cacheCollision = globals::features::grassCollision.loaded;
 	const uint32_t highBladeStride = cacheCollision ? sizeof(PGrassCommon::BladeSkylitCollision) : sizeof(PGrassCommon::BladeSkylit);
 	const uint32_t midBladeStride = cacheCollision ? sizeof(PGrassCommon::BladeCollision) : sizeof(PGrassCommon::Blade);
-	grassRendererHighLOD = new PGrassRenderer<PGrassCommon::HighTierQuadrantCap, 4>(QualityDensities[settings.Quality], threadGroupSize, vertexIndicesHighBuffer, "HIGH_LOD", "HIGH_VERTEX", nullptr, 1, highBladeStride);
+	grassRendererHighLOD = new PGrassRenderer<PGrassCommon::HighTierQuadrantCap, 4>(QualityDensities[settings.Quality], threadGroupSize, vertexIndicesHighBuffer,
+		"HIGH_LOD", "HIGH_VERTEX", nullptr, 1, highBladeStride, vertexIndicesHighOuterBuffer);
 	grassRendererMidLOD = new PGrassRenderer<PGrassCommon::MidTierQuadrantCap, 2>(static_cast<uint32_t>(settings.midGrassDensity), threadGroupSize, vertexIndicesMidBuffer, "MID_LOD", "MID_VERTEX", nullptr, 1, midBladeStride);
 	grassRendererLowLOD = new PGrassRenderer<PGrassCommon::LowTierQuadrantCap, 1>(static_cast<uint32_t>(settings.lowGrassDensity), threadGroupSize, vertexIndicesLowBuffer, "LOW_LOD", "LOW_VERTEX", nullptr, 5, sizeof(PGrassCommon::Blade));
 	grassRendererFarLOD = new PGrassRenderer<PGrassCommon::FarQuadrantCount, 1>(FarPatchDensity(), threadGroupSize, vertexIndicesFarBuffer, "LOW_LOD", "FAR_VERTEX", "FAR_LOD", 2, sizeof(PGrassCommon::BladeFar));
@@ -168,6 +216,30 @@ void ProceduralGrass::SetupResources()
 	samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
 	samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
 	device->CreateSamplerState(&samplerDesc, &linearClampSampler);
+
+	D3D11_TEXTURE2D_DESC detailDesc{};
+	detailDesc.Width = GrassMaterialDetailDim;
+	detailDesc.Height = GrassMaterialDetailDim;
+	detailDesc.MipLevels = 1;
+	detailDesc.ArraySize = PGrassCommon::MaxGrassTypes * GrassMaterialDetailVariants;
+	detailDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	detailDesc.SampleDesc.Count = 1;
+	detailDesc.Usage = D3D11_USAGE_DEFAULT;
+	detailDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	grassMaterialDetailTexture = new Texture2D(detailDesc, "PGrass::MaterialDetail");
+	D3D11_SHADER_RESOURCE_VIEW_DESC detailSRVDesc{};
+	detailSRVDesc.Format = detailDesc.Format;
+	detailSRVDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+	detailSRVDesc.Texture2DArray.MostDetailedMip = 0;
+	detailSRVDesc.Texture2DArray.MipLevels = 1;
+	detailSRVDesc.Texture2DArray.FirstArraySlice = 0;
+	detailSRVDesc.Texture2DArray.ArraySize = detailDesc.ArraySize;
+	grassMaterialDetailTexture->CreateSRV(detailSRVDesc);
+
+	D3D11_SAMPLER_DESC detailSamplerDesc = samplerDesc;
+	detailSamplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+	detailSamplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+	device->CreateSamplerState(&detailSamplerDesc, &grassDetailSampler);
 
 	D3D11_SAMPLER_DESC shadowSamplerDesc = {};
 	shadowSamplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -189,6 +261,8 @@ void ProceduralGrass::SetupResources()
 		rd.DepthClipEnable = TRUE;
 		rd.DepthBiasClamp = -100.0f;
 		device->CreateRasterizerState(&rd, &noCullRS);
+		rd.ScissorEnable = TRUE;
+		device->CreateRasterizerState(&rd, &noCullScissorRS);
 	}
 
 	if (!depthOnDSS) {
@@ -496,11 +570,7 @@ PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& 
 	t.specular = ov.value("Specular", s.specular);
 	t.minMaxSubsurfaceOpacity = ov.value("SubsurfaceOpacity", s.subsurfaceOpacity);
 	t.grassSubsurfaceColor = packColor(ov.value("SubsurfaceTint", s.grassSubsurfaceTint));
-	t.grassSurfParams = float4(
-		ov.value("MicroDetail", s.grassMicroDetail),
-		ov.value("AmbientFlatten", s.grassAmbientFlatten),
-		ov.value("Wrap", s.grassWrap),
-		ov.value("Aniso", s.grassAniso));
+	t.grassSurfParams = float4(0.0f, ov.value("AmbientFlatten", s.grassAmbientFlatten), ov.value("Wrap", s.grassWrap), 0.0f);
 	const float3 rough = ov.value("BaseMinTipRoughness", s.baseMinTipRoughness);
 	const float roughnessStart = ov.value("TipRoughnessStart", s.tipRoughnessStart);
 	t.baseMinTipRoughnessStart = float4(rough.x, rough.y, rough.z, roughnessStart);
@@ -548,6 +618,64 @@ PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& 
 		0.0f);
 
 	return t;
+}
+
+void ProceduralGrass::UpdateGrassMaterialDetailTexture()
+{
+	if (!grassMaterialDetailTexture)
+		return;
+
+	const auto encodeUNorm8 = [](float value) {
+		return static_cast<uint8_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
+	};
+
+	std::vector<uint8_t> detailData(GrassMaterialDetailDim * GrassMaterialDetailDim * 4u);
+	const uint32_t activeTypeCount = std::min<uint32_t>(static_cast<uint32_t>(typeAllocation.size()) + 2u, MaxGrassTypes);
+	for (uint32_t typeIndex = 0; typeIndex < activeTypeCount; ++typeIndex) {
+		const auto& type = resolvedGrassTypes.grassType[typeIndex];
+		const float blotchScale = std::max(type.grassTextureParams.y, 0.0f);
+		const float speckleScale = std::max(type.grassTextureParams.w, 0.0f);
+		const float veinStrength = type.grassVeinParams2.x;
+		const float veinRippleDepth = type.grassVeinParams2.y;
+		const float veinWiggleAmount = type.grassVeinParams2.z;
+
+		for (uint32_t variant = 0; variant < GrassMaterialDetailVariants; ++variant) {
+			const uint32_t offsetHash = GrassMaterialDetailHash(typeIndex * GrassMaterialDetailVariants + variant, variant);
+			const float noiseOffsetX = static_cast<float>(offsetHash & 0xFFFFu) * (1.0f / 65536.0f);
+			const float noiseOffsetY = static_cast<float>(offsetHash >> 16) * (1.0f / 65536.0f);
+			const float phase = static_cast<float>(GrassMaterialDetailHash(variant, typeIndex) >> 8) * (std::numbers::pi_v<float> * 2.0f / 16777216.0f);
+
+			for (uint32_t y = 0; y < GrassMaterialDetailDim; ++y) {
+				const float along = (static_cast<float>(y) + 0.5f) * (1.0f / GrassMaterialDetailDim);
+				for (uint32_t x = 0; x < GrassMaterialDetailDim; ++x) {
+					const float across = (static_cast<float>(x) + 0.5f) * (1.0f / GrassMaterialDetailDim);
+					const float blotch = SampleGrassMaterialDetail(across * 0.125f * blotchScale + noiseOffsetX,
+						along * 0.5f * blotchScale + noiseOffsetY, false);
+					const float grain = SampleGrassMaterialDetail(across * 6.0f * speckleScale + noiseOffsetX * 1.7f,
+						along * 26.0f * speckleScale + noiseOffsetY * 1.7f, true);
+
+					const float centreVein = 1.0f - Smoothstep(0.0f, 0.050f, std::abs(across - 0.5f));
+					const float sideVeinL = 1.0f - Smoothstep(0.0f, 0.032f, std::abs(across - 0.27f));
+					const float sideVeinR = 1.0f - Smoothstep(0.0f, 0.032f, std::abs(across - 0.73f));
+					float vein = std::clamp(centreVein + 0.5f * (sideVeinL + sideVeinR), 0.0f, 1.0f);
+					vein *= Smoothstep(0.0f, 0.16f, along) * Smoothstep(0.0f, 0.20f, 1.0f - along);
+					vein *= (1.0f - veinRippleDepth) + veinRippleDepth * std::sin(along * 26.0f + phase);
+
+					const float normalOffset = (across - 0.5f) * 2.0f * vein * veinStrength +
+						std::sin(along * 40.0f + phase) * veinWiggleAmount;
+					const uint32_t index = (y * GrassMaterialDetailDim + x) * 4u;
+					detailData[index] = encodeUNorm8(blotch);
+					detailData[index + 1u] = encodeUNorm8(grain);
+					detailData[index + 2u] = encodeUNorm8(vein);
+					detailData[index + 3u] = encodeUNorm8(normalOffset * (0.5f / GrassMaterialDetailNormalRange) + 0.5f);
+				}
+			}
+
+			const uint32_t slice = typeIndex * GrassMaterialDetailVariants + variant;
+			globals::d3d::context->UpdateSubresource(grassMaterialDetailTexture->resource.get(), D3D11CalcSubresource(0, slice, 1), nullptr,
+				detailData.data(), GrassMaterialDetailDim * 4u, 0);
+		}
+	}
 }
 
 void ProceduralGrass::PostDepthRendering()
@@ -747,7 +875,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
 	const float farStart = (farGridCells ? farGridCells->length : 5) * 2048.0f;  // Loaded-grid half extent
 	const float farEnd = std::max(farStart + 4096.0f, settings.grassCellRadius * 4096.0f);
-	grassGlobals.farParams = float4(farStart, 1.0f / (farEnd - farStart), settings.farDensityFalloff, FarPerformanceKeep);
+	grassGlobals.farParams = float4(farStart, 1.0f / (farEnd - farStart), 2048.0f / static_cast<float>(FarPatchDensity()), FarPerformanceKeep);
 
 	previousShaderTimer = shaderTimer;
 	previousWindDirection = windDirection;
@@ -817,6 +945,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 
 		grassTypesArrayCB->Update(resolvedGrassTypes);
 		grassGeneratorTypesCB->Update(resolvedGeneratorTypes);
+		UpdateGrassMaterialDetailTexture();
 		// View thickening scales with blade width.
 		nearQuadrantFrustumPadding = settings.voronoiGridSize * settings.clumpDistanceFactor + maxHeight + maxNearWidth * (1.0f + settings.grassViewThicken);
 		farQuadrantFrustumPadding = maxHeight + maxFarWidth;
@@ -883,18 +1012,7 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx) const
 		((settings.lowGrassDensity * settings.lowGrassDensity) / (farPatchDensity * farPatchDensity) - 1.0f) * 0.5f,
 		0.0f, 1.0f);
 
-	// Near bounds cover clumping and Low width. Far bounds cover wider billboard blades.
-	grassRendererHighLOD->GenerateBlades(ctx, quadrantsHighLOD, 61, 60, grassLodOrigin, noFadeIn, float4(highToMid, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, settings.debugDisableAllCulls);
-	grassRendererMidLOD->GenerateBlades(ctx, quadrantsMidLOD, 61, 60, grassLodOrigin, float4(highToMid, invBand, 0.0f, 0.0f), float4(midToLow, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, settings.debugDisableAllCulls);
-	// Cross-fade the different Low and Far blade layouts across their shared radial band.
-	grassRendererLowLOD->GenerateBlades(ctx, quadrantsLowLOD, 61, 60, grassLodOrigin, float4(midToLow, invBand, 0.0f, 0.0f), float4(lowToFar, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, settings.debugDisableAllCulls);
-	const float farCompactStart = gridEdge + (radiusEdge - gridEdge) * 0.75f;
-	grassRendererFarLOD->GenerateBlades(ctx, quadrantsFarLOD, 61, 60, grassLodOrigin, float4(lowToFar, invBand, farSeamExtraKeep, 0.0f), float4(gridEdge, 1.0f / std::max(radiusEdge - gridEdge, 1.0f), settings.farDensityFalloff, 0.0f), farQuadrantFrustumPadding, settings.debugDisableAllCulls, farCompactStart, FarPerformanceKeep);
-
-	ID3D11UnorderedAccessView* uavs[3] = { nullptr, nullptr, nullptr };
-	ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
-
-	// Gather density after generation so the heightmap SRV remains bound for blade generation.
+	// Build the canopy-density field before High generation so each emitted blade can cache one density sample.
 	if (grassPresenceUploadDirty) {
 		ctx->UpdateSubresource(grassPresenceTexture->resource.get(), 0, nullptr, grassPresenceStaging.data(), grassPresenceDim, 0);
 		grassPresenceUploadDirty = false;
@@ -909,6 +1027,27 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx) const
 
 	ID3D11UnorderedAccessView* nullUAV = nullptr;
 	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+	ID3D11ShaderResourceView* nullSRV = nullptr;
+	ctx->CSSetShaderResources(0, 1, &nullSRV);
+	if (auto heightMapSRV = globals::terrainHeightMap->GetSRV())
+		ctx->CSSetShaderResources(0, 1, &heightMapSRV);
+	ID3D11ShaderResourceView* densitySRV = grassDensityTexture->srv.get();
+	ctx->CSSetShaderResources(7, 1, &densitySRV);
+
+	// Near bounds cover clumping and Low width. Far bounds cover wider billboard blades.
+	grassRendererHighLOD->GenerateBlades(ctx, quadrantsHighLOD, quadrantsHighVersion, 61, 60, grassLodOrigin, noFadeIn,
+		float4(highToMid, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, settings.debugDisableAllCulls);
+	grassRendererMidLOD->GenerateBlades(ctx, quadrantsMidLOD, quadrantsMidVersion, 61, 60, grassLodOrigin, float4(highToMid, invBand, 0.0f, 0.0f),
+		float4(midToLow, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, settings.debugDisableAllCulls);
+	// Cross-fade the different Low and Far blade layouts across their shared radial band.
+	grassRendererLowLOD->GenerateBlades(ctx, quadrantsLowLOD, quadrantsLowVersion, 61, 60, grassLodOrigin, float4(midToLow, invBand, 0.0f, 0.0f),
+		float4(lowToFar, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, settings.debugDisableAllCulls);
+	const float farCompactStart = gridEdge + (radiusEdge - gridEdge) * 0.75f;
+	grassRendererFarLOD->GenerateBlades(ctx, quadrantsFarLOD, quadrantsFarVersion, 61, 60, grassLodOrigin, float4(lowToFar, invBand, farSeamExtraKeep, 0.0f),
+		float4(gridEdge, 1.0f / std::max(radiusEdge - gridEdge, 1.0f), settings.farDensityFalloff, 0.0f), farQuadrantFrustumPadding, settings.debugDisableAllCulls, farCompactStart, FarPerformanceKeep);
+
+	ID3D11UnorderedAccessView* uavs[3] = { nullptr, nullptr, nullptr };
+	ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
 
 	ID3D11ShaderResourceView* nullGeneratorSRVs[9]{};
 	ctx->CSSetShaderResources(0, ARRAYSIZE(nullGeneratorSRVs), nullGeneratorSRVs);
@@ -930,14 +1069,12 @@ void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx) const
 	ctx->OMSetDepthStencilState(depthWriteDS, 0);
 	ctx->OMSetBlendState(depthOnlyBlend, nullptr, 0xFFFFFFFF);
 
-	// Keep partially transparent blade bases out of depth so terrain remains available beneath the fade.
 	ID3D11Buffer* grassCB = grassGlobalsCB->CB();
 	ctx->VSSetConstantBuffers(8, 1, &grassCB);
 	ctx->PSSetConstantBuffers(8, 1, &grassCB);
 
 	grassRendererHighLOD->RenderDepth(ctx, depthClipPS);
-	grassRendererMidLOD->RenderDepth(ctx, nullptr);
-	// Low and Far skip the depth prepass and write depth in their early-Z colour pass.
+	// Mid, Low, and Far write depth in their colour passes.
 
 	ID3D11ShaderResourceView* nullBladeSRV = nullptr;
 	ctx->VSSetShaderResources(0, 1, &nullBladeSRV);
@@ -972,7 +1109,7 @@ void ProceduralGrass::DeferredRendering() const
 
 	auto& terrainBlending = globals::features::terrainBlending;
 	if (terrainBlending.loaded && terrainBlending.settings.Enabled) {
-		// Low writes depth in its colour pass, after the first terrain-depth merge.
+		// Mid and Low write depth in their colour passes, after the first terrain-depth merge.
 		terrainBlending.MergeSceneDepthIntoBlend();
 		ID3D11ShaderResourceView* sceneDepthSRV = Util::GetCurrentSceneDepthSRV(true);
 		ctx->PSSetShaderResources(17, 1, &sceneDepthSRV);
@@ -983,9 +1120,9 @@ void ProceduralGrass::DeferredRendering() const
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_DOWNSCALED].RTV,
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kINDIRECT].RTV,
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kINDIRECT_DOWNSCALED].RTV,
-			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT].RTV,
+			globals::features::dynamicCubemaps.loaded ? renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT].RTV : nullptr,
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS].RTV,
-			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS_DOWNSCALED].RTV,
+			nullptr,
 		};
 		const auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 		ctx->OMSetRenderTargets(ARRAYSIZE(rtvs), rtvs, mainDepth.views[0]);
@@ -1013,9 +1150,9 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_DOWNSCALED].RTV,
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kINDIRECT].RTV,
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kINDIRECT_DOWNSCALED].RTV,
-		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT].RTV,
+		globals::features::dynamicCubemaps.loaded ? renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT].RTV : nullptr,
 		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS].RTV,
-		renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS_DOWNSCALED].RTV,
+		nullptr,
 	};
 
 	D3D11_TEXTURE2D_DESC texDesc;
@@ -1032,8 +1169,6 @@ void ProceduralGrass::DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphic
 	static auto& precipOcclusionTexture = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPRECIPITATION_OCCLUSION_MAP];
 	ctx->PSSetShaderResources(70, 1, &precipOcclusionTexture.depthSRV);
 
-	ID3D11ShaderResourceView* densitySRV = grassDensityTexture->srv.get();
-	ctx->PSSetShaderResources(71, 1, &densitySRV);
 	ctx->PSSetSamplers(0, 1, &linearClampSampler);
 
 	const auto state = globals::state;
@@ -1090,12 +1225,71 @@ void ProceduralGrass::DarkenTerrainUnderGrass() const
 
 	D3D11_TEXTURE2D_DESC texDesc;
 	mainTex.texture->GetDesc(&texDesc);
-	SetViewport(ctx, Util::ConvertToDynamic(float2((float)texDesc.Width, (float)texDesc.Height)));
+	const float2 viewportSize = Util::ConvertToDynamic(float2((float)texDesc.Width, (float)texDesc.Height));
+	SetViewport(ctx, viewportSize);
+
+	const LONG viewportWidth = std::max(1l, static_cast<LONG>(std::ceil(viewportSize.x)));
+	const LONG viewportHeight = std::max(1l, static_cast<LONG>(std::ceil(viewportSize.y)));
+	D3D11_RECT shadowRect{ 0, 0, viewportWidth, viewportHeight };
+	bool useShadowScissor = false;
+
+	const auto* heightMap = globals::terrainHeightMap;
+	if (noCullScissorRS && heightMap->IsReady()) {
+		const auto zRange = heightMap->GetZRange();
+		const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
+		const float farStart = (farGridCells ? farGridCells->length : 5) * 2048.0f;
+		const float farEnd = std::max(farStart + 4096.0f, settings.grassCellRadius * 4096.0f);
+		const auto centre = globals::topDownOcclusion->GetWindowCentre();
+		const float minZ = std::min(zRange.x, zRange.y) - 256.0f;
+		const float maxZ = std::max(zRange.x, zRange.y) + std::max(settings.grassHeight, 256.0f);
+		const auto viewProj = globals::game::frameBufferCached.GetCameraViewProjUnjittered().Transpose();
+		const auto& cameraPosAdjust = globals::game::frameBufferCached.GetCameraPosAdjust();
+
+		float minNdcX = FLT_MAX;
+		float minNdcY = FLT_MAX;
+		float maxNdcX = -FLT_MAX;
+		float maxNdcY = -FLT_MAX;
+		bool projectable = true;
+		for (uint32_t corner = 0; corner < 8; ++corner) {
+			const float x = centre.x + ((corner & 1u) ? farEnd : -farEnd);
+			const float y = centre.y + ((corner & 2u) ? farEnd : -farEnd);
+			const float z = (corner & 4u) ? maxZ : minZ;
+			const float4 clip = float4::Transform(float4{ x - cameraPosAdjust.x, y - cameraPosAdjust.y, z - cameraPosAdjust.z, 1.0f }, viewProj);
+			if (clip.w <= 1.0e-3f) {
+				projectable = false;
+				break;
+			}
+
+			const float invW = 1.0f / clip.w;
+			const float ndcX = clip.x * invW;
+			const float ndcY = clip.y * invW;
+			minNdcX = std::min(minNdcX, ndcX);
+			minNdcY = std::min(minNdcY, ndcY);
+			maxNdcX = std::max(maxNdcX, ndcX);
+			maxNdcY = std::max(maxNdcY, ndcY);
+		}
+
+		if (projectable) {
+			constexpr float scissorPadding = 4.0f;
+			const float left = (minNdcX * 0.5f + 0.5f) * viewportSize.x - scissorPadding;
+			const float right = (maxNdcX * 0.5f + 0.5f) * viewportSize.x + scissorPadding;
+			const float top = (0.5f - maxNdcY * 0.5f) * viewportSize.y - scissorPadding;
+			const float bottom = (0.5f - minNdcY * 0.5f) * viewportSize.y + scissorPadding;
+
+			shadowRect.left = std::clamp(static_cast<LONG>(std::floor(left)), 0l, viewportWidth);
+			shadowRect.right = std::clamp(static_cast<LONG>(std::ceil(right)), 0l, viewportWidth);
+			shadowRect.top = std::clamp(static_cast<LONG>(std::floor(top)), 0l, viewportHeight);
+			shadowRect.bottom = std::clamp(static_cast<LONG>(std::ceil(bottom)), 0l, viewportHeight);
+			useShadowScissor = shadowRect.left < shadowRect.right && shadowRect.top < shadowRect.bottom;
+		}
+	}
 
 	ctx->OMSetRenderTargets(1, &mainTex.RTV, nullptr);
 	ctx->OMSetBlendState(multiplyBlend, nullptr, 0xFFFFFFFF);
 	ctx->OMSetDepthStencilState(noDepthDSS, 0);
-	ctx->RSSetState(noCullRS);
+	ctx->RSSetState(useShadowScissor ? noCullScissorRS : noCullRS);
+	if (useShadowScissor)
+		ctx->RSSetScissorRects(1, &shadowRect);
 
 	auto terrainHeightSRV = globals::terrainHeightMap->GetSRV();
 	ID3D11ShaderResourceView* srvs[3] = { mainDepth.depthSRV, grassDensityTexture->srv.get(), terrainHeightSRV };
@@ -1112,6 +1306,8 @@ void ProceduralGrass::DarkenTerrainUnderGrass() const
 	ctx->VSSetShader(densityAOVS, nullptr, 0);
 	ctx->PSSetShader(densityAOPS, nullptr, 0);
 	ctx->Draw(3, 0);
+	if (useShadowScissor)
+		ctx->RSSetState(noCullRS);
 
 	ID3D11RenderTargetView* nullRTV = nullptr;
 	ctx->OMSetRenderTargets(1, &nullRTV, nullptr);
@@ -1168,20 +1364,26 @@ void ProceduralGrass::RenderGrass(ID3D11DeviceContext* ctx) const
 {
 	globals::profiler->BeginPass("ProceduralGrass::Deferred");
 
+	ID3D11ShaderResourceView* densitySRV = grassDensityTexture->srv.get();
+	ctx->PSSetShaderResources(71, 1, &densitySRV);
+	ID3D11ShaderResourceView* detailSRV = grassMaterialDetailTexture->srv.get();
+	ctx->PSSetShaderResources(75, 1, &detailSRV);
+	ctx->PSSetSamplers(13, 1, &grassDetailSampler);
+
 	// Only High uses terrain-contact blending; other append buffers render opaque.
 	ctx->OMSetBlendState(terrainFadeBlend, nullptr, 0xFFFFFFFF);
 	grassRendererHighLOD->RenderGrass(ctx);
 	ctx->OMSetBlendState(defaultBlend, nullptr, 0xFFFFFFFF);
-	grassRendererMidLOD->RenderGrass(ctx);
 
-	// Low writes depth here because it skips the depth prepass. Its colour pass remains early-Z.
+	// Mid and Low skip the depth prepass and write depth in their early-Z colour passes.
 	ctx->OMSetDepthStencilState(depthWriteDS, 0);
+	grassRendererMidLOD->RenderGrass(ctx);
 	grassRendererLowLOD->RenderGrass(ctx);
 
 	ID3D11ShaderResourceView* nullSRV = nullptr;
 	ctx->VSSetShaderResources(0, 1, &nullSRV);
-	ID3D11ShaderResourceView* nullGrassSRVs[3] = { nullptr, nullptr, nullptr };
-	ctx->PSSetShaderResources(71, 3, nullGrassSRVs);
+	ID3D11ShaderResourceView* nullGrassSRVs[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
+	ctx->PSSetShaderResources(71, 5, nullGrassSRVs);
 
 	globals::profiler->EndPass();
 }

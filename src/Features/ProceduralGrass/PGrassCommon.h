@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 namespace PGrassCommon
 {
@@ -37,6 +37,40 @@ namespace PGrassCommon
 	// A LAND quadrant carries a 17x17 grid of texture-blend samples, so 128 world units apart.
 	static constexpr uint32_t QuadrantGrassPitch = 17;
 	static constexpr uint32_t QuadrantGrassSamples = QuadrantGrassPitch * QuadrantGrassPitch;
+	static constexpr uint32_t QuadrantCellPitch = QuadrantGrassPitch - 1;
+	using QuadrantOccupancy = std::array<uint16_t, QuadrantCellPitch>;
+
+	/** @brief Builds a 16x16 occupied-cell mask after the generator's one-sample neighbour fill. */
+	inline QuadrantOccupancy BuildQuadrantOccupancy(const uint8_t* ids)
+	{
+		QuadrantOccupancy rows{};
+		if (!ids)
+			return rows;
+
+		for (uint32_t cellY = 0; cellY < QuadrantCellPitch; ++cellY) {
+			uint16_t row = 0;
+			for (uint32_t cellX = 0; cellX < QuadrantCellPitch; ++cellX) {
+				const uint32_t minX = cellX > 0 ? cellX - 1 : 0;
+				const uint32_t minY = cellY > 0 ? cellY - 1 : 0;
+				const uint32_t maxX = std::min(cellX + 2, QuadrantGrassPitch - 1);
+				const uint32_t maxY = std::min(cellY + 2, QuadrantGrassPitch - 1);
+
+				bool occupied = false;
+				for (uint32_t y = minY; y <= maxY && !occupied; ++y)
+					for (uint32_t x = minX; x <= maxX; ++x)
+						if (ids[y * QuadrantGrassPitch + x] != 0u) {
+							occupied = true;
+							break;
+						}
+
+				if (occupied)
+					row |= static_cast<uint16_t>(1u << cellX);
+			}
+			rows[cellY] = row;
+		}
+
+		return rows;
+	}
 
 	/** @brief Returns one neighbouring grass id for a bare sample; reads use the original map so the fill cannot spread farther. */
 	inline uint8_t FindAdjacentGrassId(const uint8_t* ids, uint32_t width, uint32_t height, uint32_t x, uint32_t y, int32_t worldSampleX, int32_t worldSampleY)
@@ -87,6 +121,7 @@ namespace PGrassCommon
 		uint64_t cacheVersion;
 		bool nearCovered;  // a loaded near tier also renders this quadrant
 		const uint8_t* grassIds;
+		const uint16_t* occupancyRows;
 		const float* heights;  // null when the LAND is unloaded
 		float2 worldPos;       // cached lower-left world XY
 		float minHeight;       // QuadrantNoHeight when unavailable
@@ -135,7 +170,7 @@ namespace PGrassCommon
 		float4 grassLightParams;  // x: density AO, y: canopy sky occlusion, z: resolved sun-shadow exponent, w: base canopy shading
 		float4 grassFrameLight;   // xyz: resolved TRUE_PBR directional light, w: resolved grass brightness scale
 
-		float4 farParams;          // x: thin start, y: inverse range, z: edge keep, w: far-only performance keep
+		float4 farParams;          // x: thin start, y: inverse range, z: Far candidate spacing, w: Far performance keep
 		float4 miscParams;         //  x: grass map edge noise in world units, y: slope facing, z: view thicken, w: timer delta
 		float4 grassTerrainBlend;  // x: blend strength, y: blend height (world units), z: normal blend, w: roughness blend
 
@@ -180,7 +215,7 @@ namespace PGrassCommon
 		float specular;
 
 		float2 minMaxSubsurfaceOpacity;
-		float4 grassSurfParams;           // x: micro-detail, y: ambient normal flatten, z: wrap amount, w: anisotropic specular
+		float4 grassSurfParams;           // y: ambient normal flatten, z: wrap amount
 		float4 baseMinTipRoughnessStart;  // roughness at the base, at the smoothest point, and at the tip and t at which roughness bottoms out and starts climbing to the tip
 		float4 midRoughnessPolynomial;    // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}
 		float4 grassTypeLightParams;      // x: ground bounce, y: sky translucency, z: specular occlusion, w: ambient desaturation
@@ -236,12 +271,11 @@ namespace PGrassCommon
 		uint posXY;           // camera-relative x/y as two f16 values
 		uint posZWidthHeight;  // camera-relative z as f16, then width and height as UNORM8
 		uint facingAndWind;  // low 16: current facing as 2x SNORM8; high 16: current wind displacement as f16
-		uint previousWind;   // low 16: previous wind displacement as f16; high 16: packed RGB565 blade colour
+		uint previousWind;   // low 16: previous wind displacement or Mid collision Z; high 16: blade colour and bend
 		uint hashClumpAndGrassType;
-		uint clumpDensity;
-		uint tipDir;  // (sin, cos) of the blade tilt as 2x f16
+		uint tipDir;  // tier-specific packed tilt and lighting or distance data
 	};
-	static_assert(sizeof(Blade) == 28);
+	static_assert(sizeof(Blade) == 24);
 
 	// Struct for high blades to store a compact, per-blade skylighting SH value (four f16 values) along with the blade's packed data.
 	struct BladeSkylit
@@ -250,22 +284,22 @@ namespace PGrassCommon
 		uint skylightingSH0;
 		uint skylightingSH1;
 	};
-	static_assert(sizeof(BladeSkylit) == 36);
+	static_assert(sizeof(BladeSkylit) == 32);
 
-	// Current and previous collision bends, packed as six f16 values.
+	// Mid stores only the current bend because it has no previous-position output.
 	struct BladeCollision
 	{
 		Blade blade;
-		uint collisionData[3];
+		uint collisionData;
 	};
-	static_assert(sizeof(BladeCollision) == 40);
+	static_assert(sizeof(BladeCollision) == 28);
 
 	struct BladeSkylitCollision
 	{
 		BladeSkylit blade;
 		uint collisionData[3];
 	};
-	static_assert(sizeof(BladeSkylitCollision) == 48);
+	static_assert(sizeof(BladeSkylitCollision) == 44);
 
 	struct BladeFar
 	{

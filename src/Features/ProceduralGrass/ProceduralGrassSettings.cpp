@@ -195,8 +195,6 @@ void ProceduralGrass::DrawSettings()
 		if (ImGui::CollapsingHeader(T("feature.procedural_grass.blade_detail_section", "Blade Detail"))) {
 			ImGui::SliderFloat(T("feature.procedural_grass.canopy_base_shading", "Canopy Base Shading"), &settings.grassBaseAO, 0.0f, 1.0f, "%.2f");
 			DrawSettingDescription(T("feature.procedural_grass.canopy_base_shading_tooltip", "Darkens blade bases beneath the grass canopy."));
-			ImGui::SliderFloat(T("feature.procedural_grass.micro_detail", "Micro Detail"), &settings.grassMicroDetail, 0.0f, 1.0f, "%.2f");
-			DrawSettingDescription(T("feature.procedural_grass.micro_detail_tooltip", "Controls fine surface detail on individual blades."));
 
 			// Surface texture. Grain fades out with distance so it cannot alias into shimmer on the far field.
 			ImGui::SliderFloat(T("feature.procedural_grass.blotch_strength", "Blotch Strength"), &settings.grassBlotchStrength, 0.0f, 1.0f, "%.2f");
@@ -231,8 +229,7 @@ void ProceduralGrass::DrawSettings()
 			DrawSettingDescription(T("feature.procedural_grass.density_occlusion_tooltip", "Darkens areas containing more overlapping blades."));
 			ImGui::SliderFloat(T("feature.procedural_grass.terminator_wrap", "Terminator Wrap"), &settings.grassWrap, 0.0f, 1.0f, "%.2f");
 			DrawSettingDescription(T("feature.procedural_grass.terminator_wrap_tooltip", "Wraps direct light around blades to soften the light-shadow boundary."));
-			ImGui::SliderFloat(T("feature.procedural_grass.anisotropic_specular", "Anisotropic Specular"), &settings.grassAniso, 0.0f, 2.0f, "%.2f");
-			DrawSettingDescription(T("feature.procedural_grass.anisotropic_specular_tooltip", "Controls elongated highlights along the blade direction."));
+
 			ImGui::SliderFloat(T("feature.procedural_grass.ground_bounce", "Ground Bounce"), &settings.grassBounceStrength, 0.0f, 2.0f, "%.2f");
 			DrawSettingDescription(T("feature.procedural_grass.ground_bounce_tooltip", "Controls indirect light reflected from the ground onto blades."));
 			ImGui::SliderFloat3(T("feature.procedural_grass.ground_bounce_tint", "Ground Bounce Tint"), reinterpret_cast<float*>(&settings.grassBounceColor), 0.0f, 2.0f, "%.2f");
@@ -400,7 +397,7 @@ void ProceduralGrass::DrawSettings()
 		ImGui::Checkbox("Ignore preprocessed-node check", &settings.debugIgnorePreProcessedFlag);
 		DrawSettingDescription(T("feature.procedural_grass.debug_ignore_preprocessed_tooltip", "Includes LAND meshes that are not marked as preprocessed."));
 		if (invalidate) {
-			grassMapCache.clear();
+			ClearGrassMapCache();
 		}
 
 		size_t grassSet = 0;
@@ -563,10 +560,10 @@ void ProceduralGrass::DrawGrassTypeEditor()
 		fFloat3(ov, "SubsurfaceTint", T("feature.procedural_grass.subsurface_color", "Subsurface Color"), s.grassSubsurfaceTint, 0.0f, 2.0f, false);
 		fFloat3(ov, "BaseMinTipRoughness", T("feature.procedural_grass.roughness", "Roughness (Base>Min>Tip)"), s.baseMinTipRoughness, 0.0f, 1.0f, false);
 		fFloat(ov, "TipRoughnessStart", T("feature.procedural_grass.roughness_tip_start", "Roughness Tip Start"), s.tipRoughnessStart, 0.05f, 0.95f);
-		fFloat(ov, "MicroDetail", T("feature.procedural_grass.micro_detail", "Micro Detail"), s.grassMicroDetail, 0.0f, 1.0f);
+
 		fFloat(ov, "AmbientFlatten", T("feature.procedural_grass.ambient_flatten", "Ambient Flatten"), s.grassAmbientFlatten, 0.0f, 1.0f);
 		fFloat(ov, "Wrap", T("feature.procedural_grass.terminator_wrap", "Terminator Wrap"), s.grassWrap, 0.0f, 1.0f);
-		fFloat(ov, "Aniso", T("feature.procedural_grass.anisotropic_specular", "Anisotropic Specular"), s.grassAniso, 0.0f, 2.0f);
+
 		fFloat(ov, "BounceStrength", T("feature.procedural_grass.ground_bounce", "Ground Bounce"), s.grassBounceStrength, 0.0f, 2.0f);
 		fFloat3(ov, "BounceColor", T("feature.procedural_grass.ground_bounce_tint", "Ground Bounce Tint"), s.grassBounceColor, 0.0f, 2.0f, false);
 		fFloat(ov, "SpecOcclusion", T("feature.procedural_grass.specular_occlusion", "Specular Occlusion"), s.grassSpecOcclusion, 0.0f, 1.0f);
@@ -713,7 +710,7 @@ void ProceduralGrass::DrawGrassTypeEditor()
 
 	if (typesChanged) {
 		RebuildTypeAllocation();
-		grassMapCache.clear();
+		ClearGrassMapCache();
 	}
 }
 
@@ -751,12 +748,12 @@ void ProceduralGrass::LoadSettings(json& o_json)
 	// Detail / lighting
 	settings.grassBaseAO = o_json.value("BaseAO", settings.grassBaseAO);
 	settings.grassClumpColorStrength = o_json.value("ClumpColorStrength", settings.grassClumpColorStrength);
-	settings.grassMicroDetail = o_json.value("MicroDetail", settings.grassMicroDetail);
+
 	settings.grassAmbientFlatten = o_json.value("AmbientFlatten", settings.grassAmbientFlatten);
 	settings.grassCanopySkyOcclusion = o_json.value("CanopySkyOcclusion", settings.grassCanopySkyOcclusion);
 	settings.grassDensityAO = o_json.value("DensityAO", settings.grassDensityAO);
 	settings.grassWrap = o_json.value("Wrap", settings.grassWrap);
-	settings.grassAniso = o_json.value("Aniso", settings.grassAniso);
+
 	settings.grassBounceStrength = o_json.value("BounceStrength", settings.grassBounceStrength);
 	settings.grassBounceColor = o_json.value("BounceColor", settings.grassBounceColor);
 	settings.grassSunSelfShadow = o_json.value("SunSelfShadow", settings.grassSunSelfShadow);
@@ -874,12 +871,12 @@ void ProceduralGrass::SaveSettings(json& o_json)
 	// Detail / lighting
 	o_json["BaseAO"] = settings.grassBaseAO;
 	o_json["ClumpColorStrength"] = settings.grassClumpColorStrength;
-	o_json["MicroDetail"] = settings.grassMicroDetail;
+
 	o_json["AmbientFlatten"] = settings.grassAmbientFlatten;
 	o_json["CanopySkyOcclusion"] = settings.grassCanopySkyOcclusion;
 	o_json["DensityAO"] = settings.grassDensityAO;
 	o_json["Wrap"] = settings.grassWrap;
-	o_json["Aniso"] = settings.grassAniso;
+
 	o_json["BounceStrength"] = settings.grassBounceStrength;
 	o_json["BounceColor"] = settings.grassBounceColor;
 	o_json["SunSelfShadow"] = settings.grassSunSelfShadow;
@@ -951,7 +948,7 @@ void ProceduralGrass::RestoreDefaultSettings()
 {
 	settings = {};
 	RebuildTypeAllocation();
-	grassMapCache.clear();
+	ClearGrassMapCache();
 
 	windDirection = float2(std::cos(settings.windAngle), std::sin(settings.windAngle));
 	if (grassRendererMidLOD)

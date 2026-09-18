@@ -1,4 +1,4 @@
-// Writes depth only where the blade is fully opaque, leaving terrain depth beneath the smooth base fade.
+// Keep the faded blade base out of the depth buffer so terrain remains visible through the blend.
 
 #include "ProceduralGrass/PGrassCommon.hlsli"
 

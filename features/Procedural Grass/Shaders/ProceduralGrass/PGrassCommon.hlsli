@@ -21,7 +21,7 @@ cbuffer GrassGlobals : register(b8)
 	float4 grassLightParams;  // x: density AO, y: canopy sky occlusion, z: resolved sun-shadow exponent, w: base canopy shading
 	float4 grassFrameLight;   // xyz: resolved TRUE_PBR directional light, w: resolved grass brightness scale
 
-	float4 farParams;          // x: thin start, y: inverse range, z: edge keep, w: far-only performance keep
+	float4 farParams;          // x: thin start, y: inverse range, z: Far candidate spacing, w: Far performance keep
 	float4 miscParams;         //  x: grass map edge noise in world units, y: slope facing, z: view thicken, w: timer delta
 	float4 grassTerrainBlend;  // x: blend strength, y: blend height (world units), z: normal blend, w: roughness blend
 
@@ -35,6 +35,20 @@ cbuffer GrassGlobals : register(b8)
 	float2 grassLodOrigin;       // camera XY with a small dead zone, preventing stationary camera sway from moving LOD bands
 	float2 _grassLodPadding;
 }
+
+#if defined(FAR_LOD)
+float GetFarPerformanceKeep(float lodDistance, float projectionScale)
+{
+	float farWidthT = saturate((lodDistance - farParams.x) * farParams.y);
+	float distanceKeep = lerp(1.0f, farParams.w, farWidthT);
+
+	// Keep about one Far candidate per projected pixel once the original lattice becomes sub-pixel.
+	float renderWidth = rcp(max(dynamicResolutionInverted.x, 1.0e-6f));
+	float projectedSpacing = farParams.z * abs(projectionScale) * (0.5f * renderWidth) / max(lodDistance, 1.0f);
+	float screenKeep = max(saturate(projectedSpacing * projectedSpacing), 0.4f);
+	return min(distanceKeep, lerp(1.0f, screenKeep, farWidthT));
+}
+#endif
 
 struct GrassType
 {
@@ -62,7 +76,7 @@ struct GrassType
 	float specular;
 
 	float2 minMaxSubsurfaceOpacity;
-	float4 grassSurfParams;           // x: micro-detail, y: ambient normal flatten, z: wrap amount, w: anisotropic specular
+	float4 grassSurfParams;           // y: ambient normal flatten, z: wrap amount
 	float4 baseMinTipRoughnessStart;  // roughness at the base, at the smoothest point, and at the tip and t at which roughness bottoms out and starts climbing to the tip
 	float4 midRoughnessPolynomial;    // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}
 	float4 grassTypeLightParams;      // x: ground bounce, y: sky translucency, z: specular occlusion, w: ambient desaturation
@@ -130,16 +144,19 @@ struct Blade
 	uint posXY;          // camera-relative x/y as two f16 values
 	uint posZWidthHeight;  // camera-relative z as f16, then UNORM8 width/height
 	uint facingAndWind;  // low 16: current facing as 2x SNORM8; high 16: current wind displacement as f16
-	uint previousWind;   // low 16: previous wind displacement as f16; high 16: packed RGB565 blade colour
+	uint previousWind;   // low 16: previous wind displacement or Mid collision Z; high 16: blade colour and bend
 	uint hashClumpAndGrassType;
-	uint clumpDensity;  // low 16: clump density (f16); high 16: randBend (f16), the blade's precomputed bend amount
-	uint tipDir;        // (sin, cos) of the blade tilt as 2x f16; precomputed in the generator so the VS skips the pcg hash + sincos
+	uint tipDir;
 #	if defined(HIGH_LOD)
 	uint skylightingSH0;  // x/y as f16
 	uint skylightingSH1;  // z/w as f16
 #	endif
 #	if defined(PGRASS_CACHED_COLLISION)
-	uint3 collisionData;  // current.xyz + previous.xyz packed as six f16 values
+#	if defined(MID_LOD)
+	uint collisionData;  // current x and y as f16, with current z in previousWind
+#	else
+	uint3 collisionData;  // current.xyz and previous.xyz packed as six f16 values
+#	endif
 #	endif
 };
 #endif

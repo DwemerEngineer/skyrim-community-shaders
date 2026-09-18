@@ -70,33 +70,43 @@ void GrassCellCache::BeginFrame(RE::TESWorldSpace* landWorldSpace)
 	ready.clear();
 	lastTouched.clear();
 	pending.clear();
+	++readyVersion;
 	{
 		std::scoped_lock lock(completedMutex);
 		completed.clear();
 	}
 }
 
-void GrassCellCache::DrainCompleted()
+void GrassCellCache::DrainCompleted(const size_t maxCount)
 {
 	std::vector<std::tuple<uint64_t, uint64_t, std::unique_ptr<CellGrass>>> drained;
 	{
 		std::scoped_lock lock(completedMutex);
-		drained.swap(completed);
+		const size_t count = std::min(maxCount, completed.size());
+		drained.reserve(count);
+		for (size_t i = 0; i < count; ++i) {
+			drained.emplace_back(std::move(completed.front()));
+			completed.pop_front();
+		}
 	}
 
 	const uint64_t gen = generation.load(std::memory_order_relaxed);
+	bool changed = false;
 	for (auto& [key, taskGen, data] : drained) {
-		pending.erase(key);
 		if (taskGen != gen)
 			continue;  // read belongs to a previous worldspace
+		pending.erase(key);
 		for (auto& cacheVersion : data->quadrantCacheVersions)
 			cacheVersion = nextCacheVersion++;
 		lastTouched[key] = frame;
 		ready[key] = std::move(data);
+		changed = true;
 	}
+	if (changed)
+		++readyVersion;
 }
 
-const CellGrass* GrassCellCache::GetOrRequest(int32_t cellX, int32_t cellY)
+const CellGrass* GrassCellCache::Get(int32_t cellX, int32_t cellY)
 {
 	const uint64_t key = PGrassCommon::GrassCellKey(cellX, cellY);
 
@@ -105,8 +115,14 @@ const CellGrass* GrassCellCache::GetOrRequest(int32_t cellX, int32_t cellY)
 		return it->second.get();
 	}
 
-	if (!worldSpace || !files || !pool || pending.contains(key))
-		return nullptr;
+	return nullptr;
+}
+
+bool GrassCellCache::Request(int32_t cellX, int32_t cellY)
+{
+	const uint64_t key = PGrassCommon::GrassCellKey(cellX, cellY);
+	if (ready.contains(key) || !worldSpace || !files || !pool || pending.contains(key))
+		return false;
 
 	pending.insert(key);
 	const uint64_t gen = generation.load(std::memory_order_relaxed);
@@ -119,7 +135,7 @@ const CellGrass* GrassCellCache::GetOrRequest(int32_t cellX, int32_t cellY)
 		completed.emplace_back(key, gen, std::move(data));
 	});
 
-	return nullptr;
+	return true;
 }
 
 void GrassCellCache::EvictUntouched()
@@ -137,13 +153,17 @@ void GrassCellCache::EvictUntouched()
 	std::ranges::sort(byAge);  // oldest first
 
 	const size_t toRemove = ready.size() - kMaxCachedCells;
+	bool changed = false;
 	for (size_t i = 0; i < toRemove; ++i) {
 		if (byAge[i].first == frame)
 			break;  // never evict a cell requested this frame - its pointers are live in quadrantsFarLOD
 
 		ready.erase(byAge[i].second);
 		lastTouched.erase(byAge[i].second);
+		changed = true;
 	}
+	if (changed)
+		++readyVersion;
 }
 
 void GrassCellCache::Shutdown()
@@ -308,5 +328,6 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out)
 			out.minHeights[quad] = *minIt;
 			out.maxHeights[quad] = *maxIt;
 		}
+		out.occupancy[quad] = PGrassCommon::BuildQuadrantOccupancy(out.ids[quad].data());
 	}
 }

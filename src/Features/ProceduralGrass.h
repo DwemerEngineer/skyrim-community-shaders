@@ -36,7 +36,7 @@ public:
 		float rotationalStiffness = 1.0f;
 		float ao = 0.10f;  // Minimum blade AO
 		float specular = 0.15f;
-		float2 subsurfaceOpacity = float2(0.6f, 0.30f);            // Base to tip
+		float2 subsurfaceOpacity = float2(0.5f, 0.20f);            // Base to tip
 		float3 grassSubsurfaceTint = float3(1.50f, 1.00f, 0.60f);  // Backlight tint
 		float3 baseMinTipRoughness = float3(0.55f, 0.45f, 0.55f);
 		float tipRoughnessStart = 0.75f;
@@ -56,12 +56,12 @@ public:
 		// Detail and lighting
 		float grassBaseAO = 0.35f;
 		float grassClumpColorStrength = 0.6f;
-		float grassMicroDetail = 0.5f;
+
 		float grassAmbientFlatten = 0.7f;
 		float grassCanopySkyOcclusion = 0.0f;
 		float grassDensityAO = 0.2f;
 		float grassWrap = 1.0f;
-		float grassAniso = 0.15f;
+
 		float grassBounceStrength = 0.35f;
 		float3 grassBounceColor = float3(0.55f, 0.42f, 0.24f);
 		float grassSunSelfShadow = 0.0f;
@@ -189,13 +189,26 @@ private:
 	std::vector<PGrassCommon::Quadrant> quadrantsLowLOD;
 	std::vector<PGrassCommon::Quadrant> quadrantsFarLOD;
 	std::vector<PGrassCommon::Quadrant> quadrantsPresence;
+	uint64_t quadrantsHighVersion = 1;
+	uint64_t quadrantsMidVersion = 1;
+	uint64_t quadrantsLowVersion = 1;
+	uint64_t quadrantsFarVersion = 1;
+	uint64_t nearVisibleStamp = (std::numeric_limits<uint64_t>::max)();
+	uint64_t farVisibleStamp = (std::numeric_limits<uint64_t>::max)();
+	std::array<bool, PGrassCommon::LowTierQuadrantCap> nearCoveredQuadrants{};
 
 	bool vanillaToggled = false;
 
 	// Far reads LAND data on workers. Near tiers use loaded cell LAND data.
 	GrassCellCache grassCellCache;
+	size_t farRequestCursor = 0;
+	int32_t farRequestCenterX = (std::numeric_limits<int32_t>::min)();
+	int32_t farRequestCenterY = (std::numeric_limits<int32_t>::min)();
+	int32_t farRequestRadius = -1;
+	RE::TESWorldSpace* farRequestWorldSpace = nullptr;
 
 	ID3D11RasterizerState* noCullRS = nullptr;
+	ID3D11RasterizerState* noCullScissorRS = nullptr;
 	ID3D11DepthStencilState* depthOnDSS = nullptr;
 	ID3D11DepthStencilState* depthWriteDS = nullptr;
 	ID3D11DepthStencilState* depthEqualDS = nullptr;
@@ -207,12 +220,12 @@ private:
 
 	// Top-down grass density and the terrain-darkening pass.
 	Texture2D* grassDensityTexture = nullptr;
+	Texture2D* grassMaterialDetailTexture = nullptr;
 	Texture2D* distantAmbientLUT = nullptr;
 	mutable ID3D11ComputeShader* distantAmbientLUTCS = nullptr;
 	mutable uint32_t distantAmbientLUTFrame = UINT32_MAX;
 	ID3D11VertexShader* densityAOVS = nullptr;
 	ID3D11PixelShader* densityAOPS = nullptr;
-	/** @brief Restricts High depth writes to the fully opaque portion above the terrain fade. */
 	ID3D11PixelShader* depthClipPS = nullptr;
 	static constexpr uint32_t grassDensityDim = 256;
 	static constexpr uint32_t distantAmbientLUTDim = 32;
@@ -229,6 +242,7 @@ private:
 	mutable bool grassPresenceUploadDirty = true;
 
 	ID3D11SamplerState* linearClampSampler = nullptr;
+	ID3D11SamplerState* grassDetailSampler = nullptr;
 	ID3D11SamplerState* shadowSampler = nullptr;
 
 	ConstantBuffer* grassGlobalsCB = nullptr;
@@ -240,6 +254,7 @@ private:
 	bool resolvedTypeColorsLinear = false;
 	float resolvedTypeColorGamma = 1.0f;
 	Buffer* vertexIndicesHighBuffer = nullptr;
+	Buffer* vertexIndicesHighOuterBuffer = nullptr;
 	Buffer* vertexIndicesMidBuffer = nullptr;  // 9-index, five-vertex Mid blade
 	Buffer* vertexIndicesLowBuffer = nullptr;
 	Buffer* vertexIndicesFarBuffer = nullptr;  // 3-index single-triangle far blade
@@ -249,6 +264,7 @@ private:
 	{
 		uint64_t cacheVersion = 0;
 		std::array<uint8_t, PGrassCommon::QuadrantGrassSamples> ids{};
+		PGrassCommon::QuadrantOccupancy occupancy{};
 		/** @brief World Z per LAND vertex. All values are QuadrantNoHeight when unavailable. */
 		std::array<float, PGrassCommon::QuadrantGrassSamples> heights{};
 		float minHeight = PGrassCommon::QuadrantNoHeight;
@@ -267,6 +283,7 @@ private:
 	std::unordered_map<uint64_t, LoadedCellGrass> grassMapCache;
 	uint64_t grassMapFrame = 0;
 	uint64_t nextGrassCacheVersion = 1;
+	uint64_t grassMapCacheVersion = 1;
 
 	float2 windDirection = float2(1.0f, 0.0f);
 	float2 previousWindDirection = float2(1.0f, 0.0f);
@@ -303,6 +320,7 @@ private:
 	 * @return The cache entry, stable until eviction.
 	 */
 	const LoadedCellGrass& GetCellCache(RE::TESObjectLAND* land, int32_t cellX, int32_t cellY, uint32_t debugQuadIndex);
+	void ClearGrassMapCache();
 
 	/** @brief Evicts the oldest inactive LAND cells over the cache limit. */
 	void EvictGrassMapCache();
@@ -318,6 +336,7 @@ private:
 
 	/** @brief Builds a GPU GrassType from base settings and sparse JSON overrides. */
 	PGrassCommon::GrassType ResolveGrassType(const nlohmann::json& typeOverride) const;
+	void UpdateGrassMaterialDetailTexture();
 
 	/** @brief Returns the stable settings key for a land texture. */
 	static std::string LandTextureKey(const RE::TESLandTexture* tex);
