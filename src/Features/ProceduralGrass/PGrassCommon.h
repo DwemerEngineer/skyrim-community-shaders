@@ -99,6 +99,7 @@ namespace PGrassCommon
 	static constexpr int32_t HighTierQuadrantRadius = 2;
 	static constexpr int32_t MidTierQuadrantRadius = 4;  // Extend Mid this far to avoid popping when the player moves between Mid and Low tiers.
 	static constexpr int32_t LowTierQuadrantRadius = 5;  // Low overlaps Far across their radial transition band.
+	static constexpr int32_t FarCellRadiusCap = 15;      // Maximum total streamed cell radius that fits in the Far quadrant buffer.
 
 	// Quadrants in an md<=r square (r in each of x and y), one per tier's renderer buffer.
 	constexpr uint32_t QuadrantSquare(int32_t r) { return static_cast<uint32_t>((2 * r + 1) * (2 * r + 1)); }

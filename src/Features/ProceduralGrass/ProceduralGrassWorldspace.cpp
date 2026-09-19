@@ -305,6 +305,22 @@ void ProceduralGrass::GetVisibleQuadrants()
 		}
 	}
 
+	// Cached LAND fills Low's outer ring when Skyrim unloads a nearby cell before it leaves Low range.
+	const int32_t lowCellRadius = (PGrassCommon::LowTierQuadrantRadius + 1) / 2;
+	for (int32_t cy = playerCellY - lowCellRadius; cy <= playerCellY + lowCellRadius; ++cy) {
+		for (int32_t cx = playerCellX - lowCellRadius; cx <= playerCellX + lowCellRadius; ++cx) {
+			const CellGrass* cellGrass = grassCellCache.Get(cx, cy);
+			PGrassCommon::GrassHashValue(currentNearStamp, PGrassCommon::GrassCellKey(cx, cy));
+			if (!cellGrass) {
+				PGrassCommon::GrassHashValue(currentNearStamp, uint64_t{ 0 });
+				continue;
+			}
+
+			for (const auto cacheVersion : cellGrass->quadrantCacheVersions)
+				PGrassCommon::GrassHashValue(currentNearStamp, cacheVersion);
+		}
+	}
+
 	auto quadrant = PGrassCommon::Quadrant{};
 	const bool rebuildNear = currentNearStamp != nearVisibleStamp;
 	if (rebuildNear) {
@@ -383,6 +399,45 @@ void ProceduralGrass::GetVisibleQuadrants()
 			}
 		}
 
+		for (int32_t cy = playerCellY - lowCellRadius; cy <= playerCellY + lowCellRadius; ++cy) {
+			for (int32_t cx = playerCellX - lowCellRadius; cx <= playerCellX + lowCellRadius; ++cx) {
+				const CellGrass* cellGrass = grassCellCache.Get(cx, cy);
+				if (!cellGrass)
+					continue;
+
+				for (uint32_t j = 0; j < 4; ++j) {
+					const int32_t worldQuadrantX = cx * 2 + static_cast<int32_t>(j % 2);
+					const int32_t worldQuadrantY = cy * 2 + static_cast<int32_t>(j / 2);
+					const int32_t md = std::max(std::abs(playerQuadrantX - worldQuadrantX), std::abs(playerQuadrantY - worldQuadrantY));
+					if (md < PGrassCommon::MidTierQuadrantRadius - 1 || md > PGrassCommon::LowTierQuadrantRadius)
+						continue;
+
+					const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + PGrassCommon::LowTierQuadrantRadius);
+					const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + PGrassCommon::LowTierQuadrantRadius);
+					const uint32_t coverageIndex = coverageY * nearCoverageDiameter + coverageX;
+					if (nearCoveredQuadrants[coverageIndex])
+						continue;
+
+					quadrant.cellX = cx;
+					quadrant.cellY = cy;
+					quadrant.x = j % 2;
+					quadrant.y = j / 2;
+					quadrant.nearCovered = true;
+					quadrant.cacheVersion = cellGrass->quadrantCacheVersions[j];
+					quadrant.grassIds = cellGrass->ids[j].data();
+					quadrant.occupancyRows = cellGrass->occupancy[j].data();
+					quadrant.heights = cellGrass->heights[j].data();
+					quadrant.worldPos = float2{ worldQuadrantX * 2048.0f, worldQuadrantY * 2048.0f };
+					quadrant.minHeight = cellGrass->minHeights[j];
+					quadrant.maxHeight = cellGrass->maxHeights[j];
+
+					nearCoveredQuadrants[coverageIndex] = true;
+					quadrantsLowLOD.push_back(quadrant);
+					quadrantsPresence.push_back(quadrant);
+				}
+			}
+		}
+
 		++quadrantsHighVersion;
 		++quadrantsMidVersion;
 		++quadrantsLowVersion;
@@ -450,14 +505,18 @@ void ProceduralGrass::GetVisibleQuadrants()
 
 	// Stream Far LAND data with bounded request work and rebuild its quadrant list only when the cache changes.
 	if (landWorldSpace) {
-		const int32_t radius = std::clamp(settings.grassCellRadius, 0, 15);
+		const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
+		const int32_t loadedGridLength = farGridCells ? farGridCells->length : 5;
+		const int32_t loadedCellRadius = loadedGridLength / 2;
+		const int32_t extraRadius = std::clamp(settings.grassCellRadius, 0, std::max(0, PGrassCommon::FarCellRadiusCap - loadedCellRadius));
+		const int32_t radius = loadedCellRadius + extraRadius;
 		const auto& cameraPosAdjust = globals::game::frameBufferCached.GetCameraPosAdjust();
 
 		static const std::vector<std::pair<int32_t, int32_t>> farRequestOffsets = [] {
 			std::vector<std::pair<int32_t, int32_t>> offsets;
-			offsets.reserve(31u * 31u);
+			offsets.reserve(static_cast<size_t>((PGrassCommon::FarCellRadiusCap * 2 + 1) * (PGrassCommon::FarCellRadiusCap * 2 + 1)));
 			offsets.emplace_back(0, 0);
-			for (int32_t ring = 1; ring <= 15; ++ring)
+			for (int32_t ring = 1; ring <= PGrassCommon::FarCellRadiusCap; ++ring)
 				for (int32_t y = -ring; y <= ring; ++y)
 					for (int32_t x = -ring; x <= ring; ++x)
 						if (std::max(std::abs(x), std::abs(y)) == ring)

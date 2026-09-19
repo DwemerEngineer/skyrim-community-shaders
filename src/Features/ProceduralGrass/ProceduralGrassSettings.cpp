@@ -357,7 +357,10 @@ void ProceduralGrass::DrawSettings()
 		}
 		DrawSettingDescription(T("feature.procedural_grass.low_density_tooltip", "Sets blade density in the low-detail grass tier and scales far-tier density."));
 
-		if (ImGui::SliderInt(T("feature.procedural_grass.far_radius", "Far Grass Radius (cells)"), &settings.grassCellRadius, 0, 15, "%d", ImGuiSliderFlags_AlwaysClamp))
+		const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
+		const int32_t loadedGridLength = farGridCells ? farGridCells->length : 5;
+		const int32_t maxFarExtraRadius = std::max(0, PGrassCommon::FarCellRadiusCap - loadedGridLength / 2);
+		if (ImGui::SliderInt(T("feature.procedural_grass.far_radius", "Far Grass Radius (cells)"), &settings.grassCellRadius, 0, maxFarExtraRadius, "%d", ImGuiSliderFlags_AlwaysClamp))
 			grassRendererFarLOD->ResetBladeCapacity();
 		DrawSettingDescription(T("feature.procedural_grass.far_radius_tooltip", "Sets how many exterior cells beyond loaded grass receive the far grass tier."));
 		if (ImGui::SliderInt(T("feature.procedural_grass.far_density", "Far Grass Density"), &settings.farGrassDensity, 8, 160, "%d", ImGuiSliderFlags_AlwaysClamp))

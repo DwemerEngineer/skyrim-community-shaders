@@ -29,7 +29,7 @@ public:
 
 		// Blade shape and material
 		float grassHeight = 100.0f;
-		float grassWidth = 0.7f;
+		float grassWidth = 0.6f;
 		float stiffness = 0.24f;
 		float tipWeight = 0.54f;
 		float mid = 0.73f;

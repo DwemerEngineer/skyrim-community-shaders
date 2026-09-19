@@ -873,8 +873,11 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	grassGlobals.grassFrameLight = float4(resolvedDirLightColor.x, resolvedDirLightColor.y, resolvedDirLightColor.z, grassLightingScale);
 
 	const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
-	const float farStart = (farGridCells ? farGridCells->length : 5) * 2048.0f;  // Loaded-grid half extent
-	const float farEnd = std::max(farStart + 4096.0f, settings.grassCellRadius * 4096.0f);
+	const int32_t loadedGridLength = farGridCells ? farGridCells->length : 5;
+	const int32_t loadedCellRadius = loadedGridLength / 2;
+	const int32_t farExtraCells = std::clamp(settings.grassCellRadius, 0, std::max(0, PGrassCommon::FarCellRadiusCap - loadedCellRadius));
+	const float farStart = loadedGridLength * 2048.0f;  // Loaded-grid half extent
+	const float farEnd = farStart + std::max(farExtraCells, 1) * 4096.0f;
 	grassGlobals.farParams = float4(farStart, 1.0f / (farEnd - farStart), 2048.0f / static_cast<float>(FarPatchDensity()), FarPerformanceKeep);
 
 	previousShaderTimer = shaderTimer;
@@ -1004,7 +1007,12 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx) const
 
 	const float lowToFar = (LowTierQuadrantRadius - 1) * quad;
 	const float gridEdge = LowTierQuadrantRadius * quad;
-	const float radiusEdge = std::max(gridEdge + quad, settings.grassCellRadius * 4096.0f);
+	const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
+	const int32_t loadedGridLength = farGridCells ? farGridCells->length : 5;
+	const int32_t loadedCellRadius = loadedGridLength / 2;
+	const int32_t farExtraCells = std::clamp(settings.grassCellRadius, 0, std::max(0, PGrassCommon::FarCellRadiusCap - loadedCellRadius));
+	const float farStart = loadedGridLength * 2048.0f;
+	const float radiusEdge = farStart + std::max(farExtraCells, 1) * 4096.0f;
 	const float4 noFadeIn = float4(0.0f, 1.0e9f, 0.0f, 0.0f);
 	const float farPatchDensity = static_cast<float>(FarPatchDensity());
 	// Match Low's candidate count across the Low/Far cross-fade.
@@ -1237,8 +1245,11 @@ void ProceduralGrass::DarkenTerrainUnderGrass() const
 	if (noCullScissorRS && heightMap->IsReady()) {
 		const auto zRange = heightMap->GetZRange();
 		const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
-		const float farStart = (farGridCells ? farGridCells->length : 5) * 2048.0f;
-		const float farEnd = std::max(farStart + 4096.0f, settings.grassCellRadius * 4096.0f);
+		const int32_t loadedGridLength = farGridCells ? farGridCells->length : 5;
+		const int32_t loadedCellRadius = loadedGridLength / 2;
+		const int32_t farExtraCells = std::clamp(settings.grassCellRadius, 0, std::max(0, PGrassCommon::FarCellRadiusCap - loadedCellRadius));
+		const float farStart = loadedGridLength * 2048.0f;
+		const float farEnd = farStart + std::max(farExtraCells, 1) * 4096.0f;
 		const auto centre = globals::topDownOcclusion->GetWindowCentre();
 		const float minZ = std::min(zRange.x, zRange.y) - 256.0f;
 		const float maxZ = std::max(zRange.x, zRange.y) + std::max(settings.grassHeight, 256.0f);
