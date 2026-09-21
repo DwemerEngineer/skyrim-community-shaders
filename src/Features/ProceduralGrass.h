@@ -36,8 +36,11 @@ public:
 		float rotationalStiffness = 1.0f;
 		float ao = 0.10f;  // Minimum blade AO
 		float specular = 0.15f;
-		float2 subsurfaceOpacity = float2(0.5f, 0.20f);            // Base to tip
-		float3 grassSubsurfaceTint = float3(1.50f, 1.00f, 0.60f);  // Backlight tint
+		float waxSheenStrength = 0.08f;
+		float waxRoughnessMultiplier = 1.0f;
+		float curvedNormalStrength = 0.4f;
+		float2 subsurfaceOpacity = float2(0.8f, 0.60f);            // Base to tip
+		float3 grassSubsurfaceTint = float3(0.80f, 1.00f, 0.60f);  // Backlight tint
 		float3 baseMinTipRoughness = float3(0.55f, 0.45f, 0.55f);
 		float tipRoughnessStart = 0.75f;
 		float clumpAOStrength = 0.5f;

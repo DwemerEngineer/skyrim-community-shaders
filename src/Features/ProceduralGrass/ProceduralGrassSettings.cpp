@@ -281,6 +281,12 @@ void ProceduralGrass::DrawSettings()
 		DrawSettingDescription(T("feature.procedural_grass.subsurface_color_tooltip", "Tints light transmitted through blades."));
 		ImGui::SliderFloat(T("feature.procedural_grass.specular", "Specular"), &settings.specular, 0.0f, 1.0f, "%.2f");
 		DrawSettingDescription(T("feature.procedural_grass.specular_tooltip", "Controls the strength of blade highlights."));
+		ImGui::SliderFloat(T("feature.procedural_grass.wax_sheen_strength", "Wax Sheen Strength"), &settings.waxSheenStrength, 0.0f, 1.0f, "%.2f");
+		DrawSettingDescription(T("feature.procedural_grass.wax_sheen_strength_tooltip", "Controls the strength of the broad waxy blade highlight."));
+		ImGui::SliderFloat(T("feature.procedural_grass.wax_roughness_multiplier", "Wax Roughness Multiplier"), &settings.waxRoughnessMultiplier, 0.0f, 2.0f, "%.2f");
+		DrawSettingDescription(T("feature.procedural_grass.wax_roughness_multiplier_tooltip", "Scales the blade roughness used by the wax sheen."));
+		ImGui::SliderFloat(T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), &settings.curvedNormalStrength, 0.0f, 1.0f, "%.2f");
+		DrawSettingDescription(T("feature.procedural_grass.curved_normal_strength_tooltip", "Controls how strongly blade normals curve toward the edges."));
 		ImGui::SliderFloat3(T("feature.procedural_grass.roughness", "Roughness (Base>Min>Tip)"), reinterpret_cast<float*>(&settings.baseMinTipRoughness), 0.0f, 1.0f, "%.2f");
 		DrawSettingDescription(T("feature.procedural_grass.roughness_tooltip", "Sets roughness at the blade base, minimum point, and tip."));
 		// Kept off 0 and 1 so neither smoothstep in the vertex shader collapses to a zero-width range.
@@ -559,6 +565,9 @@ void ProceduralGrass::DrawGrassTypeEditor()
 		ImGui::SeparatorText(T("feature.procedural_grass.lighting_section", "Lighting"));
 		fFloat(ov, "MinAO", T("feature.procedural_grass.baked_min_ao", "Baked Min AO"), s.ao, 0.0f, 1.0f);
 		fFloat(ov, "Specular", T("feature.procedural_grass.specular", "Specular"), s.specular, 0.0f, 1.0f);
+		fFloat(ov, "WaxSheenStrength", T("feature.procedural_grass.wax_sheen_strength", "Wax Sheen Strength"), s.waxSheenStrength, 0.0f, 1.0f);
+		fFloat(ov, "WaxRoughnessMultiplier", T("feature.procedural_grass.wax_roughness_multiplier", "Wax Roughness Multiplier"), s.waxRoughnessMultiplier, 0.0f, 2.0f);
+		fFloat(ov, "CurvedNormalStrength", T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), s.curvedNormalStrength, 0.0f, 1.0f);
 		fFloat2(ov, "SubsurfaceOpacity", T("feature.procedural_grass.subsurface_base_tip", "Subsurface (Base>Tip)"), s.subsurfaceOpacity, 0.0f, 1.0f);
 		fFloat3(ov, "SubsurfaceTint", T("feature.procedural_grass.subsurface_color", "Subsurface Color"), s.grassSubsurfaceTint, 0.0f, 2.0f, false);
 		fFloat3(ov, "BaseMinTipRoughness", T("feature.procedural_grass.roughness", "Roughness (Base>Min>Tip)"), s.baseMinTipRoughness, 0.0f, 1.0f, false);
@@ -731,6 +740,9 @@ void ProceduralGrass::LoadSettings(json& o_json)
 	settings.rotationalStiffness = o_json.value("RotationalStiffness", settings.rotationalStiffness);
 	settings.ao = o_json.value("BakedMinAO", settings.ao);
 	settings.specular = o_json.value("Specular", settings.specular);
+	settings.waxSheenStrength = o_json.value("WaxSheenStrength", settings.waxSheenStrength);
+	settings.waxRoughnessMultiplier = o_json.value("WaxRoughnessMultiplier", settings.waxRoughnessMultiplier);
+	settings.curvedNormalStrength = o_json.value("CurvedNormalStrength", settings.curvedNormalStrength);
 	settings.subsurfaceOpacity = o_json.value("SubsurfaceOpacity", settings.subsurfaceOpacity);
 	settings.grassSubsurfaceTint = o_json.value("SubsurfaceTint", settings.grassSubsurfaceTint);
 	settings.baseMinTipRoughness = o_json.value("Roughness", settings.baseMinTipRoughness);
@@ -854,6 +866,9 @@ void ProceduralGrass::SaveSettings(json& o_json)
 	o_json["RotationalStiffness"] = settings.rotationalStiffness;
 	o_json["BakedMinAO"] = settings.ao;
 	o_json["Specular"] = settings.specular;
+	o_json["WaxSheenStrength"] = settings.waxSheenStrength;
+	o_json["WaxRoughnessMultiplier"] = settings.waxRoughnessMultiplier;
+	o_json["CurvedNormalStrength"] = settings.curvedNormalStrength;
 	o_json["SubsurfaceOpacity"] = settings.subsurfaceOpacity;
 	o_json["SubsurfaceTint"] = settings.grassSubsurfaceTint;
 	o_json["Roughness"] = settings.baseMinTipRoughness;

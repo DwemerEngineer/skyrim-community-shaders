@@ -570,7 +570,11 @@ PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& 
 	t.specular = ov.value("Specular", s.specular);
 	t.minMaxSubsurfaceOpacity = ov.value("SubsurfaceOpacity", s.subsurfaceOpacity);
 	t.grassSubsurfaceColor = packColor(ov.value("SubsurfaceTint", s.grassSubsurfaceTint));
-	t.grassSurfParams = float4(0.0f, ov.value("AmbientFlatten", s.grassAmbientFlatten), ov.value("Wrap", s.grassWrap), 0.0f);
+	t.grassSurfParams = float4(
+		ov.value("WaxSheenStrength", s.waxSheenStrength),
+		ov.value("AmbientFlatten", s.grassAmbientFlatten),
+		ov.value("Wrap", s.grassWrap),
+		ov.value("WaxRoughnessMultiplier", s.waxRoughnessMultiplier));
 	const float3 rough = ov.value("BaseMinTipRoughness", s.baseMinTipRoughness);
 	const float roughnessStart = ov.value("TipRoughnessStart", s.tipRoughnessStart);
 	t.baseMinTipRoughnessStart = float4(rough.x, rough.y, rough.z, roughnessStart);
@@ -615,7 +619,7 @@ PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& 
 		ov.value("VeinNormalStrength", s.grassVeinNormalStrength),
 		ov.value("VeinRippleDepth", s.grassVeinRippleDepth),
 		ov.value("VeinWiggleAmount", s.grassVeinWiggleAmount),
-		0.0f);
+		ov.value("CurvedNormalStrength", s.curvedNormalStrength));
 
 	return t;
 }
@@ -943,7 +947,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 			maxHeight = std::max(maxHeight, source.height);
 			const float baseWidth = source.width * 2.5f * 1.3f;
 			maxNearWidth = std::max(maxNearWidth, baseWidth * 2.0f);  // Low is the widest near tier.
-			maxFarWidth = std::max(maxFarWidth, baseWidth * 32.0f);
+			maxFarWidth = std::max(maxFarWidth, baseWidth * 32.0f * 1.6f);  // Match the maximum Far blade widening in the shader.
 		}
 
 		grassTypesArrayCB->Update(resolvedGrassTypes);

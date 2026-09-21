@@ -216,7 +216,7 @@ namespace PGrassCommon
 		float specular;
 
 		float2 minMaxSubsurfaceOpacity;
-		float4 grassSurfParams;           // y: ambient normal flatten, z: wrap amount
+		float4 grassSurfParams;           // x: wax sheen strength, y: ambient normal flatten, z: wrap amount, w: wax roughness multiplier
 		float4 baseMinTipRoughnessStart;  // roughness at the base, at the smoothest point, and at the tip and t at which roughness bottoms out and starts climbing to the tip
 		float4 midRoughnessPolynomial;    // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}
 		float4 grassTypeLightParams;      // x: ground bounce, y: sky translucency, z: specular occlusion, w: ambient desaturation
@@ -230,7 +230,7 @@ namespace PGrassCommon
 		float4 grassBounceColor;
 		float4 grassTextureParams;    // x: blotch strength, y: blotch scale, z: speckle strength, w: speckle scale
 		float4 grassVeinParams;       // rgb: vein albedo tint, w: vein albedo strength
-		float4 grassVeinParams2;      // x: vein normal strength, y: ripple depth, z: micro-wiggle amount
+		float4 grassVeinParams2;      // x: vein normal strength, y: ripple depth, z: micro-wiggle amount, w: curved normal strength
 		float4 grassSubsurfaceColor;  // rgb: subsurface/translucency tint
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassType);

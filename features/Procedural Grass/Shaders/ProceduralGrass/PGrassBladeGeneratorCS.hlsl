@@ -243,12 +243,12 @@ float TerrainHeightSlopeAt(out float2 slope, float2 world2D, float2 quadWorldPos
 Texture2D<float> OcclusionMaskHigh : register(t2);
 Texture2D<float> OcclusionMaskLow : register(t4);
 
-bool IsOccludedByObject(float3 worldPos)
+float GetObjectClearance(float3 worldPos)
 {
 	float2 uv = (worldPos.xy - occlusionParams.xy) * occlusionInvExtent + 0.5f;
 
 	if (saturate(uv.x) != uv.x || saturate(uv.y) != uv.y)
-		return false;
+		return 1.0e30f;
 
 	// TopDownOcclusion includes world-space padding, so a centre sample needs no additional footprint.
 	uint width, height;
@@ -257,10 +257,11 @@ bool IsOccludedByObject(float3 worldPos)
 	float highest = OcclusionMaskHigh.Load(int3(texel, 0));  // Empty texels hold -1e30 in the maximum map.
 
 	if (highest <= worldPos.z + occlusionParams.w)
-		return false;
+		return 1.0e30f;
 
 	float lowest = OcclusionMaskLow.Load(int3(texel, 0));  // Empty texels hold +1e30 in the minimum map.
-	return lowest < worldPos.z + occlusionParams.z;
+	float clearance = lowest - worldPos.z;
+	return clearance < occlusionParams.z ? clearance : 1.0e30f;
 }
 
 void ComputeClump(out uint clumpRand, out float clumpDist, out float2 clumpDir, float2 worldPos, float gridSize, float inverseGridSize)
@@ -348,8 +349,6 @@ bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar
 #if defined(FAR_LOD)
 	if (!cullsDisabled) {
 		lodDistance = length(bladeWorldPos2D - grassLodOrigin);
-		// Cross-fade only where a loaded tier supplies complementary blades. Retain sparse Far coverage
-		// through Mid's outer range so candidate rejection cannot expose a gap.
 		float inRamp = 1.0f;
 		if (nearCovered) {
 			float handoffRamp = saturate((lodDistance - lodFadeIn.x) * lodFadeIn.y);
@@ -428,7 +427,7 @@ float CalculateWindAdjustedAngle(float clumpedAngle, float2 direction, float ang
 
 // Finish one base or slope-fill candidate after establishing its terrain plane.
 bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D, float bladeWorldZ, float2 terrainSlope, float3 terrainNormal,
-	uint packedGrassCell, bool cullsDisabled, bool insideFrustum, float preCulledDist, out Blade b, out bool outerGeometry)
+	float2 quadWorldPos, uint quadrant, bool hasLand, uint packedGrassCell, bool cullsDisabled, bool insideFrustum, float preCulledDist, out Blade b, out bool outerGeometry)
 {
 	b = (Blade)0;
 	outerGeometry = false;
@@ -439,7 +438,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float3 worldPos = float3(bladeWorldPos2D, bladeWorldZ);
 	float3 viewPos = worldPos - FrameBuffer::CameraPosAdjust.xyz;
 
-#if !defined(FAR_LOD)
+#if !defined(LOW_LOD) && !defined(FAR_LOD)
 	float lodDistance = preCulledDist;
 #endif
 
@@ -453,17 +452,6 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	}
 #endif
 
-	if (!insideFrustum) {
-		static const float MAX_GRASS_HEIGHT = 150.0f;
-		float4 clip = mul(FrameBuffer::CameraViewProjUnjittered, float4(viewPos, 1));
-		float extraHeight = MAX_GRASS_HEIGHT * 2.0f;
-		float padX = cameraViewRow0Sum * extraHeight;
-		float padY = cameraViewRow1Sum * extraHeight;
-		bool outsideFrustum = clip.x < -(clip.w + padX) || clip.x > clip.w + padX || clip.y < -(clip.w + padY) || clip.y > clip.w + padY;
-		if (outsideFrustum && !cullsDisabled)
-			return false;
-	}
-
 	// Fetch the grass type after culling to avoid the four-sample lookup for rejected blades.
 	uint type;
 	ComputeGrassType(type, packedGrassCell, mapSamplePos, typeRandom);
@@ -472,8 +460,10 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	type = max(type, 1u);
 
 	GrassGeneratorType generatorType = generatorGrassType[type];
+#if !defined(LOW_LOD) || defined(FAR_LOD)
 	if (!cullsDisabled && (terrainNormal.z < generatorType.maxSlope || terrainNormal.z > generatorType.minSlope))
 		return false;
+#endif
 
 	// Delay the nine-cell clump search until after the inexpensive rejection tests.
 	uint clumpRand;
@@ -492,12 +482,41 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float clumpPull = lerp(0.025f, 0.225f, clumpDistRand);
 	float2 clumpDisplace = clumpDir * clumpDist * clumpPull * generatorType.clumpDistanceFactor;
 	bladeWorldPos2D += clumpDisplace;
+#if defined(LOW_LOD)
+	// The larger Low LOD displacement can cross enough terrain for the original tangent plane to become inaccurate.
+	bladeWorldZ = TerrainHeightSlopeAt(terrainSlope, bladeWorldPos2D, quadWorldPos, quadrant, hasLand);
+	terrainNormal = normalize(float3(-terrainSlope.x, -terrainSlope.y, 1.0f));
+	if (!cullsDisabled && (terrainNormal.z < generatorType.maxSlope || terrainNormal.z > generatorType.minSlope))
+		return false;
+#else
 	bladeWorldZ += dot(terrainSlope, clumpDisplace);
+#endif
 	worldPos = float3(bladeWorldPos2D, bladeWorldZ);
 	viewPos = worldPos - FrameBuffer::CameraPosAdjust.xyz;
 #endif
 
-#if !defined(FAR_LOD)
+	if (!insideFrustum) {
+		// A root outside the frustum can still produce visible blade geometry near the edge.
+		float widthExtent = generatorType.width * 2.5f * 1.3f;
+#if defined(FAR_LOD)
+		widthExtent *= 32.0f * 1.6f;
+#elif defined(LOW_LOD)
+		widthExtent *= 2.0f * (1.0f + miscParams.z);
+#elif defined(MID_LOD)
+		widthExtent *= 1.41421356f * (1.0f + miscParams.z);
+#else
+		widthExtent *= 1.0f + miscParams.z;
+#endif
+		float geometryExtent = generatorType.height + widthExtent;
+		float4 clip = mul(FrameBuffer::CameraViewProjUnjittered, float4(viewPos, 1.0f));
+		float padX = cameraViewRow0Sum * geometryExtent;
+		float padY = cameraViewRow1Sum * geometryExtent;
+		bool outsideFrustum = clip.x < -(clip.w + padX) || clip.x > clip.w + padX || clip.y < -(clip.w + padY) || clip.y > clip.w + padY;
+		if (outsideFrustum && !cullsDisabled)
+			return false;
+	}
+
+#if !defined(LOW_LOD) && !defined(FAR_LOD)
 	lodDistance = length(bladeWorldPos2D - grassLodOrigin);
 	if (!cullsDisabled) {
 		float inRamp = saturate((lodDistance - lodFadeIn.x) * lodFadeIn.y);
@@ -509,22 +528,27 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 		if ((inRamp < 1.0f && dither <= 1.0f - inRamp) || dither > outRamp)
 #elif defined(HIGH_LOD)
 		if (keep <= 0.0f || dither > keep)
-#else
-		// Mid keeps the lower values as it fades out. Low takes the adjacent range without overlap.
-		float lowRangeStart = 1.0f - inRamp;
-		if (keep <= 0.0f || dither <= lowRangeStart || dither > lowRangeStart + keep)
 #endif
 			return false;
 	}
 #endif
 
-	if (!cullsDisabled && IsOccludedByObject(worldPos))
-		return false;
+	float objectClearance = 1.0e30f;
+	if (!cullsDisabled) {
+		objectClearance = GetObjectClearance(worldPos);
+		// Preserve grass beneath overhangs when there is still vertical room for part of the blade.
+		if (objectClearance <= occlusionParams.w)
+			return false;
+	}
 
-	// Generate height after culling. The frustum test uses the maximum blade height.
+	// Height generation is deferred until after rejection because the frustum test uses type bounds.
 	float clumpHeightRandom = float(clumpRand) * UINT_TO_FLOAT;
 	float unscaledHeight = (0.45f + heightRand * 0.55f) - clumpHeightRandom * generatorType.clumpHeightFactor;
 	float randHeight = generatorType.height * unscaledHeight;
+	if (objectClearance < 1.0e29f) {
+		randHeight = min(randHeight, objectClearance - occlusionParams.w);
+		unscaledHeight = randHeight / max(generatorType.height, 1.0e-4f);
+	}
 
 	// Store the authored width variation. High also bakes its stable distance widening below.
 	float unscaledWidth = 1.0f;
@@ -974,11 +998,10 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 				continue;
 			candidatePreCulledDist = -1.0f;
 
-			// Use Far's reserved candidates to keep the Low/Far handoff density-neutral, then
-			// retire that seam fill smoothly. Steep terrain can retain candidates farther out.
-			float seamKeep = lodFadeIn.z * saturate((farParams.x + 4096.0f - candidateFarLodDistance) * (1.0f / 4096.0f));
-			float slopeKeep = baseSlopeKeep * saturate((farParams.x + 4096.0f - candidateFarLodDistance) * (1.0f / 4096.0f));
-			float extraKeep = saturate(seamKeep + slopeKeep);
+			// The reserved candidates cover both the Low/Far seam and steep terrain, but must respect Far's density floor.
+			float seamKeep = lodFadeIn.z;
+			float slopeKeep = baseSlopeKeep;
+			float extraKeep = max(saturate(seamKeep + slopeKeep), farParams.w);
 			float keepRand = float(Random::pcg3d(uint3(asuint(candidateWorldPos), oldBladeIndex)).x) * UINT_TO_FLOAT;
 
 			if (!cullsDisabled && keepRand > extraKeep)
@@ -989,9 +1012,11 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 				continue;
 
 			candidateHash = Random::pcg3d(uint3(patchPos, oldBladeIndex + quadrantHash));
+#if !defined(LOW_LOD)
 			float slopeRoll = float(candidateHash.z) * UINT_TO_FLOAT;
 			if (!cullsDisabled && slopeRoll > baseSlopeKeep)
 				continue;
+#endif
 
 			float2 candidateQuadPos = (float2(patchPos * 2u) + float2(candidateHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
 			candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
@@ -1010,7 +1035,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 		Blade blade;
 		bool outerGeometry;
 		if (BuildBlade(candidateHash, candidateMapSamplePos, candidateWorldPos, candidateWorldZ,
-			terrainSlope, terrainNormal, packedGrassCell, cullsDisabled, insideFrustum, candidatePreCulledDist, blade, outerGeometry)) {
+			terrainSlope, terrainNormal, quadrantData.quadWorldPos, quadrant, hasLand, packedGrassCell, cullsDisabled, insideFrustum, candidatePreCulledDist, blade, outerGeometry)) {
 			GroupBlades[groupIndex * MAX_BLADES_PER_THREAD + emittedBladeCount] = blade;
 			GroupBladeOuter[groupIndex * MAX_BLADES_PER_THREAD + emittedBladeCount] = outerGeometry ? 1u : 0u;
 
@@ -1025,7 +1050,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 	if (useBasePath) {
 		Blade blade;
 		bool outerGeometry;
-		if (BuildBlade(baseHash, baseMapSamplePos, baseWorldPos2D, baseWorldZ, terrainSlope, terrainNormal, baseGrassCell, cullsDisabled, insideFrustum, basePreCulledDist, blade, outerGeometry)) {
+		if (BuildBlade(baseHash, baseMapSamplePos, baseWorldPos2D, baseWorldZ, terrainSlope, terrainNormal, quadrantData.quadWorldPos, quadrant, hasLand, baseGrassCell, cullsDisabled, insideFrustum, basePreCulledDist, blade, outerGeometry)) {
 			GroupBlades[groupIndex * MAX_BLADES_PER_THREAD] = blade;
 			GroupBladeOuter[groupIndex * MAX_BLADES_PER_THREAD] = outerGeometry ? 1u : 0u;
 
