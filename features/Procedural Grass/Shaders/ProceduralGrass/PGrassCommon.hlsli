@@ -147,10 +147,8 @@ struct Blade
 	uint previousWind;   // low 16: previous wind displacement or Mid collision Z; high 16: blade colour and bend
 	uint hashClumpAndGrassType;
 	uint tipDir;
-#	if defined(HIGH_LOD)
 	uint skylightingSH0;  // x/y as f16
 	uint skylightingSH1;  // z/w as f16
-#	endif
 #	if defined(PGRASS_CACHED_COLLISION)
 #	if defined(MID_LOD)
 	uint collisionData;  // current x and y as f16, with current z in previousWind

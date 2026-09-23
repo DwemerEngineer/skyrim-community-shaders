@@ -34,7 +34,7 @@ struct VS_OUTPUT
 	float4 PreviousCameraRelativePosition : TEXCOORD1;  // xyz: previous camera-relative position; w: Bezier t
 #	endif
 #	if defined(HIGH_LOD)
-	nointerpolation float4 WindLodDensity : TEXCOORD2;  // xy: tip wind offset, z: packed lighting fades, w: canopy density and shadow
+	nointerpolation float4 WindLodDensity : TEXCOORD2;  // xy: tip wind offset; w: canopy density and shadow
 #	elif defined(MID_LOD)
 	nointerpolation float4 WindRootPosition : TEXCOORD2;  // xy: tip wind offset; zw: root camera-relative XY
 #	endif
@@ -42,7 +42,7 @@ struct VS_OUTPUT
 	nointerpolation float4 BezierTipAndMid : TEXCOORD4;  // xy: tip; zw: midpoint in facing/up space
 	nointerpolation float4 BladeParams : TEXCOORD5;  // xy: facing; z: type; w: two f16 randoms
 	float4 BaseToTipColor : TEXCOORD7;  // xyz: blade colour; w: positive view depth
-#	if defined(SKYLIGHTING) && defined(HIGH_LOD)
+#	if defined(SKYLIGHTING) && !defined(FAR_LOD)
 	nointerpolation float4 SkylightingVertexSH : TEXCOORD9;  // Per-blade SH from the generator.
 #	endif
 #endif
@@ -107,22 +107,12 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 		f16tof32(blade.posZWidthHeight >> 16));
 #if defined(MID_LOD)
 	float rootDistance = float(blade.tipDir >> 16) * (6144.0f / 65535.0f);
-	#elif defined(FAR_LOD)
+#elif defined(FAR_LOD)
 	float2 rootLodOffset = rootViewPosition.xy + FrameBuffer::CameraPosAdjust.xy - grassLodOrigin;
 	float rootDistance = ApproximateGrassDistance(rootLodOffset);
 #endif
 
 #if !defined(DEPTH) && defined(HIGH_LOD)
-#if defined(HIGH_INNER)
-	static const float detailedSpecularWeight = 1.0f;
-	static const float detailFade = 1.0f;
-#else
-	uint packedFadeWeights = blade.tipDir >> 24;
-	float detailedSpecularWeight = float(packedFadeWeights & 0xFu) * (1.0f / 15.0f);
-	float detailFade = float(packedFadeWeights >> 4) * (1.0f / 15.0f);
-#endif
-	uint packedLightingFades = (f32tof16(detailedSpecularWeight) << 16) | f32tof16(detailFade);
-
 	uint packedCanopy = hashClumpAndGrassType >> 24;
 	uint packedCanopyShadow = packedCanopy | ((blade.tipDir >> 16) & 0xFFu) << 8;
 #endif
@@ -301,7 +291,7 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	o.PreviousCameraRelativePosition = float4(previousViewPos.xyz, t);
 #		endif
 #		if defined(HIGH_LOD)
-	o.WindLodDensity = float4(windOffset, asfloat(packedLightingFades), float(packedCanopyShadow));
+	o.WindLodDensity = float4(windOffset, 0.0f, float(packedCanopyShadow));
 #		elif defined(MID_LOD)
 	o.WindRootPosition = float4(windOffset, rootViewPosition.xy);
 #		endif
@@ -366,8 +356,7 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	o.BaseToTipColor = float4(baseToTipColor, clipPosition.w);
 #	endif
 
-#	if defined(SKYLIGHTING) && defined(HIGH_LOD)
-	// Generator packs four f16 SH coefficients per High blade.
+#	if defined(SKYLIGHTING) && !defined(FAR_LOD)
 	o.SkylightingVertexSH = float4(f16tof32(blade.skylightingSH0 >> 16), f16tof32(blade.skylightingSH0),
 		f16tof32(blade.skylightingSH1 >> 16), f16tof32(blade.skylightingSH1));
 #	endif

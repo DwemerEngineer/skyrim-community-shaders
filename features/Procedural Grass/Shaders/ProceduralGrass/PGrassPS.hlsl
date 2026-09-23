@@ -45,7 +45,7 @@ Texture2D<uint> GrassDensityTexture : register(t71);
 #	include "WetnessEffects/WetnessEffects.hlsli"
 #endif
 
-#if defined(SKYLIGHTING) && defined(HIGH_LOD)
+#if defined(SKYLIGHTING) && !defined(FAR_LOD)
 #	include "Skylighting/Skylighting.hlsli"
 #endif
 
@@ -71,7 +71,7 @@ struct PS_INPUT
 	float4 PreviousCameraRelativePosition: TEXCOORD1;  // xyz: previous camera-relative position; w: Bezier t
 #	endif
 #	if defined(HIGH_LOD)
-	nointerpolation float4 WindLodDensity: TEXCOORD2;  // xy: tip wind offset, z: packed lighting fades, w: canopy density and shadow
+	nointerpolation float4 WindLodDensity: TEXCOORD2;  // xy: tip wind offset; z: inner lighting weight; w: canopy density and shadow
 #	elif defined(MID_LOD)
 	nointerpolation float4 WindRootPosition: TEXCOORD2;  // xy: tip wind offset; zw: root camera-relative XY
 #	endif
@@ -79,7 +79,7 @@ struct PS_INPUT
 	nointerpolation float4 BezierTipAndMid: TEXCOORD4;  // xy: tip; zw: midpoint in facing/up space
 	nointerpolation float4 BladeParams: TEXCOORD5;      // xy: facing; z: type; w: two f16 randoms
 	float4 BaseToTipColor: TEXCOORD7;                   // xyz: blade colour; w: positive view depth.
-#	if defined(SKYLIGHTING) && defined(HIGH_LOD)
+#	if defined(SKYLIGHTING) && !defined(FAR_LOD)
 	nointerpolation float4 SkylightingVertexSH: TEXCOORD9;  // Per-blade SH from the generator.
 #	endif
 #endif
@@ -283,16 +283,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Keep stochastic lighting samples fixed in screen space.
 	float screenNoise = Random::InterleavedGradientNoise(input.Position.xy, 0u);
 #if defined(HIGH_LOD)
-#if defined(HIGH_INNER)
 	static const float detailedSpecularWeight = 1.0f;
+#	if defined(HIGH_INNER)
 	static const float detailFade = 1.0f;
-#else
-	uint packedLightingFades = asuint(input.WindLodDensity.z);
-	float detailedSpecularWeight = f16tof32(packedLightingFades >> 16);
-	float detailFade = f16tof32(packedLightingFades);
-#endif
+#	else
+	static const float detailFade = 0.0f;
+#	endif
 #elif defined(MID_LOD)
-	static const float SPECULAR_FADE_START = 2048.0f;
+	static const float SPECULAR_FADE_START = 4096.0f;
 	static const float SPECULAR_FADE_END = 6144.0f;
 	static const float DETAIL_FADE_START = 1024.0f;
 	static const float DETAIL_FADE_END = 3072.0f;
@@ -304,12 +302,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #endif
 
 #if defined(HIGH_LOD)
-	float4 materialDetail = 0.0f;
-	if (detailFade > 0.0f) {
-		uint materialVariant = min((uint)(bladeRand * 4.0f), 3u);
-		uint materialSlice = grassTypeIndex * 4u + materialVariant;
-		materialDetail = GrassMaterialDetailTexture.SampleLevel(SampGrassDetail, float3(across, along, float(materialSlice)), 0.0f);
-	}
+#	if defined(HIGH_INNER)
+	uint materialVariant = min((uint)(bladeRand * 4.0f), 3u);
+	uint materialSlice = grassTypeIndex * 4u + materialVariant;
+	float4 materialDetail = GrassMaterialDetailTexture.SampleLevel(SampGrassDetail, float3(across, along, float(materialSlice)), 0.0f);
+#	else
+	static const float4 materialDetail = 0.0f;
+#	endif
 #endif
 
 	float3 worldSpaceViewDirection = -normalize(cameraRelativePosition);
@@ -354,10 +353,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #if defined(LOW_LOD)
 	float vein = 0.0;
 #elif defined(HIGH_LOD)
+#	if defined(HIGH_INNER)
 	static const float MaterialDetailNormalRange = 1.25f;
 	float vein = materialDetail.z * detailFade;
 	float veinNormalOffset = (materialDetail.w * 2.0f - 1.0f) * MaterialDetailNormalRange * detailFade;
 	worldSpaceNormal = normalize(worldSpaceNormal + bitangent * veinNormalOffset);
+#	else
+	float vein = 0.0f;
+#	endif
 #else
 	float vein = 0.0;
 	[branch] if (detailFade > 0.0)
@@ -403,33 +406,32 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #if defined(HIGH_LOD)
 	float speckle = 0.5;
 	float speckleAmount = 0.0;
-	[branch] if (detailFade > 0.0)
+#	if defined(HIGH_INNER)
+	float mottle = sin(along * 5.0 + bladeRand * Math::TAU) * 0.5 + 0.5;
+	baseColor.rgb *= 1.0 + (mottle - 0.5) * 2.0 * mottleStrength * detailFade;
+
+	float blotch = smoothstep(0.28, 0.72, materialDetail.x);
+	float blotchAmount = bladeType.grassTextureParams.x * detailFade;
+	float3 blotchTint = lerp(bladeType.grassColorCool.rgb, bladeType.grassColorWarm.rgb, blotch);
+	float blotchTintLuma = dot(blotchTint, float3(0.2126, 0.7152, 0.0722));
+	blotchTint *= rcp(max(blotchTintLuma, 0.25));
+	baseColor.rgb *= lerp(1.0, blotchTint, blotchAmount);
+	baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * tipDryTint,
+		saturate(blotch - 0.55) * blotchAmount * 0.65);
+
+	float2 grainCoord = float2(across, along) * float2(6.0, 26.0) * bladeType.grassTextureParams.w;
+	float grainFootprint = max(fwidth(grainCoord.x), fwidth(grainCoord.y));
+	float grainVisibility = saturate(1.5 - grainFootprint);
+	float textureFade = saturate(1.0 - viewDepth * (1.0 / 2500.0));
+	speckleAmount = saturate(bladeType.grassTextureParams.z * 1.5) * textureFade * detailFade * grainVisibility;
+	if (speckleAmount > 0.0)
 	{
-		float mottle = sin(along * 5.0 + bladeRand * Math::TAU) * 0.5 + 0.5;
-		baseColor.rgb *= 1.0 + (mottle - 0.5) * 2.0 * mottleStrength * detailFade;
-
-		float blotch = smoothstep(0.28, 0.72, materialDetail.x);
-		float blotchAmount = bladeType.grassTextureParams.x * detailFade;
-		float3 blotchTint = lerp(bladeType.grassColorCool.rgb, bladeType.grassColorWarm.rgb, blotch);
-		float blotchTintLuma = dot(blotchTint, float3(0.2126, 0.7152, 0.0722));
-		blotchTint *= rcp(max(blotchTintLuma, 0.25));
-		baseColor.rgb *= lerp(1.0, blotchTint, blotchAmount);
-		baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * tipDryTint,
-			saturate(blotch - 0.55) * blotchAmount * 0.65);
-
-		float2 grainCoord = float2(across, along) * float2(6.0, 26.0) * bladeType.grassTextureParams.w;
-		float grainFootprint = max(fwidth(grainCoord.x), fwidth(grainCoord.y));
-		float grainVisibility = saturate(1.5 - grainFootprint);
-		float textureFade = saturate(1.0 - viewDepth * (1.0 / 2500.0));
-		speckleAmount = saturate(bladeType.grassTextureParams.z * 1.5) * textureFade * detailFade * grainVisibility;
-		if (speckleAmount > 0.0)
-		{
-			speckle = saturate((materialDetail.y - 0.5) * 2.0 + 0.5);
-			float grainSpot = smoothstep(0.58, 0.82, speckle);
-			baseColor.rgb *= 1.0 - grainSpot * speckleAmount * 0.60;
-		}
-		baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * veinTint, vein * veinAlbedoStrength);
+		speckle = saturate((materialDetail.y - 0.5) * 2.0 + 0.5);
+		float grainSpot = smoothstep(0.58, 0.82, speckle);
+		baseColor.rgb *= 1.0 - grainSpot * speckleAmount * 0.60;
 	}
+	baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * veinTint, vein * veinAlbedoStrength);
+#	endif
 #elif defined(LOW_LOD)
 	float speckle = 0.5;
 	float speckleAmount = 0.0;
@@ -453,8 +455,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	// Determine the authored color in display space, then convert it once for Linear Lighting.
 	baseColor.rgb = Color::ColorToLinear(baseColor.rgb);
-
-	float3 ambientNormal = worldSpaceNormal;
 
 	float canopyHeight01 = saturate(sideAndBladeT.z / max(bladeType.height, 1.0));
 	float canopyAO = lerp(1.0 - grassLightParams.y, 1.0, canopyHeight01);
@@ -510,7 +510,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 transmissionColor = 0;
 	float pbrGlossiness = 1 - material.Roughness;
 
-#if defined(SKYLIGHTING) && defined(HIGH_LOD)
+#if defined(SKYLIGHTING) && !defined(FAR_LOD)
 	float3 positionMSSkylight = cameraRelativePosition;
 	// The generator provides per-blade SH; evaluate it here with the pixel's ambient normal.
 	sh2 skylightingSH = input.SkylightingVertexSH;
@@ -533,7 +533,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	minWetnessAngle = saturate(max(minWetnessValue, worldSpaceNormal.z));
 
 #	if !defined(PGRASS_DRY_WETNESS)
-#		if defined(SKYLIGHTING) && defined(HIGH_LOD)
+#		if defined(SKYLIGHTING) && !defined(FAR_LOD)
 	float wetnessOcclusion = saturate(SphericalHarmonics::Unproject(skylightingSH, float3(0, 0, 1)));
 	wetnessOcclusion *= wetnessOcclusion;
 #		else
@@ -616,9 +616,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float dirDiffuseNdotL = saturate(abs(dot(worldSpaceNormal, dirLightDirection)));
 
 	float dirDetailShadow = 1.0;
-#if defined(SCREEN_SPACE_SHADOWS) && !defined(LOW_LOD)
-	[branch] if (detailFade > 0.0)
-		dirDetailShadow = lerp(1.0, ScreenSpaceShadows::GetScreenSpaceShadow(input.Position.xyz, screenUV, screenNoise), detailFade);
+#if defined(SCREEN_SPACE_SHADOWS) && !defined(FAR_LOD)
+	dirDetailShadow = ScreenSpaceShadows::GetScreenSpaceShadow(input.Position.xyz, screenUV, screenNoise);
 #endif
 
 #if defined(HIGH_LOD)
@@ -719,16 +718,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	endif
 #endif
 
-	float3 directionalAmbientColor = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(ambientNormal), 0).rgb;
+	float3 directionalAmbientColor = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(worldSpaceNormal), 0).rgb;
 	float ambientLuma = dot(directionalAmbientColor, float3(0.2126, 0.7152, 0.0722));
 	directionalAmbientColor = lerp(directionalAmbientColor, ambientLuma, bladeType.grassTypeLightParams.w);
 
-#if defined(SKYLIGHTING) && defined(HIGH_LOD)
-	float skylightingDiffuse = 1.0;
-	[branch] if (detailFade > 0.0)
-		skylightingDiffuse = Skylighting::GetSkylightingDiffuse(skylightingSH, positionMSSkylight, ambientNormal);
-	// Fade skylighting to neutral where the generator stops sampling probes.
-	skylightingDiffuse = lerp(1.0, skylightingDiffuse, detailFade);
+#if defined(SKYLIGHTING) && !defined(FAR_LOD)
+	float skylightingDiffuse = Skylighting::GetSkylightingDiffuse(skylightingSH, positionMSSkylight, worldSpaceNormal);
 #endif
 
 	directionalAmbientColor *= canopyAO;
@@ -763,7 +758,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 shadedDiffuseColor = diffuseColor.xyz * baseColor.xyz + ambientDiffuseColor + transmissionColor;
 	shadedDiffuseColor += directionalAmbientColor * bladeType.grassBounceColor.rgb * bladeType.grassTypeLightParams.x * (1.0 - canopyHeight01) * baseColor.xyz;
 
-#if defined(SKYLIGHTING) && defined(HIGH_LOD)
+#if defined(SKYLIGHTING) && !defined(FAR_LOD)
 	Skylighting::ApplySkylighting(shadedDiffuseColor, ambientDiffuseColor, indirectLobeWeights.diffuse, skylightingDiffuse);
 #endif
 
@@ -832,7 +827,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #endif
 
-	psout.Reflectance = float4(indirectLobeWeights.specular * specOcclusion, psout.Diffuse.w);
+	psout.Reflectance = float4(indirectLobeWeights.specular * specOcclusion * lerp(0.125f, 0.5f, dirSurfaceShadow), psout.Diffuse.w);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), pbrGlossiness, psout.Diffuse.w);
 #if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
 	float wetnessNormalAmount = saturate(dot(float3(0, 0, 1), wetnessNormal) * saturate(flatnessAmount));

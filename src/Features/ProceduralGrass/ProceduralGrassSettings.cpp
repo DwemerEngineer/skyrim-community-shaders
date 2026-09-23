@@ -365,7 +365,7 @@ void ProceduralGrass::DrawSettings()
 
 		const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
 		const int32_t loadedGridLength = farGridCells ? farGridCells->length : 5;
-		const int32_t maxFarExtraRadius = std::max(0, PGrassCommon::FarCellRadiusCap - loadedGridLength / 2);
+		const int32_t maxFarExtraRadius = std::max(0, PGrassCommon::FarCellRadiusCap - PGrassCommon::FarStreamGuardCells - loadedGridLength / 2);
 		if (ImGui::SliderInt(T("feature.procedural_grass.far_radius", "Far Grass Radius (cells)"), &settings.grassCellRadius, 0, maxFarExtraRadius, "%d", ImGuiSliderFlags_AlwaysClamp))
 			grassRendererFarLOD->ResetBladeCapacity();
 		DrawSettingDescription(T("feature.procedural_grass.far_radius_tooltip", "Sets how many exterior cells beyond loaded grass receive the far grass tier."));

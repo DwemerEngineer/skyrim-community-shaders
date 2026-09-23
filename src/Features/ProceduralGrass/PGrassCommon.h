@@ -100,15 +100,16 @@ namespace PGrassCommon
 	static constexpr int32_t MidTierQuadrantRadius = 4;  // Extend Mid this far to avoid popping when the player moves between Mid and Low tiers.
 	static constexpr int32_t LowTierQuadrantRadius = 5;  // Low overlaps Far across their radial transition band.
 	static constexpr int32_t FarCellRadiusCap = 15;      // Maximum total streamed cell radius that fits in the Far quadrant buffer.
+	static constexpr int32_t LowTierStreamGuardQuadrants = 1;
+	static constexpr int32_t FarStreamGuardCells = 1;
+	static constexpr float FarUnloadFadeWidth = 2048.0f;
 
 	// Quadrants in an md<=r square (r in each of x and y), one per tier's renderer buffer.
 	constexpr uint32_t QuadrantSquare(int32_t r) { return static_cast<uint32_t>((2 * r + 1) * (2 * r + 1)); }
 
-	// Each tier's renderer holds a full (2r+1)^2 quadrant square.
-	// Used by QuadrantCount to sizes its cbuffer + blade buffers and the cap used for each tier (25/81/121 for radii 2/4/5).
 	static constexpr uint32_t HighTierQuadrantCap = QuadrantSquare(HighTierQuadrantRadius);
 	static constexpr uint32_t MidTierQuadrantCap = QuadrantSquare(MidTierQuadrantRadius);
-	static constexpr uint32_t LowTierQuadrantCap = QuadrantSquare(LowTierQuadrantRadius);
+	static constexpr uint32_t LowTierQuadrantCap = QuadrantSquare(LowTierQuadrantRadius + LowTierStreamGuardQuadrants);
 
 	// Set near the 4,096 dx11 cbuffer size cap to be able to fit as many far-tier quadrants as possible in a single cbuffer, to avoid multiple dispatches for far cells.
 	static constexpr uint32_t FarQuadrantCount = 4000;
@@ -144,7 +145,7 @@ namespace PGrassCommon
 	{
 		// Per-tier LOD cross-fade bands, so a quadrant dithers in/out at tier boundaries instead of popping.
 		float4 lodFadeIn;   // x: fade-in start dist (world), y: 1/range, z: Far seam-extra keep
-		float4 lodFadeOut;  // x: fade-out start dist (world), y: 1/range, z: min keep at/after the far edge
+		float4 lodFadeOut;
 		QuadrantData data[N];
 	};
 
@@ -278,7 +279,6 @@ namespace PGrassCommon
 	};
 	static_assert(sizeof(Blade) == 24);
 
-	// Struct for high blades to store a compact, per-blade skylighting SH value (four f16 values) along with the blade's packed data.
 	struct BladeSkylit
 	{
 		Blade blade;
@@ -287,13 +287,13 @@ namespace PGrassCommon
 	};
 	static_assert(sizeof(BladeSkylit) == 32);
 
-	// Mid stores only the current bend because it has no previous-position output.
-	struct BladeCollision
+	// Mid has no previous-position output.
+	struct BladeSkylitMidCollision
 	{
-		Blade blade;
+		BladeSkylit blade;
 		uint collisionData;
 	};
-	static_assert(sizeof(BladeCollision) == 28);
+	static_assert(sizeof(BladeSkylitMidCollision) == 36);
 
 	struct BladeSkylitCollision
 	{

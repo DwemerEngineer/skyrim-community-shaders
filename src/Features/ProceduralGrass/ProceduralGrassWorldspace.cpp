@@ -234,7 +234,8 @@ void ProceduralGrass::GetVisibleQuadrants()
 	globals::profiler->BeginPass("ProceduralGrass::Visible Quadrants");
 
 	grassMapFrame++;
-	constexpr int32_t nearCoverageDiameter = PGrassCommon::LowTierQuadrantRadius * 2 + 1;
+	constexpr int32_t nearCoverageRadius = PGrassCommon::LowTierQuadrantRadius + PGrassCommon::LowTierStreamGuardQuadrants;
+	constexpr int32_t nearCoverageDiameter = nearCoverageRadius * 2 + 1;
 	constexpr size_t farCompletionBudget = 12;
 
 	const auto tes = globals::game::tes;
@@ -306,7 +307,7 @@ void ProceduralGrass::GetVisibleQuadrants()
 	}
 
 	// Cached LAND fills Low's outer ring when Skyrim unloads a nearby cell before it leaves Low range.
-	const int32_t lowCellRadius = (PGrassCommon::LowTierQuadrantRadius + 1) / 2;
+	const int32_t lowCellRadius = (nearCoverageRadius + 1) / 2;
 	for (int32_t cy = playerCellY - lowCellRadius; cy <= playerCellY + lowCellRadius; ++cy) {
 		for (int32_t cx = playerCellX - lowCellRadius; cx <= playerCellX + lowCellRadius; ++cx) {
 			const CellGrass* cellGrass = grassCellCache.Get(cx, cy);
@@ -379,18 +380,19 @@ void ProceduralGrass::GetVisibleQuadrants()
 								// Overlap max-distance bands so adjacent tiers cross-fade.
 								const int32_t md = std::max(xDiff, yDiff);
 
-								if (md <= PGrassCommon::LowTierQuadrantRadius) {
+								if (md <= nearCoverageRadius) {
 									// Record only near quadrants with accepted LAND geometry.
-									const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + PGrassCommon::LowTierQuadrantRadius);
-									const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + PGrassCommon::LowTierQuadrantRadius);
+									const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + nearCoverageRadius);
+									const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + nearCoverageRadius);
 									nearCoveredQuadrants[coverageY * nearCoverageDiameter + coverageX] = true;
-									quadrantsPresence.push_back(quadrant);
+									if (md <= PGrassCommon::LowTierQuadrantRadius)
+										quadrantsPresence.push_back(quadrant);
 								}
 								if (md <= PGrassCommon::HighTierQuadrantRadius && quadrantsHighLOD.size() < PGrassCommon::HighTierQuadrantCap)
 									quadrantsHighLOD.push_back(quadrant);
 								if (md >= PGrassCommon::HighTierQuadrantRadius - 1 && md <= PGrassCommon::MidTierQuadrantRadius && quadrantsMidLOD.size() < PGrassCommon::MidTierQuadrantCap)
 									quadrantsMidLOD.push_back(quadrant);
-								if (md >= PGrassCommon::MidTierQuadrantRadius - 1 && md <= PGrassCommon::LowTierQuadrantRadius && quadrantsLowLOD.size() < PGrassCommon::LowTierQuadrantCap)
+								if (md >= PGrassCommon::MidTierQuadrantRadius - 2 && md <= nearCoverageRadius && quadrantsLowLOD.size() < PGrassCommon::LowTierQuadrantCap)
 									quadrantsLowLOD.push_back(quadrant);
 							}
 						}
@@ -409,11 +411,11 @@ void ProceduralGrass::GetVisibleQuadrants()
 					const int32_t worldQuadrantX = cx * 2 + static_cast<int32_t>(j % 2);
 					const int32_t worldQuadrantY = cy * 2 + static_cast<int32_t>(j / 2);
 					const int32_t md = std::max(std::abs(playerQuadrantX - worldQuadrantX), std::abs(playerQuadrantY - worldQuadrantY));
-					if (md < PGrassCommon::MidTierQuadrantRadius - 1 || md > PGrassCommon::LowTierQuadrantRadius)
+					if (md < PGrassCommon::MidTierQuadrantRadius - 2 || md > nearCoverageRadius)
 						continue;
 
-					const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + PGrassCommon::LowTierQuadrantRadius);
-					const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + PGrassCommon::LowTierQuadrantRadius);
+					const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + nearCoverageRadius);
+					const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + nearCoverageRadius);
 					const uint32_t coverageIndex = coverageY * nearCoverageDiameter + coverageX;
 					if (nearCoveredQuadrants[coverageIndex])
 						continue;
@@ -433,7 +435,8 @@ void ProceduralGrass::GetVisibleQuadrants()
 
 					nearCoveredQuadrants[coverageIndex] = true;
 					quadrantsLowLOD.push_back(quadrant);
-					quadrantsPresence.push_back(quadrant);
+					if (md <= PGrassCommon::LowTierQuadrantRadius)
+						quadrantsPresence.push_back(quadrant);
 				}
 			}
 		}
@@ -508,8 +511,9 @@ void ProceduralGrass::GetVisibleQuadrants()
 		const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
 		const int32_t loadedGridLength = farGridCells ? farGridCells->length : 5;
 		const int32_t loadedCellRadius = loadedGridLength / 2;
-		const int32_t extraRadius = std::clamp(settings.grassCellRadius, 0, std::max(0, PGrassCommon::FarCellRadiusCap - loadedCellRadius));
-		const int32_t radius = loadedCellRadius + extraRadius;
+		const int32_t extraRadius = std::clamp(settings.grassCellRadius, 0,
+			std::max(0, PGrassCommon::FarCellRadiusCap - PGrassCommon::FarStreamGuardCells - loadedCellRadius));
+		const int32_t radius = std::min(loadedCellRadius + std::max(extraRadius, 1) + PGrassCommon::FarStreamGuardCells, PGrassCommon::FarCellRadiusCap);
 		const auto& cameraPosAdjust = globals::game::frameBufferCached.GetCameraPosAdjust();
 
 		static const std::vector<std::pair<int32_t, int32_t>> farRequestOffsets = [] {
@@ -576,9 +580,9 @@ void ProceduralGrass::GetVisibleQuadrants()
 						const int32_t worldQuadrantY = cy * 2 + static_cast<int32_t>(j / 2);
 						const int32_t md = std::max(std::abs(playerQuadrantX - worldQuadrantX), std::abs(playerQuadrantY - worldQuadrantY));
 						bool nearCovered = false;
-						if (md <= PGrassCommon::LowTierQuadrantRadius) {
-							const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + PGrassCommon::LowTierQuadrantRadius);
-							const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + PGrassCommon::LowTierQuadrantRadius);
+						if (md <= nearCoverageRadius) {
+							const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + nearCoverageRadius);
+							const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + nearCoverageRadius);
 							nearCovered = nearCoveredQuadrants[coverageY * nearCoverageDiameter + coverageX];
 						}
 

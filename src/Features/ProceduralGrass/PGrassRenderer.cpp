@@ -549,8 +549,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 	ID3D11ShaderResourceView* hiZSRV = globals::hiZPyramid->GetSRV();
 	ctx->CSSetShaderResources(8, 1, &hiZSRV);
 
-	// Skylighting is only used by the High tier
-	if constexpr (PatchBladeCount == 4) {
+	if (!extraDefine) {
 		auto& skylighting = globals::features::skylighting;
 		ID3D11ShaderResourceView* skylightingSRV = skylighting.loaded && skylighting.texProbeArray ? skylighting.texProbeArray->srv.get() : nullptr;
 		ctx->CSSetShaderResources(50, 1, &skylightingSRV);
@@ -690,10 +689,11 @@ ID3D11ComputeShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetBladeGen
 		defines.push_back({ "PATCH_BLADE_COUNT", patchBladeCountString.c_str() });
 		defines.push_back({ "SLOPE_EXTRA_BLADES", slopeExtraBladesString.c_str() });
 
+		if (!extraDefine && globals::features::skylighting.loaded && globals::features::skylighting.texProbeArray)
+			defines.push_back({ "SKYLIGHTING", nullptr });
+
 		if constexpr (PatchBladeCount == 4) {
 			defines.push_back({ "HIGH_GEOMETRY_LOD", nullptr });
-			if (globals::features::skylighting.loaded && globals::features::skylighting.texProbeArray)
-				defines.push_back({ "SKYLIGHTING", nullptr });
 			for (auto* feature : Feature::GetFeatureList()) {
 				const auto featureName = feature->GetShaderDefineName();
 				if (feature->loaded && (featureName == "TERRAIN_SHADOWS" || featureName == "CLOUD_SHADOWS"))
@@ -805,7 +805,8 @@ ID3D11PixelShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetPS(bool no
 			const bool requiredSimpleLightingFeature =
 				featureName == "LINEAR_LIGHTING" ||
 				featureName == "TERRAIN_SHADOWS" ||
-				featureName == "CLOUD_SHADOWS";
+				featureName == "CLOUD_SHADOWS" ||
+				((featureName == "SKYLIGHTING" || featureName == "SCREEN_SPACE_SHADOWS") && !extraDefine);
 			if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting) &&
 				(!simpleLighting || requiredSimpleLightingFeature) &&
 				(featureName != "SKYLIGHTING" || globals::features::skylighting.texProbeArray))

@@ -21,7 +21,7 @@
 #	include "GrassCollision/GrassCollision.hlsli"
 #endif
 
-#if defined(HIGH_LOD) && defined(SKYLIGHTING)
+#if defined(SKYLIGHTING) && !defined(FAR_LOD)
 #	define SKYLIGHTING_PROBE_REGISTER t50
 #	include "Skylighting/Skylighting.hlsli"
 #endif
@@ -81,7 +81,7 @@ struct QuadrantData
 cbuffer QuadrantData : register(b7)
 {
 	float4 lodFadeIn;   // x: fade-in start, y: inverse range, z: Far seam-fill retention
-	float4 lodFadeOut;  // x: fade-out start, y: inverse range, z: minimum retention
+	float4 lodFadeOut;
 	QuadrantData data[QUADRANT_DATA_SIZE];
 }
 
@@ -342,21 +342,24 @@ void ComputeGrassType(out uint type, uint packedGrassCell, float2 quadLocalPos, 
 }
 
 // Far can complete its LOD test before terrain and grass-map access.
-bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar, bool cullsDisabled, out float lodDistance)
+bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar, bool cullsDisabled)
 {
-	lodDistance = -1.0f;
 	bool passes = true;
 #if defined(FAR_LOD)
 	if (!cullsDisabled) {
-		lodDistance = length(bladeWorldPos2D - grassLodOrigin);
+		float2 lodOffset = abs(bladeWorldPos2D - grassLodOrigin);
+		float lodDistance = length(lodOffset);
+		float handoffDistance = max(lodOffset.x, lodOffset.y);
 		float inRamp = 1.0f;
 		if (nearCovered) {
-			float handoffRamp = saturate((lodDistance - lodFadeIn.x) * lodFadeIn.y);
-			float fallbackRamp = saturate((lodDistance - (lodFadeIn.x - 2.0f * rcp(lodFadeIn.y))) * (lodFadeIn.y * 0.5f));
-			float fallbackKeep = min(lodFadeIn.z * 0.25f, 0.25f) * fallbackRamp;
+			float handoffRamp = saturate((handoffDistance - lodFadeIn.x) * lodFadeIn.y);
+			float fallbackRamp = saturate((handoffDistance - (lodFadeIn.x - 2.0f * rcp(lodFadeIn.y))) * (lodFadeIn.y * 0.5f));
+			float fallbackKeep = lodFadeIn.z * 0.25f * fallbackRamp;
 			inRamp = max(handoffRamp, fallbackKeep);
 		}
 		float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodDistance - lodFadeOut.x) * lodFadeOut.y));
+		float unloadFadeStart = lodFadeOut.x + rcp(lodFadeOut.y);
+		outRamp *= 1.0f - saturate((lodDistance - unloadFadeStart) * lodFadeOut.w);
 		// Thin only after the Low/Far handoff. Widening in the VS loosely preserves coverage.
 		float projectedKeep = GetFarPerformanceKeep(lodDistance, FrameBuffer::CameraProj._m00);
 		float performanceKeep = compactFar ? saturate(projectedKeep / max(farParams.w, 1.0e-3f)) : projectedKeep;
@@ -438,7 +441,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float3 worldPos = float3(bladeWorldPos2D, bladeWorldZ);
 	float3 viewPos = worldPos - FrameBuffer::CameraPosAdjust.xyz;
 
-#if !defined(LOW_LOD) && !defined(FAR_LOD)
+#if !defined(FAR_LOD)
 	float lodDistance = preCulledDist;
 #endif
 
@@ -470,7 +473,8 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float clumpDist;
 	float2 clumpDir;
 	ComputeClump(clumpRand, clumpDist, clumpDir, bladeWorldPos2D, voronoiGridSize, inverseVoronoiGridSize);
-	float clumpDensity = saturate(1.0f - clumpDist);
+	float clumpDistance01 = clumpDist * inverseVoronoiGridSize;
+	float clumpDensity = 1.0f - smoothstep(0.15f, 0.50f, clumpDistance01);
 
 	hash = Random::pcg3d(hash);
 	float clumpDistRand = float(hash.x) * UINT_TO_FLOAT;
@@ -480,7 +484,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 #if !defined(FAR_LOD)
 	// Pull every near blade toward its Voronoi feature to hide the regular candidate lattice.
 	float clumpPull = lerp(0.025f, 0.225f, clumpDistRand);
-	float2 clumpDisplace = clumpDir * clumpDist * clumpPull * generatorType.clumpDistanceFactor;
+	float2 clumpDisplace = clumpDir * clumpDist * clumpPull * generatorType.clumpDistanceFactor * clumpDensity;
 	bladeWorldPos2D += clumpDisplace;
 #if defined(LOW_LOD)
 	// The larger Low LOD displacement can cross enough terrain for the original tangent plane to become inaccurate.
@@ -516,18 +520,22 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 			return false;
 	}
 
-#if !defined(LOW_LOD) && !defined(FAR_LOD)
-	lodDistance = length(bladeWorldPos2D - grassLodOrigin);
+#if !defined(FAR_LOD)
+	float2 lodOffset = abs(bladeWorldPos2D - grassLodOrigin);
+	lodDistance = length(lodOffset);
+#if defined(LOW_LOD)
+	float lodFadeOutDistance = max(lodOffset.x, lodOffset.y);
+#else
+	float lodFadeOutDistance = lodDistance;
+#endif
 	if (!cullsDisabled) {
 		float inRamp = saturate((lodDistance - lodFadeIn.x) * lodFadeIn.y);
-		float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodDistance - lodFadeOut.x) * lodFadeOut.y));
-		float keep = min(inRamp, outRamp);
+		float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodFadeOutDistance - lodFadeOut.x) * lodFadeOut.y));
 		float dither = float(Random::pcg3d(uint3(asuint(bladeWorldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
-#if defined(MID_LOD)
-		// High keeps the lower random values. Mid takes the rest during their shared transition.
+#if defined(MID_LOD) || defined(LOW_LOD)
 		if ((inRamp < 1.0f && dither <= 1.0f - inRamp) || dither > outRamp)
 #elif defined(HIGH_LOD)
-		if (keep <= 0.0f || dither > keep)
+		if (dither > min(inRamp, outRamp))
 #endif
 			return false;
 	}
@@ -542,7 +550,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	}
 
 	// Height generation is deferred until after rejection because the frustum test uses type bounds.
-	float clumpHeightRandom = float(clumpRand) * UINT_TO_FLOAT;
+	float clumpHeightRandom = float(clumpRand) * UINT_TO_FLOAT * clumpDensity;
 	float unscaledHeight = (0.45f + heightRand * 0.55f) - clumpHeightRandom * generatorType.clumpHeightFactor;
 	float randHeight = generatorType.height * unscaledHeight;
 	if (objectClearance < 1.0e29f) {
@@ -574,7 +582,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	else if (delta >= Math::TAU)
 		delta -= Math::TAU;
 
-	float clumpedAngle = randAngle + delta * generatorType.clumpFacingFactor;
+	float clumpedAngle = randAngle + delta * generatorType.clumpFacingFactor * clumpDensity;
 
 	if (clumpedAngle < 0.0f)
 		clumpedAngle += Math::TAU;
@@ -649,14 +657,14 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 #if defined(MID_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
 	float2 viewOffset = grassLodOrigin - bladeWorldPos2D;
 	float2 viewDirection = viewOffset * rsqrt(max(dot(viewOffset, viewOffset), 1.0e-4f));
-	float viewDotNormal = saturate(dot(randFacing, viewDirection));
+	float viewDotNormal = abs(dot(randFacing, viewDirection));
 	float viewDotNormal2 = viewDotNormal * viewDotNormal;
-	float viewThicken = (1.0f - viewDotNormal2 * viewDotNormal2) * smoothstep(0.0f, 0.2f, viewDotNormal);
+	float viewThicken = 1.0f - viewDotNormal2 * viewDotNormal2;
 
 	float2 rotatedFacing = float2(randFacing.x * 0.8660254f - randFacing.y * 0.5f, randFacing.x * 0.5f + randFacing.y * 0.8660254f);
-	float rotatedViewDotNormal = saturate(dot(rotatedFacing, viewDirection));
+	float rotatedViewDotNormal = abs(dot(rotatedFacing, viewDirection));
 	float rotatedViewDotNormal2 = rotatedViewDotNormal * rotatedViewDotNormal;
-	float rotatedViewThicken = (1.0f - rotatedViewDotNormal2 * rotatedViewDotNormal2) * smoothstep(0.0f, 0.2f, rotatedViewDotNormal);
+	float rotatedViewThicken = 1.0f - rotatedViewDotNormal2 * rotatedViewDotNormal2;
 
 	uint packedViewThicken = (uint)round(saturate(viewThicken) * 15.0f) | (uint)round(saturate(rotatedViewThicken) * 15.0f) << 4;
 	uint packedClumpDensity = (uint)round(clumpDensity * 255.0f);
@@ -712,7 +720,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float clumpValueRand = (float((clumpRand >> 8) & 0xFFu) + 0.5f) * (1.0f / 256.0f);
 	float3 clumpTint = lerp(surfaceType.grassColorCool.rgb, surfaceType.grassColorWarm.rgb, clumpColorRand);
 	float clumpValue = 1.0f + (clumpValueRand * 2.0f - 1.0f) * surfaceType.grassColorVar.y * 0.75f;
-	perBladeColor *= lerp(1.0f, clumpTint * clumpValue, surfaceType.clumpColorStrength);
+	perBladeColor *= lerp(1.0f, clumpTint * clumpValue, surfaceType.clumpColorStrength * clumpDensity);
 
 	// Pack blade-wide colour variation. The pixel shader evaluates spatial blotch and grain detail.
 	uint3 packedColor = (uint3)round(saturate(perBladeColor * 0.5f) * 15.0f);
@@ -749,16 +757,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 	uint2 packedTilt = (uint2)round(saturate(float2(tiltSin, tiltCos) * 0.5f + 0.5f) * 255.0f);
 	uint packedWorldShadow = (uint)round(saturate(worldShadow) * 255.0f);
-
-	static const float SPECULAR_FADE_START = 2048.0f;
-	static const float SPECULAR_FADE_END = 6144.0f;
-	static const float DETAIL_FADE_START = 1024.0f;
-	static const float DETAIL_FADE_END = 3072.0f;
-
-	float detailedSpecularWeight = 1.0f - smoothstep(SPECULAR_FADE_START, SPECULAR_FADE_END, appearanceDistance);
-	float detailFade = saturate((DETAIL_FADE_END - appearanceDistance) * (1.0f / (DETAIL_FADE_END - DETAIL_FADE_START)));
-	uint packedLightingFades = (uint)round(detailedSpecularWeight * 15.0f) | (uint)round(detailFade * 15.0f) << 4;
-	b.tipDir = packedTilt.x | packedTilt.y << 8 | packedWorldShadow << 16 | packedLightingFades << 24;
+	b.tipDir = packedTilt.x | packedTilt.y << 8 | packedWorldShadow << 16;
 #elif defined(MID_LOD)
 	uint2 packedTilt = (uint2)round(saturate(float2(tiltSin, tiltCos) * 0.5f + 0.5f) * 255.0f);
 	float appearanceDistance = ApproximateGrassDistance(bladeWorldPos2D - grassLodOrigin);
@@ -774,17 +773,21 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	b.facingAndWind = (uint)(packedFacing.x & 0xFF) | (uint)(packedFacing.y & 0xFF) << 8 | f32tof16(windDisplacement) << 16;
 	b.previousWind = packedBladeData << 16 | f32tof16(previousWindDisplacement);
 
-#if defined(HIGH_LOD)
-	// One root-position probe sample covers the blade. Use UNIT_SH outside the detail range.
+#if !defined(FAR_LOD)
 #	if defined(SKYLIGHTING)
-	sh2 skylightingSH = Skylighting::UNIT_SH;
-	if (appearanceDistance < DETAIL_FADE_END)
-		skylightingSH = Skylighting::Sample(viewPos, float3(0.0f, 0.0f, 1.0f));
+	float3 probeCell = round(FrameBuffer::CameraPosAdjust.xyz / Skylighting::CELL_SIZE);
+	float3 probeOffset = probeCell * Skylighting::CELL_SIZE - FrameBuffer::CameraPosAdjust.xyz;
+	uint3 probeArrayOrigin = (uint3)((int3)probeCell - (int3)(Skylighting::ARRAY_DIM / 2)) % Skylighting::ARRAY_DIM;
+	float3 skylightingPosition = viewPos;
+#		if defined(MID_LOD) || defined(LOW_LOD)
+	float3 probeExtent = Skylighting::ARRAY_SIZE * 0.5f - Skylighting::CELL_SIZE;
+	skylightingPosition = clamp(viewPos - probeOffset, -probeExtent, probeExtent) + probeOffset;
+#		endif
+	sh2 skylightingSH = Skylighting::SampleWithOrigin(skylightingPosition, float3(0.0f, 0.0f, 1.0f), probeOffset, probeArrayOrigin);
 
 	b.skylightingSH0 = f32tof16(skylightingSH.x) << 16 | f32tof16(skylightingSH.y);
 	b.skylightingSH1 = f32tof16(skylightingSH.z) << 16 | f32tof16(skylightingSH.w);
 #	else
-	// Preserve the 32-byte High blade stride when Skylighting is disabled.
 	b.skylightingSH0 = 0u;
 	b.skylightingSH1 = 0u;
 #	endif
@@ -885,8 +888,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 	float2 baseWorldPos2D = baseQuadPos2D + quadrantData.quadWorldPos;
 	float2 baseMapSamplePos = GrassMapSamplePos(baseQuadPos2D, baseHash);
 	uint baseGrassCell = 0u;
-	float baseFarLodDistance;
-	bool useBasePath = PassesEarlyFarLOD(baseWorldPos2D, nearCovered, compactFar, cullsDisabled, baseFarLodDistance);
+	bool useBasePath = PassesEarlyFarLOD(baseWorldPos2D, nearCovered, compactFar, cullsDisabled);
 	float basePreCulledDist = -1.0f;
 
 #if !defined(LOW_LOD) && !defined(FAR_LOD)
@@ -938,9 +940,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 			uint3 extraHash = Random::pcg3d(uint3(patchPos, oldBladeIndex + quadrantHash));
 			float2 extraQuadPos = (float2(patchPos * 2u) + float2(extraHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
 			float2 extraMapSamplePos = GrassMapSamplePos(extraQuadPos, extraHash);
-			float extraFarLodDistance = -1.0f;
-
-			if (!PassesEarlyFarLOD(extraQuadPos + quadrantData.quadWorldPos, nearCovered, compactFar, cullsDisabled, extraFarLodDistance))
+			if (!PassesEarlyFarLOD(extraQuadPos + quadrantData.quadWorldPos, nearCovered, compactFar, cullsDisabled))
 				continue;
 			if (cullsDisabled || LoadGrassCell(extraMapSamplePos, quadrant) != 0u) {
 				hasValidCandidate = true;
@@ -976,7 +976,6 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 		uint packedGrassCell = baseGrassCell;
 		float candidateWorldZ = baseWorldZ;
 		bool candidateValid = useBasePath;
-		float candidateFarLodDistance = baseFarLodDistance;
 		float candidatePreCulledDist = basePreCulledDist;
 
 		if (!isBase) {
@@ -990,7 +989,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 			float2 extraQuadPos = (float2(patchPos * 2u) + float2(candidateHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
 			candidateWorldPos = extraQuadPos + quadrantData.quadWorldPos;
 			candidateMapSamplePos = GrassMapSamplePos(extraQuadPos, candidateHash);
-			candidateValid = PassesEarlyFarLOD(candidateWorldPos, nearCovered, compactFar, cullsDisabled, candidateFarLodDistance);
+			candidateValid = PassesEarlyFarLOD(candidateWorldPos, nearCovered, compactFar, cullsDisabled);
 			if (!candidateValid)
 				continue;
 			packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
@@ -1007,7 +1006,6 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 			if (!cullsDisabled && keepRand > extraKeep)
 				continue;
 #else
-			// Resolve the slope roll from the extra seed before constructing its position.
 			if ((emitExtraIndex % PATCH_BLADE_COUNT) != bladeIndex)
 				continue;
 
