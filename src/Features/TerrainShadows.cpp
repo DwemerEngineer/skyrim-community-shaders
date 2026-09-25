@@ -272,6 +272,8 @@ TerrainShadows::PerFrame TerrainShadows::GetCommonBufferData()
 	if (isHeightmapReady) {
 		// One heightmap step of light descent, so the z blur spans about two texels in xy.
 		constexpr float zBlurSteps = 1.0f;
+		auto cachedHeightmap = heightMap->GetCached();
+		auto texHeightMap = heightMap->GetTexture();
 		auto invScale = cachedHeightmap->pos1 - cachedHeightmap->pos0;
 		data.Scale = float3(1.f, 1.f, 1.f) / invScale;
 		// Texel centres lie on terrain vertices anchored at the south-west corner.
