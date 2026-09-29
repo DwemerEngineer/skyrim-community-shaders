@@ -61,7 +61,7 @@ public:
 
 	void GenerateBlades(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion, int32_t cellXOffset, int32_t cellYOffset,
 		const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, float frustumPadding, bool disableGeneratorCulls,
-		float compactStartDistance = -1.0f, float compactKeep = 1.0f);
+		float fadeInPositionPadding = 0.0f, float compactStartDistance = -1.0f, float compactKeep = 1.0f);
 	void RenderDepth(ID3D11DeviceContext* ctx, ID3D11PixelShader* depthClipPS);
 	void RenderGrass(ID3D11DeviceContext* ctx);
 

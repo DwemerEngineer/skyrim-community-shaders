@@ -29,11 +29,13 @@ cbuffer GrassGlobals : register(b8)
 	float2 heightMapOffset;  // -pos0.xy * heightMapScale
 	float2 heightMapZRange;  // {pos0.z, pos1.z}; texels are normalised and lerp between these
 
-	float2 debugFlags;           // x: bypass every cull in the generator, y: High body depth-clip height (-1 disables clipping)
+	float2 debugFlags;           // x: bypass generator culling
 	float4 grassPresenceParams;  // xy: world min-corner of the grass-id texture, z: 1/sample spacing, w: texture dim (density gather)
-	float4 grassHiZParams;       // xy: valid base extent, z: nominal pixels/texel, w: trustworthy mip count; zero disables
+	float4 grassHiZParams;       // xy: valid base extent, z: conservative grass geometry radius, w: trustworthy mip count; zero disables
 	float2 grassLodOrigin;       // camera XY with a small dead zone, preventing stationary camera sway from moving LOD bands
-	float2 _grassLodPadding;
+	float windRotationScale;
+	uint occlusionMapDim;
+	float4 frustumPlaneExtent;  // Left, right, bottom, top clip-plane extents for a unit world-space box.
 }
 
 #if defined(FAR_LOD)
@@ -107,7 +109,7 @@ float ApproximateGrassDistance(float2 offset)
 	return max(distanceXY.x, distanceXY.y) + min(distanceXY.x, distanceXY.y) * 0.375f;
 }
 
-#if defined(CSHADER)
+#if defined(CSHADER) || defined(DEPTH)
 struct GrassGeneratorType
 {
 	float height;
@@ -117,7 +119,7 @@ struct GrassGeneratorType
 	float stiffness;
 	float rotationalStiffness;
 	float tipWeight;
-	float _pad0;
+	float mid;
 	float clumpDistanceFactor;
 	float clumpHeightFactor;
 	float clumpFacingFactor;
@@ -134,7 +136,7 @@ cbuffer GrassGeneratorTypes : register(b10)
 struct Blade
 {
 	uint posXY;          // camera-relative x/y as two f16 values
-	uint posZWidthHeight;  // camera-relative z as f16, then UNORM8 width/height
+	uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
 	uint facingTilt;   // 4x UNORM8 mapped to [-1,1]: facing.xy, tilt sin/cos
 	uint seedAndType;  // high 8: clump density; next 16: Voronoi-cell appearance seed; low 8: grass type
 };
@@ -142,13 +144,15 @@ struct Blade
 struct Blade
 {
 	uint posXY;          // camera-relative x/y as two f16 values
-	uint posZWidthHeight;  // camera-relative z as f16, then UNORM8 width/height
-	uint facingAndWind;  // low 16: current facing as 2x SNORM8; high 16: current wind displacement as f16
-	uint previousWind;   // low 16: previous wind displacement or Mid collision Z; high 16: blade colour and bend
+	uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
+	uint facingAndWind;  // low 16: current facing as 2x SNORM8; high 16 is tier-specific
+	uint previousWind;   // tier-specific geometry and motion data
 	uint hashClumpAndGrassType;
 	uint tipDir;
+#	if !defined(LOW_LOD)
 	uint skylightingSH0;  // x/y as f16
 	uint skylightingSH1;  // z/w as f16
+#	endif
 #	if defined(PGRASS_CACHED_COLLISION)
 #	if defined(MID_LOD)
 	uint collisionData;  // current x and y as f16, with current z in previousWind

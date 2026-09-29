@@ -4,6 +4,45 @@ namespace PGrassCommon
 {
 	/** @brief Returns the game's default landscape texture used when a LAND quadrant has no base texture. */
 	RE::TESLandTexture* GetDefaultLandTexture();
+	float GetGrassTexturePctThreshold();
+
+	inline uint32_t QuadrantSampleHash(int32_t cellX, int32_t cellY, uint32_t quadrant, uint32_t sample)
+	{
+		const auto mix = [](uint32_t hash, uint32_t value) {
+			for (uint32_t shift = 0; shift < 32; shift += 8) {
+				hash ^= (value >> shift) & 0xFFu;
+				hash *= 16777619u;
+			}
+			return hash;
+		};
+
+		uint32_t hash = 2166136261u;
+		hash = mix(hash, static_cast<uint32_t>(cellX));
+		hash = mix(hash, static_cast<uint32_t>(cellY));
+		hash = mix(hash, quadrant);
+		return mix(hash, sample);
+	}
+
+	inline bool HasWeightedGrass(const std::vector<uint8_t>& ids, const std::vector<float>& cumulative)
+	{
+		float previous = 0.0f;
+		for (size_t i = 0; i < ids.size(); ++i) {
+			if (ids[i] != 0u && cumulative[i] > previous)
+				return true;
+			previous = cumulative[i];
+		}
+		return false;
+	}
+
+	inline uint8_t SelectWeightedGrass(const std::vector<uint8_t>& ids, const std::vector<float>& cumulative, float total, uint32_t hash)
+	{
+		const float r = (hash * (1.0f / 4294967296.0f)) * total;
+		for (size_t i = 0; i < ids.size(); ++i) {
+			if (r < cumulative[i])
+				return ids[i];
+		}
+		return ids.back();
+	}
 
 	inline constexpr uint64_t GrassHashOffsetBasis = 14695981039346656037ull;
 	inline constexpr uint64_t GrassHashPrime = 1099511628211ull;
@@ -38,6 +77,8 @@ namespace PGrassCommon
 	static constexpr uint32_t QuadrantGrassPitch = 17;
 	static constexpr uint32_t QuadrantGrassSamples = QuadrantGrassPitch * QuadrantGrassPitch;
 	static constexpr uint32_t QuadrantCellPitch = QuadrantGrassPitch - 1;
+	// The terrain material uses one base texture and five overlay slots.
+	static constexpr uint32_t LandscapeOverlayCount = 5;
 	using QuadrantOccupancy = std::array<uint16_t, QuadrantCellPitch>;
 
 	/** @brief Builds a 16x16 occupied-cell mask after the generator's one-sample neighbour fill. */
@@ -144,7 +185,7 @@ namespace PGrassCommon
 	struct alignas(16) QuadrantDataArray
 	{
 		// Per-tier LOD cross-fade bands, so a quadrant dithers in/out at tier boundaries instead of popping.
-		float4 lodFadeIn;   // x: fade-in start dist (world), y: 1/range, z: Far seam-extra keep
+		float4 lodFadeIn;   // x: fade-in start dist, y: 1/range, z: Far seam-extra keep, w: fade-out endpoint
 		float4 lodFadeOut;
 		QuadrantData data[N];
 	};
@@ -182,14 +223,16 @@ namespace PGrassCommon
 
 		float2 debugFlags;           // x: bypass every cull in the generator
 		float4 grassPresenceParams;  // xy: world min-corner of the grass-id texture, z: 1/sample spacing, w: texture dim (density gather)
-		float4 grassHiZParams;       // xy: valid base extent, z: nominal pixels/texel, w: trustworthy mip count; zero disables
+		float4 grassHiZParams;       // xy: valid base extent, z: conservative grass geometry radius, w: trustworthy mip count; zero disables
 		float2 grassLodOrigin;       // camera XY with a small dead zone, preventing stationary camera sway from moving LOD bands
-		float2 _grassLodPadding;
+		float windRotationScale;
+		uint32_t occlusionMapDim;
+		float4 frustumPlaneExtent;  // L1 extent of left, right, bottom, and top clip planes.
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassGlobals);
 	static_assert(offsetof(GrassGlobals, grassPBRLightingScale) == 60);
 	static_assert(offsetof(GrassGlobals, grassFrameLight) == 112);
-	static_assert(sizeof(GrassGlobals) == 256);
+	static_assert(sizeof(GrassGlobals) == 272);
 
 	struct alignas(16) GrassType
 	{
@@ -255,7 +298,7 @@ namespace PGrassCommon
 		float stiffness;
 		float rotationalStiffness;
 		float tipWeight;
-		float _pad0;
+		float mid;
 		float clumpDistanceFactor;
 		float clumpHeightFactor;
 		float clumpFacingFactor;
@@ -271,9 +314,9 @@ namespace PGrassCommon
 	struct Blade
 	{
 		uint posXY;           // camera-relative x/y as two f16 values
-		uint posZWidthHeight;  // camera-relative z as f16, then width and height as UNORM8
-		uint facingAndWind;  // low 16: current facing as 2x SNORM8; high 16: current wind displacement as f16
-		uint previousWind;   // low 16: previous wind displacement or Mid collision Z; high 16: blade colour and bend
+		uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
+		uint facingAndWind;  // low 16: current facing as 2x SNORM8; high 16 is tier-specific
+		uint previousWind;   // tier-specific geometry and motion data
 		uint hashClumpAndGrassType;
 		uint tipDir;  // tier-specific packed tilt and lighting or distance data
 	};
@@ -305,7 +348,7 @@ namespace PGrassCommon
 	struct BladeFar
 	{
 		uint posXY;           // camera-relative x/y as two f16 values
-		uint posZWidthHeight;  // camera-relative z as f16, then width and height as UNORM8
+		uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
 		uint facingTilt;
 		uint seedAndType;  // high 8: clump density; next 16: Voronoi-cell appearance seed; low 8: grass type
 	};

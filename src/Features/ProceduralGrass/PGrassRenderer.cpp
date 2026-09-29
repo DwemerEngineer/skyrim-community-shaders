@@ -74,7 +74,7 @@ namespace PGrassRendererQuads
 		return frustum;
 	}
 
-	QuadrantFrustumState ClassifyQuadrantFrustum(const Quadrant& quadrant, const SideFrustum& frustum, const float4& cameraPosAdjust, float xyPadding, bool& hasLand)
+	QuadrantFrustumState ClassifyQuadrantFrustum(const Quadrant& quadrant, const SideFrustum& frustum, const float4& cameraPosAdjust, float geometryPadding, bool& hasLand)
 	{
 		hasLand = quadrant.maxHeight > QuadrantNoHeight && quadrant.minHeight <= quadrant.maxHeight;
 		if (!hasLand)
@@ -83,7 +83,8 @@ namespace PGrassRendererQuads
 		const float minZ = quadrant.minHeight - 256.0f;
 		const float maxZ = quadrant.maxHeight + 300.0f;
 		const float3 center = { quadrant.worldPos.x + 1024.0f - cameraPosAdjust.x, quadrant.worldPos.y + 1024.0f - cameraPosAdjust.y, (minZ + maxZ) * 0.5f - cameraPosAdjust.z };
-		const float3 extent = { 1024.0f + xyPadding, 1024.0f + xyPadding, (maxZ - minZ) * 0.5f };
+		// The top and bottom side planes have a Z component, so include the blade envelope on every axis.
+		const float3 extent = { 1024.0f + geometryPadding, 1024.0f + geometryPadding, (maxZ - minZ) * 0.5f + geometryPadding };
 
 		bool fullyInside = true;
 		for (const auto& plane : frustum.planes) {
@@ -309,7 +310,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::ClearShaderCache()
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
 void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11DeviceContext* ctx, const std::vector<Quadrant>& quadrants, const uint64_t contentVersion, const int32_t cellXOffset, const int32_t cellYOffset,
 	const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, const float frustumPadding,
-	const bool disableGeneratorCulls, const float compactStartDistance, const float compactKeep)
+	const bool disableGeneratorCulls, const float fadeInPositionPadding, const float compactStartDistance, const float compactKeep)
 {
 	auto* bladeGenerator = GetBladeGeneratorCS();
 	if (!bladeGenerator) {
@@ -415,9 +416,71 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 	const uint32_t fullGX = (patchesPerQuadrant + threadGroupSize - 1u) / threadGroupSize;
 	const uint32_t tileGX = (maxTilePatchCount + threadGroupSize - 1u) / threadGroupSize;
 	const float compactStartSq = compactStartDistance * compactStartDistance;
+	const bool isFarTier = extraDefine != nullptr;
+	const bool isLowTier = !isFarTier && UsesSimpleLighting();
+	const bool cullInnerFade = !disableGeneratorCulls && isLowTier && lodFadeIn.y > 0.0f;
+	const bool cullLowOuter = !disableGeneratorCulls && isLowTier && lodFadeIn.w > 0.0f;
+	const bool cullFarOuter = !disableGeneratorCulls && isFarTier && lodFadeOut.w > 0.0f;
+	const float innerFadeRadius = std::max(lodFadeIn.x - fadeInPositionPadding, 0.0f);
+	const float innerFadeRadiusSq = innerFadeRadius * innerFadeRadius;
+	const float lowOuterRadius = lodFadeIn.w + fadeInPositionPadding;
+	const float farOuterRadius = cullFarOuter ? lodFadeIn.w + 1.0f / lodFadeOut.w : 0.0f;
+	const float farOuterRadiusSq = farOuterRadius * farOuterRadius;
+	const float patchWorldSize = 4096.0f / static_cast<float>(density);
 	const auto viewProj = globals::game::frameBufferCached.GetCameraViewProjUnjittered().Transpose();
 	const auto frustum = BuildSideFrustum(viewProj);
 	const auto& cameraPosAdjust = globals::game::frameBufferCached.GetCameraPosAdjust();
+	const auto maxDistanceSqToRect = [&](const float minX, const float minY, const float maxX, const float maxY) {
+		const float dx = std::max(std::abs(minX - lodOrigin.x), std::abs(maxX - lodOrigin.x));
+		const float dy = std::max(std::abs(minY - lodOrigin.y), std::abs(maxY - lodOrigin.y));
+		return dx * dx + dy * dy;
+	};
+	const auto minDistanceSqToRect = [&](const float minX, const float minY, const float maxX, const float maxY) {
+		const float closestX = std::clamp(lodOrigin.x, minX, maxX);
+		const float closestY = std::clamp(lodOrigin.y, minY, maxY);
+		const float dx = closestX - lodOrigin.x;
+		const float dy = closestY - lodOrigin.y;
+		return dx * dx + dy * dy;
+	};
+	const auto tileRejected = [&](const Quadrant& quadrant, const uint32_t tile, const uint32_t workFlags) {
+		const uint32_t tileX = tile % OccupancyTilesPerAxis;
+		const uint32_t tileY = tile / OccupancyTilesPerAxis;
+		const uint32_t patchStartX = tileX * patchesPerRow / OccupancyTilesPerAxis;
+		const uint32_t patchEndX = (tileX + 1u) * patchesPerRow / OccupancyTilesPerAxis;
+		const uint32_t patchStartY = tileY * patchRows / OccupancyTilesPerAxis;
+		const uint32_t patchEndY = (tileY + 1u) * patchRows / OccupancyTilesPerAxis;
+		const float minX = quadrant.worldPos.x + static_cast<float>(patchStartX) * patchWorldSize;
+		const float maxX = quadrant.worldPos.x + static_cast<float>(patchEndX) * patchWorldSize;
+		const float minY = quadrant.worldPos.y + static_cast<float>(patchStartY) * patchWorldSize;
+		const float maxY = quadrant.worldPos.y + static_cast<float>(patchEndY) * patchWorldSize;
+
+		if ((workFlags & WorkInsideFrustum) == 0u && (workFlags & WorkHasLand) != 0u) {
+			const float minZ = quadrant.minHeight - 256.0f;
+			const float maxZ = quadrant.maxHeight + 300.0f;
+			const float3 center = { (minX + maxX) * 0.5f - cameraPosAdjust.x, (minY + maxY) * 0.5f - cameraPosAdjust.y,
+				(minZ + maxZ) * 0.5f - cameraPosAdjust.z };
+			const float3 extent = { (maxX - minX) * 0.5f + frustumPadding, (maxY - minY) * 0.5f + frustumPadding,
+				(maxZ - minZ) * 0.5f + frustumPadding };
+			for (const auto& plane : frustum.planes) {
+				const float distance = plane.x * center.x + plane.y * center.y + plane.z * center.z + plane.w;
+				const float radius = std::abs(plane.x) * extent.x + std::abs(plane.y) * extent.y + std::abs(plane.z) * extent.z;
+				if (distance + radius < 0.0f)
+					return true;
+			}
+		}
+
+		if (cullInnerFade && maxDistanceSqToRect(minX, minY, maxX, maxY) < innerFadeRadiusSq)
+			return true;
+
+		if (cullLowOuter) {
+			const float closestX = std::clamp(lodOrigin.x, minX, maxX);
+			const float closestY = std::clamp(lodOrigin.y, minY, maxY);
+			if (std::max(std::abs(closestX - lodOrigin.x), std::abs(closestY - lodOrigin.y)) > lowOuterRadius)
+				return true;
+		}
+
+		return cullFarOuter && minDistanceSqToRect(minX, minY, maxX, maxY) >= farOuterRadiusSq;
+	};
 	const float grassMapEdgeNoise = globals::features::proceduralGrass.settings.grassMapEdgeNoise;
 	if (occupancyCache.size() > static_cast<size_t>(QuadrantCount) * 4u)
 		occupancyCache.clear();
@@ -434,16 +497,30 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 	};
 
 	for (uint32_t i = 0; i < quadrants.size(); ++i) {
-		bool hasLand = false;
-		const auto frustumState = ClassifyQuadrantFrustum(quadrants[i], frustum, cameraPosAdjust, frustumPadding, hasLand);
-		if (frustumState == QuadrantFrustumState::Outside)
-			continue;
+		bool hasLand = quadrants[i].maxHeight > QuadrantNoHeight && quadrants[i].minHeight <= quadrants[i].maxHeight;
+		auto frustumState = QuadrantFrustumState::Inside;
+		if (!disableGeneratorCulls) {
+			frustumState = ClassifyQuadrantFrustum(quadrants[i], frustum, cameraPosAdjust, frustumPadding, hasLand);
+			if (frustumState == QuadrantFrustumState::Outside)
+				continue;
+		}
 
 		const float worldX = quadrants[i].worldPos.x;
 		const float worldY = quadrants[i].worldPos.y;
-		const float closestX = std::clamp(lodOrigin.x, worldX, worldX + 2048.0f);
-		const float closestY = std::clamp(lodOrigin.y, worldY, worldY + 2048.0f);
-		const float minDistanceSq = (closestX - lodOrigin.x) * (closestX - lodOrigin.x) + (closestY - lodOrigin.y) * (closestY - lodOrigin.y);
+		const float quadrantMaxX = worldX + 2048.0f;
+		const float quadrantMaxY = worldY + 2048.0f;
+		if (cullInnerFade && maxDistanceSqToRect(worldX, worldY, quadrantMaxX, quadrantMaxY) < innerFadeRadiusSq)
+			continue;
+
+		const float closestX = std::clamp(lodOrigin.x, worldX, quadrantMaxX);
+		const float closestY = std::clamp(lodOrigin.y, worldY, quadrantMaxY);
+		const float closestDx = closestX - lodOrigin.x;
+		const float closestDy = closestY - lodOrigin.y;
+		const float minDistanceSq = closestDx * closestDx + closestDy * closestDy;
+		if (cullLowOuter && std::max(std::abs(closestDx), std::abs(closestDy)) > lowOuterRadius)
+			continue;
+		if (cullFarOuter && minDistanceSq >= farOuterRadiusSq)
+			continue;
 
 		uint32_t flags = (hasLand ? WorkHasLand : 0u) |
 		                 (frustumState == QuadrantFrustumState::Inside ? WorkInsideFrustum : 0u) |
@@ -506,16 +583,24 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 			occupancy.edgeNoise = grassMapEdgeNoise;
 		}
 
-		tiledGroupCount += static_cast<uint64_t>(PatchBladeCount) * occupancy.occupiedTileCount * tileGX;
+		uint32_t visibleTileCount = 0;
+		for (uint32_t tileIndex = 0; tileIndex < occupancy.occupiedTileCount; ++tileIndex) {
+			if (!tileRejected(quadrants[i], occupancy.occupiedTiles[tileIndex].tile, flags))
+				++visibleTileCount;
+		}
+		tiledGroupCount += static_cast<uint64_t>(PatchBladeCount) * visibleTileCount * tileGX;
 		visibleWorkCandidates.push_back({ i, flags, occupancyKey });
 	}
 
-	const bool useOccupiedTiles = !disableGeneratorCulls && tiledGroupCount * 4u <= legacyGroupCount * 3u;
+	const bool useOccupiedTiles = !disableGeneratorCulls &&
+		((cullInnerFade || cullLowOuter || cullFarOuter) ? tiledGroupCount * 8u <= legacyGroupCount * 7u : tiledGroupCount * 4u <= legacyGroupCount * 3u);
 	for (const auto& candidate : visibleWorkCandidates) {
 		if (useOccupiedTiles) {
 			const auto& occupancy = occupancyCache.at(candidate.occupancyKey);
 			for (uint32_t tileIndex = 0; tileIndex < occupancy.occupiedTileCount; ++tileIndex) {
 				const auto& tile = occupancy.occupiedTiles[tileIndex];
+				if (tileRejected(quadrants[candidate.quadrantIndex], tile.tile, candidate.flags))
+					continue;
 				appendWork(visibleWorkStaging, requiredBladeCount, tile.patchCount, candidate.quadrantIndex,
 					candidate.flags | WorkOccupiedTile | static_cast<uint32_t>(tile.tile) << WorkTileShift);
 			}
@@ -549,7 +634,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 	ID3D11ShaderResourceView* hiZSRV = globals::hiZPyramid->GetSRV();
 	ctx->CSSetShaderResources(8, 1, &hiZSRV);
 
-	if (!extraDefine) {
+	if (!extraDefine && !UsesSimpleLighting()) {
 		auto& skylighting = globals::features::skylighting;
 		ID3D11ShaderResourceView* skylightingSRV = skylighting.loaded && skylighting.texProbeArray ? skylighting.texProbeArray->srv.get() : nullptr;
 		ctx->CSSetShaderResources(50, 1, &skylightingSRV);
@@ -689,7 +774,7 @@ ID3D11ComputeShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetBladeGen
 		defines.push_back({ "PATCH_BLADE_COUNT", patchBladeCountString.c_str() });
 		defines.push_back({ "SLOPE_EXTRA_BLADES", slopeExtraBladesString.c_str() });
 
-		if (!extraDefine && globals::features::skylighting.loaded && globals::features::skylighting.texProbeArray)
+		if (!extraDefine && !UsesSimpleLighting() && globals::features::skylighting.loaded && globals::features::skylighting.texProbeArray)
 			defines.push_back({ "SKYLIGHTING", nullptr });
 
 		if constexpr (PatchBladeCount == 4) {
@@ -719,6 +804,8 @@ ID3D11VertexShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetDepthVS()
 	if (!depthVS) {
 		ShaderDefines defines;
 		defines.push_back({ "DEPTH", nullptr });
+		if (std::string_view(lodDefine) == "HIGH_LOD")
+			defines.push_back({ "DEPTH_CLIP", nullptr });
 		AppendVertexShaderDefines(defines);
 
 		depthVS = CompileShader<ID3D11VertexShader>(L"Data\\Shaders\\ProceduralGrass\\PGrassVS.hlsl", defines, "vs_5_0");
@@ -731,7 +818,7 @@ template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
 ID3D11VertexShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetOuterDepthVS()
 {
 	if (!outerDepthVS) {
-		ShaderDefines defines{ { "DEPTH", nullptr }, { "HIGH_OUTER_VERTEX", nullptr }, { lodDefine, nullptr } };
+		ShaderDefines defines{ { "DEPTH", nullptr }, { "DEPTH_CLIP", nullptr }, { "HIGH_OUTER_VERTEX", nullptr }, { lodDefine, nullptr } };
 		if (UsesGrassCollision(globals::features::grassCollision.loaded))
 			defines.push_back({ "PGRASS_CACHED_COLLISION", nullptr });
 		outerDepthVS = CompileShader<ID3D11VertexShader>(L"Data\\Shaders\\ProceduralGrass\\PGrassVS.hlsl", defines, "vs_5_0");

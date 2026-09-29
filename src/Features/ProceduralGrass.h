@@ -113,9 +113,9 @@ public:
 		// Occlusion / placement
 		float occlusionClearance = 100.0f;  // Underside clearance in world units
 		float occlusionHalfExtent = 10240.0f;
-		float occlusionPadding = 10.0f;
+		float occlusionPadding = 12.0f;
 		float occlusionBias = 4.0f;  // Minimum occluder height above a blade
-		float grassMapEdgeNoise = 48.0f;
+		float grassMapEdgeNoise = 64.0f;
 		float grassViewThicken = 1.0f;  // Edge-on blade widening. 0 disables it.
 
 		// Per-LOD densities and far tier
@@ -204,6 +204,7 @@ private:
 
 	// Far reads LAND data on workers. Near tiers use loaded cell LAND data.
 	GrassCellCache grassCellCache;
+	bool grassCellCachePolicyDirty = true;
 	size_t farRequestCursor = 0;
 	int32_t farRequestCenterX = (std::numeric_limits<int32_t>::min)();
 	int32_t farRequestCenterY = (std::numeric_limits<int32_t>::min)();
@@ -278,6 +279,7 @@ private:
 	struct LoadedCellGrass
 	{
 		RE::TESObjectLAND* land = nullptr;
+		RE::TESObjectLAND::LoadedLandData* loadedData = nullptr;
 		uint64_t lastSeenFrame = 0;
 		std::array<QuadrantGrass, 4> quadrants{};
 	};
@@ -296,6 +298,7 @@ private:
 	bool grassLodOriginInitialized = false;
 	float nearQuadrantFrustumPadding = 0.0f;
 	float farQuadrantFrustumPadding = 0.0f;
+	float lowFadeInPositionPadding = 1.0f;
 
 	/** @brief Raw LAND height inputs for the last resolved quadrant; debug panel only. */
 	struct LandHeightDebug
@@ -323,6 +326,7 @@ private:
 	 * @return The cache entry, stable until eviction.
 	 */
 	const LoadedCellGrass& GetCellCache(RE::TESObjectLAND* land, int32_t cellX, int32_t cellY, uint32_t debugQuadIndex);
+	void SyncGrassCellCachePolicy();
 	void ClearGrassMapCache();
 
 	/** @brief Evicts the oldest inactive LAND cells over the cache limit. */

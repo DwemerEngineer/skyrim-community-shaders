@@ -28,6 +28,15 @@ struct CellGrass
 	std::array<float, 4> maxHeights{};
 };
 
+struct GrassTexturePolicy
+{
+	std::vector<uint8_t> ids;
+	std::vector<float> cumulative;
+	float total = 0.0f;
+
+	bool operator==(const GrassTexturePolicy&) const = default;
+};
+
 /**
  * @brief Background reader + cache of per-cell grass data, mirroring the water cache's file-seeking.
  *
@@ -41,6 +50,9 @@ public:
 
 	/** @brief Per-frame setup on the main thread. Rebuilds from scratch when the worldspace changes. */
 	void BeginFrame(RE::TESWorldSpace* landWorldSpace);
+
+	/** @brief Updates LTEX grass overrides used by streamed LAND reads and invalidates stale cells. */
+	void SetGrassMapPolicy(std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy> textureOverrides, bool ignoreGrassMap);
 
 	/** @brief Folds up to maxCount finished background reads into the readable map. Main thread only. */
 	void DrainCompleted(size_t maxCount);
@@ -59,8 +71,10 @@ public:
 	void Shutdown();
 
 private:
-	static std::unique_ptr<CellGrass> ReadCell(RE::TESWorldSpace* worldSpace, RE::TESFileArray* files, int32_t cellX, int32_t cellY);
-	static void ParseLandscape(RE::TESFile* file, CellGrass& out);
+	static std::unique_ptr<CellGrass> ReadCell(RE::TESWorldSpace* worldSpace, std::shared_ptr<const std::vector<RE::TESFile*>> files, int32_t cellX, int32_t cellY,
+		std::shared_ptr<const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>> textureOverrides, bool ignoreGrassMap);
+	static void ParseLandscape(RE::TESFile* file, CellGrass& out, int32_t cellX, int32_t cellY,
+		const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>& textureOverrides, bool ignoreGrassMap);
 
 	std::unordered_map<uint64_t, std::unique_ptr<CellGrass>> ready;  // main-thread only
 	std::unordered_map<uint64_t, uint64_t> lastTouched;              // key -> frame, main-thread only
@@ -71,7 +85,10 @@ private:
 
 	std::unique_ptr<BS::thread_pool<>> pool;
 	RE::TESWorldSpace* worldSpace = nullptr;
-	RE::TESFileArray* files = nullptr;
+	std::shared_ptr<const std::vector<RE::TESFile*>> files = std::make_shared<const std::vector<RE::TESFile*>>();
+	std::shared_ptr<const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>> textureOverrides =
+		std::make_shared<const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>>();
+	bool ignoreGrassMap = false;
 	std::atomic<uint64_t> generation{ 0 };  // bumped on worldspace change, stale results dropped
 	uint64_t frame = 0;
 	uint64_t nextCacheVersion = 1;

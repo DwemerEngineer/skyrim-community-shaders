@@ -14,27 +14,6 @@ namespace
 		return a >= 0 ? a / 2 : -((-a + 1) / 2);
 	}
 
-	/** @brief Stable 32-bit hash of a grass-map sample's identity, for deterministic per-sample type selection. */
-	uint32_t QuadrantSampleHash(int32_t cellX, int32_t cellY, uint32_t quadIndex, uint32_t sample)
-	{
-		constexpr uint32_t Fnv1aOffsetBasis = 2166136261u;
-		const auto mix = [](uint32_t hash, uint32_t value) {
-			constexpr uint32_t Fnv1aPrime = 16777619u;
-			for (uint32_t shift = 0; shift < 32; shift += 8) {
-				hash ^= (value >> shift) & 0xFFu;
-				hash *= Fnv1aPrime;
-			}
-			return hash;
-		};
-
-		uint32_t h = Fnv1aOffsetBasis;
-		h = mix(h, static_cast<uint32_t>(cellX));
-		h = mix(h, static_cast<uint32_t>(cellY));
-		h = mix(h, quadIndex);
-		h = mix(h, sample);
-		return h;
-	}
-
 }
 
 RE::TESLandTexture* PGrassCommon::GetDefaultLandTexture()
@@ -43,17 +22,24 @@ RE::TESLandTexture* PGrassCommon::GetDefaultLandTexture()
 	return *defaultLandTextureAddress;
 }
 
+float PGrassCommon::GetGrassTexturePctThreshold()
+{
+	if (const auto setting = RE::GetINISetting("fTexturePctThreshold:Grass"))
+		return std::max(setting->GetFloat(), 0.0f);
+	return 0.005f;
+}
+
 const ProceduralGrass::LoadedCellGrass& ProceduralGrass::GetCellCache(RE::TESObjectLAND* land, int32_t cellX, int32_t cellY, uint32_t debugQuadIndex)
 {
 	auto& cell = grassMapCache[PGrassCommon::GrassCellKey(cellX, cellY)];
 	cell.lastSeenFrame = grassMapFrame;
+	const auto landData = land->loadedData;
 
-	if (cell.land == land)
+	if (cell.land == land && cell.loadedData == landData)
 		return cell;
 
 	cell.land = land;
-
-	const auto landData = land->loadedData;
+	cell.loadedData = landData;
 
 	// Convert possible record-relative heights with one four-quadrant anchor to avoid seams.
 	float rawMin = std::numeric_limits<float>::max();
@@ -72,6 +58,24 @@ const ProceduralGrass::LoadedCellGrass& ProceduralGrass::GetCellCache(RE::TESObj
 	};
 
 	const RE::TESLandTexture* defaultLandTexture = PGrassCommon::GetDefaultLandTexture();
+	const float texturePctThreshold = PGrassCommon::GetGrassTexturePctThreshold() * 255.0f;
+	const auto getSelection = [this](const RE::TESLandTexture* texture) -> const TextureSelection* {
+		if (!texture)
+			return static_cast<const TextureSelection*>(nullptr);
+		if (const auto cached = textureSelectionByTexture.find(texture); cached != textureSelectionByTexture.end())
+			return cached->second;
+		const auto selection = textureSelection.find(LandTextureKey(texture));
+		const auto result = selection != textureSelection.end() ? &selection->second : nullptr;
+		textureSelectionByTexture.emplace(texture, result);
+		return result;
+	};
+	const auto growsGrass = [](const RE::TESLandTexture* texture, const TextureSelection* selection) {
+		if (!texture)
+			return false;
+		if (selection && selection->total > 0.0f)
+			return PGrassCommon::HasWeightedGrass(selection->ids, selection->cumulative);
+		return !texture->textureGrassList.empty();
+	};
 
 	for (uint32_t quadIndex = 0; quadIndex < 4; ++quadIndex) {
 		auto& quadrant = cell.quadrants[quadIndex];
@@ -92,60 +96,47 @@ const ProceduralGrass::LoadedCellGrass& ProceduralGrass::GetCellCache(RE::TESObj
 			continue;
 		}
 
-		// Reuse the last texture selection within the quadrant.
-		const RE::TESLandTexture* cachedWinner = nullptr;
-		const TextureSelection* cachedSelection = nullptr;
-
 		for (uint32_t v = 0; v < PGrassCommon::QuadrantGrassSamples; ++v) {
 			int32_t overlayTotal = 0;
-			for (uint32_t layer = 0; layer < 5; ++layer) {
+			for (uint32_t layer = 0; layer < PGrassCommon::LandscapeOverlayCount; ++layer) {
 				const auto texture = landData->quadTextures[quadIndex][layer];
 				if (texture && (texture->formID != 0 || defaultLandTexture))
 					overlayTotal += static_cast<uint8_t>(landData->percents[quadIndex][v][layer]);
 			}
 
 			const auto baseTexture = landData->defQuadTextures[quadIndex];
-			const RE::TESLandTexture* winner = baseTexture && baseTexture->formID != 0 ? baseTexture : defaultLandTexture;
-			int32_t bestPercent = std::max(255 - overlayTotal, 0);
+			const RE::TESLandTexture* grassTexture = nullptr;
+			const TextureSelection* grassSelection = nullptr;
+			int32_t bestGrassPercent = -1;
+			const auto considerTexture = [&](const RE::TESLandTexture* texture, const int32_t percent) {
+				if (!texture || percent <= 0 || static_cast<float>(percent) < texturePctThreshold)
+					return;
+				const auto selection = getSelection(texture);
+				if (percent > bestGrassPercent && growsGrass(texture, selection)) {
+					bestGrassPercent = percent;
+					grassTexture = texture;
+					grassSelection = selection;
+				}
+			};
 
-			for (uint32_t layer = 0; layer < 5; ++layer) {
-				// Stored as int8_t but represents unsigned opacity.
+			considerTexture(baseTexture && baseTexture->formID != 0 ? baseTexture : defaultLandTexture, std::max(255 - overlayTotal, 0));
+
+			for (uint32_t layer = 0; layer < PGrassCommon::LandscapeOverlayCount; ++layer) {
 				const int32_t percent = static_cast<uint8_t>(landData->percents[quadIndex][v][layer]);
 				const auto texture = landData->quadTextures[quadIndex][layer];
 				const auto effectiveTexture = texture && texture->formID == 0 ? defaultLandTexture : texture;
-				if (effectiveTexture && percent > bestPercent) {
-					bestPercent = percent;
-					winner = effectiveTexture;
-				}
+				considerTexture(effectiveTexture, percent);
 			}
 
-			if (!winner) {
+			if (!grassTexture) {
 				quadrant.ids[v] = 0u;
 				continue;
 			}
 
-			if (winner != cachedWinner) {
-				cachedWinner = winner;
-				if (const auto cached = textureSelectionByTexture.find(winner); cached != textureSelectionByTexture.end()) {
-					cachedSelection = cached->second;
-				} else {
-					const auto selection = textureSelection.find(LandTextureKey(winner));
-					cachedSelection = selection != textureSelection.end() ? &selection->second : nullptr;
-					textureSelectionByTexture.emplace(winner, cachedSelection);
-				}
-			}
-
-			// Select configured variants deterministically; otherwise preserve vanilla behavior.
-			uint32_t type = winner->textureGrassList.empty() ? 0u : 1u;
-			if (cachedSelection && cachedSelection->total > 0.0f) {
-				const float r = (QuadrantSampleHash(cellX, cellY, quadIndex, v) * (1.0f / 4294967296.0f)) * cachedSelection->total;
-				type = cachedSelection->ids.back();
-				for (size_t i = 0; i < cachedSelection->ids.size(); ++i) {
-					if (r < cachedSelection->cumulative[i]) {
-						type = cachedSelection->ids[i];
-						break;
-					}
-				}
+			uint32_t type = 1u;
+			if (grassSelection && grassSelection->total > 0.0f) {
+				type = PGrassCommon::SelectWeightedGrass(grassSelection->ids, grassSelection->cumulative,
+					grassSelection->total, PGrassCommon::QuadrantSampleHash(cellX, cellY, quadIndex, v));
 			}
 
 			quadrant.ids[v] = static_cast<uint8_t>(type);
@@ -156,8 +147,33 @@ const ProceduralGrass::LoadedCellGrass& ProceduralGrass::GetCellCache(RE::TESObj
 	return cell;
 }
 
+void ProceduralGrass::SyncGrassCellCachePolicy()
+{
+	const auto dataHandler = RE::TESDataHandler::GetSingleton();
+	if (!dataHandler)
+		return;
+
+	std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy> textureOverrides;
+	textureOverrides.reserve(textureSelection.size());
+	for (const auto texture : dataHandler->GetFormArray<RE::TESLandTexture>()) {
+		if (!texture)
+			continue;
+
+		const auto selection = textureSelection.find(LandTextureKey(texture));
+		if (selection == textureSelection.end() || selection->second.total <= 0.0f)
+			continue;
+
+		textureOverrides.emplace(texture, GrassTexturePolicy{ selection->second.ids, selection->second.cumulative, selection->second.total });
+	}
+
+	grassCellCache.SetGrassMapPolicy(std::move(textureOverrides), settings.debugIgnoreGrassMap);
+	grassCellCachePolicyDirty = false;
+}
+
 void ProceduralGrass::ClearGrassMapCache()
 {
+	grassCellCachePolicyDirty = true;
+	SyncGrassCellCachePolicy();
 	grassMapCache.clear();
 	++grassMapCacheVersion;
 	nearVisibleStamp = (std::numeric_limits<uint64_t>::max)();
@@ -232,6 +248,8 @@ std::optional<float> ProceduralGrass::GetLandHeightAt(const float worldX, const 
 void ProceduralGrass::GetVisibleQuadrants()
 {
 	globals::profiler->BeginPass("ProceduralGrass::Visible Quadrants");
+	if (grassCellCachePolicyDirty)
+		SyncGrassCellCachePolicy();
 
 	grassMapFrame++;
 	constexpr int32_t nearCoverageRadius = PGrassCommon::LowTierQuadrantRadius + PGrassCommon::LowTierStreamGuardQuadrants;
@@ -583,7 +601,8 @@ void ProceduralGrass::GetVisibleQuadrants()
 						if (md <= nearCoverageRadius) {
 							const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + nearCoverageRadius);
 							const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + nearCoverageRadius);
-							nearCovered = nearCoveredQuadrants[coverageY * nearCoverageDiameter + coverageX];
+							const uint32_t coverageIndex = coverageY * nearCoverageDiameter + coverageX;
+							nearCovered = nearCoveredQuadrants[coverageIndex];
 						}
 
 						const float worldX = worldQuadrantX * 2048.0f;

@@ -20,7 +20,7 @@ static const uint PBRFlags = PBR::Flags::Subsurface;
 SamplerState SampColorSampler : register(s0);
 #define LinearSampler SampColorSampler
 
-#if defined(MID_LOD)
+#if defined(MID_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
 Texture2D<uint> GrassDensityTexture : register(t71);
 #endif
 
@@ -63,23 +63,31 @@ struct PS_INPUT
 	float4 Position: SV_POSITION;
 #if defined(FAR_LOD)
 	float4 CameraPositionSide: TEXCOORD0;                // xyz: camera-relative position; w: across-blade coordinate
-	float4 BladeTColor: TEXCOORD1;                       // x: blade parameter; yzw: base-to-tip colour
-	nointerpolation uint4 PackedBladeParams: TEXCOORD2;  // facing/tilt, seed/type, root Z/width/height, continuous Far ramp
+	float4 BladeTColor: TEXCOORD1;                       // x: actual blade parameter; yzw: stabilized base-to-tip colour
+	nointerpolation uint4 PackedBladeParams: TEXCOORD2;  // facing/tilt, seed/type, root Z/width/height, two f16 Far ramps
 #else
 	float4 CameraRelativePosition: TEXCOORD0;          // xyz: camera-relative position; w: across-blade coordinate
-#	if !defined(MID_LOD)
+#	if defined(HIGH_LOD)
 	float4 PreviousCameraRelativePosition: TEXCOORD1;  // xyz: previous camera-relative position; w: Bezier t
+#	elif defined(LOW_LOD)
+	float BladeT: TEXCOORD1;
 #	endif
 #	if defined(HIGH_LOD)
-	nointerpolation float4 WindLodDensity: TEXCOORD2;  // xy: tip wind offset; z: inner lighting weight; w: canopy density and shadow
+	nointerpolation float4 WindLodDensity: TEXCOORD2;  // xy: tip wind offset; w: canopy density and shadow
 #	elif defined(MID_LOD)
 	nointerpolation float4 WindRootPosition: TEXCOORD2;  // xy: tip wind offset; zw: root camera-relative XY
+#	elif defined(LOW_LOD)
+	nointerpolation float2 RootPosition: TEXCOORD2;  // camera-relative blade root XY
 #	endif
+#	if !defined(LOW_LOD)
 	float4 AOThicknessRoughness: TEXCOORD3;             // xyz: AO, thickness, roughness; w: root-relative height, or Bezier t for Mid
+#	endif
 	nointerpolation float4 BezierTipAndMid: TEXCOORD4;  // xy: tip; zw: midpoint in facing/up space
 	nointerpolation float4 BladeParams: TEXCOORD5;      // xy: facing; z: type; w: two f16 randoms
+#	if !defined(LOW_LOD)
 	float4 BaseToTipColor: TEXCOORD7;                   // xyz: blade colour; w: positive view depth.
-#	if defined(SKYLIGHTING) && !defined(FAR_LOD)
+#	endif
+#	if defined(SKYLIGHTING) && !defined(LOW_LOD)
 	nointerpolation float4 SkylightingVertexSH: TEXCOORD9;  // Per-blade SH from the generator.
 #	endif
 #endif
@@ -88,8 +96,8 @@ struct PS_INPUT
 struct PS_OUTPUT
 {
 	float4 Diffuse: SV_Target0;
-	float4 MotionVectors: SV_Target1;
 #if !defined(FAR_LOD)
+	float4 MotionVectors: SV_Target1;
 	float4 NormalGlossiness: SV_Target2;
 	float4 Albedo: SV_Target3;
 	float4 Specular: SV_Target4;
@@ -100,7 +108,6 @@ struct PS_OUTPUT
 
 Texture2D<float4> DistantAmbientLUT : register(t73);
 #if defined(FAR_LOD)
-Texture2D<float> TerrainHeightTexture : register(t74);
 #elif defined(HIGH_LOD)
 Texture2DArray<float4> GrassMaterialDetailTexture : register(t75);
 #endif
@@ -127,6 +134,49 @@ float GrassValueNoise(float2 p)
 	float c = GrassNoiseHash(fl + float2(0.0, 1.0));
 	float d = GrassNoiseHash(fl + float2(1.0, 1.0));
 	return lerp(lerp(a, b, fr.x), lerp(c, d, fr.x), fr.y);
+}
+
+#if defined(SKYLIGHTING) && defined(LOW_LOD)
+sh2 SampleLowSkylighting(float3 positionMS, float3 positionOffset, uint3 arrayOrigin)
+{
+	sh2 scaledUnitSH = Skylighting::UNIT_SH / 1e-10;
+	if (SharedData::InInterior)
+		return scaledUnitSH;
+
+	positionMS.z += Skylighting::CELL_SIZE.z * 0.5f;
+	float3 positionMSAdjusted = positionMS - positionOffset;
+	float3 cellCoord = positionMSAdjusted / Skylighting::CELL_SIZE + float3(Skylighting::ARRAY_DIM) * 0.5f - 0.5f;
+	cellCoord = clamp(cellCoord, 0.0f, float3(Skylighting::ARRAY_DIM) - 1.001f);
+	int3 cell000 = int3(floor(cellCoord));
+	float3 f = cellCoord - cell000;
+
+	float largest = max(f.x, max(f.y, f.z));
+	float smallest = min(f.x, min(f.y, f.z));
+	float middle = max(min(f.x, f.y), min(max(f.x, f.y), f.z));
+	int3 offset1 = int3(f.x >= f.y && f.x >= f.z, f.y > f.x && f.y >= f.z, f.z > f.x && f.z > f.y);
+	int3 offset2 = int3(f.x >= f.y || f.x >= f.z, f.y > f.x || f.y >= f.z, f.z > f.x || f.z > f.y);
+	float4 weights = float4(1.0f - largest, largest - middle, middle - smallest, smallest);
+
+	uint3 tex000 = (uint3(cell000) + arrayOrigin) % Skylighting::ARRAY_DIM;
+	uint3 tex1 = (uint3(cell000 + offset1) + arrayOrigin) % Skylighting::ARRAY_DIM;
+	uint3 tex2 = (uint3(cell000 + offset2) + arrayOrigin) % Skylighting::ARRAY_DIM;
+	uint3 tex111 = (uint3(cell000 + 1) + arrayOrigin) % Skylighting::ARRAY_DIM;
+	return Skylighting::SkylightingProbeArray[tex000] * weights.x +
+		Skylighting::SkylightingProbeArray[tex1] * weights.y +
+		Skylighting::SkylightingProbeArray[tex2] * weights.z +
+		Skylighting::SkylightingProbeArray[tex111] * weights.w;
+}
+#endif
+
+float3 GetDistantAOThicknessRoughness(GrassType bladeType, float appearanceT, float clumpDensity)
+{
+	float roughness = lerp(bladeType.baseMinTipRoughnessStart.x, bladeType.baseMinTipRoughnessStart.y,
+		smoothstep(0.0f, bladeType.baseMinTipRoughnessStart.w, appearanceT));
+	roughness = lerp(roughness, bladeType.baseMinTipRoughnessStart.z,
+		smoothstep(bladeType.baseMinTipRoughnessStart.x, 1.0f, appearanceT));
+	float clumpAO = lerp(1.0f, bladeType.minAO, clumpDensity * bladeType.clumpAOStrength);
+	return float3(lerp(bladeType.minAO, 1.0f, appearanceT) * clumpAO,
+		lerp(bladeType.minMaxSubsurfaceOpacity.x, bladeType.minMaxSubsurfaceOpacity.y, appearanceT), roughness);
 }
 
 void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, float diffuseNdotL, float diffuseWrap, float detailedSpecularWeight, float3 transmissionNormal, float waxSheenStrength, float waxRoughnessMultiplier)
@@ -165,11 +215,15 @@ void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, Direc
 
 	float waxNdotL = saturate(abs(dot(N, L)));
 	float waxNdotV = saturate(abs(dot(N, V)) + EPSILON_DOT_CLAMP);
-	float waxNdotH = saturate(abs(dot(N, H)));
 	float3 waxF0 = float3(0.035f, 0.035f, 0.035f);
-	float3 waxFresnel;
 	float waxRoughness = saturate(material.Roughness * waxRoughnessMultiplier);
+#if defined(LOW_LOD)
+	float3 waxSpecular = BRDF::F_Schlick(waxF0, satVdotH) * canopyLobe * lerp(1.15f, 0.75f, waxRoughness) * waxNdotL;
+#else
+	float waxNdotH = saturate(abs(dot(N, H)));
+	float3 waxFresnel;
 	float3 waxSpecular = PBR::SpecularMicrofacet(waxRoughness, waxF0, waxNdotL, waxNdotV, waxNdotH, satVdotH, waxFresnel) * waxNdotL;
+#endif
 	float waxGrazing = 1.0f - waxNdotV;
 	float waxWeight = waxSheenStrength * lerp(0.15f, 1.0f, smoothstep(0.10f, 0.70f, waxGrazing));
 	float3 diffuseEnergy = 1.0f - fresnel;
@@ -211,7 +265,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	uint packedPositionWidthHeight = input.PackedBladeParams.z;
 	uint grassTypeIndex = packedSeedAndType & 0xFFu;
 	float clumpDensity = float(packedSeedAndType >> 24) * (1.0f / 255.0f);
-	float farWidthT = asfloat(input.PackedBladeParams.w);
+	float farWidthT = f16tof32(input.PackedBladeParams.w);
+	float tipMatch = f16tof32(input.PackedBladeParams.w >> 16);
 #else
 	uint grassTypeIndex = (uint)input.BladeParams.z;
 #endif
@@ -231,27 +286,27 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float across = input.CameraPositionSide.w;
 	float along = input.BladeTColor.x;
 	float3 baseToTipColor = input.BladeTColor.yzw;
+	float appearanceT = 0.25f * (along + 1.0f);
 
 	float randHeight = bladeType.height * float(packedPositionWidthHeight & 0xFFu) * (1.0f / 255.0f);
-	float bladeHeight = along * derivative.y * randHeight;
+	float bladeHeight = lerp(appearanceT, along, tipMatch) * derivative.y * randHeight;
 	float3 sideAndBladeT = float3(across, along, bladeHeight);
 
 	// Match Low's authored roughness curve at the shared stabilized blade sample.
-	float roughness = lerp(bladeType.baseMinTipRoughnessStart.x, bladeType.baseMinTipRoughnessStart.y,
-		smoothstep(0.0f, bladeType.baseMinTipRoughnessStart.w, along));
-	roughness = lerp(roughness, bladeType.baseMinTipRoughnessStart.z,
-		smoothstep(bladeType.baseMinTipRoughnessStart.x, 1.0f, along));
-	float clumpAO = lerp(1.0f, bladeType.minAO, clumpDensity * bladeType.clumpAOStrength);
-	float3 aoThicknessRoughness = float3(lerp(bladeType.minAO, 1.0f, along) * clumpAO, lerp(bladeType.minMaxSubsurfaceOpacity.x, bladeType.minMaxSubsurfaceOpacity.y, along), roughness);
+	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity);
 
 	uint bladeSeed = (packedSeedAndType >> 8) & 0xFFFFu;
 	float bladeRand = (float(bladeSeed & 0xFFu) + 0.5f) * (1.0f / 256.0f);
 	float bladeRand2 = (float(bladeSeed >> 8) + 0.5f) * (1.0f / 256.0f);
 #else
 	float3 cameraRelativePosition = input.CameraRelativePosition.xyz;
-#	if defined(MID_LOD)
+#	if defined(MID_LOD) || defined(LOW_LOD)
 	float3 previousCameraRelativePosition = cameraRelativePosition + (FrameBuffer::CameraPosAdjust.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz);
+#		if defined(MID_LOD)
 	float along = input.AOThicknessRoughness.w;
+#		else
+	float along = input.BladeT;
+#		endif
 	float2 derivative = 2.0f * (1.0f - along) * input.BezierTipAndMid.zw + 2.0f * along * (input.BezierTipAndMid.xy - input.BezierTipAndMid.zw);
 	float bladeHeight = 2.0f * (1.0f - along) * along * input.BezierTipAndMid.w + along * along * input.BezierTipAndMid.y;
 	float3 sideAndBladeT = float3(input.CameraRelativePosition.w, along, bladeHeight);
@@ -262,20 +317,40 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float along = sideAndBladeT.y;
 #	endif
 
+#	if defined(LOW_LOD)
+	uint lowBladeData = asuint(input.BladeParams.w);
+	float appearanceT = 0.25f * (along + 1.0f);
+	float clumpDensity = float(lowBladeData >> 24) * (1.0f / 255.0f);
+	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity);
+
+	uint clumpSeed = (lowBladeData >> 8) & 0xFFu;
+	float clumpColorRand = (float(clumpSeed) + 0.5f) * (1.0f / 256.0f);
+	float clumpValueRand = (float((clumpSeed * 73u + 41u) & 0xFFu) + 0.5f) * (1.0f / 256.0f);
+	float3 clumpTint = lerp(bladeType.grassColorCool.rgb, bladeType.grassColorWarm.rgb, clumpColorRand);
+	float clumpValue = 1.0f + (clumpValueRand * 2.0f - 1.0f) * bladeType.grassColorVar.y * 0.75f;
+	float3 stableClumpColor = lerp(1.0f, clumpTint * clumpValue, bladeType.clumpColorStrength);
+	float3 tipDryMul = lerp(1.0f, bladeType.grassColorTipDry.rgb,
+		smoothstep(0.5f, 1.0f, appearanceT) * bladeType.grassColorVar.z);
+	float baseShade = lerp(1.0f - grassLightParams.w, 1.0f, smoothstep(0.0f, 0.5f, appearanceT));
+	float3 baseToTipColor = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, appearanceT) * stableClumpColor * tipDryMul * baseShade;
+#	else
 	float3 aoThicknessRoughness = input.AOThicknessRoughness.xyz;
 	float3 baseToTipColor = input.BaseToTipColor.xyz;
 	float viewDepth = input.BaseToTipColor.w;
+#	endif
 	float2 facing = input.BladeParams.xy;
 
 	float across = sideAndBladeT.x;
 
+#	if !defined(LOW_LOD)
 	uint bladeRandBits = asuint(input.BladeParams.w);
-#	if defined(MID_LOD)
+#		if defined(MID_LOD)
 	float bladeRand = float(bladeRandBits & 0xFFu) * (1.0f / 255.0f);
 	float bladeRand2 = float((bladeRandBits >> 8) & 0xFFu) * (1.0f / 255.0f);
-#	else
+#		else
 	float bladeRand = f16tof32(bladeRandBits >> 16);
 	float bladeRand2 = f16tof32(bladeRandBits);
+#		endif
 #	endif
 #endif
 
@@ -314,6 +389,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 worldSpaceViewDirection = -normalize(cameraRelativePosition);
 
 	float4 baseColor = float4(baseToTipColor, 1.0f);
+#if defined(FAR_LOD)
+	// Restore Low's sunlit tip contrast at the handoff, then shed it across early Far.
+	baseColor.rgb *= 1.0f + 0.15f * tipMatch * smoothstep(0.55f, 0.95f, along);
+#endif
 	float4 rawRMAOS = float4(aoThicknessRoughness.z, 0.0f, aoThicknessRoughness.x, bladeType.specular);
 
 	// Reconstruct the blade basis and curve its normal toward the visible edge.
@@ -466,10 +545,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float canopyAODensity = float(packedCanopy >> 4) * (1.0f / 15.0f);
 	float cachedWorldShadow = float((packedCanopyShadow >> 8) & 0xFFu) * (1.0f / 255.0f);
 	canopyAO *= 1.0 - grassLightParams.x * canopyAODensity * (1.0 - canopyHeight01);
-#elif defined(MID_LOD)
+#elif defined(MID_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
 	float canopyDensity = 1.0f;
 	float canopyAODensity = 0.0f;
+#	if defined(MID_LOD)
 	float2 densityUV = (input.WindRootPosition.zw + FrameBuffer::CameraPosAdjust.xy - occlusionParams.xy) * occlusionInvExtent + 0.5f;
+#	else
+	float2 densityUV = (input.RootPosition + FrameBuffer::CameraPosAdjust.xy - occlusionParams.xy) * occlusionInvExtent + 0.5f;
+#	endif
 	if (densityUV.x == saturate(densityUV.x) && densityUV.y == saturate(densityUV.y)) {
 		float bladeCount = GrassDensityTexture[uint2(densityUV * grassAOParams.x)];
 		float onMapDensity = saturate(bladeCount / max(grassAOParams.z, 1.0f));
@@ -512,8 +595,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #if defined(SKYLIGHTING) && !defined(FAR_LOD)
 	float3 positionMSSkylight = cameraRelativePosition;
-	// The generator provides per-blade SH; evaluate it here with the pixel's ambient normal.
+#	if defined(LOW_LOD)
+	float3 probeCell = round(FrameBuffer::CameraPosAdjust.xyz / Skylighting::CELL_SIZE);
+	float3 probeOffset = probeCell * Skylighting::CELL_SIZE - FrameBuffer::CameraPosAdjust.xyz;
+	uint3 probeArrayOrigin = (uint3)((int3)probeCell - (int3)(Skylighting::ARRAY_DIM / 2)) % Skylighting::ARRAY_DIM;
+	float3 probeExtent = Skylighting::ARRAY_SIZE * 0.5f - Skylighting::CELL_SIZE;
+	float3 samplePosition = clamp(positionMSSkylight - probeOffset, -probeExtent, probeExtent) + probeOffset;
+	sh2 skylightingSH = SampleLowSkylighting(samplePosition, probeOffset, probeArrayOrigin);
+#	else
 	sh2 skylightingSH = input.SkylightingVertexSH;
+#	endif
 #endif
 
 #if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
@@ -622,6 +713,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #if defined(HIGH_LOD)
 	float dirShadow = cachedWorldShadow;
+#elif defined(MID_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
+#	if defined(MID_LOD)
+	float3 shadowPosition = float3(input.WindRootPosition.zw, cameraRelativePosition.z - sideAndBladeT.z);
+#	else
+	float3 shadowPosition = float3(input.RootPosition, cameraRelativePosition.z - sideAndBladeT.z);
+#	endif
+	float dirShadow = ShadowSampling::GetWorldShadow(shadowPosition, FrameBuffer::CameraPosAdjust.xyz);
 #else
 	float dirShadow = ShadowSampling::GetWorldShadow(cameraRelativePosition, FrameBuffer::CameraPosAdjust.xyz);
 #endif
@@ -799,12 +897,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float densityShadowOuterFade = 1.0f - smoothstep(densityShadowOuterStart, 1.0f, farWidthT);
 	float densityShadow = lerp(1.0f, 0.875f, smoothstep(0.0f, 0.2f, farWidthT)) * densityShadowOuterFade;
 	float densityShadowHeight = 1.0f - 0.75f * saturate(sideAndBladeT.z / max(grassAOParams.w, 1.0f));
-	if (heightMapScale.x != 0.0f && heightMapScale.y != 0.0f) {
-		float3 worldPosition = cameraRelativePosition + FrameBuffer::CameraPosAdjust.xyz;
-		float terrainZ = lerp(heightMapZRange.x, heightMapZRange.y,
-			TerrainHeightTexture.SampleLevel(LinearSampler, worldPosition.xy * heightMapScale + heightMapOffset, 0));
-		densityShadowHeight = 1.0f - 0.75f * saturate((worldPosition.z - terrainZ) / max(grassAOParams.w, 1.0f));
-	}
 	psout.Diffuse.xyz *= saturate(1.0f - densityShadow * saturate(grassAOParams.y) * densityShadowHeight);
 
 	// Far runs after deferred composite, so resolve diffuse and specular in the same order here.
@@ -838,9 +930,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #endif
 
+#if !defined(FAR_LOD)
 	float2 screenMotionVector = MotionBlur::GetSSMotionVector(float4(cameraRelativePosition, 1), float4(previousCameraRelativePosition, 1));
 	psout.MotionVectors.xy = screenMotionVector.xy;
 	psout.MotionVectors.zw = float2(0, psout.Diffuse.w);
+#endif
 
 	return psout;
 }
