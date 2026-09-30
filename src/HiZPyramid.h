@@ -2,12 +2,15 @@
 
 #include "Buffer.h"
 
-/** @brief Max-depth mip pyramid over the scene depth copy, used to occlusion-cull grass instances. A texel at level N is exactly the farthest depth of everything beneath it */
+/**
+ * @brief Max-depth mip pyramid over scene depth, shared by Grass Optimizations and Procedural Grass for occlusion culling.
+ * A texel at level N is exactly the farthest depth of everything beneath it.
+ */
 class HiZPyramid
 {
 public:
 	/**
-	 * @brief Rebuilds the pyramid from the current scene depth copy.
+	 * @brief Rebuilds the pyramid from the live main depth, falling back to the post-Z-prepass copy.
 	 * @param device Device used to create the per-mip views when the size changes.
 	 * @param ctx Immediate context the reduction dispatches are issued on.
 	 * @param forceRefresh Rebuild even when the pyramid was already produced this frame.
