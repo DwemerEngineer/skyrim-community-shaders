@@ -4,9 +4,6 @@
 #include <cctype>
 #include <ranges>
 
-#include <DirectXTex.h>
-#include <pystring/pystring.h>
-
 #include "I18n/I18n.h"
 #include "State.h"
 #include "TerrainHeightMap.h"
@@ -476,7 +473,10 @@ void TerrainShadows::ReflectionsPrepass()
 
 void TerrainShadows::EarlyPrepass()
 {
-	if (globals::terrainHeightMap->LoadForCurrentWorldspace()) {
+	auto heightMap = globals::terrainHeightMap;
+	heightMap->LoadForCurrentWorldspace();
+	if (heightMap->GetLoadGeneration() != handledHeightMapGeneration) {
+		handledHeightMapGeneration = heightMap->GetLoadGeneration();
 		shadowUpdateIdx = 0;
 		needPrecompute = true;
 	}

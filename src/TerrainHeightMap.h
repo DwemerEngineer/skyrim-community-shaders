@@ -28,9 +28,12 @@ public:
 
 	/**
 	 * @brief Loads the DDS for the current worldspace unless it is already cached.
-	 * @return true if the cached heightmap changed, so callers can invalidate derived data.
+	 * Several features call this; each compares @ref GetLoadGeneration to detect a change it has not handled.
 	 */
-	bool LoadForCurrentWorldspace();
+	void LoadForCurrentWorldspace();
+
+	/** @brief Increments whenever a different heightmap is loaded. */
+	uint32_t GetLoadGeneration() const { return loadGeneration; }
 
 	/** @brief Whether a heightmap is loaded and belongs to the worldspace the player is in. */
 	bool IsReady() const;
@@ -60,6 +63,7 @@ private:
 	void ParseHeightmapPath(std::filesystem::path p, bool xlodgen_style);
 
 	bool discovered = false;
+	uint32_t loadGeneration = 0;
 	std::unordered_map<std::string, Metadata> heightmaps;
 	Metadata* cachedHeightmap = nullptr;
 	std::unique_ptr<Texture2D> texHeightMap = nullptr;

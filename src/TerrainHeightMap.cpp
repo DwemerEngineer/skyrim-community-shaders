@@ -108,23 +108,23 @@ bool TerrainHeightMap::IsReady() const
 	return false;
 }
 
-bool TerrainHeightMap::LoadForCurrentWorldspace()
+void TerrainHeightMap::LoadForCurrentWorldspace()
 {
 	auto tes = globals::game::tes;
 	if (!tes)
-		return false;
+		return;
 
 	auto worldspace = ResolveLandWorldspace(tes->GetRuntimeData2().worldSpace);
 
 	if (!worldspace)
-		return false;
+		return;
 
 	std::string worldspace_name = worldspace->GetFormEditorID();
 	if (!heightmaps.contains(worldspace_name))  // no height map for that, but we don't remove cache
-		return false;
+		return;
 
 	if (cachedHeightmap && cachedHeightmap->worldspace == worldspace_name)  // already cached
-		return false;
+		return;
 
 	auto device = globals::d3d::device;
 
@@ -140,7 +140,7 @@ bool TerrainHeightMap::LoadForCurrentWorldspace()
 			DX::ThrowIfFailed(LoadFromDDSFile(path.c_str(), DirectX::DDS_FLAGS_NONE, nullptr, image));
 		} catch (const DX::com_exception& e) {
 			logger::error("{}", e.what());
-			return false;
+			return;
 		}
 
 		ID3D11Resource* pResource = nullptr;
@@ -150,7 +150,7 @@ bool TerrainHeightMap::LoadForCurrentWorldspace()
 				image.GetMetadata(), &pResource));
 		} catch (const DX::com_exception& e) {
 			logger::error("{}", e.what());
-			return false;
+			return;
 		}
 
 		texHeightMap = std::make_unique<Texture2D>(reinterpret_cast<ID3D11Texture2D*>(pResource), "TerrainHeightMap::HeightMap");
@@ -167,7 +167,7 @@ bool TerrainHeightMap::LoadForCurrentWorldspace()
 		cachedHeightmap = &heightmaps[worldspace_name];
 	}
 
-	return true;
+	++loadGeneration;
 }
 
 float3 TerrainHeightMap::GetScale() const

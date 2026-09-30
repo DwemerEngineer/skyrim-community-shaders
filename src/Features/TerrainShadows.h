@@ -36,6 +36,7 @@ public:
 	bool needPrecompute = false;
 	uint shadowUpdateIdx = 0;
 	std::uint32_t handledTimeJumpRefreshGeneration = 0;
+	std::uint32_t handledHeightMapGeneration = 0;
 
 	struct ShadowUpdateCB
 	{
