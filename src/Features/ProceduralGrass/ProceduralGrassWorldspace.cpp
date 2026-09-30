@@ -373,7 +373,6 @@ void ProceduralGrass::GetVisibleQuadrants()
 						if (const auto mesh = land->loadedData->mesh[j]) {
 							quadrantReject.withMesh++;
 							if (settings.debugIgnorePreProcessedFlag || mesh->GetFlags().all(RE::NiAVObject::Flag::kPreProcessedNode)) {
-
 								quadrantReject.preProcessed++;
 								quadrant.x = j % 2;
 								quadrant.y = j / 2;
@@ -482,7 +481,6 @@ void ProceduralGrass::GetVisibleQuadrants()
 			std::fill(grassPresenceStaging.begin(), grassPresenceStaging.end(), uint8_t{ 0 });
 
 			for (const auto& presenceQuadrant : quadrantsPresence) {
-
 				if (!presenceQuadrant.grassIds)
 					continue;
 
@@ -519,7 +517,6 @@ void ProceduralGrass::GetVisibleQuadrants()
 			grassPresenceOriginQuadY = presenceOriginQuadY;
 			grassPresenceContentHash = presenceContentHash;
 			grassPresenceUploadDirty = true;
-
 		}
 		nearVisibleStamp = currentNearStamp;
 	}
@@ -583,7 +580,8 @@ void ProceduralGrass::GetVisibleQuadrants()
 		PGrassCommon::GrassHashValue(currentFarStamp, readyVersion);
 
 		if (currentFarStamp != farVisibleStamp) {
-			quadrantsFarLOD.clear();
+			size_t quadrantCount = 0;
+			bool contentChanged = false;
 			const float farFallbackStart = PGrassCommon::HighTierQuadrantRadius * 2048.0f;
 			const float farFallbackStartSq = farFallbackStart * farFallbackStart;
 
@@ -593,7 +591,7 @@ void ProceduralGrass::GetVisibleQuadrants()
 					if (!cellGrass)
 						continue;
 
-					for (uint32_t j = 0; j < 4 && quadrantsFarLOD.size() < PGrassCommon::FarQuadrantCount; ++j) {
+					for (uint32_t j = 0; j < 4 && quadrantCount < PGrassCommon::FarQuadrantCount; ++j) {
 						const int32_t worldQuadrantX = cx * 2 + static_cast<int32_t>(j % 2);
 						const int32_t worldQuadrantY = cy * 2 + static_cast<int32_t>(j / 2);
 						const int32_t md = std::max(std::abs(playerQuadrantX - worldQuadrantX), std::abs(playerQuadrantY - worldQuadrantY));
@@ -624,13 +622,28 @@ void ProceduralGrass::GetVisibleQuadrants()
 						quadrant.worldPos = float2{ worldX, worldY };
 						quadrant.minHeight = cellGrass->minHeights[j];
 						quadrant.maxHeight = cellGrass->maxHeights[j];
-						quadrantsFarLOD.push_back(quadrant);
+						if (quadrantCount < quadrantsFarLOD.size()) {
+							auto& previous = quadrantsFarLOD[quadrantCount];
+							contentChanged |= previous.cellX != quadrant.cellX || previous.cellY != quadrant.cellY ||
+							                  previous.x != quadrant.x || previous.y != quadrant.y || previous.cacheVersion != quadrant.cacheVersion ||
+							                  previous.nearCovered != quadrant.nearCovered || previous.grassIds != quadrant.grassIds ||
+							                  previous.occupancyRows != quadrant.occupancyRows || previous.heights != quadrant.heights ||
+							                  previous.worldPos != quadrant.worldPos || previous.minHeight != quadrant.minHeight || previous.maxHeight != quadrant.maxHeight;
+							previous = quadrant;
+						} else {
+							quadrantsFarLOD.push_back(quadrant);
+							contentChanged = true;
+						}
+						++quadrantCount;
 					}
 				}
 			}
 
 			farVisibleStamp = currentFarStamp;
-			++quadrantsFarVersion;
+			contentChanged |= quadrantCount != quadrantsFarLOD.size();
+			quadrantsFarLOD.resize(quadrantCount);
+			if (contentChanged)
+				++quadrantsFarVersion;
 		}
 	} else {
 		farRequestWorldSpace = nullptr;

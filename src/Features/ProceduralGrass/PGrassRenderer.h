@@ -15,6 +15,7 @@ namespace PGrassRendererQuads
 	inline constexpr uint32_t WorkOccupiedTile = 1u << 21;
 	inline constexpr uint32_t WorkTileShift = 22;
 	inline constexpr uint32_t WorkTileMask = 0xFFu;
+	inline constexpr uint32_t WorkFullGrass = 1u << 30;
 	inline constexpr uint32_t OccupancyTilesPerAxis = PGrassCommon::QuadrantGrassPitch - 1;
 	inline constexpr uint32_t OccupancyTileCount = OccupancyTilesPerAxis * OccupancyTilesPerAxis;
 
@@ -60,9 +61,9 @@ public:
 	void ClearShaderCache();
 
 	void GenerateBlades(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion, int32_t cellXOffset, int32_t cellYOffset,
-		const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, float frustumPadding, bool disableGeneratorCulls,
+		const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, float frustumPadding, float clumpGridSize, bool disableGeneratorCulls,
 		float fadeInPositionPadding = 0.0f, float compactStartDistance = -1.0f, float compactKeep = 1.0f);
-	void RenderDepth(ID3D11DeviceContext* ctx, ID3D11PixelShader* depthClipPS);
+	void RenderDepth(ID3D11DeviceContext* ctx, ID3D11PixelShader* depthClipPS = nullptr);
 	void RenderGrass(ID3D11DeviceContext* ctx);
 
 	/** @brief Reads back the instance count generated last frame. Debug only; stalls. */
@@ -75,11 +76,12 @@ private:
 	const char* vertCountDefine;
 	const char* extraDefine;
 	uint32_t density;
-	uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade);  // High may include skylighting/collision, Mid may include collision, and Far is 16 bytes.
+	uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade);  // High stores SH, Mid stores the probe root; either may include collision. Far is 16 bytes.
 	std::string densityString;
 	uint32_t slopeExtraBlades = 0;
 	std::string patchBladeCountString = std::to_string(PatchBladeCount);
 	std::string slopeExtraBladesString = "0";
+	std::string bladeBatchSizeString;
 	uint32_t patchesPerQuadrant;
 	uint32_t bladeBufferCapacity = 0;
 	uint32_t threadGroupSize;
@@ -87,7 +89,12 @@ private:
 	std::string quadrantCountString = std::to_string(QuadrantCount);
 
 	ID3D11ComputeShader* bladeGeneratorCS = nullptr;
+	ID3D11ComputeShader* compactBladeGeneratorCS = nullptr;
+	ID3D11ComputeShader* batchArgsCS = nullptr;
+	ID3D11ComputeShader* featureCacheCS = nullptr;
+	ID3D11ComputeShader* placementCacheCS = nullptr;
 	bool bladeGeneratorCompileAttempted = false;
+	bool compactBladeGeneratorCompileAttempted = false;
 	ID3D11VertexShader* depthVS = nullptr;
 	ID3D11VertexShader* outerDepthVS = nullptr;
 	ID3D11VertexShader* vs = nullptr;
@@ -96,21 +103,31 @@ private:
 	std::array<ID3D11PixelShader*, 8> pixelShaders{};
 
 	StructuredBuffer* bladesSB = nullptr;
-
+	StructuredBuffer* clumpFeaturesSB = nullptr;
+	uint32_t clumpFeatureQuadrantCapacity = 0;
+	StructuredBuffer* placementCacheSB = nullptr;
+	uint32_t placementQuadrantCapacity = 0;
 
 	StructuredBuffer* quadrantGrassCellsSB = nullptr;
 	std::vector<uint32_t> quadrantGrassCellsStaging;  // one packed 2x2 LAND-id cell per 16x16 quadrant cell
+	StructuredBuffer* quadrantOccupancySB = nullptr;
+	std::vector<uint32_t> quadrantOccupancyStaging;
 	StructuredBuffer* quadrantHeightSB = nullptr;
 	std::vector<float> quadrantHeightStaging;
+	StructuredBuffer* tileHeightBoundsSB = nullptr;
+	std::vector<float2> tileHeightBoundsStaging;
 	StructuredBuffer* visibleWorkSB = nullptr;
 	StructuredBuffer* visibleCompactWorkSB = nullptr;
 	std::vector<uint32_t> visibleWorkStaging;
 	std::vector<uint32_t> visibleCompactWorkStaging;
+	bool compactWorkAllowsSlopeExtras = false;
 	struct OccupiedTile
 	{
 		uint16_t tile = 0;
 		uint16_t patchCount = 0;
 	};
+	std::array<float4, PGrassRendererQuads::OccupancyTileCount> tileLocalBounds{};
+	std::vector<OccupiedTile> visibleTilesStaging;
 	struct OccupancyCacheEntry
 	{
 		uint64_t cacheVersion = 0;
@@ -124,17 +141,51 @@ private:
 	{
 		uint32_t quadrantIndex = 0;
 		uint32_t flags = 0;
-		uint64_t occupancyKey = 0;
+		uint32_t tileOffset = 0;
+		uint32_t tileCount = 0;
+		const OccupiedTile* cachedTiles = nullptr;
 	};
 	std::vector<VisibleWorkCandidate> visibleWorkCandidates;
+	struct WorkListState
+	{
+		uint64_t contentVersion;
+		uint32_t density;
+		uint32_t threadGroupSize;
+		uint32_t quadrantCount;
+		float4x4 viewProj;
+		float4 cameraPosAdjust;
+		float2 lodOrigin;
+		float4 lodFadeIn;
+		float4 lodFadeOut;
+		float frustumPadding;
+		float fadeInPositionPadding;
+		float compactStartDistance;
+		float compactKeep;
+		float edgeNoise;
+		bool disableGeneratorCulls;
+
+		bool operator==(const WorkListState&) const = default;
+	};
+	WorkListState lastWorkListState{};
+	uint64_t cachedRequiredBladeCount = 0;
+	uint32_t cachedWorkGX = 0;
+	bool hasCachedWorkList = false;
 	ConstantBuffer* quadrantsCB = nullptr;
+	PGrassCommon::QuadrantDataArray<QuadrantCount> quadrantDataStaging{};
 
 	// Skip staging rebuilds and uploads while the tier content and fade constants are unchanged.
 	uint64_t lastUploadVersion = 0;
+	uint64_t lastPlacementVersion = 0;
+	uint64_t lastFeatureVersion = 0;
+	float lastFeatureGridSize = 0.0f;
+	bool hasCachedFeatures = false;
+	bool hasCachedPlacements = false;
 	float4 lastUploadLodFadeIn{};
 	float4 lastUploadLodFadeOut{};
+	float lastTileReach = -1.0f;
 	bool hasUploadedQuadrants = false;
 	Buffer* argsBuffer = nullptr;
+	Buffer* batchArgsBuffer = nullptr;
 	winrt::com_ptr<ID3D11Buffer> argsStaging;
 	Buffer* vertexIndicesBuffer = nullptr;
 	Buffer* outerVertexIndicesBuffer = nullptr;
@@ -148,9 +199,14 @@ private:
 		return grassCollisionLoaded && (lod == "HIGH_LOD" || lod == "MID_LOD");
 	}
 	bool UsesSimpleLighting() const;
+	bool UsesBatchedLow() const { return std::string_view(vertCountDefine) == "LOW_VERTEX"; }
+	bool UsesBatchedDraws() const { return UsesBatchedLow() || std::string_view(vertCountDefine) == "MID_VERTEX"; }
 	void AppendVertexShaderDefines(ShaderDefines& defines) const;
 
-	ID3D11ComputeShader* GetBladeGeneratorCS();
+	ID3D11ComputeShader* GetBladeGeneratorCS(bool compact = false);
+	ID3D11ComputeShader* GetBatchArgsCS();
+	ID3D11ComputeShader* GetFeatureCacheCS();
+	ID3D11ComputeShader* GetPlacementCacheCS();
 	ID3D11VertexShader* GetDepthVS();
 	ID3D11VertexShader* GetOuterDepthVS();
 	ID3D11VertexShader* GetVS();

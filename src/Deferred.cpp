@@ -6,6 +6,7 @@
 #include "State.h"
 #include "Utils/D3D.h"
 
+#include "Features/CSEditor.h"
 #include "Features/DynamicCubemaps.h"
 #include "Features/Effects11.h"
 #include "Features/IBL.h"
@@ -15,7 +16,6 @@
 #include "Features/SubsurfaceScattering.h"
 #include "Features/TerrainBlending.h"
 #include "Features/Upscaling.h"
-#include "Features/CSEditor.h"
 
 #include "Hooks.h"
 
@@ -352,30 +352,26 @@ void Deferred::DeferredPasses()
 		TracyD3D11Zone(globals::state->tracyCtx, "Deferred Composite");
 
 		ID3D11ShaderResourceView* srvs[16]{
-			specular.SRV,                                                                                    // t0  SpecularTexture
-			albedo.SRV,                                                                                      // t1  AlbedoTexture
-			normalRoughness.SRV,                                                                             // t2  NormalRoughnessTexture
-			masks.SRV,                                                                                       // t3  MasksTexture
-			dynamicCubemaps.loaded ? Util::GetCurrentSceneDepthSRV(false) : nullptr,                         // t4  DepthTexture (24/32-bit; HLSL type baked at compile via TERRAIN_BLENDING)
-			dynamicCubemaps.loaded ? reflectance.SRV : nullptr,                                              // t5  ReflectanceTexture
-			dynamicCubemaps.loaded ? dynamicCubemaps.envTexture->srv.get() : nullptr,                        // t6  EnvTexture
-			dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr,             // t7  EnvReflectionsTexture
-			dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr,   // t8  SkylightingProbeArray
-			masks2.SRV,                                                                                      // t9  Masks2Texture (vertexAO in .x)
-			ssgi_ao,                                                                                         // t10 SsgiAoTexture
-			ssgi_hq_spec ? nullptr : ssgi_y,                                                                 // t11 SsgiYTexture
-			ssgi_hq_spec ? nullptr : ssgi_cocg,                                                              // t12 SsgiCoCgTexture
-			ssgi_hq_spec ? ssgi_gi_spec : nullptr,                                                           // t13 SsgiSpecularTexture
-			ibl.loaded ? ibl.envIBLTexture->srv.get() : nullptr,                                             // t14 EnvIBLTexture
-			ibl.loaded ? ibl.skyIBLTexture->srv.get() : nullptr,                                             // t15 SkyIBLTexture
+			specular.SRV,                                                                                   // t0  SpecularTexture
+			albedo.SRV,                                                                                     // t1  AlbedoTexture
+			normalRoughness.SRV,                                                                            // t2  NormalRoughnessTexture
+			masks.SRV,                                                                                      // t3  MasksTexture
+			dynamicCubemaps.loaded ? Util::GetCurrentSceneDepthSRV(false) : nullptr,                        // t4  DepthTexture (24/32-bit; HLSL type baked at compile via TERRAIN_BLENDING)
+			dynamicCubemaps.loaded ? reflectance.SRV : nullptr,                                             // t5  ReflectanceTexture
+			dynamicCubemaps.loaded ? dynamicCubemaps.envTexture->srv.get() : nullptr,                       // t6  EnvTexture
+			dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr,            // t7  EnvReflectionsTexture
+			dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr,  // t8  SkylightingProbeArray
+			masks2.SRV,                                                                                     // t9  Masks2Texture (vertexAO in .x)
+			ssgi_ao,                                                                                        // t10 SsgiAoTexture
+			ssgi_hq_spec ? nullptr : ssgi_y,                                                                // t11 SsgiYTexture
+			ssgi_hq_spec ? nullptr : ssgi_cocg,                                                             // t12 SsgiCoCgTexture
+			ssgi_hq_spec ? ssgi_gi_spec : nullptr,                                                          // t13 SsgiSpecularTexture
+			ibl.loaded ? ibl.envIBLTexture->srv.get() : nullptr,                                            // t14 EnvIBLTexture
+			ibl.loaded ? ibl.skyIBLTexture->srv.get() : nullptr,                                            // t15 SkyIBLTexture
 		};
 
 		if (dynamicCubemaps.loaded)
 			context->CSSetSamplers(0, 1, &linearSampler);
-
-		// Terrain albedo is only complete now, so darken it under grass just before the composite reads it.
-		if (globals::features::proceduralGrass.loaded)
-			globals::features::proceduralGrass.DarkenTerrainUnderGrass();
 
 		context->CSSetShaderResources(0, ARRAYSIZE(srvs), srvs);
 
@@ -407,8 +403,11 @@ void Deferred::DeferredPasses()
 		context->CSSetShader(nullptr, nullptr, 0);
 	}
 
-	if (proceduralGrass.loaded)
+	if (proceduralGrass.loaded) {
+		// Resolve indirect lighting and reflections before applying the grass canopy darkening.
+		proceduralGrass.DarkenTerrainUnderGrass();
 		proceduralGrass.ForwardRenderFar();
+	}
 
 	if (dynamicCubemaps.loaded)
 		dynamicCubemaps.PostDeferred();

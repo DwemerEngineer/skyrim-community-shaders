@@ -1,4 +1,4 @@
-// Samples density to directly darken blades to fake self-occlusion and darken terrain albedo by how much grass stands over each point to fake canopy AO.
+// Darkens resolved lighting under the grass canopy, fading out above the terrain.
 
 #define FRAMEBUFFER
 #include "Common/FrameBuffer.hlsli"

@@ -31,11 +31,12 @@ cbuffer GrassGlobals : register(b8)
 
 	float2 debugFlags;           // x: bypass generator culling
 	float4 grassPresenceParams;  // xy: world min-corner of the grass-id texture, z: 1/sample spacing, w: texture dim (density gather)
-	float4 grassHiZParams;       // xy: valid base extent, z: conservative grass geometry radius, w: trustworthy mip count; zero disables
+	float4 grassHiZParams;       // xy: valid base extent, z: near-tier geometry radius, w: trustworthy mip count; zero disables
 	float2 grassLodOrigin;       // camera XY with a small dead zone, preventing stationary camera sway from moving LOD bands
 	float windRotationScale;
 	uint occlusionMapDim;
 	float4 frustumPlaneExtent;  // Left, right, bottom, top clip-plane extents for a unit world-space box.
+	float4 grassHiZBounds;      // x: Far radius, y: near-tier clump reach, z: wind reach, w: High depth base cutoff; negative disables.
 }
 
 #if defined(FAR_LOD)
@@ -109,7 +110,7 @@ float ApproximateGrassDistance(float2 offset)
 	return max(distanceXY.x, distanceXY.y) + min(distanceXY.x, distanceXY.y) * 0.375f;
 }
 
-#if defined(CSHADER) || defined(DEPTH)
+#if defined(CSHADER) || defined(DEPTH) || defined(MID_VERTEX)
 struct GrassGeneratorType
 {
 	float height;
@@ -135,30 +136,32 @@ cbuffer GrassGeneratorTypes : register(b10)
 #if defined(FAR_LOD)
 struct Blade
 {
-	uint posXY;          // camera-relative x/y as two f16 values
+	uint posXY;            // camera-relative x/y as two f16 values
 	uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
-	uint facingTilt;   // 4x UNORM8 mapped to [-1,1]: facing.xy, tilt sin/cos
-	uint seedAndType;  // high 8: clump density; next 16: Voronoi-cell appearance seed; low 8: grass type
+	uint facingTilt;       // 4x UNORM8 mapped to [-1,1]: facing.xy, tilt sin/cos
+	uint seedAndType;      // high 8: clump density; next 16: Voronoi-cell appearance seed; low 8: grass type
 };
 #else
 struct Blade
 {
-	uint posXY;          // camera-relative x/y as two f16 values
+	uint posXY;            // camera-relative x/y as two f16 values
 	uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
-	uint facingAndWind;  // low 16: current facing as 2x SNORM8; high 16 is tier-specific
-	uint previousWind;   // tier-specific geometry and motion data
+	uint facingAndWind;    // low 16: current facing as 2x SNORM8; high 16 is tier-specific
+	uint previousWind;     // tier-specific geometry and motion data
 	uint hashClumpAndGrassType;
 	uint tipDir;
-#	if !defined(LOW_LOD)
+#	if defined(MID_LOD)
+	float3 skylightingRoot;  // Preserve the generator's full-precision probe position.
+#	elif !defined(LOW_LOD)
 	uint skylightingSH0;  // x/y as f16
 	uint skylightingSH1;  // z/w as f16
 #	endif
 #	if defined(PGRASS_CACHED_COLLISION)
-#	if defined(MID_LOD)
+#		if defined(MID_LOD)
 	uint collisionData;  // current x and y as f16, with current z in previousWind
-#	else
+#		else
 	uint3 collisionData;  // current.xyz and previous.xyz packed as six f16 values
-#	endif
+#		endif
 #	endif
 };
 #endif

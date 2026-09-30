@@ -19,6 +19,8 @@ public:
 	ID3D11ShaderResourceView* GetSRV() const;
 	/** @brief Returns true when Build succeeded for the current frame. */
 	bool IsValid() const;
+	/** @brief Returns true when the current pyramid uses this frame's live opaque depth. */
+	bool HasCurrentSceneDepth() const { return IsValid() && usingLiveDepth; }
 	/** @brief Returns the base level width in texels. */
 	uint32_t GetWidth() const { return width; }
 	/** @brief Returns the base level height in texels. */

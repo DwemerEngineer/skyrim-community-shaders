@@ -231,6 +231,9 @@ private:
 	ID3D11VertexShader* densityAOVS = nullptr;
 	ID3D11PixelShader* densityAOPS = nullptr;
 	ID3D11PixelShader* depthClipPS = nullptr;
+	float depthBlendStrength = -1.0f;
+	float depthBlendHeight = -1.0f;
+	float depthBaseCutoff = -1.0f;
 	static constexpr uint32_t grassDensityDim = 256;
 	static constexpr uint32_t distantAmbientLUTDim = 32;
 
@@ -261,6 +264,7 @@ private:
 	Buffer* vertexIndicesHighOuterBuffer = nullptr;
 	Buffer* vertexIndicesMidBuffer = nullptr;  // 9-index, five-vertex Mid blade
 	Buffer* vertexIndicesLowBuffer = nullptr;
+	Buffer* vertexIndicesLowOuterBuffer = nullptr;
 	Buffer* vertexIndicesFarBuffer = nullptr;  // 3-index single-triangle far blade
 
 	/** @brief Cached grass ids and heights for one LAND quadrant. */
@@ -297,6 +301,8 @@ private:
 	float2 grassLodOrigin = float2(0.0f, 0.0f);
 	bool grassLodOriginInitialized = false;
 	float nearQuadrantFrustumPadding = 0.0f;
+	float nearHiZRadius = 0.0f;
+	float hiZClumpReach = 0.0f;
 	float farQuadrantFrustumPadding = 0.0f;
 	float lowFadeInPositionPadding = 1.0f;
 
@@ -384,6 +390,6 @@ private:
 	void RenderGrass(ID3D11DeviceContext* ctx) const;
 
 public:
-	/** @brief Multiply-darkens terrain albedo from the grass density map. */
+	/** @brief Darkens resolved scene lighting below the grass canopy from the density map. */
 	void DarkenTerrainUnderGrass() const;
 };

@@ -66,7 +66,7 @@ struct PS_INPUT
 	float4 BladeTColor: TEXCOORD1;                       // x: actual blade parameter; yzw: stabilized base-to-tip colour
 	nointerpolation uint4 PackedBladeParams: TEXCOORD2;  // facing/tilt, seed/type, root Z/width/height, two f16 Far ramps
 #else
-	float4 CameraRelativePosition: TEXCOORD0;          // xyz: camera-relative position; w: across-blade coordinate
+	float4 CameraRelativePosition: TEXCOORD0;  // xyz: camera-relative position; w: across-blade coordinate
 #	if defined(HIGH_LOD)
 	float4 PreviousCameraRelativePosition: TEXCOORD1;  // xyz: previous camera-relative position; w: Bezier t
 #	elif defined(LOW_LOD)
@@ -79,16 +79,27 @@ struct PS_INPUT
 #	elif defined(LOW_LOD)
 	nointerpolation float2 RootPosition: TEXCOORD2;  // camera-relative blade root XY
 #	endif
-#	if !defined(LOW_LOD)
-	float4 AOThicknessRoughness: TEXCOORD3;             // xyz: AO, thickness, roughness; w: root-relative height, or Bezier t for Mid
+#	if defined(MID_LOD)
+	float2 BladeTDepth: TEXCOORD3;                 // x: Bezier t; y: positive view depth
+	nointerpolation uint MaterialData: TEXCOORD7;  // clump seed/density and double-blade flag
+#	elif !defined(LOW_LOD)
+	float4 AOThicknessRoughness: TEXCOORD3;  // xyz: AO, thickness, roughness; w: root-relative height, or Bezier t for Mid
 #	endif
+#	if defined(LOW_LOD)
+	nointerpolation float2 BezierTipAndMid: TEXCOORD4;  // Low reconstructs its midpoint per visible pixel.
+#	else
 	nointerpolation float4 BezierTipAndMid: TEXCOORD4;  // xy: tip; zw: midpoint in facing/up space
-	nointerpolation float4 BladeParams: TEXCOORD5;      // xy: facing; z: type; w: two f16 randoms
-#	if !defined(LOW_LOD)
-	float4 BaseToTipColor: TEXCOORD7;                   // xyz: blade colour; w: positive view depth.
+#	endif
+	nointerpolation float4 BladeParams: TEXCOORD5;  // xy: facing; z: type; w: two f16 randoms
+#	if !defined(LOW_LOD) && !defined(MID_LOD)
+	float4 BaseToTipColor: TEXCOORD7;  // xyz: blade colour; w: positive view depth.
 #	endif
 #	if defined(SKYLIGHTING) && !defined(LOW_LOD)
+#		if defined(MID_LOD)
+	nointerpolation float3 SkylightingRoot: TEXCOORD9;  // Full-precision probe position from the generator.
+#		else
 	nointerpolation float4 SkylightingVertexSH: TEXCOORD9;  // Per-blade SH from the generator.
+#		endif
 #	endif
 #endif
 };
@@ -162,11 +173,20 @@ sh2 SampleLowSkylighting(float3 positionMS, float3 positionOffset, uint3 arrayOr
 	uint3 tex2 = (uint3(cell000 + offset2) + arrayOrigin) % Skylighting::ARRAY_DIM;
 	uint3 tex111 = (uint3(cell000 + 1) + arrayOrigin) % Skylighting::ARRAY_DIM;
 	return Skylighting::SkylightingProbeArray[tex000] * weights.x +
-		Skylighting::SkylightingProbeArray[tex1] * weights.y +
-		Skylighting::SkylightingProbeArray[tex2] * weights.z +
-		Skylighting::SkylightingProbeArray[tex111] * weights.w;
+	       Skylighting::SkylightingProbeArray[tex1] * weights.y +
+	       Skylighting::SkylightingProbeArray[tex2] * weights.z +
+	       Skylighting::SkylightingProbeArray[tex111] * weights.w;
 }
 #endif
+
+float3 GetStableClumpColor(GrassType bladeType, uint seed)
+{
+	float colorRandom = (float(seed) + 0.5f) * (1.0f / 256.0f);
+	float valueRandom = (float((seed * 73u + 41u) & 0xFFu) + 0.5f) * (1.0f / 256.0f);
+	float3 tint = lerp(bladeType.grassColorCool.rgb, bladeType.grassColorWarm.rgb, colorRandom);
+	float value = 1.0f + (valueRandom * 2.0f - 1.0f) * bladeType.grassColorVar.y * 0.75f;
+	return lerp(1.0f, tint * value, bladeType.clumpColorStrength);
+}
 
 float3 GetDistantAOThicknessRoughness(GrassType bladeType, float appearanceT, float clumpDensity)
 {
@@ -250,7 +270,7 @@ void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, Direc
 		float3 transmissionTint = saturate(material.SubsurfaceColor * 1.20f);
 		float transmissionShadow = lerp(context.softShadow, 1.0f, thinness * 0.35f);
 		float3 sheetTransmission = transmissionTint * context.lightColor * transmissionShadow *
-			BRDF::Diffuse_Lambert() * diffuseEnergy * transmissionAmount;
+		                           BRDF::Diffuse_Lambert() * diffuseEnergy * transmissionAmount;
 		lightingOutput.transmission = sheetTransmission;
 	}
 }
@@ -303,12 +323,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if defined(MID_LOD) || defined(LOW_LOD)
 	float3 previousCameraRelativePosition = cameraRelativePosition + (FrameBuffer::CameraPosAdjust.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz);
 #		if defined(MID_LOD)
-	float along = input.AOThicknessRoughness.w;
-#		else
-	float along = input.BladeT;
-#		endif
+	float along = input.BladeTDepth.x;
 	float2 derivative = 2.0f * (1.0f - along) * input.BezierTipAndMid.zw + 2.0f * along * (input.BezierTipAndMid.xy - input.BezierTipAndMid.zw);
 	float bladeHeight = 2.0f * (1.0f - along) * along * input.BezierTipAndMid.w + along * along * input.BezierTipAndMid.y;
+#		else
+	float along = input.BladeT;
+	uint lowBladeData = asuint(input.BladeParams.w);
+	float2 lowTip = input.BezierTipAndMid;
+	float lowRandBend = bladeType.stiffness * (0.25f + float((lowBladeData >> 16) & 0xFu) * (1.6f / 15.0f));
+	float2 lowMidPoint = lowTip * bladeType.mid + float2(-lowTip.y, lowTip.x) * lowRandBend;
+	float2 derivative = 2.0f * (1.0f - along) * lowMidPoint + 2.0f * along * (lowTip - lowMidPoint);
+	float bladeHeight = 2.0f * (1.0f - along) * along * lowMidPoint.y + along * along * lowTip.y;
+#		endif
 	float3 sideAndBladeT = float3(input.CameraRelativePosition.w, along, bladeHeight);
 #	else
 	float3 previousCameraRelativePosition = input.PreviousCameraRelativePosition.xyz;
@@ -318,21 +344,36 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	endif
 
 #	if defined(LOW_LOD)
-	uint lowBladeData = asuint(input.BladeParams.w);
 	float appearanceT = 0.25f * (along + 1.0f);
 	float clumpDensity = float(lowBladeData >> 24) * (1.0f / 255.0f);
 	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity);
 
 	uint clumpSeed = (lowBladeData >> 8) & 0xFFu;
-	float clumpColorRand = (float(clumpSeed) + 0.5f) * (1.0f / 256.0f);
-	float clumpValueRand = (float((clumpSeed * 73u + 41u) & 0xFFu) + 0.5f) * (1.0f / 256.0f);
-	float3 clumpTint = lerp(bladeType.grassColorCool.rgb, bladeType.grassColorWarm.rgb, clumpColorRand);
-	float clumpValue = 1.0f + (clumpValueRand * 2.0f - 1.0f) * bladeType.grassColorVar.y * 0.75f;
-	float3 stableClumpColor = lerp(1.0f, clumpTint * clumpValue, bladeType.clumpColorStrength);
+	float3 stableClumpColor = GetStableClumpColor(bladeType, clumpSeed);
 	float3 tipDryMul = lerp(1.0f, bladeType.grassColorTipDry.rgb,
 		smoothstep(0.5f, 1.0f, appearanceT) * bladeType.grassColorVar.z);
 	float baseShade = lerp(1.0f - grassLightParams.w, 1.0f, smoothstep(0.0f, 0.5f, appearanceT));
 	float3 baseToTipColor = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, appearanceT) * stableClumpColor * tipDryMul * baseShade;
+#	elif defined(MID_LOD)
+	float appearanceT = 0.25f * (along + 1.0f);
+	float clumpDensity = float((input.MaterialData >> 8) & 0xFFu) * (1.0f / 255.0f);
+	float clumpAO = lerp(1.0f, bladeType.minAO, clumpDensity * bladeType.clumpAOStrength);
+	bool doubleBlade = (input.MaterialData & (1u << 16)) != 0u;
+	float segmentWidth = doubleBlade ? 1.0f : 0.5f;
+	float segmentStart = doubleBlade ? 0.0f : step(0.5f, along) * 0.5f;
+	float2 rungT = 0.25f + 0.25f * float2(segmentStart, segmentStart + segmentWidth);
+	float rungBlend = (along - segmentStart) / segmentWidth;
+	float2 rungRoughness = mad(mad(bladeType.midRoughnessPolynomial.x, rungT, bladeType.midRoughnessPolynomial.y), rungT * rungT, bladeType.midRoughnessPolynomial.z);
+	float3 aoThicknessRoughness = float3(lerp(bladeType.minAO, 1.0f, appearanceT) * clumpAO,
+		lerp(bladeType.minMaxSubsurfaceOpacity.x, bladeType.minMaxSubsurfaceOpacity.y, appearanceT), lerp(rungRoughness.x, rungRoughness.y, rungBlend));
+	uint clumpSeed = input.MaterialData & 0xFFu;
+	float3 stableClumpColor = GetStableClumpColor(bladeType, clumpSeed);
+	// Preserve the existing rung interpolation. Mid's appearance samples never exceed t = 0.5.
+	float2 rungShade = lerp(1.0f - grassLightParams.w, 1.0f, smoothstep(0.0f, 0.5f, rungT));
+	float3 rungColor0 = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, rungT.x) * stableClumpColor * rungShade.x;
+	float3 rungColor1 = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, rungT.y) * stableClumpColor * rungShade.y;
+	float3 baseToTipColor = lerp(rungColor0, rungColor1, rungBlend);
+	float viewDepth = input.BladeTDepth.y;
 #	else
 	float3 aoThicknessRoughness = input.AOThicknessRoughness.xyz;
 	float3 baseToTipColor = input.BaseToTipColor.xyz;
@@ -345,8 +386,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if !defined(LOW_LOD)
 	uint bladeRandBits = asuint(input.BladeParams.w);
 #		if defined(MID_LOD)
-	float bladeRand = float(bladeRandBits & 0xFFu) * (1.0f / 255.0f);
-	float bladeRand2 = float((bladeRandBits >> 8) & 0xFFu) * (1.0f / 255.0f);
+	float packedBladeColor = float(bladeRandBits & 0xFFFu);
+	float bladeRand = round(frac(packedBladeColor * 0.61803398875f + 0.17f) * 255.0f) * (1.0f / 255.0f);
+	float bladeRand2 = round(frac(packedBladeColor * 0.38196601125f + 0.61f) * 255.0f) * (1.0f / 255.0f);
 #		else
 	float bladeRand = f16tof32(bladeRandBits >> 16);
 	float bladeRand2 = f16tof32(bladeRandBits);
@@ -503,8 +545,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float grainVisibility = saturate(1.5 - grainFootprint);
 	float textureFade = saturate(1.0 - viewDepth * (1.0 / 2500.0));
 	speckleAmount = saturate(bladeType.grassTextureParams.z * 1.5) * textureFade * detailFade * grainVisibility;
-	if (speckleAmount > 0.0)
-	{
+	if (speckleAmount > 0.0) {
 		speckle = saturate((materialDetail.y - 0.5) * 2.0 + 0.5);
 		float grainSpot = smoothstep(0.58, 0.82, speckle);
 		baseColor.rgb *= 1.0 - grainSpot * speckleAmount * 0.60;
@@ -596,12 +637,24 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #if defined(SKYLIGHTING) && !defined(FAR_LOD)
 	float3 positionMSSkylight = cameraRelativePosition;
 #	if defined(LOW_LOD)
+	sh2 skylightingSH = Skylighting::UNIT_SH;
+	// Low only uses diffuse skylighting, which is fully faded outside the probe volume.
+	[branch] if (!SharedData::InInterior && Skylighting::GetFadeOutFactor(positionMSSkylight) > 0.0f)
+	{
+		float3 probeCell = round(FrameBuffer::CameraPosAdjust.xyz / Skylighting::CELL_SIZE);
+		float3 probeOffset = probeCell * Skylighting::CELL_SIZE - FrameBuffer::CameraPosAdjust.xyz;
+		uint3 probeArrayOrigin = (uint3)((int3)probeCell - (int3)(Skylighting::ARRAY_DIM / 2)) % Skylighting::ARRAY_DIM;
+		float3 probeExtent = Skylighting::ARRAY_SIZE * 0.5f - Skylighting::CELL_SIZE;
+		float3 samplePosition = clamp(positionMSSkylight - probeOffset, -probeExtent, probeExtent) + probeOffset;
+		skylightingSH = SampleLowSkylighting(samplePosition, probeOffset, probeArrayOrigin);
+	}
+#	elif defined(MID_LOD)
 	float3 probeCell = round(FrameBuffer::CameraPosAdjust.xyz / Skylighting::CELL_SIZE);
 	float3 probeOffset = probeCell * Skylighting::CELL_SIZE - FrameBuffer::CameraPosAdjust.xyz;
 	uint3 probeArrayOrigin = (uint3)((int3)probeCell - (int3)(Skylighting::ARRAY_DIM / 2)) % Skylighting::ARRAY_DIM;
 	float3 probeExtent = Skylighting::ARRAY_SIZE * 0.5f - Skylighting::CELL_SIZE;
-	float3 samplePosition = clamp(positionMSSkylight - probeOffset, -probeExtent, probeExtent) + probeOffset;
-	sh2 skylightingSH = SampleLowSkylighting(samplePosition, probeOffset, probeArrayOrigin);
+	float3 samplePosition = clamp(input.SkylightingRoot - probeOffset, -probeExtent, probeExtent) + probeOffset;
+	sh2 skylightingSH = Skylighting::SampleWithOrigin(samplePosition, float3(0.0f, 0.0f, 1.0f), probeOffset, probeArrayOrigin);
 #	else
 	sh2 skylightingSH = input.SkylightingVertexSH;
 #	endif
@@ -752,66 +805,66 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	uint numClusteredLights = 0;
 #	if !defined(PGRASS_NO_LOCAL_LIGHTS)
 	if (detailedSpecularWeight > 0.0) {
-	uint totalLightCount = LightLimitFix::NumStrictLights;
-	uint clusterIndex = 0;
-	uint lightOffset = 0;
-	if (LightLimitFix::GetClusterIndex(screenUV, viewDepth, clusterIndex)) {
-		numClusteredLights = LightLimitFix::lightGrid[clusterIndex].lightCount;
-		totalLightCount += numClusteredLights;
-		lightOffset = LightLimitFix::lightGrid[clusterIndex].offset;
-	}
-
-	[loop] for (uint lightIndex = 0; lightIndex < totalLightCount; lightIndex++)
-	{
-		LightLimitFix::Light light;
-		if (lightIndex < LightLimitFix::NumStrictLights) {
-			light = LightLimitFix::StrictLights[lightIndex];
-		} else {
-			uint clusteredLightIndex = LightLimitFix::lightList[lightOffset + (lightIndex - LightLimitFix::NumStrictLights)];
-			light = LightLimitFix::lights[clusteredLightIndex];
-
-			if (LightLimitFix::IsLightIgnored(light) || (!(Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) && light.lightFlags & LightLimitFix::LightFlags::Shadow)) {
-				continue;
-			}
+		uint totalLightCount = LightLimitFix::NumStrictLights;
+		uint clusterIndex = 0;
+		uint lightOffset = 0;
+		if (LightLimitFix::GetClusterIndex(screenUV, viewDepth, clusterIndex)) {
+			numClusteredLights = LightLimitFix::lightGrid[clusterIndex].lightCount;
+			totalLightCount += numClusteredLights;
+			lightOffset = LightLimitFix::lightGrid[clusterIndex].offset;
 		}
 
-		float3 lightDirection = light.positionWS.xyz - cameraRelativePosition;
-		float distSq = dot(lightDirection, lightDirection);
+		[loop] for (uint lightIndex = 0; lightIndex < totalLightCount; lightIndex++)
+		{
+			LightLimitFix::Light light;
+			if (lightIndex < LightLimitFix::NumStrictLights) {
+				light = LightLimitFix::StrictLights[lightIndex];
+			} else {
+				uint clusteredLightIndex = LightLimitFix::lightList[lightOffset + (lightIndex - LightLimitFix::NumStrictLights)];
+				light = LightLimitFix::lights[clusteredLightIndex];
+
+				if (LightLimitFix::IsLightIgnored(light) || (!(Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) && light.lightFlags & LightLimitFix::LightFlags::Shadow)) {
+					continue;
+				}
+			}
+
+			float3 lightDirection = light.positionWS.xyz - cameraRelativePosition;
+			float distSq = dot(lightDirection, lightDirection);
 
 #		if defined(ISL)
-		float lightDist = sqrt(distSq);
-		float intensityMultiplier = InverseSquareLighting::GetAttenuation(lightDist, light);
-		if (intensityMultiplier < 1e-5)
-			continue;
-		float3 normalizedLightDirection = lightDirection * rcp(max(lightDist, 1e-5));
+			float lightDist = sqrt(distSq);
+			float intensityMultiplier = InverseSquareLighting::GetAttenuation(lightDist, light);
+			if (intensityMultiplier < 1e-5)
+				continue;
+			float3 normalizedLightDirection = lightDirection * rcp(max(lightDist, 1e-5));
 #		else
-		float radiusSq = light.radius * light.radius;
-		if (distSq >= radiusSq)
-			continue;
-		float intensityMultiplier = 1 - distSq / radiusSq;
-		float3 normalizedLightDirection = lightDirection * rsqrt(max(distSq, 1e-10));
+			float radiusSq = light.radius * light.radius;
+			if (distSq >= radiusSq)
+				continue;
+			float intensityMultiplier = 1 - distSq / radiusSq;
+			float3 normalizedLightDirection = lightDirection * rsqrt(max(distSq, 1e-10));
 #		endif
 
-		const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
-		float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * light.fade;
-		float lightShadow = 1.0;
-		if (light.lightFlags & LightLimitFix::LightFlags::Shadow)
-			lightShadow = shadowColor[light.shadowLightIndex];
+			const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
+			float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * light.fade;
+			float lightShadow = 1.0;
+			if (light.lightFlags & LightLimitFix::LightFlags::Shadow)
+				lightShadow = shadowColor[light.shadowLightIndex];
 
-		DirectContext pointContext = CreateDirectLightingContext(worldSpaceNormal, worldSpaceNormal, worldSpaceNormal, worldSpaceViewDirection, worldSpaceViewDirection, normalizedLightDirection, normalizedLightDirection, lightColor, lightShadow, lightShadow);
+			DirectContext pointContext = CreateDirectLightingContext(worldSpaceNormal, worldSpaceNormal, worldSpaceNormal, worldSpaceViewDirection, worldSpaceViewDirection, normalizedLightDirection, normalizedLightDirection, lightColor, lightShadow, lightShadow);
 
-		DirectLightingOutput pointLighting = (DirectLightingOutput)0;
-		float pointDiffuseNdotL = saturate(abs(dot(worldSpaceNormal, normalizedLightDirection)));
+			DirectLightingOutput pointLighting = (DirectLightingOutput)0;
+			float pointDiffuseNdotL = saturate(abs(dot(worldSpaceNormal, normalizedLightDirection)));
 
-		PBR::GetDirectLightInputGrass(pointLighting, pointContext, material, false, pointDiffuseNdotL, pointDiffuseNdotL, bladeType.grassSurfParams.z);
+			PBR::GetDirectLightInputGrass(pointLighting, pointContext, material, false, pointDiffuseNdotL, pointDiffuseNdotL, bladeType.grassSurfParams.z);
 #		if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
-			EvaluateWetnessLighting(wetnessNormal, pointContext, waterRoughnessSpecular, pointLighting);
+			if (waterRoughnessSpecular < 1.0)
+				EvaluateWetnessLighting(wetnessNormal, pointContext, waterRoughnessSpecular, pointLighting);
 #		endif
-		diffuseColor += pointLighting.diffuse * detailedSpecularWeight;
-		transmissionColor += pointLighting.transmission * detailedSpecularWeight;
-		specularColorPBR += pointLighting.specular * detailedSpecularWeight;
-	}
+			diffuseColor += pointLighting.diffuse * detailedSpecularWeight;
+			transmissionColor += pointLighting.transmission * detailedSpecularWeight;
+			specularColorPBR += pointLighting.specular * detailedSpecularWeight;
+		}
 	}
 #	endif
 #endif
@@ -911,22 +964,22 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	psout.Albedo = float4(outputAlbedo, psout.Diffuse.w);
 
-#if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
+#	if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
 	indirectLobeWeights.specular += wetnessReflectance;
 	if (waterRoughnessSpecular < 1.0) {
 		screenSpaceNormal = normalize(FrameBuffer::WorldToView(wetnessNormal, false));
 		pbrGlossiness = saturate(1.0 - waterRoughnessSpecular);
 	}
-#endif
+#	endif
 
 	psout.Reflectance = float4(indirectLobeWeights.specular * specOcclusion * lerp(0.125f, 0.5f, dirSurfaceShadow), psout.Diffuse.w);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), pbrGlossiness, psout.Diffuse.w);
-#if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
+#	if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
 	float wetnessNormalAmount = saturate(dot(float3(0, 0, 1), wetnessNormal) * saturate(flatnessAmount));
 	psout.Masks = float4(0, 0, wetnessNormalAmount, psout.Diffuse.w);
-#else
+#	else
 	psout.Masks = float4(0, 0, 0, psout.Diffuse.w);
-#endif
+#	endif
 
 #endif
 
