@@ -155,6 +155,30 @@ static const uint MAX_TILE_PATCH_WIDTH = (PATCHES_PER_ROW + OCCUPANCY_TILES_PER_
 static const uint SLOPE_EXTRA_SEED_BASE = 4u;
 groupshared uint GroupTileOccluded;
 
+// The Hi-Z depth bounds assume the game's forward perspective projection.
+bool HasForwardPerspective()
+{
+	return FrameBuffer::CameraProj._m20 == 0.0f && FrameBuffer::CameraProj._m21 == 0.0f &&
+	       FrameBuffer::CameraProj._m30 == 0.0f && FrameBuffer::CameraProj._m31 == 0.0f &&
+	       FrameBuffer::CameraProj._m32 == 1.0f && FrameBuffer::CameraProj._m33 == 0.0f && FrameBuffer::CameraProj._m23 < 0.0f;
+}
+
+// Farthest Hi-Z depth over at most 3x3 texels of one mip.
+float LoadHiZMax3x3(int2 sampleMin, int2 sampleMax, int mip)
+{
+	float tileMax = 0.0f;
+	[unroll] for (int y = 0; y < 3; ++y)
+	{
+		[unroll] for (int x = 0; x < 3; ++x)
+		{
+			const int2 texel = sampleMin + int2(x, y);
+			if (all(texel <= sampleMax))
+				tileMax = max(tileMax, GrassHiZ.Load(int3(texel, mip)));
+		}
+	}
+	return tileMax;
+}
+
 bool IsVolumeOccluded(float3 centre, float radius, float minDistance, bool cullsDisabled)
 {
 	if (cullsDisabled || grassHiZParams.w < 1.0f)
@@ -162,10 +186,7 @@ bool IsVolumeOccluded(float3 centre, float radius, float minDistance, bool culls
 	const float distanceSq = dot(centre, centre);
 	if (distanceSq < minDistance * minDistance)
 		return false;
-	// The depth bound below assumes the game's forward perspective projection.
-	if (FrameBuffer::CameraProj._m20 != 0.0f || FrameBuffer::CameraProj._m21 != 0.0f ||
-		FrameBuffer::CameraProj._m30 != 0.0f || FrameBuffer::CameraProj._m31 != 0.0f ||
-		FrameBuffer::CameraProj._m32 != 1.0f || FrameBuffer::CameraProj._m33 != 0.0f || FrameBuffer::CameraProj._m23 >= 0.0f)
+	if (!HasForwardPerspective())
 		return false;
 
 	// Include half-packed root rounding in both the depth and screen bounds.
@@ -203,15 +224,7 @@ bool IsVolumeOccluded(float3 centre, float radius, float minDistance, bool culls
 
 	float tileMax = 0.0f;
 	if (wantedMip <= grassHiZParams.w - 1.0f) {
-		[unroll] for (int y = 0; y < 3; ++y)
-		{
-			[unroll] for (int x = 0; x < 3; ++x)
-			{
-				const int2 texel = sampleMin + int2(x, y);
-				if (all(texel <= sampleMax))
-					tileMax = max(tileMax, GrassHiZ.Load(int3(texel, mip)));
-			}
-		}
+		tileMax = LoadHiZMax3x3(sampleMin, sampleMax, mip);
 	} else {
 		// Large bounds scan the covered coarsest mip instead of bypassing the shallow pyramid.
 		[loop] for (int y = sampleMin.y; y <= sampleMax.y; ++y)
@@ -225,6 +238,55 @@ bool IsVolumeOccluded(float3 centre, float radius, float minDistance, bool culls
 	const float nearestDepth = FrameBuffer::CameraProj._m22 + FrameBuffer::CameraProj._m23 / minRenderedW;
 	return nearestDepth > tileMax + 2.0e-6f;
 }
+
+#if defined(LOW_LOD)
+// Rejects one finished blade whose projected root-to-tip rectangle is entirely behind Hi-Z.
+// Patch and tile spheres overlap nearby silhouettes, so this catches distant blades hidden behind nearer grass and terrain.
+bool IsBladeOccluded(float3 rootView, float3 tipView, float radius, float depthMargin, bool cullsDisabled)
+{
+	if (cullsDisabled || grassHiZParams.w < 1.0f || !HasForwardPerspective())
+		return false;
+
+	const float4 clipRoot = mul(FrameBuffer::CameraViewProj, float4(rootView, 1.0f));
+	const float4 clipTip = mul(FrameBuffer::CameraViewProj, float4(tipView, 1.0f));
+	const float3 clipWAxis = FrameBuffer::CameraViewProj[3].xyz;
+	const float minClipW = min(clipRoot.w, clipTip.w) - radius * length(clipWAxis);
+	const float minRenderedW = minClipW - depthMargin;
+	if (minRenderedW <= 1.0f)
+		return false;
+
+	// Bound each endpoint's width sphere, then take the rectangle covering the whole segment.
+	const float2 ndcRoot = clipRoot.xy / clipRoot.w;
+	const float2 ndcTip = clipTip.xy / clipTip.w;
+	const float radiusScale = radius / minClipW;
+	const float2 extentRoot = radiusScale * float2(length(FrameBuffer::CameraViewProj[0].xyz - ndcRoot.x * clipWAxis), length(FrameBuffer::CameraViewProj[1].xyz - ndcRoot.y * clipWAxis));
+	const float2 extentTip = radiusScale * float2(length(FrameBuffer::CameraViewProj[0].xyz - ndcTip.x * clipWAxis), length(FrameBuffer::CameraViewProj[1].xyz - ndcTip.y * clipWAxis));
+	const float2 ndcMin = min(ndcRoot - extentRoot, ndcTip - extentTip);
+	const float2 ndcMax = max(ndcRoot + extentRoot, ndcTip + extentTip);
+
+	// Half a texel (two pixels) of padding covers TAA jitter.
+	const float2 hiZSize = grassHiZParams.xy;
+	float2 uvMin = float2(ndcMin.x, -ndcMax.y) * 0.5f + 0.5f - 0.5f / hiZSize;
+	float2 uvMax = float2(ndcMax.x, -ndcMin.y) * 0.5f + 0.5f + 0.5f / hiZSize;
+	if (any(uvMax <= 0.0f) || any(uvMin >= 1.0f))
+		return false;
+	uvMin = max(uvMin, 0.0f);
+	uvMax = min(uvMax, 1.0f);
+
+	// Pick the finest mip where the rectangle spans at most three texels on each axis.
+	const float2 spanTexels = (uvMax - uvMin) * hiZSize;
+	const int mip = (int)max(ceil(log2(max(max(spanTexels.x, spanTexels.y), 1.0f) * 0.5f)), 0.0f);
+	if (mip > (int)grassHiZParams.w - 1)
+		return false;
+	const float mipScale = exp2((float)mip);
+	const int2 mipSize = max(int2(ceil(hiZSize / mipScale)), int2(1, 1));
+	const int2 sampleMin = clamp(int2(floor(uvMin * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
+	const int2 sampleMax = clamp(int2(floor(uvMax * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
+
+	const float nearestDepth = FrameBuffer::CameraProj._m22 + FrameBuffer::CameraProj._m23 / minRenderedW;
+	return nearestDepth > LoadHiZMax3x3(sampleMin, sampleMax, mip) + 2.0e-6f;
+}
+#endif
 
 bool ResolveTileHeightBounds(uint quadrant, uint tile, out float2 heightBounds)
 {
@@ -1055,6 +1117,21 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 	uint packedClumpDensity = (uint)round(clumpDensity * 255.0f);
 	b.seedAndType = packedClumpDensity << 24 | (clumpRand & 0xFFFFu) << 8 | (type & 0xFFu);
+
+	// Mirror the Far VS: packed root and directions, distance widening, coverage compensation, and edge depth margin.
+	float3 packedRoot = float3(f16tof32(b.posXY >> 16), f16tof32(b.posXY), f16tof32(b.posZWidthHeight >> 16));
+	float4 packedDirectionValues = float4(packedDirections) * (2.0f / 255.0f) - 1.0f;
+	float2 farTip = packedDirectionValues.zw * (generatorType.height * float(packedHeight) * (1.0f / 255.0f));
+	float3 packedTip = packedRoot + float3(packedDirectionValues.xy * farTip.x, farTip.y);
+	float2 farRootOffset = packedRoot.xy + FrameBuffer::CameraPosAdjust.xy - grassLodOrigin;
+	float farRootDistance = ApproximateGrassDistance(farRootOffset);
+	float farCoverage = min(rcp(max(GetFarPerformanceKeep(farRootDistance, FrameBuffer::CameraProj._m00), 0.5f)), 2.0f);
+	float farWidth = generatorType.width * 2.5f * lerp(0.45f, 1.3f, float(packedWidth) * (1.0f / 255.0f)) *
+	                 lerp(2.0f, 32.0f, saturate((farRootDistance - farParams.x) * farParams.y)) * farCoverage;
+	float farEdgeDistance = max(abs(farRootOffset.x), abs(farRootOffset.y));
+	float farDepthMargin = farEdgeDistance > farParams.x - 2048.0f ? 128.0f * smoothstep(farParams.x - 2048.0f, farParams.x, farEdgeDistance) : 0.0f;
+	if (IsBladeOccluded(packedRoot, packedTip, farWidth + 1.0f, farDepthMargin, cullsDisabled))
+		return false;
 #else
 	uint packedRandBend = (uint)round(saturate(float(tiltHash.y) * UINT_TO_FLOAT) * 15.0f);
 
@@ -1106,6 +1183,13 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	uint packedTerrainMargin = (uint)round(terrainLODDepthMargin * (2047.0f / 128.0f));
 	// Low reuses these packed geometry inputs in both depth and colour draws.
 	b.posZWidthHeight = f32tof16(viewPos.z) << 16 | packedTerrainMargin << 5 | packedRandBend << 1 | storedHeight;
+
+	// Test the geometry the VS will draw: packed root, tip along the facing, and view-thickened width.
+	float3 packedRoot = float3(f16tof32(b.posXY >> 16), f16tof32(b.posXY), f16tof32(b.posZWidthHeight >> 16));
+	float3 packedTip = packedRoot + float3(packedFacingValue * lowTip.x, lowTip.y);
+	float bladeRadius = packedWidthValue * (1.0f + miscParams.z) + 1.0f;
+	if (IsBladeOccluded(packedRoot, packedTip, bladeRadius, terrainLODDepthMargin, cullsDisabled))
+		return false;
 #	endif
 
 #	if defined(HIGH_LOD)

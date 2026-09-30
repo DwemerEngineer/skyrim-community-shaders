@@ -725,8 +725,16 @@ void ProceduralGrass::PostDepthRendering()
 	grassHiZ->Build(globals::d3d::device, ctx, true);
 
 	PostDepthRenderPrep(ctx, renderer);
-	GenerateBlades(ctx);
-	RenderDepth(ctx);
+	GenerateBlades(ctx, true);
+	RenderDepth(ctx, true);
+	// High and Mid form a dense wall close to the camera; rebuild Hi-Z so Low and Far generation can reject blades behind it.
+	if (grassHiZ->HasCurrentSceneDepth() && !grassHiZ->Build(globals::d3d::device, ctx, true)) {
+		// An unbound pyramid reads as zero depth and would reject everything.
+		grassGlobalsStaging->grassHiZParams = float4::Zero;
+		grassGlobalsCB->Update(*grassGlobalsStaging);
+	}
+	GenerateBlades(ctx, false);
+	RenderDepth(ctx, false);
 	CopyDepthBuffer(ctx, renderer);
 
 	// Merge grass depth after terrain blending so grass does not appear transparent over terrain.
@@ -854,7 +862,8 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 		}
 	}
 
-	auto grassGlobals = GrassGlobals{};
+	auto& grassGlobals = *grassGlobalsStaging;
+	grassGlobals = GrassGlobals{};
 	grassGlobals.voronoiGridSize = static_cast<float>(settings.voronoiGridSize);
 	grassGlobals.inverseVoronoiGridSize = 1.0f / grassGlobals.voronoiGridSize;
 	grassGlobals.cameraViewRow0Sum = abs(row0[0]) + abs(row0[1]) + abs(row0[2]);
@@ -1053,7 +1062,7 @@ void ProceduralGrass::SetViewport(ID3D11DeviceContext* ctx, const float2 size)
 	ctx->RSSetViewports(1, &vp);
 }
 
-void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx) const
+void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx, const bool nearTiers) const
 {
 	const float quad = 2048.0f;
 	const float invBand = 1.0f / quad;
@@ -1076,37 +1085,43 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx) const
 		((settings.lowGrassDensity * settings.lowGrassDensity) / (farPatchDensity * farPatchDensity) - 1.0f) * 0.5f,
 		0.0f, 1.0f);
 
-	// Build the canopy-density field before High generation so each emitted blade can cache one density sample.
-	if (grassPresenceUploadDirty) {
-		ctx->UpdateSubresource(grassPresenceTexture->resource.get(), 0, nullptr, grassPresenceStaging.data(), grassPresenceDim, 0);
-		grassPresenceUploadDirty = false;
+	if (nearTiers) {
+		// Build the canopy-density field before High generation so each emitted blade can cache one density sample.
+		if (grassPresenceUploadDirty) {
+			ctx->UpdateSubresource(grassPresenceTexture->resource.get(), 0, nullptr, grassPresenceStaging.data(), grassPresenceDim, 0);
+			grassPresenceUploadDirty = false;
+		}
+		ID3D11ShaderResourceView* presSRV = grassPresenceTexture->srv.get();
+		ctx->CSSetShaderResources(0, 1, &presSRV);
+		ID3D11UnorderedAccessView* densityUAV = grassDensityTexture->uav.get();
+		ctx->CSSetUnorderedAccessViews(0, 1, &densityUAV, nullptr);
+		ctx->CSSetShader(densityGatherCS, nullptr, 0);
+		const uint32_t gatherGroups = (grassDensityDim + 7) / 8;
+		ctx->Dispatch(gatherGroups, gatherGroups, 1);
+
+		ID3D11UnorderedAccessView* nullUAV = nullptr;
+		ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+		ID3D11ShaderResourceView* densitySRV = grassDensityTexture->srv.get();
+		ctx->CSSetShaderResources(7, 1, &densitySRV);
 	}
-	ID3D11ShaderResourceView* presSRV = grassPresenceTexture->srv.get();
-	ctx->CSSetShaderResources(0, 1, &presSRV);
-	ID3D11UnorderedAccessView* densityUAV = grassDensityTexture->uav.get();
-	ctx->CSSetUnorderedAccessViews(0, 1, &densityUAV, nullptr);
-	ctx->CSSetShader(densityGatherCS, nullptr, 0);
-	const uint32_t gatherGroups = (grassDensityDim + 7) / 8;
-	ctx->Dispatch(gatherGroups, gatherGroups, 1);
+	// The density gather and the Hi-Z rebuild both use CS t0 and b0.
+	ID3D11ShaderResourceView* heightMapSRV = globals::terrainHeightMap->GetSRV();
+	ctx->CSSetShaderResources(0, 1, &heightMapSRV);
 
-	ID3D11UnorderedAccessView* nullUAV = nullptr;
-	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-	ID3D11ShaderResourceView* nullSRV = nullptr;
-	ctx->CSSetShaderResources(0, 1, &nullSRV);
-	if (auto heightMapSRV = globals::terrainHeightMap->GetSRV())
-		ctx->CSSetShaderResources(0, 1, &heightMapSRV);
-	ID3D11ShaderResourceView* densitySRV = grassDensityTexture->srv.get();
-	ctx->CSSetShaderResources(7, 1, &densitySRV);
+	if (nearTiers) {
+		// Near bounds cover clumping and Low width. Far bounds cover wider billboard blades.
+		globals::profiler->BeginPass("ProceduralGrass::High Generation");
+		grassRendererHighLOD->GenerateBlades(ctx, quadrantsHighLOD, quadrantsHighVersion, 61, 60, grassLodOrigin, noFadeIn,
+			float4(highToMid, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls);
+		globals::profiler->EndPass();
+		globals::profiler->BeginPass("ProceduralGrass::Mid Generation");
+		grassRendererMidLOD->GenerateBlades(ctx, quadrantsMidLOD, quadrantsMidVersion, 61, 60, grassLodOrigin, float4(highToMid, invBand, 0.0f, midToLow + quad),
+			float4(midToLow, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls);
+		globals::profiler->EndPass();
+		UnbindGeneratorResources(ctx);
+		return;
+	}
 
-	// Near bounds cover clumping and Low width. Far bounds cover wider billboard blades.
-	globals::profiler->BeginPass("ProceduralGrass::High Generation");
-	grassRendererHighLOD->GenerateBlades(ctx, quadrantsHighLOD, quadrantsHighVersion, 61, 60, grassLodOrigin, noFadeIn,
-		float4(highToMid, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls);
-	globals::profiler->EndPass();
-	globals::profiler->BeginPass("ProceduralGrass::Mid Generation");
-	grassRendererMidLOD->GenerateBlades(ctx, quadrantsMidLOD, quadrantsMidVersion, 61, 60, grassLodOrigin, float4(highToMid, invBand, 0.0f, midToLow + quad),
-		float4(midToLow, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls);
-	globals::profiler->EndPass();
 	globals::profiler->BeginPass("ProceduralGrass::Low Generation");
 	grassRendererLowLOD->GenerateBlades(ctx, quadrantsLowLOD, quadrantsLowVersion, 61, 60, grassLodOrigin, float4(midToLow, invBand, 0.0f, lowToFar + quad),
 		float4(lowToFar, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls, lowFadeInPositionPadding);
@@ -1121,9 +1136,15 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx) const
 		farQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls, 0.0f, farCompactStart, FarPerformanceKeep);
 	globals::profiler->EndPass();
 
+	UnbindGeneratorResources(ctx);
+}
+
+void ProceduralGrass::UnbindGeneratorResources(ID3D11DeviceContext* ctx)
+{
 	ID3D11UnorderedAccessView* uavs[3] = { nullptr, nullptr, nullptr };
 	ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
 
+	// Includes the Hi-Z SRV at t8, which must be unbound before the pyramid is rebuilt.
 	ID3D11ShaderResourceView* nullGeneratorSRVs[9]{};
 	ctx->CSSetShaderResources(0, ARRAYSIZE(nullGeneratorSRVs), nullGeneratorSRVs);
 	ID3D11ShaderResourceView* nullSkylightingSRV = nullptr;
@@ -1131,7 +1152,7 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx) const
 	ctx->CSSetShader(nullptr, nullptr, 0);
 }
 
-void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx) const
+void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx, const bool nearTiers) const
 {
 	const auto& mainDepth = globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 	ctx->OMSetRenderTargets(0, nullptr, mainDepth.views[0]);
@@ -1146,16 +1167,19 @@ void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx) const
 	ctx->VSSetConstantBuffers(8, 1, &grassCB);
 	ctx->PSSetConstantBuffers(8, 1, &grassCB);
 
-	globals::profiler->BeginPass("ProceduralGrass::High Depth");
-	grassRendererHighLOD->RenderDepth(ctx, depthClipPS);
-	globals::profiler->EndPass();
 	// Screen-space lighting needs blade depth before the shadow and occlusion passes.
-	globals::profiler->BeginPass("ProceduralGrass::Mid Depth");
-	grassRendererMidLOD->RenderDepth(ctx);
-	globals::profiler->EndPass();
-	globals::profiler->BeginPass("ProceduralGrass::Low Depth");
-	grassRendererLowLOD->RenderDepth(ctx);
-	globals::profiler->EndPass();
+	if (nearTiers) {
+		globals::profiler->BeginPass("ProceduralGrass::High Depth");
+		grassRendererHighLOD->RenderDepth(ctx, depthClipPS);
+		globals::profiler->EndPass();
+		globals::profiler->BeginPass("ProceduralGrass::Mid Depth");
+		grassRendererMidLOD->RenderDepth(ctx);
+		globals::profiler->EndPass();
+	} else {
+		globals::profiler->BeginPass("ProceduralGrass::Low Depth");
+		grassRendererLowLOD->RenderDepth(ctx);
+		globals::profiler->EndPass();
+	}
 
 	ID3D11ShaderResourceView* nullBladeSRV = nullptr;
 	ctx->VSSetShaderResources(0, 1, &nullBladeSRV);

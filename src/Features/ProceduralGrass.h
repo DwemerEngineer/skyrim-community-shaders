@@ -301,6 +301,8 @@ private:
 	float2 grassLodOrigin = float2(0.0f, 0.0f);
 	bool grassLodOriginInitialized = false;
 	float nearQuadrantFrustumPadding = 0.0f;
+	// Heap-allocated because the 16-byte-aligned struct would pad the feature object.
+	std::unique_ptr<PGrassCommon::GrassGlobals> grassGlobalsStaging = std::make_unique<PGrassCommon::GrassGlobals>();
 	float nearHiZRadius = 0.0f;
 	float hiZClumpReach = 0.0f;
 	float farQuadrantFrustumPadding = 0.0f;
@@ -382,8 +384,14 @@ private:
 	void PostDepthRendering();
 	void GetVisibleQuadrants();
 	void PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer);
-	void GenerateBlades(ID3D11DeviceContext* ctx) const;
-	void RenderDepth(ID3D11DeviceContext* ctx) const;
+	/**
+	 * @brief Generates one group of tiers. High and Mid run first so their depth can occlude Low and Far generation.
+	 * @param nearTiers True for High and Mid; false for Low and Far.
+	 */
+	void GenerateBlades(ID3D11DeviceContext* ctx, bool nearTiers) const;
+	/** @brief Renders High and Mid depth, or Low depth when @p nearTiers is false. */
+	void RenderDepth(ID3D11DeviceContext* ctx, bool nearTiers) const;
+	static void UnbindGeneratorResources(ID3D11DeviceContext* ctx);
 
 	void DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const;
 	void UpdateDistantAmbientLUT(ID3D11DeviceContext* ctx) const;
