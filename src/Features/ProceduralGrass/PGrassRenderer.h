@@ -61,7 +61,7 @@ public:
 	void ClearShaderCache();
 
 	void GenerateBlades(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion, int32_t cellXOffset, int32_t cellYOffset,
-		const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, float frustumPadding, float clumpGridSize, bool disableGeneratorCulls,
+		const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, float frustumPadding, bool disableGeneratorCulls,
 		float fadeInPositionPadding = 0.0f, float compactStartDistance = -1.0f, float compactKeep = 1.0f);
 	void RenderDepth(ID3D11DeviceContext* ctx, ID3D11PixelShader* depthClipPS = nullptr);
 	void RenderGrass(ID3D11DeviceContext* ctx);
@@ -91,22 +91,14 @@ private:
 	ID3D11ComputeShader* bladeGeneratorCS = nullptr;
 	ID3D11ComputeShader* compactBladeGeneratorCS = nullptr;
 	ID3D11ComputeShader* batchArgsCS = nullptr;
-	ID3D11ComputeShader* featureCacheCS = nullptr;
-	ID3D11ComputeShader* placementCacheCS = nullptr;
 	bool bladeGeneratorCompileAttempted = false;
 	bool compactBladeGeneratorCompileAttempted = false;
-	ID3D11VertexShader* depthVS = nullptr;
-	ID3D11VertexShader* outerDepthVS = nullptr;
-	ID3D11VertexShader* vs = nullptr;
-	ID3D11VertexShader* outerVS = nullptr;
+	// Indexed by (depth ? 2 : 0) + (outer ? 1 : 0).
+	std::array<ID3D11VertexShader*, 4> vertexShaders{};
 	// Feature variants for wetness and local-light availability.
 	std::array<ID3D11PixelShader*, 8> pixelShaders{};
 
 	StructuredBuffer* bladesSB = nullptr;
-	StructuredBuffer* clumpFeaturesSB = nullptr;
-	uint32_t clumpFeatureQuadrantCapacity = 0;
-	StructuredBuffer* placementCacheSB = nullptr;
-	uint32_t placementQuadrantCapacity = 0;
 
 	StructuredBuffer* quadrantGrassCellsSB = nullptr;
 	std::vector<uint32_t> quadrantGrassCellsStaging;  // one packed 2x2 LAND-id cell per 16x16 quadrant cell
@@ -175,11 +167,6 @@ private:
 
 	// Skip staging rebuilds and uploads while the tier content and fade constants are unchanged.
 	uint64_t lastUploadVersion = 0;
-	uint64_t lastPlacementVersion = 0;
-	uint64_t lastFeatureVersion = 0;
-	float lastFeatureGridSize = 0.0f;
-	bool hasCachedFeatures = false;
-	bool hasCachedPlacements = false;
 	float4 lastUploadLodFadeIn{};
 	float4 lastUploadLodFadeOut{};
 	float lastTileReach = -1.0f;
@@ -205,12 +192,10 @@ private:
 
 	ID3D11ComputeShader* GetBladeGeneratorCS(bool compact = false);
 	ID3D11ComputeShader* GetBatchArgsCS();
-	ID3D11ComputeShader* GetFeatureCacheCS();
-	ID3D11ComputeShader* GetPlacementCacheCS();
-	ID3D11VertexShader* GetDepthVS();
-	ID3D11VertexShader* GetOuterDepthVS();
-	ID3D11VertexShader* GetVS();
-	ID3D11VertexShader* GetOuterVS();
+	/** @brief Appends lit-shader feature defines; simple lighting keeps only the features its reduced model evaluates. */
+	void AppendFeatureDefines(ShaderDefines& defines, bool simpleLighting) const;
+	/** @brief Returns the depth or colour VS for the inner or outer geometry segment, compiling on first use. */
+	ID3D11VertexShader* GetVertexShader(bool depth, bool outer);
 	ID3D11PixelShader* GetPS(bool noWetness = false, bool noLocalLights = false, bool innerHigh = false);
 
 	/** @brief Patches kept per compact Far quadrant for the given keep fraction. */
@@ -222,16 +207,12 @@ private:
 	void StageQuadrantGrassCells(uint32_t index, const PGrassCommon::Quadrant& quadrant);
 	/** @brief Stages conservative per-tile LAND height bounds that cover jittered and clumped roots. */
 	void StageTileHeightBounds(uint32_t index, const PGrassCommon::Quadrant& quadrant, float tileReach);
-	/** @brief Rebuilds the per-quadrant Voronoi feature cache when content or grid size changes. */
-	void UpdateClumpFeatureCache(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion, float clumpGridSize);
-	/** @brief Rebuilds Low's cached base placements when content changes. */
-	void UpdatePlacementCache(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion);
 	/** @brief Returns the cached occupied tiles of a quadrant, recomputing them when its grass map changes. */
 	const OccupancyCacheEntry& GetOccupiedTiles(const PGrassCommon::Quadrant& quadrant, float edgeNoise);
 	/** @brief Culls quadrants and tiles on the CPU and uploads the generator's work list. */
 	void BuildVisibleWorkList(const std::vector<PGrassCommon::Quadrant>& quadrants, const WorkListState& state);
 	/** @brief Binds generator inputs and dispatches full, compact and batch-argument passes. */
-	void DispatchGeneration(ID3D11DeviceContext* ctx, ID3D11ComputeShader* bladeGenerator, ID3D11ComputeShader* batchArgsGenerator, float clumpGridSize, float compactKeep);
+	void DispatchGeneration(ID3D11DeviceContext* ctx, ID3D11ComputeShader* bladeGenerator, ID3D11ComputeShader* batchArgsGenerator, float compactKeep);
 
 	static std::string BuildDefineList(std::span<const std::pair<const char*, const char*>> defines);
 

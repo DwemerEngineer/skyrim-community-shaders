@@ -4,8 +4,6 @@ namespace PGrassCommon
 {
 	inline constexpr uint32_t LowBladeBatchSize = 64;
 	inline constexpr uint32_t MidBladeBatchSize = 32;
-	// A 2048-unit quadrant spans at most eight clump cells when the grid is at least 256 units wide.
-	inline constexpr uint32_t ClumpFeaturePitch = 12;
 	/** @brief Returns the game's default landscape texture used when a LAND quadrant has no base texture. */
 	RE::TESLandTexture* GetDefaultLandTexture();
 	float GetGrassTexturePctThreshold();

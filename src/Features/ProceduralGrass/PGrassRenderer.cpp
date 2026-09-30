@@ -117,18 +117,15 @@ PGrassRenderer<QuadrantCount, PatchBladeCount>::PGrassRenderer(const uint32_t gr
 	SetDensity(grassDensity);
 	SetThreadGroupSize(tgSize);
 
-	GetFeatureCacheCS();
-	if (UsesBatchedLow())
-		GetPlacementCacheCS();
 	GetBladeGeneratorCS();
 	if (extraDefine)
 		GetBladeGeneratorCS(true);
 	if (std::string_view(lodDefine) == "HIGH_LOD")
-		GetDepthVS();
-	GetVS();
+		GetVertexShader(true, false);
+	GetVertexShader(false, false);
 	if (outerVertexIndicesBuffer) {
-		GetOuterDepthVS();
-		GetOuterVS();
+		GetVertexShader(true, true);
+		GetVertexShader(false, true);
 	}
 
 	bool noWetness = false;
@@ -261,10 +258,6 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetDensity(uint32_t grassDe
 		}
 	}
 	occupancyCache.clear();
-	delete placementCacheSB;
-	placementCacheSB = nullptr;
-	placementQuadrantCapacity = 0;
-	hasCachedPlacements = false;
 
 	ResetBladeCapacity();
 
@@ -272,7 +265,6 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetDensity(uint32_t grassDe
 	bladeGeneratorCompileAttempted = false;
 	ReleaseAndNull(compactBladeGeneratorCS);
 	compactBladeGeneratorCompileAttempted = false;
-	ReleaseAndNull(placementCacheCS);
 }
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
@@ -349,15 +341,8 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::ClearShaderCache()
 	ReleaseAndNull(compactBladeGeneratorCS);
 	compactBladeGeneratorCompileAttempted = false;
 	ReleaseAndNull(batchArgsCS);
-	ReleaseAndNull(featureCacheCS);
-	ReleaseAndNull(placementCacheCS);
-	// Rebuild cached data when its generating shaders are reloaded.
-	hasCachedFeatures = false;
-	hasCachedPlacements = false;
-	ReleaseAndNull(depthVS);
-	ReleaseAndNull(outerDepthVS);
-	ReleaseAndNull(vs);
-	ReleaseAndNull(outerVS);
+	for (auto& vertexShader : vertexShaders)
+		ReleaseAndNull(vertexShader);
 
 	for (auto& pixelShader : pixelShaders)
 		ReleaseAndNull(pixelShader);
@@ -365,12 +350,9 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::ClearShaderCache()
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
 void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11DeviceContext* ctx, const std::vector<Quadrant>& quadrants, const uint64_t contentVersion, const int32_t cellXOffset, const int32_t cellYOffset,
-	const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, const float frustumPadding, const float clumpGridSize,
+	const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, const float frustumPadding,
 	const bool disableGeneratorCulls, const float fadeInPositionPadding, const float compactStartDistance, const float compactKeep)
 {
-	GetFeatureCacheCS();
-	if (UsesBatchedLow())
-		GetPlacementCacheCS();
 	auto* bladeGenerator = GetBladeGeneratorCS();
 	auto* batchArgsGenerator = batchArgsBuffer ? GetBatchArgsCS() : nullptr;
 	if (!bladeGenerator || (batchArgsBuffer && !batchArgsGenerator)) {
@@ -391,8 +373,6 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 
 	const auto quadrantsBuffer = quadrantsCB->CB();
 	ctx->CSSetConstantBuffers(7, 1, &quadrantsBuffer);
-	UpdateClumpFeatureCache(ctx, quadrants, contentVersion, clumpGridSize);
-	UpdatePlacementCache(ctx, quadrants, contentVersion);
 
 	const WorkListState workListState{ contentVersion, density, threadGroupSize, static_cast<uint32_t>(quadrants.size()),
 		globals::game::frameBufferCached.GetCameraViewProjUnjittered().Transpose(), globals::game::frameBufferCached.GetCameraPosAdjust(),
@@ -403,7 +383,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 		BuildVisibleWorkList(quadrants, workListState);
 
 	EnsureBladeCapacity(cachedRequiredBladeCount);
-	DispatchGeneration(ctx, bladeGenerator, batchArgsGenerator, clumpGridSize, compactKeep);
+	DispatchGeneration(ctx, bladeGenerator, batchArgsGenerator, compactKeep);
 }
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
@@ -539,84 +519,6 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::StageTileHeightBounds(const
 			}
 			tileHeightBoundsStaging[index * OccupancyTileCount + tileY * OccupancyTilesPerAxis + tileX] = bounds;
 		}
-	}
-}
-
-template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
-void PGrassRenderer<QuadrantCount, PatchBladeCount>::UpdateClumpFeatureCache(ID3D11DeviceContext* ctx, const std::vector<Quadrant>& quadrants, const uint64_t contentVersion, const float clumpGridSize)
-{
-	const bool updateFeatures = featureCacheCS && clumpGridSize >= 256.0f && !quadrants.empty() &&
-	                            (!hasCachedFeatures || contentVersion != lastFeatureVersion || clumpGridSize != lastFeatureGridSize || quadrants.size() > clumpFeatureQuadrantCapacity);
-	if (!updateFeatures)
-		return;
-
-	if (quadrants.size() > clumpFeatureQuadrantCapacity) {
-		delete clumpFeaturesSB;
-		struct FeaturePoint
-		{
-			uint32_t fraction;
-			uint32_t random;
-		};
-		static_assert(sizeof(FeaturePoint) == 8);
-		clumpFeatureQuadrantCapacity = std::min(QuadrantCount,
-			std::max(static_cast<uint32_t>(quadrants.size()), clumpFeatureQuadrantCapacity + clumpFeatureQuadrantCapacity / 2u));
-		const uint32_t featureCount = clumpFeatureQuadrantCapacity * ClumpFeaturePitch * ClumpFeaturePitch;
-		auto featureDesc = StructuredBufferDesc<FeaturePoint>(featureCount, false);
-		featureDesc.CPUAccessFlags = 0;
-		clumpFeaturesSB = new StructuredBuffer(featureDesc, featureCount, "PGrass::ClumpFeatures");
-		clumpFeaturesSB->CreateUAV();
-		clumpFeaturesSB->CreateSRV();
-	}
-	if (auto* featureCache = GetFeatureCacheCS()) {
-		ID3D11UnorderedAccessView* featuresUAV = clumpFeaturesSB->UAV();
-		ctx->CSSetUnorderedAccessViews(0, 1, &featuresUAV, nullptr);
-		ctx->CSSetShader(featureCache, nullptr, 0);
-		ctx->Dispatch(1, 1, static_cast<uint32_t>(quadrants.size()));
-		ID3D11UnorderedAccessView* nullFeaturesUAV = nullptr;
-		ctx->CSSetUnorderedAccessViews(0, 1, &nullFeaturesUAV, nullptr);
-		lastFeatureVersion = contentVersion;
-		lastFeatureGridSize = clumpGridSize;
-		hasCachedFeatures = true;
-	}
-}
-
-template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
-void PGrassRenderer<QuadrantCount, PatchBladeCount>::UpdatePlacementCache(ID3D11DeviceContext* ctx, const std::vector<Quadrant>& quadrants, const uint64_t contentVersion)
-{
-	const bool updatePlacements = placementCacheCS && UsesBatchedLow() && !quadrants.empty() &&
-	                              (!hasCachedPlacements || contentVersion != lastPlacementVersion || quadrants.size() > placementQuadrantCapacity);
-	if (!updatePlacements)
-		return;
-
-	if (quadrants.size() > placementQuadrantCapacity) {
-		delete placementCacheSB;
-		struct CachedPlacement
-		{
-			uint32_t hash[3];
-			float height;
-			float slope[2];
-		};
-		static_assert(sizeof(CachedPlacement) == 24);
-		placementQuadrantCapacity = std::min(QuadrantCount,
-			std::max(static_cast<uint32_t>(quadrants.size()), placementQuadrantCapacity + placementQuadrantCapacity / 2u));
-		const uint32_t placementCount = placementQuadrantCapacity * patchesPerQuadrant;
-		auto placementDesc = StructuredBufferDesc<CachedPlacement>(placementCount, false);
-		placementDesc.CPUAccessFlags = 0;
-		placementCacheSB = new StructuredBuffer(placementDesc, placementCount, "PGrass::LowPlacements");
-		placementCacheSB->CreateUAV();
-		placementCacheSB->CreateSRV();
-	}
-	if (auto* placementCache = GetPlacementCacheCS()) {
-		ID3D11ShaderResourceView* heightsSRV = quadrantHeightSB->SRV();
-		ctx->CSSetShaderResources(3, 1, &heightsSRV);
-		ID3D11UnorderedAccessView* placementUAV = placementCacheSB->UAV();
-		ctx->CSSetUnorderedAccessViews(0, 1, &placementUAV, nullptr);
-		ctx->CSSetShader(placementCache, nullptr, 0);
-		ctx->Dispatch((patchesPerQuadrant + 63u) / 64u, 1, static_cast<uint32_t>(quadrants.size()));
-		ID3D11UnorderedAccessView* nullPlacementUAV = nullptr;
-		ctx->CSSetUnorderedAccessViews(0, 1, &nullPlacementUAV, nullptr);
-		lastPlacementVersion = contentVersion;
-		hasCachedPlacements = true;
 	}
 }
 
@@ -871,8 +773,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::BuildVisibleWorkList(const 
 }
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
-void PGrassRenderer<QuadrantCount, PatchBladeCount>::DispatchGeneration(ID3D11DeviceContext* ctx, ID3D11ComputeShader* bladeGenerator, ID3D11ComputeShader* batchArgsGenerator,
-	const float clumpGridSize, const float compactKeep)
+void PGrassRenderer<QuadrantCount, PatchBladeCount>::DispatchGeneration(ID3D11DeviceContext* ctx, ID3D11ComputeShader* bladeGenerator, ID3D11ComputeShader* batchArgsGenerator, const float compactKeep)
 {
 	const uint32_t initialArgs[10] = {
 		vertexIndicesBuffer->desc.ByteWidth / sizeof(uint16_t), 0, 0, 0, 0,
@@ -888,13 +789,8 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::DispatchGeneration(ID3D11De
 	ctx->CSSetShaderResources(2, 5, mapSRVs);
 	ID3D11ShaderResourceView* hiZSRV = globals::hiZPyramid->GetSRV();
 	ctx->CSSetShaderResources(8, 1, &hiZSRV);
-	ID3D11ShaderResourceView* cacheSRVs[4] = {
-		clumpGridSize >= 256.0f && hasCachedFeatures ? clumpFeaturesSB->SRV() : nullptr,
-		hasCachedPlacements ? placementCacheSB->SRV() : nullptr,
-		tileHeightBoundsSB->SRV(),
-		quadrantOccupancySB->SRV()
-	};
-	ctx->CSSetShaderResources(9, 4, cacheSRVs);
+	ID3D11ShaderResourceView* boundsSRVs[2] = { tileHeightBoundsSB->SRV(), quadrantOccupancySB->SRV() };
+	ctx->CSSetShaderResources(11, 2, boundsSRVs);
 
 	if (std::string_view(lodDefine) == "HIGH_LOD") {
 		auto& skylighting = globals::features::skylighting;
@@ -935,8 +831,8 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::DispatchGeneration(ID3D11De
 		ID3D11ShaderResourceView* nullBladeArgsSRV = nullptr;
 		ctx->CSSetShaderResources(13, 1, &nullBladeArgsSRV);
 	}
-	ID3D11ShaderResourceView* nullCacheSRVs[4] = {};
-	ctx->CSSetShaderResources(9, 4, nullCacheSRVs);
+	ID3D11ShaderResourceView* nullBoundsSRVs[2] = {};
+	ctx->CSSetShaderResources(11, 2, nullBoundsSRVs);
 }
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
@@ -974,7 +870,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::RenderDepth(ID3D11DeviceCon
 	}
 
 	ctx->IASetIndexBuffer(vertexIndicesBuffer->resource.get(), DXGI_FORMAT_R16_UINT, 0);
-	ctx->VSSetShader(GetDepthVS(), nullptr, 0);
+	ctx->VSSetShader(GetVertexShader(true, false), nullptr, 0);
 	ctx->PSSetShader(depthClipPS, nullptr, 0);
 	ID3D11Buffer* drawArgs = batchArgsBuffer ? batchArgsBuffer->resource.get() : argsBuffer->resource.get();
 	ctx->DrawIndexedInstancedIndirect(drawArgs, 0);
@@ -982,7 +878,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::RenderDepth(ID3D11DeviceCon
 		ID3D11ShaderResourceView* argsSRV = argsBuffer->srv.get();
 		ctx->VSSetShaderResources(1, 1, &argsSRV);
 		ctx->IASetIndexBuffer(outerVertexIndicesBuffer->resource.get(), DXGI_FORMAT_R16_UINT, 0);
-		ctx->VSSetShader(GetOuterDepthVS(), nullptr, 0);
+		ctx->VSSetShader(GetVertexShader(true, true), nullptr, 0);
 		ctx->DrawIndexedInstancedIndirect(drawArgs, 5 * sizeof(uint32_t));
 	}
 	if (outerVertexIndicesBuffer || batchArgsBuffer) {
@@ -1006,7 +902,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::RenderGrass(ID3D11DeviceCon
 		ID3D11ShaderResourceView* argsSRV = argsBuffer->srv.get();
 		ctx->VSSetShaderResources(1, 1, &argsSRV);
 	}
-	ctx->VSSetShader(GetVS(), nullptr, 0);
+	ctx->VSSetShader(GetVertexShader(false, false), nullptr, 0);
 
 	auto& wetnessEffects = globals::features::wetnessEffects;
 	const auto sky = globals::game::sky;
@@ -1031,7 +927,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::RenderGrass(ID3D11DeviceCon
 		ID3D11ShaderResourceView* argsSRV = argsBuffer->srv.get();
 		ctx->VSSetShaderResources(1, 1, &argsSRV);
 		ctx->IASetIndexBuffer(outerVertexIndicesBuffer->resource.get(), DXGI_FORMAT_R16_UINT, 0);
-		ctx->VSSetShader(GetOuterVS(), nullptr, 0);
+		ctx->VSSetShader(GetVertexShader(false, true), nullptr, 0);
 		ctx->DrawIndexedInstancedIndirect(drawArgs, 5 * sizeof(uint32_t));
 	}
 	if (outerVertexIndicesBuffer || batchArgsBuffer) {
@@ -1073,10 +969,6 @@ ID3D11ComputeShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetBladeGen
 		defines.push_back({ "QUADRANT_DATA_SIZE", quadrantCountString.c_str() });
 		defines.push_back({ "PATCH_BLADE_COUNT", patchBladeCountString.c_str() });
 		defines.push_back({ "SLOPE_EXTRA_BLADES", compact ? "0" : slopeExtraBladesString.c_str() });
-		if (featureCacheCS)
-			defines.push_back({ "PGRASS_FEATURE_CACHE", nullptr });
-		if (placementCacheCS && UsesBatchedLow())
-			defines.push_back({ "PGRASS_PLACEMENT_CACHE", nullptr });
 		if (outerVertexIndicesBuffer && UsesBatchedLow())
 			defines.push_back({ "LOW_OUTER_GEOMETRY", nullptr });
 
@@ -1117,113 +1009,53 @@ ID3D11ComputeShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetBatchArg
 }
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
-ID3D11ComputeShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetFeatureCacheCS()
+void PGrassRenderer<QuadrantCount, PatchBladeCount>::AppendFeatureDefines(ShaderDefines& defines, const bool simpleLighting) const
 {
-	if (!featureCacheCS) {
-		ShaderDefines defines{ { "QUADRANT_DATA_SIZE", quadrantCountString.c_str() } };
-		featureCacheCS = CompileShader<ID3D11ComputeShader>(L"Data\\Shaders\\ProceduralGrass\\PGrassFeatureCacheCS.hlsl", defines, "cs_5_0");
+	for (auto* feature : Feature::GetFeatureList()) {
+		const auto featureName = feature->GetShaderDefineName();
+		if (!feature->loaded || !feature->HasShaderDefine(RE::BSShader::Type::Lighting))
+			continue;
+		if (featureName == "SKYLIGHTING" && !globals::features::skylighting.texProbeArray)
+			continue;
+		// Simple lighting keeps only the colour-space and shadowing features it evaluates.
+		if (simpleLighting && featureName != "LINEAR_LIGHTING" && featureName != "TERRAIN_SHADOWS" && featureName != "CLOUD_SHADOWS" &&
+			(extraDefine || (featureName != "SKYLIGHTING" && featureName != "SCREEN_SPACE_SHADOWS")))
+			continue;
+		defines.push_back({ featureName.data(), nullptr });
 	}
-	return featureCacheCS;
 }
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
-ID3D11ComputeShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetPlacementCacheCS()
+ID3D11VertexShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetVertexShader(const bool depth, const bool outer)
 {
-	if (!placementCacheCS) {
-		ShaderDefines defines{ { "DENSITY", densityString.c_str() }, { "QUADRANT_DATA_SIZE", quadrantCountString.c_str() } };
-		placementCacheCS = CompileShader<ID3D11ComputeShader>(L"Data\\Shaders\\ProceduralGrass\\PGrassPlacementCacheCS.hlsl", defines, "cs_5_0");
-	}
-	return placementCacheCS;
-}
+	auto& shader = vertexShaders[(depth ? 2 : 0) + (outer ? 1 : 0)];
+	if (shader)
+		return shader;
 
-template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
-ID3D11VertexShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetDepthVS()
-{
-	auto& shader = depthVS;
-	if (!shader) {
-		ShaderDefines defines;
+	const bool high = std::string_view(lodDefine) == "HIGH_LOD";
+	ShaderDefines defines;
+	if (depth) {
 		defines.push_back({ "DEPTH", nullptr });
-		if (std::string_view(lodDefine) == "HIGH_LOD")
+		if (high)
 			defines.push_back({ "DEPTH_CLIP", nullptr });
-		AppendVertexShaderDefines(defines);
-
-		shader = CompileShader<ID3D11VertexShader>(L"Data\\Shaders\\ProceduralGrass\\PGrassVS.hlsl", defines, "vs_5_0");
+	} else {
+		AppendFeatureDefines(defines, false);
 	}
 
-	return shader;
-}
-
-template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
-ID3D11VertexShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetOuterDepthVS()
-{
-	auto& shader = outerDepthVS;
-	if (!shader) {
-		ShaderDefines defines{ { "DEPTH", nullptr } };
-		if (UsesBatchedLow()) {
-			AppendVertexShaderDefines(defines);
+	if (outer && !UsesBatchedLow()) {
+		defines.push_back({ "HIGH_OUTER_VERTEX", nullptr });
+		defines.push_back({ lodDefine, nullptr });
+		if (UsesGrassCollision(globals::features::grassCollision.loaded))
+			defines.push_back({ "PGRASS_CACHED_COLLISION", nullptr });
+	} else {
+		AppendVertexShaderDefines(defines);
+		if (outer)
 			defines.push_back({ "LOW_OUTER_VERTEX", nullptr });
-		} else {
-			defines.push_back({ "DEPTH_CLIP", nullptr });
-			defines.push_back({ "HIGH_OUTER_VERTEX", nullptr });
-			defines.push_back({ lodDefine, nullptr });
-			if (UsesGrassCollision(globals::features::grassCollision.loaded))
-				defines.push_back({ "PGRASS_CACHED_COLLISION", nullptr });
-		}
-		shader = CompileShader<ID3D11VertexShader>(L"Data\\Shaders\\ProceduralGrass\\PGrassVS.hlsl", defines, "vs_5_0");
-	}
-
-	return shader;
-}
-
-template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
-ID3D11VertexShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetVS()
-{
-	auto& shader = vs;
-	if (!shader) {
-		ShaderDefines defines;
-
-		for (auto feature : Feature::GetFeatureList()) {
-			if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting) &&
-				(feature != &globals::features::skylighting || globals::features::skylighting.texProbeArray))
-				defines.push_back({ feature->GetShaderDefineName().data(), nullptr });
-		}
-
-		AppendVertexShaderDefines(defines);
-		if (std::string_view(lodDefine) == "HIGH_LOD")
+		else if (high && !depth)
 			defines.push_back({ "HIGH_INNER", nullptr });
-
-		shader = CompileShader<ID3D11VertexShader>(L"Data\\Shaders\\ProceduralGrass\\PGrassVS.hlsl", defines, "vs_5_0");
 	}
 
-	return shader;
-}
-
-template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
-ID3D11VertexShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetOuterVS()
-{
-	auto& shader = outerVS;
-	if (!shader) {
-		ShaderDefines defines;
-
-		for (auto* feature : Feature::GetFeatureList()) {
-			if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting) &&
-				(feature != &globals::features::skylighting || globals::features::skylighting.texProbeArray))
-				defines.push_back({ feature->GetShaderDefineName().data(), nullptr });
-		}
-
-		if (UsesBatchedLow()) {
-			AppendVertexShaderDefines(defines);
-			defines.push_back({ "LOW_OUTER_VERTEX", nullptr });
-		} else {
-			defines.push_back({ "HIGH_OUTER_VERTEX", nullptr });
-			defines.push_back({ lodDefine, nullptr });
-			if (UsesGrassCollision(globals::features::grassCollision.loaded))
-				defines.push_back({ "PGRASS_CACHED_COLLISION", nullptr });
-		}
-
-		shader = CompileShader<ID3D11VertexShader>(L"Data\\Shaders\\ProceduralGrass\\PGrassVS.hlsl", defines, "vs_5_0");
-	}
-
+	shader = CompileShader<ID3D11VertexShader>(L"Data\\Shaders\\ProceduralGrass\\PGrassVS.hlsl", defines, "vs_5_0");
 	return shader;
 }
 
@@ -1241,19 +1073,7 @@ ID3D11PixelShader* PGrassRenderer<QuadrantCount, PatchBladeCount>::GetPS(bool no
 	auto& selectedPS = pixelShaders[variant];
 	if (!selectedPS) {
 		ShaderDefines defines;
-
-		for (auto* feature : Feature::GetFeatureList()) {
-			const auto featureName = feature->GetShaderDefineName();
-			const bool requiredSimpleLightingFeature =
-				featureName == "LINEAR_LIGHTING" ||
-				featureName == "TERRAIN_SHADOWS" ||
-				featureName == "CLOUD_SHADOWS" ||
-				((featureName == "SKYLIGHTING" || featureName == "SCREEN_SPACE_SHADOWS") && !extraDefine);
-			if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting) &&
-				(!simpleLighting || requiredSimpleLightingFeature) &&
-				(featureName != "SKYLIGHTING" || globals::features::skylighting.texProbeArray))
-				defines.push_back({ featureName.data(), nullptr });
-		}
+		AppendFeatureDefines(defines, simpleLighting);
 
 		defines.push_back({ lodDefine, nullptr });
 		defines.push_back({ vertCountDefine, nullptr });
@@ -1282,7 +1102,7 @@ ShaderT* PGrassRenderer<QuadrantCount, PatchBladeCount>::CompileShader(const wch
 	auto list = BuildDefineList(defines);
 	const std::wstring ws(path);
 	std::string s = std::filesystem::path(ws).string();
-	logger::info("[Procedural Grass] Compiling {} â€“ {}", s, list);
+	logger::info("[Procedural Grass] Compiling {} - {}", s, list);
 
 	return static_cast<ShaderT*>(Util::CompileShader(path, defines, programType));
 }

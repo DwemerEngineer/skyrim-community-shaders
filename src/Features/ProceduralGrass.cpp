@@ -21,6 +21,35 @@ using namespace PGrassCommon;
 
 namespace
 {
+	/** @brief Creates a single-mip square texture with an SRV and, when requested, a UAV. */
+	Texture2D* CreateSquareTexture(uint32_t dim, DXGI_FORMAT format, bool unorderedAccess, const char* name)
+	{
+		D3D11_TEXTURE2D_DESC desc{};
+		desc.Width = dim;
+		desc.Height = dim;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.Format = format;
+		desc.SampleDesc = { 1, 0 };
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (unorderedAccess ? D3D11_BIND_UNORDERED_ACCESS : 0u);
+		auto* texture = new Texture2D(desc, name);
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = format;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+		texture->CreateSRV(srvDesc);
+
+		if (unorderedAccess) {
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+			uavDesc.Format = format;
+			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+			texture->CreateUAV(uavDesc);
+		}
+		return texture;
+	}
+
 	// Preserve full density at the Low/Far handoff, then retain this fraction in distant Far regions.
 	constexpr float FarPerformanceKeep = 0.55f;
 	constexpr uint32_t GrassMaterialDetailDim = 64;
@@ -319,72 +348,13 @@ void ProceduralGrass::CreateGrassTextures()
 	detailSRVDesc.Texture2DArray.ArraySize = detailDesc.ArraySize;
 	grassMaterialDetailTexture->CreateSRV(detailSRVDesc);
 
-	if (!grassDensityTexture) {
-		D3D11_TEXTURE2D_DESC td{};
-		td.Width = grassDensityDim;
-		td.Height = grassDensityDim;
-		td.MipLevels = 1;
-		td.ArraySize = 1;
-		td.Format = DXGI_FORMAT_R32_UINT;
-		td.SampleDesc = { 1, 0 };
-		td.Usage = D3D11_USAGE_DEFAULT;
-		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-		grassDensityTexture = new Texture2D(td, "PGrass::GrassDensity");
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-		sd.Format = td.Format;
-		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		sd.Texture2D.MipLevels = 1;
-		grassDensityTexture->CreateSRV(sd);
-
-		D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-		ud.Format = td.Format;
-		ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-		grassDensityTexture->CreateUAV(ud);
-	}
-
-	if (!distantAmbientLUT) {
-		D3D11_TEXTURE2D_DESC td{};
-		td.Width = distantAmbientLUTDim;
-		td.Height = distantAmbientLUTDim;
-		td.MipLevels = 1;
-		td.ArraySize = 1;
-		td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-		td.SampleDesc = { 1, 0 };
-		td.Usage = D3D11_USAGE_DEFAULT;
-		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-		distantAmbientLUT = new Texture2D(td, "PGrass::DistantAmbientLUT");
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-		sd.Format = td.Format;
-		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		sd.Texture2D.MipLevels = 1;
-		distantAmbientLUT->CreateSRV(sd);
-
-		D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-		ud.Format = td.Format;
-		ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-		distantAmbientLUT->CreateUAV(ud);
-	}
-
+	if (!grassDensityTexture)
+		grassDensityTexture = CreateSquareTexture(grassDensityDim, DXGI_FORMAT_R32_UINT, true, "PGrass::GrassDensity");
+	if (!distantAmbientLUT)
+		distantAmbientLUT = CreateSquareTexture(distantAmbientLUTDim, DXGI_FORMAT_R16G16B16A16_FLOAT, true, "PGrass::DistantAmbientLUT");
 	if (!grassPresenceTexture) {
-		D3D11_TEXTURE2D_DESC td{};
-		td.Width = grassPresenceDim;
-		td.Height = grassPresenceDim;
-		td.MipLevels = 1;
-		td.ArraySize = 1;
-		td.Format = DXGI_FORMAT_R8_UINT;
-		td.SampleDesc = { 1, 0 };
-		td.Usage = D3D11_USAGE_DEFAULT;  // rewritten each frame via UpdateSubresource (window scrolls with the player)
-		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		grassPresenceTexture = new Texture2D(td, "PGrass::GrassPresence");
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-		sd.Format = td.Format;
-		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		sd.Texture2D.MipLevels = 1;
-		grassPresenceTexture->CreateSRV(sd);
-
+		// Rewritten via UpdateSubresource as the window scrolls with the player.
+		grassPresenceTexture = CreateSquareTexture(grassPresenceDim, DXGI_FORMAT_R8_UINT, false, "PGrass::GrassPresence");
 		grassPresenceStaging.assign(static_cast<size_t>(grassPresenceDim) * grassPresenceDim, 0);
 	}
 }
@@ -1114,11 +1084,11 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx, const bool nearTi
 		// Near bounds cover clumping and Low width. Far bounds cover wider billboard blades.
 		globals::profiler->BeginPass("ProceduralGrass::High Generation");
 		grassRendererHighLOD->GenerateBlades(ctx, quadrantsHighLOD, quadrantsHighVersion, 61, 60, grassLodOrigin, noFadeIn,
-			float4(highToMid, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls);
+			float4(highToMid, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, settings.debugDisableAllCulls);
 		globals::profiler->EndPass();
 		globals::profiler->BeginPass("ProceduralGrass::Mid Generation");
 		grassRendererMidLOD->GenerateBlades(ctx, quadrantsMidLOD, quadrantsMidVersion, 61, 60, grassLodOrigin, float4(highToMid, invBand, 0.0f, midToLow + quad),
-			float4(midToLow, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls);
+			float4(midToLow, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, settings.debugDisableAllCulls);
 		globals::profiler->EndPass();
 		UnbindGeneratorResources(ctx);
 		return;
@@ -1126,7 +1096,7 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx, const bool nearTi
 
 	globals::profiler->BeginPass("ProceduralGrass::Low Generation");
 	grassRendererLowLOD->GenerateBlades(ctx, quadrantsLowLOD, quadrantsLowVersion, 61, 60, grassLodOrigin, float4(midToLow, invBand, 0.0f, lowToFar + quad),
-		float4(lowToFar, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls, lowFadeInPositionPadding);
+		float4(lowToFar, invBand, 0.0f, 0.0f), nearQuadrantFrustumPadding, settings.debugDisableAllCulls, lowFadeInPositionPadding);
 	globals::profiler->EndPass();
 	const float compactFadeT = settings.farDensityFalloff < FarPerformanceKeep ?
 	                               (1.0f - FarPerformanceKeep) / std::max(1.0f - settings.farDensityFalloff, 1.0e-4f) :
@@ -1135,7 +1105,7 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx, const bool nearTi
 	globals::profiler->BeginPass("ProceduralGrass::Far Generation");
 	grassRendererFarLOD->GenerateBlades(ctx, quadrantsFarLOD, quadrantsFarVersion, 61, 60, grassLodOrigin, float4(lowToFar, invBand, farSeamExtraKeep, radiusEdge),
 		float4(gridEdge, 1.0f / std::max(radiusEdge - gridEdge, 1.0f), settings.farDensityFalloff, 1.0f / PGrassCommon::FarUnloadFadeWidth),
-		farQuadrantFrustumPadding, static_cast<float>(settings.voronoiGridSize), settings.debugDisableAllCulls, 0.0f, farCompactStart, FarPerformanceKeep);
+		farQuadrantFrustumPadding, settings.debugDisableAllCulls, 0.0f, farCompactStart, FarPerformanceKeep);
 	globals::profiler->EndPass();
 
 	UnbindGeneratorResources(ctx);

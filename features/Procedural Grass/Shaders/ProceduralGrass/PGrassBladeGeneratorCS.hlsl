@@ -71,9 +71,38 @@ static const float BLADE_TO_WORLD = 2048.0f / BLADES_PER_ROW;
 
 static const float UINT_TO_FLOAT = 1.0f / 4294967296.0f;
 
-#include "ProceduralGrass/PGrassBasePlacement.hlsli"
+uint2 BaseGridPosition(uint2 patchPos, uint bladeIndex)
+{
+	uint patchHash = Random::iqint3(patchPos);
+	uint bladeIndexRandomiser = (patchHash >> 16) & 3u;
+	uint randomBladeIndex = bladeIndex ^ bladeIndexRandomiser;
+	return patchPos * 2u + uint2(randomBladeIndex >> 1u, randomBladeIndex & 1u);
+}
 
-#include "ProceduralGrass/PGrassQuadrants.hlsli"
+float2 BaseQuadrantPosition(uint2 pos, uint3 hash)
+{
+	float2 jitter = float2(hash.xy) * UINT_TO_FLOAT;
+#if defined(FAR_LOD)
+	jitter *= 0.5f;
+#endif
+	return (float2(pos) + jitter) * BLADE_TO_WORLD;
+}
+
+static const uint WORK_HAS_LAND = 1u << 16u;
+
+struct QuadrantData
+{
+	float2 quadWorldPos;
+	uint quadrantHash;
+	uint flags;
+};
+
+cbuffer QuadrantData : register(b7)
+{
+	float4 lodFadeIn;  // x: fade-in start, y: inverse range, z: Far seam-fill retention, w: fade-out endpoint
+	float4 lodFadeOut;
+	QuadrantData data[QUADRANT_DATA_SIZE];
+}
 
 RWStructuredBuffer<Blade> BladeOutput : register(u0);
 RWByteAddressBuffer IndirectArgs : register(u1);
@@ -115,19 +144,45 @@ groupshared uint2 GroupOutputBase;
 Texture2D<float> TerrainHeightTexture : register(t0);
 SamplerState LinearSampler : register(s0);
 
-#include "ProceduralGrass/PGrassLand.hlsli"
+static const uint QUADRANT_GRASS_PITCH = 17;
+static const float QUADRANT_GRASS_SPACING = 2048.0f / 16.0f;
+
+StructuredBuffer<float> QuadrantHeights : register(t3);
+
+// Return bilinear LAND height and slope from the same four corners.
+bool SampleLandHeightSlope(out float height, out float2 slope, float2 quadLocalPos, uint quadrant, bool hasLand)
+{
+	height = 0.0f;
+	slope = float2(0.0f, 0.0f);
+
+	if (!hasLand)
+		return false;
+
+	float2 gridPosition = clamp(quadLocalPos / QUADRANT_GRASS_SPACING, 0.0f, QUADRANT_GRASS_PITCH - 1.001f);
+	int2 baseSample = int2(gridPosition);
+	float2 sampleFraction = gridPosition - baseSample;
+
+	uint quadrantBase = quadrant * (QUADRANT_GRASS_PITCH * QUADRANT_GRASS_PITCH);
+	uint lowerLeftIndex = quadrantBase + baseSample.y * QUADRANT_GRASS_PITCH + baseSample.x;
+	float heightLowerLeft = QuadrantHeights[lowerLeftIndex];
+	float heightLowerRight = QuadrantHeights[lowerLeftIndex + 1];
+	float heightUpperLeft = QuadrantHeights[lowerLeftIndex + QUADRANT_GRASS_PITCH];
+	float heightUpperRight = QuadrantHeights[lowerLeftIndex + QUADRANT_GRASS_PITCH + 1];
+
+	height = lerp(lerp(heightLowerLeft, heightLowerRight, sampleFraction.x), lerp(heightUpperLeft, heightUpperRight, sampleFraction.x), sampleFraction.y);
+	slope = float2(
+				lerp(heightLowerRight - heightLowerLeft, heightUpperRight - heightUpperLeft, sampleFraction.y),
+				lerp(heightUpperLeft - heightLowerLeft, heightUpperRight - heightLowerRight, sampleFraction.x)) *
+	        (1.0f / QUADRANT_GRASS_SPACING);
+
+	return true;
+}
 
 // The low 12 bits select QuadrantData. The remaining bits store the blade slot and flags.
 StructuredBuffer<uint> VisibleBladeTasks : register(t5);
 StructuredBuffer<uint> QuadrantGrassCells : register(t6);  // Packed 2x2 LAND IDs for each quadrant cell.
 StructuredBuffer<float2> TileHeightBounds : register(t11);
 StructuredBuffer<uint> OccupancyRows : register(t12);
-#if defined(PGRASS_FEATURE_CACHE)
-StructuredBuffer<PackedClumpFeature> ClumpFeatures : register(t9);
-#endif
-#if defined(PGRASS_PLACEMENT_CACHE)
-StructuredBuffer<BasePlacement> PlacementCache : register(t10);
-#endif
 
 #if defined(HIGH_LOD)
 Texture2D<uint> GrassDensityTexture : register(t7);
@@ -153,6 +208,48 @@ static const uint MAX_TILE_PATCH_WIDTH = (PATCHES_PER_ROW + OCCUPANCY_TILES_PER_
 
 // Start slope-fill seeds after High's four base slots to keep their positions consistent across tiers.
 static const uint SLOPE_EXTRA_SEED_BASE = 4u;
+
+uint3 ExtraCandidateHash(uint2 patchPos, uint extraIndex, uint quadrantHash)
+{
+	return Random::pcg3d(uint3(patchPos, SLOPE_EXTRA_SEED_BASE + extraIndex + quadrantHash));
+}
+
+float2 ExtraCandidateQuadPos(uint2 patchPos, uint3 hash)
+{
+	return (float2(patchPos * 2u) + float2(hash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
+}
+
+// Stable per-position dither shared by every tier's LOD fades.
+float LodDither(float2 worldPos2D)
+{
+	return float(Random::pcg3d(uint3(asuint(worldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
+}
+
+// Maps a tile-local task index to its quadrant patch. Returns false outside the tile or past the last patch.
+bool ResolveTilePatch(uint bladeTask, inout uint patch)
+{
+	if ((bladeTask & WORK_OCCUPIED_TILE) != 0u) {
+		uint tile = (bladeTask >> WORK_TILE_SHIFT) & WORK_TILE_MASK;
+		uint2 tilePos = uint2(tile % OCCUPANCY_TILES_PER_AXIS, tile / OCCUPANCY_TILES_PER_AXIS);
+		uint2 patchStart = tilePos * uint2(PATCHES_PER_ROW, PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS;
+		uint2 patchEnd = (tilePos + 1u) * uint2(PATCHES_PER_ROW, PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS;
+		uint2 localPatch = uint2(patch % MAX_TILE_PATCH_WIDTH, patch / MAX_TILE_PATCH_WIDTH);
+		if (any(localPatch >= patchEnd - patchStart))
+			return false;
+		patch = (patchStart.y + localPatch.y) * PATCHES_PER_ROW + patchStart.x + localPatch.x;
+	}
+	return patch < PATCHES_PER_QUADRANT;
+}
+
+// Rejects a root whose blade envelope lies wholly outside a side plane of the unjittered frustum.
+bool IsOutsideFrustum(float3 viewPos, float geometryExtent)
+{
+	float4 clip = mul(FrameBuffer::CameraViewProjUnjittered, float4(viewPos, 1.0f));
+	return clip.x + clip.w < -frustumPlaneExtent.x * geometryExtent ||
+	       clip.w - clip.x < -frustumPlaneExtent.y * geometryExtent ||
+	       clip.y + clip.w < -frustumPlaneExtent.z * geometryExtent ||
+	       clip.w - clip.y < -frustumPlaneExtent.w * geometryExtent;
+}
 groupshared uint GroupTileOccluded;
 
 // The Hi-Z depth bounds assume the game's forward perspective projection.
@@ -327,6 +424,16 @@ bool IsPatchOccluded(float2 worldXY, float terrainZ, float2 terrainSlope, uint q
 #endif
 }
 
+// Tests a quadrant-local box of blade roots, padded by the blade geometry radius, against Hi-Z.
+bool IsRootBoxOccluded(uint quadrant, float2 localMin, float2 localMax, float2 heightBounds, float geometryRadius, float minDistanceFloor, float minDistanceScale, bool cullsDisabled)
+{
+	float3 reach = float3((localMax - localMin) * 0.5f + geometryRadius, (heightBounds.y - heightBounds.x) * 0.5f + geometryRadius);
+	float radius = length(reach);
+	float bladeHeight = max(grassAOParams.w, 64.0f);
+	float3 centre = float3(data[quadrant].quadWorldPos + (localMin + localMax) * 0.5f, (heightBounds.x + heightBounds.y + bladeHeight) * 0.5f) - FrameBuffer::CameraPosAdjust.xyz;
+	return IsVolumeOccluded(centre, radius, max(minDistanceFloor, radius * minDistanceScale), cullsDisabled);
+}
+
 bool IsOccupiedTileOccluded(uint bladeTask)
 {
 	if ((bladeTask & (WORK_OCCUPIED_TILE | WORK_HAS_LAND)) != (WORK_OCCUPIED_TILE | WORK_HAS_LAND))
@@ -336,10 +443,6 @@ bool IsOccupiedTileOccluded(uint bladeTask)
 	float2 heightBounds;
 	if (!ResolveTileHeightBounds(quadrant, tile, heightBounds))
 		return false;
-	uint2 tileXY = uint2(tile % OCCUPANCY_TILES_PER_AXIS, tile / OCCUPANCY_TILES_PER_AXIS);
-	float tileWidth = 2048.0f / OCCUPANCY_TILES_PER_AXIS;
-	float2 worldXY = data[quadrant].quadWorldPos + (float2(tileXY) + 0.5f) * tileWidth;
-	float bladeHeight = max(grassAOParams.w, 64.0f);
 	float geometryRadius =
 #if defined(FAR_LOD)
 		max(grassHiZBounds.x, 96.0f);
@@ -348,11 +451,10 @@ bool IsOccupiedTileOccluded(uint bladeTask)
 #else
 		max(grassHiZParams.z, 96.0f);
 #endif
-	float horizontalReach = tileWidth * 0.5f + 2.0f * BLADE_TO_WORLD + geometryRadius;
-	float verticalReach = (heightBounds.y - heightBounds.x) * 0.5f + geometryRadius;
-	float radius = sqrt(2.0f * horizontalReach * horizontalReach + verticalReach * verticalReach);
-	float3 centre = float3(worldXY, (heightBounds.x + heightBounds.y + bladeHeight) * 0.5f) - FrameBuffer::CameraPosAdjust.xyz;
-	return IsVolumeOccluded(centre, radius, max(768.0f, radius * 2.0f), debugFlags.x > 0.5f);
+	// Roots jitter up to one patch beyond the tile.
+	float2 tileMin = float2(tile % OCCUPANCY_TILES_PER_AXIS, tile / OCCUPANCY_TILES_PER_AXIS) * QUADRANT_GRASS_SPACING - 2.0f * BLADE_TO_WORLD;
+	float2 tileMax = tileMin + QUADRANT_GRASS_SPACING + 4.0f * BLADE_TO_WORLD;
+	return IsRootBoxOccluded(quadrant, tileMin, tileMax, heightBounds, geometryRadius, 768.0f, 2.0f, debugFlags.x > 0.5f);
 }
 
 #if defined(FAR_LOD)
@@ -362,19 +464,12 @@ bool IsFarPatchBoundsOccluded(uint2 patchPos, uint quadrant, bool hasLand, bool 
 		return false;
 
 	const float patchWidth = 2.0f * BLADE_TO_WORLD;
-	const float2 patchCentre = (float2(patchPos) + 0.5f) * patchWidth;
-	const int2 tileXY = clamp(int2(patchCentre / QUADRANT_GRASS_SPACING), int2(0, 0), int2(OCCUPANCY_TILES_PER_AXIS - 1, OCCUPANCY_TILES_PER_AXIS - 1));
+	const float2 patchMin = float2(patchPos) * patchWidth;
+	const int2 tileXY = clamp(int2((patchMin + 0.5f * patchWidth) / QUADRANT_GRASS_SPACING), int2(0, 0), int2(OCCUPANCY_TILES_PER_AXIS - 1, OCCUPANCY_TILES_PER_AXIS - 1));
 	float2 heightBounds;
 	if (!ResolveTileHeightBounds(quadrant, tileXY.y * OCCUPANCY_TILES_PER_AXIS + tileXY.x, heightBounds))
 		return false;
-
-	const float geometryRadius = max(grassHiZBounds.x, 96.0f);
-	const float horizontalReach = patchWidth * 0.5f + geometryRadius;
-	const float verticalReach = (heightBounds.y - heightBounds.x) * 0.5f + geometryRadius;
-	const float radius = sqrt(2.0f * horizontalReach * horizontalReach + verticalReach * verticalReach);
-	const float bladeHeight = max(grassAOParams.w, 64.0f);
-	const float3 centre = float3(data[quadrant].quadWorldPos + patchCentre, (heightBounds.x + heightBounds.y + bladeHeight) * 0.5f) - FrameBuffer::CameraPosAdjust.xyz;
-	return IsVolumeOccluded(centre, radius, max(512.0f, radius * 1.5f), cullsDisabled);
+	return IsRootBoxOccluded(quadrant, patchMin, patchMin + patchWidth, heightBounds, max(grassHiZBounds.x, 96.0f), 512.0f, 1.5f, cullsDisabled);
 }
 
 bool IsFarGroupOccluded(uint bladeTask, uint groupX)
@@ -389,14 +484,13 @@ bool IsFarGroupOccluded(uint bladeTask, uint groupX)
 	const uint2 firstPos = uint2(firstPatch % PATCHES_PER_ROW, firstPatch / PATCHES_PER_ROW);
 	const uint2 lastPos = uint2(lastPatch % PATCHES_PER_ROW, lastPatch / PATCHES_PER_ROW);
 	const bool wrapsRow = firstPos.y != lastPos.y;
-	const uint minPatchX = wrapsRow ? 0u : firstPos.x;
-	const uint maxPatchX = wrapsRow ? PATCHES_PER_ROW - 1u : lastPos.x;
-	const uint minPatchY = firstPos.y;
-	const uint maxPatchY = lastPos.y;
+	const uint2 minPatch = uint2(wrapsRow ? 0u : firstPos.x, firstPos.y);
+	const uint2 maxPatch = uint2(wrapsRow ? PATCHES_PER_ROW - 1u : lastPos.x, lastPos.y) + 1u;
 
 	const float patchWidth = 2.0f * BLADE_TO_WORLD;
-	const uint2 minTile = min(uint2(float2(minPatchX, minPatchY) * patchWidth / QUADRANT_GRASS_SPACING), OCCUPANCY_TILES_PER_AXIS - 1u);
-	const uint2 maxTile = min(uint2(float2(maxPatchX + 1u, maxPatchY + 1u) * patchWidth / QUADRANT_GRASS_SPACING), OCCUPANCY_TILES_PER_AXIS - 1u);
+	const uint2 minTile = min(uint2(float2(minPatch) * patchWidth / QUADRANT_GRASS_SPACING), OCCUPANCY_TILES_PER_AXIS - 1u);
+	const uint2 maxTile = min(uint2(float2(maxPatch) * patchWidth / QUADRANT_GRASS_SPACING), OCCUPANCY_TILES_PER_AXIS - 1u);
+	const uint quadrant = bladeTask & WORK_QUADRANT_MASK;
 
 	float2 heightBounds = float2(3.402823466e+38f, -3.402823466e+38f);
 	[loop] for (uint tileY = minTile.y; tileY <= maxTile.y; ++tileY)
@@ -404,24 +498,12 @@ bool IsFarGroupOccluded(uint bladeTask, uint groupX)
 		[loop] for (uint tileX = minTile.x; tileX <= maxTile.x; ++tileX)
 		{
 			float2 tileBounds;
-			if (!ResolveTileHeightBounds(bladeTask & WORK_QUADRANT_MASK, tileY * OCCUPANCY_TILES_PER_AXIS + tileX, tileBounds))
+			if (!ResolveTileHeightBounds(quadrant, tileY * OCCUPANCY_TILES_PER_AXIS + tileX, tileBounds))
 				return false;
-			heightBounds.x = min(heightBounds.x, tileBounds.x);
-			heightBounds.y = max(heightBounds.y, tileBounds.y);
+			heightBounds = float2(min(heightBounds.x, tileBounds.x), max(heightBounds.y, tileBounds.y));
 		}
 	}
-
-	const float2 localMin = float2(minPatchX, minPatchY) * patchWidth;
-	const float2 localMax = float2(maxPatchX + 1u, maxPatchY + 1u) * patchWidth;
-	const float geometryRadius = max(grassHiZBounds.x, 96.0f);
-	const float2 horizontalReach = (localMax - localMin) * 0.5f + geometryRadius;
-	const float verticalReach = (heightBounds.y - heightBounds.x) * 0.5f + geometryRadius;
-	const float radius = length(float3(horizontalReach, verticalReach));
-	const float bladeHeight = max(grassAOParams.w, 64.0f);
-	const float3 centre = float3(data[bladeTask & WORK_QUADRANT_MASK].quadWorldPos + (localMin + localMax) * 0.5f,
-							  (heightBounds.x + heightBounds.y + bladeHeight) * 0.5f) -
-	                      FrameBuffer::CameraPosAdjust.xyz;
-	return IsVolumeOccluded(centre, radius, max(768.0f, radius * 1.5f), false);
+	return IsRootBoxOccluded(quadrant, float2(minPatch) * patchWidth, float2(maxPatch) * patchWidth, heightBounds, max(grassHiZBounds.x, 96.0f), 768.0f, 1.5f, false);
 }
 #endif
 
@@ -469,76 +551,33 @@ float GetObjectClearance(float3 worldPos, bool cullsDisabled)
 	return clearance < occlusionParams.z ? clearance : 1.0e30f;
 }
 
-ClumpFeature HashClumpFeature(int2 cell)
-{
-	uint3 hash = Random::pcg3d(uint3(asuint(cell), 0u));
-	ClumpFeature feature;
-#if defined(PGRASS_FEATURE_CACHE)
-	feature.fraction = voronoiGridSize >= 256.0f ? float2(hash.xy >> 16u) * (1.0f / 65536.0f) : float2(hash.xy) * UINT_TO_FLOAT;
-#else
-	feature.fraction = float2(hash.xy) * UINT_TO_FLOAT;
-#endif
-	feature.random = hash.z;
-	return feature;
-}
-
-ClumpFeature GetClumpFeature(int2 cell, uint featureBase, int2 quadrantCell, bool cachedNeighborhood)
-{
-	ClumpFeature feature;
-#if defined(PGRASS_FEATURE_CACHE)
-	if (cachedNeighborhood) {
-		int2 localCell = cell - quadrantCell + 1;
-		PackedClumpFeature packed = ClumpFeatures[featureBase + localCell.y * CLUMP_FEATURE_PITCH + localCell.x];
-		feature.fraction = float2(packed.fraction & 0xFFFFu, packed.fraction >> 16u) * (1.0f / 65536.0f);
-		feature.random = packed.random;
-	} else
-#endif
-		feature = HashClumpFeature(cell);
-	return feature;
-}
-
-#if defined(FAR_LOD)
-void TryFarClumpCell(inout uint clumpRand, inout float clumpDistSq, inout float2 clumpDir, int2 cell, float2 gridPos,
-	uint featureBase, int2 quadrantCell, bool cachedNeighborhood)
+// Keep the nearest Voronoi feature, skipping cells whose closest point cannot beat the current best.
+void TryClumpCell(inout uint clumpRand, inout float clumpDistSq, inout float2 clumpDir, int2 cell, float2 gridPos)
 {
 	float2 cellMin = float2(cell);
 	float2 cellOffset = clamp(gridPos, cellMin, cellMin + 1.0f) - gridPos;
 	if (dot(cellOffset, cellOffset) >= clumpDistSq)
 		return;
 
-	ClumpFeature feature = GetClumpFeature(cell, featureBase, quadrantCell, cachedNeighborhood);
-	float2 offset = cellMin + feature.fraction - gridPos;
+	uint3 hash = Random::pcg3d(uint3(asuint(cell), 0u));
+	float2 offset = cellMin + float2(hash.xy) * UINT_TO_FLOAT - gridPos;
 	float distanceSquared = dot(offset, offset);
 	if (distanceSquared < clumpDistSq) {
 		clumpDistSq = distanceSquared;
 		clumpDir = offset;
-		clumpRand = feature.random;
+		clumpRand = hash.z;
 	}
 }
-#endif
 
-void ComputeClump(out uint clumpRand, out float clumpDist, out float2 clumpDir, float2 worldPos, float inverseGridSize, uint quadrant)
+void ComputeClump(out uint clumpRand, out float clumpDist, out float2 clumpDir, float2 worldPos, float inverseGridSize)
 {
 	float2 gridPos = worldPos * inverseGridSize;
 	// Floor keeps the Voronoi grid continuous across negative world coordinates.
 	int2 gridCell = int2(floor(gridPos));
-	uint featureBase = quadrant * CLUMP_FEATURE_PITCH * CLUMP_FEATURE_PITCH;
-	int2 quadrantCell = int2(0, 0);
-	bool cachedNeighborhood = false;
-#if defined(PGRASS_FEATURE_CACHE)
-	if (voronoiGridSize >= 256.0f) {
-		quadrantCell = int2(floor(data[quadrant].quadWorldPos * inverseGridSize));
-		int2 localCell = gridCell - quadrantCell + 1;
-		// Validate the whole search once. Cached and hashed features use the same quantization.
-		cachedNeighborhood = all(localCell >= 1) && all(localCell < CLUMP_FEATURE_PITCH - 1);
-	}
-#endif
-
-	ClumpFeature centerFeatureData = GetClumpFeature(gridCell, featureBase, quadrantCell, cachedNeighborhood);
-	float2 centerFeature = float2(gridCell) + centerFeatureData.fraction;
-	clumpDir = centerFeature - gridPos;
-	clumpDist = dot(clumpDir, clumpDir);
-	clumpRand = centerFeatureData.random;
+	clumpRand = 0u;
+	clumpDist = 1.0e30f;
+	clumpDir = float2(0.0f, 0.0f);
+	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell, gridPos);
 
 #if defined(FAR_LOD)
 	// Features across the farther cell boundaries are at least 0.5 cells away, where clump density is already zero.
@@ -546,41 +585,20 @@ void ComputeClump(out uint clumpRand, out float clumpDist, out float2 clumpDir, 
 	float2 cellFraction = gridPos - float2(gridCell);
 	int xNear = cellFraction.x < 0.5f ? -1 : 1;
 	int yNear = cellFraction.y < 0.5f ? -1 : 1;
-	int xFar = -xNear;
-	int yFar = -yNear;
-
-	TryFarClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(xNear, 0), gridPos, featureBase, quadrantCell, cachedNeighborhood);
-	TryFarClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(0, yNear), gridPos, featureBase, quadrantCell, cachedNeighborhood);
-	TryFarClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(xNear, yNear), gridPos, featureBase, quadrantCell, cachedNeighborhood);
+	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(xNear, 0), gridPos);
+	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(0, yNear), gridPos);
+	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(xNear, yNear), gridPos);
 
 	float farXDistance = max(cellFraction.x, 1.0f - cellFraction.x);
 	float farYDistance = max(cellFraction.y, 1.0f - cellFraction.y);
-	int2 farCardinal = farXDistance < farYDistance ? int2(xFar, 0) : int2(0, yFar);
-	TryFarClumpCell(clumpRand, clumpDist, clumpDir, gridCell + farCardinal, gridPos, featureBase, quadrantCell, cachedNeighborhood);
+	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + (farXDistance < farYDistance ? int2(-xNear, 0) : int2(0, -yNear)), gridPos);
 #else
 	[unroll] for (int y = -1; y <= 1; y++)
 	{
 		[unroll] for (int x = -1; x <= 1; x++)
 		{
-			if (x == 0 && y == 0)
-				continue;
-
-			int2 cell = gridCell + int2(x, y);
-			float2 cellMin = float2(cell);
-			float2 cellOffset = clamp(gridPos, cellMin, cellMin + 1.0f) - gridPos;
-			if (dot(cellOffset, cellOffset) >= clumpDist)
-				continue;
-
-			ClumpFeature feature = GetClumpFeature(cell, featureBase, quadrantCell, cachedNeighborhood);
-			float2 featurePos = cellMin + feature.fraction;
-			float2 offset = featurePos - gridPos;
-			float distanceSquared = dot(offset, offset);
-
-			if (distanceSquared < clumpDist) {
-				clumpDist = distanceSquared;
-				clumpDir = offset;
-				clumpRand = feature.random;
-			}
+			if (x != 0 || y != 0)
+				TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(x, y), gridPos);
 		}
 	}
 #endif
@@ -667,7 +685,7 @@ bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar
 			return true;
 
 		float keep = compactFar ? saturate(inRamp / max(farParams.w, 1.0e-3f)) : inRamp;
-		float dither = float(Random::pcg3d(uint3(asuint(bladeWorldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
+		float dither = LodDither(bladeWorldPos2D);
 		return dither <= keep;
 	}
 
@@ -687,7 +705,7 @@ bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar
 	keep = max(keep, seamKeep);
 	if (compactFar)
 		keep = saturate(keep / max(farParams.w, 1.0e-3f));
-	float dither = float(Random::pcg3d(uint3(asuint(bladeWorldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
+	float dither = LodDither(bladeWorldPos2D);
 
 	return dither <= keep;
 #else
@@ -761,7 +779,7 @@ bool PassesBladeLOD(float2 bladeWorldPos2D, bool cullsDisabled)
 	float lodDistance = length(lodOffset);
 	float inRamp = saturate((lodDistance - lodFadeIn.x) * lodFadeIn.y);
 	float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodDistance - lodFadeOut.x) * lodFadeOut.y));
-	float dither = float(Random::pcg3d(uint3(asuint(bladeWorldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
+	float dither = LodDither(bladeWorldPos2D);
 	return !((inRamp < 1.0f && dither <= 1.0f - inRamp) || dither > outRamp);
 #	else
 	float lodDistanceSq = dot(lodOffset, lodOffset);
@@ -791,7 +809,7 @@ bool PassesBladeLOD(float2 bladeWorldPos2D, bool cullsDisabled)
 	if (lodDistanceSq >= lodFadeInEndSq && beforeFadeOut)
 		return true;
 
-	float dither = float(Random::pcg3d(uint3(asuint(bladeWorldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
+	float dither = LodDither(bladeWorldPos2D);
 	if (lodDistanceSq >= lodFadeInEndSq && afterFadeOut)
 		return dither <= lodFadeOut.z;
 
@@ -872,12 +890,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	if (!insideFrustum) {
 		float widthExtent = generatorType.width * 2.5f * 1.3f * 32.0f * 2.0f;
 		float geometryExtent = generatorType.height + widthExtent;
-		float4 clip = mul(FrameBuffer::CameraViewProjUnjittered, float4(viewPos, 1.0f));
-		bool outsideFrustum = clip.x + clip.w < -frustumPlaneExtent.x * geometryExtent ||
-		                      clip.w - clip.x < -frustumPlaneExtent.y * geometryExtent ||
-		                      clip.y + clip.w < -frustumPlaneExtent.z * geometryExtent ||
-		                      clip.w - clip.y < -frustumPlaneExtent.w * geometryExtent;
-		if (outsideFrustum && !cullsDisabled)
+		if (!cullsDisabled && IsOutsideFrustum(viewPos, geometryExtent))
 			return false;
 	}
 
@@ -889,7 +902,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	uint clumpRand;
 	float clumpDist;
 	float2 clumpDir;
-	ComputeClump(clumpRand, clumpDist, clumpDir, bladeWorldPos2D, inverseVoronoiGridSize, quadrant);
+	ComputeClump(clumpRand, clumpDist, clumpDir, bladeWorldPos2D, inverseVoronoiGridSize);
 	float clumpDensity = 1.0f - smoothstep(0.15f, 0.50f, clumpDist);
 
 	hash = Random::pcg3d(hash);
@@ -935,12 +948,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 		widthExtent *= 1.0f + miscParams.z;
 #	endif
 		float geometryExtent = generatorType.height + widthExtent;
-		float4 clip = mul(FrameBuffer::CameraViewProjUnjittered, float4(viewPos, 1.0f));
-		bool outsideFrustum = clip.x + clip.w < -frustumPlaneExtent.x * geometryExtent ||
-		                      clip.w - clip.x < -frustumPlaneExtent.y * geometryExtent ||
-		                      clip.y + clip.w < -frustumPlaneExtent.z * geometryExtent ||
-		                      clip.w - clip.y < -frustumPlaneExtent.w * geometryExtent;
-		if (outsideFrustum && !cullsDisabled)
+		if (!cullsDisabled && IsOutsideFrustum(viewPos, geometryExtent))
 			return false;
 	}
 
@@ -1312,9 +1320,8 @@ void GenerateLowExtra(uint3 dispatch, uint extraTask)
 	bool cullsDisabled = debugFlags.x > 0.5f;
 	QuadrantData quadrantData = data[quadrant];
 	uint2 patchPos = uint2(setup.patch % PATCHES_PER_ROW, setup.patch / PATCHES_PER_ROW);
-	uint oldBladeIndex = SLOPE_EXTRA_SEED_BASE + extraIndex;
-	uint3 candidateHash = Random::pcg3d(uint3(patchPos, oldBladeIndex + quadrantData.quadrantHash));
-	float2 candidateQuadPos = (float2(patchPos * 2u) + float2(candidateHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
+	uint3 candidateHash = ExtraCandidateHash(patchPos, extraIndex, quadrantData.quadrantHash);
+	float2 candidateQuadPos = ExtraCandidateQuadPos(patchPos, candidateHash);
 	float2 candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
 	float2 candidateMapSamplePos = GrassMapSamplePos(candidateQuadPos, candidateHash);
 	uint packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
@@ -1342,24 +1349,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 	if (laneHasPatch) {
 		uint dispatchGroup = dispatch.x / THREADGROUP_SIZE;
 		uint patch = dispatchGroup * LOW_PATCHES_PER_GROUP + patchSlot;
-		bool validPatch = true;
-
-		if ((bladeTask & WORK_OCCUPIED_TILE) != 0u) {
-			uint tile = (bladeTask >> WORK_TILE_SHIFT) & WORK_TILE_MASK;
-			uint2 tilePos = uint2(tile & 15u, tile >> 4u);
-			uint2 patchStart = uint2(tilePos.x * PATCHES_PER_ROW, tilePos.y * PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS;
-			uint2 patchEnd = uint2((tilePos.x + 1u) * PATCHES_PER_ROW, (tilePos.y + 1u) * PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS;
-			uint2 tilePatchDim = patchEnd - patchStart;
-			uint2 localPatch = uint2(patch % MAX_TILE_PATCH_WIDTH, patch / MAX_TILE_PATCH_WIDTH);
-
-			if (any(localPatch >= tilePatchDim))
-				validPatch = false;
-			else
-				patch = (patchStart.y + localPatch.y) * PATCHES_PER_ROW + patchStart.x + localPatch.x;
-		}
-
-		if (patch >= PATCHES_PER_QUADRANT)
-			validPatch = false;
+		bool validPatch = ResolveTilePatch(bladeTask, patch);
 		if (validPatch && debugFlags.x <= 0.5f && (bladeTask & WORK_FULL_GRASS) == 0u && !PatchHasGrass(uint2(patch % PATCHES_PER_ROW, patch / PATCHES_PER_ROW), bladeTask & WORK_QUADRANT_MASK))
 			validPatch = false;
 
@@ -1376,14 +1366,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 
 			uint3 baseHash;
 			uint2 gridPos = BaseGridPosition(patchPos, bladeIndex);
-#	if defined(PGRASS_PLACEMENT_CACHE)
-			BasePlacement cached;
-			if (hasLand) {
-				cached = PlacementCache[quadrant * PATCHES_PER_QUADRANT + patch];
-				baseHash = cached.hash;
-			} else
-#	endif
-				baseHash = Random::pcg3d(uint3(gridPos, quadrantHash));
+			baseHash = Random::pcg3d(uint3(gridPos, quadrantHash));
 			float2 baseQuadPos2D = BaseQuadrantPosition(gridPos, baseHash);
 
 			float2 baseWorldPos2D = baseQuadPos2D + quadrantData.quadWorldPos;
@@ -1399,13 +1382,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 
 			float2 terrainSlope;
 			float baseWorldZ;
-#	if defined(PGRASS_PLACEMENT_CACHE)
-			if (hasLand) {
-				baseWorldZ = cached.height;
-				terrainSlope = cached.slope;
-			} else
-#	endif
-				baseWorldZ = TerrainHeightSlopeAt(terrainSlope, baseWorldPos2D, quadrantData.quadWorldPos, quadrant, hasLand);
+			baseWorldZ = TerrainHeightSlopeAt(terrainSlope, baseWorldPos2D, quadrantData.quadWorldPos, quadrant, hasLand);
 
 			if (!(useBasePath && IsPatchOccluded(baseWorldPos2D, baseWorldZ, terrainSlope, quadrant, hasLand, cullsDisabled))) {
 				// Share only the terrain plane needed by extra candidates. Base inputs stay in this lane.
@@ -1446,23 +1423,10 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 	bool allowSlopeExtras = (bladeTask & WORK_ALLOW_SLOPE_EXTRAS) != 0u;
 	bool nearCovered = (bladeTask & WORK_NEAR_COVERED) != 0u;
 	bool compactFar = (bladeTask & WORK_COMPACT_FAR) != 0u;
-	bool occupiedTile = (bladeTask & WORK_OCCUPIED_TILE) != 0u;
 
-	if (occupiedTile) {
-		uint tile = (bladeTask >> WORK_TILE_SHIFT) & WORK_TILE_MASK;
-		uint2 tilePos = uint2(tile & 15u, tile >> 4u);
-		uint2 patchStart = uint2(tilePos.x * PATCHES_PER_ROW, tilePos.y * PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS;
-		uint2 patchEnd = uint2((tilePos.x + 1u) * PATCHES_PER_ROW, (tilePos.y + 1u) * PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS;
-		uint2 tilePatchDim = patchEnd - patchStart;
-		uint2 localPatch = uint2(patch % MAX_TILE_PATCH_WIDTH, patch / MAX_TILE_PATCH_WIDTH);
-
-		if (any(localPatch >= tilePatchDim))
-			return;
-
-		patch = (patchStart.y + localPatch.y) * PATCHES_PER_ROW + patchStart.x + localPatch.x;
-		if (patch >= PATCHES_PER_QUADRANT)
-			return;
-	}
+	// Full-quadrant dispatches round up to whole groups, so also reject the tail past the last patch.
+	if (!ResolveTilePatch(bladeTask, patch))
+		return;
 
 #	if defined(FAR_LOD)
 	if (compactFar) {
@@ -1486,14 +1450,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 	// Preserve the base blade slot's position and seed.
 	uint3 baseHash;
 	uint2 gridPos = BaseGridPosition(patchPos, bladeIndex);
-#	if defined(PGRASS_PLACEMENT_CACHE)
-	BasePlacement cached;
-	if (hasLand) {
-		cached = PlacementCache[quadrant * PATCHES_PER_QUADRANT + patch];
-		baseHash = cached.hash;
-	} else
-#	endif
-		baseHash = Random::pcg3d(uint3(gridPos, quadrantHash));
+	baseHash = Random::pcg3d(uint3(gridPos, quadrantHash));
 	float2 baseQuadPos2D = BaseQuadrantPosition(gridPos, baseHash);
 	float2 baseWorldPos2D = baseQuadPos2D + quadrantData.quadWorldPos;
 	float2 baseMapSamplePos = GrassMapSamplePos(baseQuadPos2D, baseHash);
@@ -1524,9 +1481,8 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 			if ((extraIndex % PATCH_BLADE_COUNT) != bladeIndex)
 				continue;
 
-			uint oldBladeIndex = SLOPE_EXTRA_SEED_BASE + extraIndex;
-			uint3 extraHash = Random::pcg3d(uint3(patchPos, oldBladeIndex + quadrantHash));
-			float2 extraQuadPos = (float2(patchPos * 2u) + float2(extraHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
+			uint3 extraHash = ExtraCandidateHash(patchPos, extraIndex, quadrantHash);
+			float2 extraQuadPos = ExtraCandidateQuadPos(patchPos, extraHash);
 			float2 extraMapSamplePos = GrassMapSamplePos(extraQuadPos, extraHash);
 			if (!PassesEarlyFarLOD(extraQuadPos + quadrantData.quadWorldPos, nearCovered, compactFar, cullsDisabled))
 				continue;
@@ -1546,9 +1502,8 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 		bool anyExtraGrass = false;
 		[unroll] for (uint extraIndex = 0u; extraIndex < SLOPE_EXTRA_BLADES; ++extraIndex)
 		{
-			uint oldBladeIndex = SLOPE_EXTRA_SEED_BASE + extraIndex;
-			uint3 extraHash = Random::pcg3d(uint3(patchPos, oldBladeIndex + quadrantHash));
-			float2 extraQuadPos = (float2(patchPos * 2u) + float2(extraHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
+			uint3 extraHash = ExtraCandidateHash(patchPos, extraIndex, quadrantHash);
+			float2 extraQuadPos = ExtraCandidateQuadPos(patchPos, extraHash);
 			if (LoadGrassCell(GrassMapSamplePos(extraQuadPos, extraHash), quadrant) != 0u) {
 				anyExtraGrass = true;
 				break;
@@ -1571,13 +1526,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 	// One bilinear terrain sample establishes the plane for this path and its extras.
 	float2 terrainSlope;
 	float baseWorldZ;
-#	if defined(PGRASS_PLACEMENT_CACHE)
-	if (hasLand) {
-		baseWorldZ = cached.height;
-		terrainSlope = cached.slope;
-	} else
-#	endif
-		baseWorldZ = TerrainHeightSlopeAt(terrainSlope, baseWorldPos2D, quadrantData.quadWorldPos, quadrant, hasLand);
+	baseWorldZ = TerrainHeightSlopeAt(terrainSlope, baseWorldPos2D, quadrantData.quadWorldPos, quadrant, hasLand);
 	if (useBasePath && IsPatchOccluded(baseWorldPos2D, baseWorldZ, terrainSlope, quadrant, hasLand, cullsDisabled))
 		return;
 	float terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
@@ -1601,13 +1550,12 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 
 		if (!isBase) {
 			uint emitExtraIndex = candidateIndex - 1;
-			uint oldBladeIndex = SLOPE_EXTRA_SEED_BASE + emitExtraIndex;
 #		if defined(FAR_LOD)
 			if (!allowSlopeExtras)
 				continue;
 
-			candidateHash = Random::pcg3d(uint3(patchPos, oldBladeIndex + quadrantHash));
-			float2 extraQuadPos = (float2(patchPos * 2u) + float2(candidateHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
+			candidateHash = ExtraCandidateHash(patchPos, emitExtraIndex, quadrantHash);
+			float2 extraQuadPos = ExtraCandidateQuadPos(patchPos, candidateHash);
 			candidateWorldPos = extraQuadPos + quadrantData.quadWorldPos;
 			candidateMapSamplePos = GrassMapSamplePos(extraQuadPos, candidateHash);
 			candidateValid = PassesEarlyFarLOD(candidateWorldPos, nearCovered, compactFar, cullsDisabled);
@@ -1619,7 +1567,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 
 			float slopeKeep = baseSlopeKeep;
 			float extraKeep = max(saturate(lodFadeIn.z + slopeKeep), farParams.w);
-			float keepRand = float(Random::pcg3d(uint3(asuint(candidateWorldPos), oldBladeIndex)).x) * UINT_TO_FLOAT;
+			float keepRand = float(Random::pcg3d(uint3(asuint(candidateWorldPos), SLOPE_EXTRA_SEED_BASE + emitExtraIndex)).x) * UINT_TO_FLOAT;
 
 			if (!cullsDisabled && keepRand > extraKeep)
 				continue;
@@ -1627,14 +1575,14 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 			if ((emitExtraIndex % PATCH_BLADE_COUNT) != bladeIndex)
 				continue;
 
-			candidateHash = Random::pcg3d(uint3(patchPos, oldBladeIndex + quadrantHash));
+			candidateHash = ExtraCandidateHash(patchPos, emitExtraIndex, quadrantHash);
 #			if !defined(LOW_LOD)
 			float slopeRoll = float(candidateHash.z) * UINT_TO_FLOAT;
 			if (!cullsDisabled && slopeRoll > baseSlopeKeep)
 				continue;
 #			endif
 
-			float2 candidateQuadPos = (float2(patchPos * 2u) + float2(candidateHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
+			float2 candidateQuadPos = ExtraCandidateQuadPos(patchPos, candidateHash);
 			candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
 			candidateMapSamplePos = GrassMapSamplePos(candidateQuadPos, candidateHash);
 			packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
