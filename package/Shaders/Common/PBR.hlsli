@@ -278,7 +278,6 @@ namespace PBR
 		lobeWeights.specular *= SpecularOcclusion(NdotV, alpha, material.AO);
 	}
 
-
 #if defined(GRASS_LIGHTING)
 	float3 GetGrassTransmission(DirectContext context, MaterialProperties material, float diffuseNdotL, float3 diffuseEnergy)
 	{
@@ -317,8 +316,7 @@ namespace PBR
 		lightingOutput.diffuse += detailedLightColor * wrappedNdotL * BRDF::Diffuse_Lambert() * kD;
 		lightingOutput.specular += Fr * detailedLightColor * satNdotL;
 
-		if ((PBRFlags & Flags::Subsurface) != 0)
-		{
+		if ((PBRFlags & Flags::Subsurface) != 0) {
 			lightingOutput.transmission = GetGrassTransmission(context, material, transmissionNdotL, kD);
 		}
 	}
@@ -335,8 +333,7 @@ namespace PBR
 
 		lobeWeights.diffuse = material.BaseColor;
 
-		if ((PBRFlags & Flags::Subsurface) != 0)
-		{
+		if ((PBRFlags & Flags::Subsurface) != 0) {
 			lobeWeights.diffuse += material.SubsurfaceColor * (1 - material.Thickness) / Math::PI;
 		}
 

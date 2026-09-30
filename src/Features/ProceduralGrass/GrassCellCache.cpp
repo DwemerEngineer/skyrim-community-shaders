@@ -14,7 +14,7 @@ namespace
 	constexpr uint32_t kATXT = Util::FCC("ATXT");
 	constexpr uint32_t kVTXT = Util::FCC("VTXT");
 
-	constexpr uint32_t kQuadrantPitch = PGrassCommon::QuadrantGrassPitch;  // 17 vertices per side
+	constexpr uint32_t kQuadrantPitch = PGrassCommon::QuadrantGrassPitch;      // 17 vertices per side
 	constexpr uint32_t kQuadrantSamples = PGrassCommon::QuadrantGrassSamples;  // 17 x 17 = 289 samples
 	constexpr uint32_t kCellVertexPitch = 33;
 

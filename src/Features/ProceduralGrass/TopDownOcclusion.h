@@ -5,8 +5,8 @@
 /**
  * @brief Top-down world-height map of nearby geometry, for coverage/occlusion queries.
  *
- * Separate from the engine's precipitation occlusion pass so the projection and resolution can be configured independently.
- * and to cover more than view-dependent geometry.
+ * Separate from the engine's precipitation occlusion pass so the projection and resolution can be configured independently
+ * and the map can cover more than view-dependent geometry.
  */
 class TopDownOcclusion
 {
@@ -50,15 +50,6 @@ public:
 		}
 	}
 
-	float GetMinOccluderRadius() const { return minOccluderRadius; }
-	void SetMinOccluderRadius(float a_radius)
-	{
-		if (minOccluderRadius != a_radius) {
-			minOccluderRadius = a_radius;
-			Invalidate();
-		}
-	}
-
 	void SetPaddingWorld(float a_padding)
 	{
 		if (paddingWorld != a_padding) {
@@ -87,7 +78,8 @@ private:
 	uint32_t snapDim = 1024;
 	float halfExtent = 4096.0f;
 	float2 windowCentre = { 0.0f, 0.0f };
-	float minOccluderRadius = 8.0f;
+	// Skip tiny clutter whose occlusion would not visibly remove grass.
+	static constexpr float MinOccluderRadius = 8.0f;
 	float paddingWorld = 8.0f;
 
 	ID3D11VertexShader* heightVS = nullptr;
@@ -118,16 +110,7 @@ private:
 		uint32_t snapDim = 0;
 		uint64_t capturedGeometryRevision = 0;
 
-		bool operator==(const RenderCacheState& other) const
-		{
-			return windowCentre.x == other.windowCentre.x &&
-			       windowCentre.y == other.windowCentre.y &&
-			       halfExtent == other.halfExtent &&
-			       paddingWorld == other.paddingWorld &&
-			       mapDim == other.mapDim &&
-			       snapDim == other.snapDim &&
-			       capturedGeometryRevision == other.capturedGeometryRevision;
-		}
+		bool operator==(const RenderCacheState&) const = default;
 	};
 
 	RenderCacheState renderCacheState{};

@@ -7,13 +7,39 @@
 
 namespace
 {
-
 	/** @brief Floor division by 2, so negative cell coordinates map to the correct quadrant. */
 	constexpr int32_t FloorDiv2(int32_t a)
 	{
 		return a >= 0 ? a / 2 : -((-a + 1) / 2);
 	}
 
+	/** @brief Builds a quadrant from streamed LAND data for one of a cell's four quadrants. */
+	PGrassCommon::Quadrant MakeStreamedQuadrant(const CellGrass& cellGrass, int32_t cellX, int32_t cellY, uint32_t index, bool nearCovered)
+	{
+		PGrassCommon::Quadrant quadrant{};
+		quadrant.cellX = cellX;
+		quadrant.cellY = cellY;
+		quadrant.x = index % 2;
+		quadrant.y = index / 2;
+		quadrant.cacheVersion = cellGrass.quadrantCacheVersions[index];
+		quadrant.nearCovered = nearCovered;
+		quadrant.grassIds = cellGrass.ids[index].data();
+		quadrant.occupancyRows = cellGrass.occupancy[index].data();
+		quadrant.heights = cellGrass.heights[index].data();
+		quadrant.worldPos = float2{ (cellX * 2 + static_cast<int32_t>(quadrant.x)) * 2048.0f, (cellY * 2 + static_cast<int32_t>(quadrant.y)) * 2048.0f };
+		quadrant.minHeight = cellGrass.minHeights[index];
+		quadrant.maxHeight = cellGrass.maxHeights[index];
+		return quadrant;
+	}
+}
+
+int32_t ProceduralGrass::NearCoverageIndex(int32_t worldQuadrantX, int32_t worldQuadrantY, const VisibilityOrigin& origin)
+{
+	const int32_t x = worldQuadrantX - origin.quadrantX + NearCoverageRadius;
+	const int32_t y = worldQuadrantY - origin.quadrantY + NearCoverageRadius;
+	if (x < 0 || y < 0 || x >= NearCoverageDiameter || y >= NearCoverageDiameter)
+		return -1;
+	return y * NearCoverageDiameter + x;
 }
 
 RE::TESLandTexture* PGrassCommon::GetDefaultLandTexture()
@@ -252,400 +278,267 @@ void ProceduralGrass::GetVisibleQuadrants()
 		SyncGrassCellCachePolicy();
 
 	grassMapFrame++;
-	constexpr int32_t nearCoverageRadius = PGrassCommon::LowTierQuadrantRadius + PGrassCommon::LowTierStreamGuardQuadrants;
-	constexpr int32_t nearCoverageDiameter = nearCoverageRadius * 2 + 1;
 	constexpr size_t farCompletionBudget = 12;
 
 	const auto tes = globals::game::tes;
-
-	RE::TESWorldSpace* landWorldSpace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
-	while (landWorldSpace && landWorldSpace->parentWorld && landWorldSpace->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData))
-		landWorldSpace = landWorldSpace->parentWorld;
+	RE::TESWorldSpace* landWorldSpace = Util::GetLandDataWorldspace(tes ? tes->GetRuntimeData2().worldSpace : nullptr);
 
 	grassCellCache.BeginFrame(landWorldSpace);
 	grassCellCache.DrainCompleted(farCompletionBudget);
 
-	const auto& playerNiPos = RE::PlayerCharacter::GetSingleton()->GetPosition();
-	const auto& playerPos = reinterpret_cast<float3 const&>(playerNiPos);
-	const int playerQuadrantX = static_cast<int>(std::floor(playerPos.x / 2048.0f));
-	const int playerQuadrantY = static_cast<int>(std::floor(playerPos.y / 2048.0f));
-	const int32_t playerCellX = static_cast<int32_t>(std::floor(playerPos.x / 4096.0f));
-	const int32_t playerCellY = static_cast<int32_t>(std::floor(playerPos.y / 4096.0f));
+	const auto& playerPos = RE::PlayerCharacter::GetSingleton()->GetPosition();
+	const VisibilityOrigin origin{
+		static_cast<int32_t>(std::floor(playerPos.x / 2048.0f)),
+		static_cast<int32_t>(std::floor(playerPos.y / 2048.0f)),
+		static_cast<int32_t>(std::floor(playerPos.x / 4096.0f)),
+		static_cast<int32_t>(std::floor(playerPos.y / 4096.0f))
+	};
 
 	// Centre the terrain-darkening grass-id window on the player.
-	const int32_t presenceOriginQuadX = playerQuadrantX - PGrassCommon::LowTierQuadrantRadius;
-	const int32_t presenceOriginQuadY = playerQuadrantY - PGrassCommon::LowTierQuadrantRadius;
+	const int32_t presenceOriginQuadX = origin.quadrantX - PGrassCommon::LowTierQuadrantRadius;
+	const int32_t presenceOriginQuadY = origin.quadrantY - PGrassCommon::LowTierQuadrantRadius;
 	grassPresenceOrigin = float2{ presenceOriginQuadX * 2048.0f, presenceOriginQuadY * 2048.0f };
 
 	const auto cells = tes ? tes->gridCells : nullptr;
-	const auto cellCount = cells ? cells->length * cells->length : 0u;
-	uint64_t currentNearStamp = PGrassCommon::GrassHashOffsetBasis;
-	const uintptr_t worldSpaceIdentity = reinterpret_cast<uintptr_t>(landWorldSpace);
-	const uintptr_t gridIdentity = reinterpret_cast<uintptr_t>(cells);
-	PGrassCommon::GrassHashValue(currentNearStamp, worldSpaceIdentity);
-	PGrassCommon::GrassHashValue(currentNearStamp, gridIdentity);
-	PGrassCommon::GrassHashValue(currentNearStamp, playerQuadrantX);
-	PGrassCommon::GrassHashValue(currentNearStamp, playerQuadrantY);
-	PGrassCommon::GrassHashValue(currentNearStamp, grassMapCacheVersion);
-	PGrassCommon::GrassHashValue(currentNearStamp, settings.debugIgnorePreProcessedFlag);
-	PGrassCommon::GrassHashValue(currentNearStamp, cellCount);
+	const uint64_t currentNearStamp = ComputeNearVisibilityStamp(landWorldSpace, cells, origin);
+	if (currentNearStamp != nearVisibleStamp) {
+		RebuildNearQuadrants(cells, origin);
+		RebuildGrassPresence(presenceOriginQuadX, presenceOriginQuadY);
+		nearVisibleStamp = currentNearStamp;
+	}
+
+	UpdateFarQuadrants(landWorldSpace, cells, origin);
+	grassCellCache.EvictUntouched();
+
+	globals::profiler->EndPass();
+}
+
+uint64_t ProceduralGrass::ComputeNearVisibilityStamp(RE::TESWorldSpace* landWorldSpace, const RE::GridCellArray* cells, const VisibilityOrigin& origin)
+{
+	const uint32_t cellCount = cells ? cells->length * cells->length : 0u;
+	uint64_t stamp = PGrassCommon::GrassHashOffsetBasis;
+	PGrassCommon::GrassHashValue(stamp, reinterpret_cast<uintptr_t>(landWorldSpace));
+	PGrassCommon::GrassHashValue(stamp, reinterpret_cast<uintptr_t>(cells));
+	PGrassCommon::GrassHashValue(stamp, origin.quadrantX);
+	PGrassCommon::GrassHashValue(stamp, origin.quadrantY);
+	PGrassCommon::GrassHashValue(stamp, grassMapCacheVersion);
+	PGrassCommon::GrassHashValue(stamp, settings.debugIgnorePreProcessedFlag);
+	PGrassCommon::GrassHashValue(stamp, cellCount);
 
 	for (uint32_t i = 0; i < cellCount; ++i) {
 		const auto cell = cells->cells[i];
-		const uintptr_t cellIdentity = reinterpret_cast<uintptr_t>(cell);
-		PGrassCommon::GrassHashValue(currentNearStamp, cellIdentity);
+		PGrassCommon::GrassHashValue(stamp, reinterpret_cast<uintptr_t>(cell));
 		if (!cell)
 			continue;
 
 		const auto& runtimeData = cell->GetRuntimeData();
 		const auto exterior = runtimeData.cellData.exterior;
 		const auto land = runtimeData.cellLand;
-		const uintptr_t exteriorIdentity = reinterpret_cast<uintptr_t>(exterior);
-		const uintptr_t landIdentity = reinterpret_cast<uintptr_t>(land);
-		PGrassCommon::GrassHashValue(currentNearStamp, exteriorIdentity);
-		PGrassCommon::GrassHashValue(currentNearStamp, landIdentity);
+		PGrassCommon::GrassHashValue(stamp, reinterpret_cast<uintptr_t>(exterior));
+		PGrassCommon::GrassHashValue(stamp, reinterpret_cast<uintptr_t>(land));
 		if (exterior) {
-			PGrassCommon::GrassHashValue(currentNearStamp, exterior->cellX);
-			PGrassCommon::GrassHashValue(currentNearStamp, exterior->cellY);
+			PGrassCommon::GrassHashValue(stamp, exterior->cellX);
+			PGrassCommon::GrassHashValue(stamp, exterior->cellY);
 		}
 		if (!land || !land->loadedData)
 			continue;
 
-		const uintptr_t loadedIdentity = reinterpret_cast<uintptr_t>(land->loadedData);
-		PGrassCommon::GrassHashValue(currentNearStamp, loadedIdentity);
+		PGrassCommon::GrassHashValue(stamp, reinterpret_cast<uintptr_t>(land->loadedData));
 		for (uint32_t j = 0; j < 4; ++j) {
 			const auto mesh = land->loadedData->mesh[j];
-			const uintptr_t meshIdentity = reinterpret_cast<uintptr_t>(mesh);
-			PGrassCommon::GrassHashValue(currentNearStamp, meshIdentity);
+			PGrassCommon::GrassHashValue(stamp, reinterpret_cast<uintptr_t>(mesh));
 			if (mesh) {
 				const bool preProcessed = mesh->GetFlags().all(RE::NiAVObject::Flag::kPreProcessedNode);
-				PGrassCommon::GrassHashValue(currentNearStamp, preProcessed);
+				PGrassCommon::GrassHashValue(stamp, preProcessed);
 			}
 		}
 	}
 
 	// Cached LAND fills Low's outer ring when Skyrim unloads a nearby cell before it leaves Low range.
-	const int32_t lowCellRadius = (nearCoverageRadius + 1) / 2;
-	for (int32_t cy = playerCellY - lowCellRadius; cy <= playerCellY + lowCellRadius; ++cy) {
-		for (int32_t cx = playerCellX - lowCellRadius; cx <= playerCellX + lowCellRadius; ++cx) {
+	for (int32_t cy = origin.cellY - LowCellRadius; cy <= origin.cellY + LowCellRadius; ++cy) {
+		for (int32_t cx = origin.cellX - LowCellRadius; cx <= origin.cellX + LowCellRadius; ++cx) {
 			const CellGrass* cellGrass = grassCellCache.Get(cx, cy);
-			PGrassCommon::GrassHashValue(currentNearStamp, PGrassCommon::GrassCellKey(cx, cy));
+			PGrassCommon::GrassHashValue(stamp, PGrassCommon::GrassCellKey(cx, cy));
 			if (!cellGrass) {
-				PGrassCommon::GrassHashValue(currentNearStamp, uint64_t{ 0 });
+				PGrassCommon::GrassHashValue(stamp, uint64_t{ 0 });
 				continue;
 			}
 
 			for (const auto cacheVersion : cellGrass->quadrantCacheVersions)
-				PGrassCommon::GrassHashValue(currentNearStamp, cacheVersion);
+				PGrassCommon::GrassHashValue(stamp, cacheVersion);
+		}
+	}
+	return stamp;
+}
+
+void ProceduralGrass::RebuildNearQuadrants(const RE::GridCellArray* cells, const VisibilityOrigin& origin)
+{
+	quadrantsHighLOD.clear();
+	quadrantsMidLOD.clear();
+	quadrantsLowLOD.clear();
+	quadrantsPresence.clear();
+	nearCoveredQuadrants.fill(false);
+	quadrantReject = {};
+
+	const uint32_t cellCount = cells ? cells->length * cells->length : 0u;
+	for (uint32_t i = 0; i < cellCount; i++) {
+		const auto cell = cells->cells[i];
+		if (!cell)
+			continue;
+		quadrantReject.cells++;
+
+		const auto& runtimeData = cell->GetRuntimeData();
+		const auto exterior = runtimeData.cellData.exterior;
+		if (!exterior)
+			continue;
+		quadrantReject.withExterior++;
+
+		const auto land = runtimeData.cellLand;
+		if (!land)
+			continue;
+		quadrantReject.withLand++;
+		if (!land->loadedData)
+			continue;
+		quadrantReject.withLoadedData++;
+
+		const LoadedCellGrass* cellCache = nullptr;
+		for (uint32_t j = 0; j < 4; j++) {
+			const auto mesh = land->loadedData->mesh[j];
+			if (!mesh)
+				continue;
+			quadrantReject.withMesh++;
+			if (!settings.debugIgnorePreProcessedFlag && !mesh->GetFlags().all(RE::NiAVObject::Flag::kPreProcessedNode))
+				continue;
+			quadrantReject.preProcessed++;
+
+			if (!cellCache)
+				cellCache = &GetCellCache(land, exterior->cellX, exterior->cellY, j);
+			const auto& quadrantCache = cellCache->quadrants[j];
+
+			PGrassCommon::Quadrant quadrant{};
+			quadrant.cellX = exterior->cellX;
+			quadrant.cellY = exterior->cellY;
+			quadrant.x = j % 2;
+			quadrant.y = j / 2;
+			quadrant.nearCovered = true;
+			quadrant.cacheVersion = quadrantCache.cacheVersion;
+			quadrant.grassIds = quadrantCache.ids.data();
+			quadrant.occupancyRows = quadrantCache.occupancy.data();
+			quadrant.heights = quadrantCache.heights.data();
+			quadrant.worldPos = float2{ (quadrant.cellX + quadrant.x * 0.5f) * 4096.0f, (quadrant.cellY + quadrant.y * 0.5f) * 4096.0f };
+			quadrant.minHeight = quadrantCache.minHeight;
+			quadrant.maxHeight = quadrantCache.maxHeight;
+
+			const int32_t worldQuadrantX = quadrant.cellX * 2 + static_cast<int32_t>(quadrant.x);
+			const int32_t worldQuadrantY = quadrant.cellY * 2 + static_cast<int32_t>(quadrant.y);
+			// Overlap max-distance bands so adjacent tiers cross-fade.
+			const int32_t md = std::max(std::abs(origin.quadrantX - worldQuadrantX), std::abs(origin.quadrantY - worldQuadrantY));
+
+			if (const int32_t coverageIndex = NearCoverageIndex(worldQuadrantX, worldQuadrantY, origin); coverageIndex >= 0) {
+				// Record only near quadrants with accepted LAND geometry.
+				nearCoveredQuadrants[coverageIndex] = true;
+				if (md <= PGrassCommon::LowTierQuadrantRadius)
+					quadrantsPresence.push_back(quadrant);
+			}
+			if (md <= PGrassCommon::HighTierQuadrantRadius && quadrantsHighLOD.size() < PGrassCommon::HighTierQuadrantCap)
+				quadrantsHighLOD.push_back(quadrant);
+			if (md >= PGrassCommon::HighTierQuadrantRadius - 1 && md <= PGrassCommon::MidTierQuadrantRadius && quadrantsMidLOD.size() < PGrassCommon::MidTierQuadrantCap)
+				quadrantsMidLOD.push_back(quadrant);
+			if (md >= PGrassCommon::MidTierQuadrantRadius - 2 && md <= NearCoverageRadius && quadrantsLowLOD.size() < PGrassCommon::LowTierQuadrantCap)
+				quadrantsLowLOD.push_back(quadrant);
 		}
 	}
 
-	auto quadrant = PGrassCommon::Quadrant{};
-	const bool rebuildNear = currentNearStamp != nearVisibleStamp;
-	if (rebuildNear) {
-		quadrantsHighLOD.clear();
-		quadrantsMidLOD.clear();
-		quadrantsLowLOD.clear();
-		quadrantsPresence.clear();
-		nearCoveredQuadrants.fill(false);
-		quadrantReject = {};
+	// Fill Low's ring from streamed LAND where the loaded grid no longer covers it.
+	for (int32_t cy = origin.cellY - LowCellRadius; cy <= origin.cellY + LowCellRadius; ++cy) {
+		for (int32_t cx = origin.cellX - LowCellRadius; cx <= origin.cellX + LowCellRadius; ++cx) {
+			const CellGrass* cellGrass = grassCellCache.Get(cx, cy);
+			if (!cellGrass)
+				continue;
 
-		for (uint32_t i = 0; i < cellCount; i++) {
-			if (const auto cell = cells->cells[i]) {
-				quadrantReject.cells++;
-
-				const auto& runtimeData = cell->GetRuntimeData();
-				if (!runtimeData.cellData.exterior)
+			for (uint32_t j = 0; j < 4; ++j) {
+				const int32_t worldQuadrantX = cx * 2 + static_cast<int32_t>(j % 2);
+				const int32_t worldQuadrantY = cy * 2 + static_cast<int32_t>(j / 2);
+				const int32_t md = std::max(std::abs(origin.quadrantX - worldQuadrantX), std::abs(origin.quadrantY - worldQuadrantY));
+				if (md < PGrassCommon::MidTierQuadrantRadius - 2 || md > NearCoverageRadius)
 					continue;
 
-				quadrantReject.withExterior++;
-				quadrant.cellX = runtimeData.cellData.exterior->cellX;
-				quadrant.cellY = runtimeData.cellData.exterior->cellY;
-
-				const auto land = runtimeData.cellLand;
-				if (land)
-					quadrantReject.withLand++;
-
-				if (land && land->loadedData) {
-					quadrantReject.withLoadedData++;
-					const LoadedCellGrass* cellCache = nullptr;
-					for (uint32_t j = 0; j < 4; j++) {
-						if (const auto mesh = land->loadedData->mesh[j]) {
-							quadrantReject.withMesh++;
-							if (settings.debugIgnorePreProcessedFlag || mesh->GetFlags().all(RE::NiAVObject::Flag::kPreProcessedNode)) {
-								quadrantReject.preProcessed++;
-								quadrant.x = j % 2;
-								quadrant.y = j / 2;
-								quadrant.nearCovered = true;
-
-								if (!cellCache)
-									cellCache = &GetCellCache(land, quadrant.cellX, quadrant.cellY, j);
-								const auto& quadrantCache = cellCache->quadrants[j];
-								quadrant.cacheVersion = quadrantCache.cacheVersion;
-								quadrant.grassIds = quadrantCache.ids.data();
-								quadrant.occupancyRows = quadrantCache.occupancy.data();
-								quadrant.heights = quadrantCache.heights.data();
-								quadrant.worldPos = float2{ (quadrant.cellX + quadrant.x * 0.5f) * 4096.0f, (quadrant.cellY + quadrant.y * 0.5f) * 4096.0f };
-								quadrant.minHeight = quadrantCache.minHeight;
-								quadrant.maxHeight = quadrantCache.maxHeight;
-
-								const int32_t worldQuadrantX = quadrant.cellX * 2 + static_cast<int32_t>(quadrant.x);
-								const int32_t worldQuadrantY = quadrant.cellY * 2 + static_cast<int32_t>(quadrant.y);
-								const int32_t xDiff = abs(playerQuadrantX - worldQuadrantX);
-								const int32_t yDiff = abs(playerQuadrantY - worldQuadrantY);
-
-								// Overlap max-distance bands so adjacent tiers cross-fade.
-								const int32_t md = std::max(xDiff, yDiff);
-
-								if (md <= nearCoverageRadius) {
-									// Record only near quadrants with accepted LAND geometry.
-									const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + nearCoverageRadius);
-									const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + nearCoverageRadius);
-									nearCoveredQuadrants[coverageY * nearCoverageDiameter + coverageX] = true;
-									if (md <= PGrassCommon::LowTierQuadrantRadius)
-										quadrantsPresence.push_back(quadrant);
-								}
-								if (md <= PGrassCommon::HighTierQuadrantRadius && quadrantsHighLOD.size() < PGrassCommon::HighTierQuadrantCap)
-									quadrantsHighLOD.push_back(quadrant);
-								if (md >= PGrassCommon::HighTierQuadrantRadius - 1 && md <= PGrassCommon::MidTierQuadrantRadius && quadrantsMidLOD.size() < PGrassCommon::MidTierQuadrantCap)
-									quadrantsMidLOD.push_back(quadrant);
-								if (md >= PGrassCommon::MidTierQuadrantRadius - 2 && md <= nearCoverageRadius && quadrantsLowLOD.size() < PGrassCommon::LowTierQuadrantCap)
-									quadrantsLowLOD.push_back(quadrant);
-							}
-						}
-					}
-				}
-			}
-		}
-
-		for (int32_t cy = playerCellY - lowCellRadius; cy <= playerCellY + lowCellRadius; ++cy) {
-			for (int32_t cx = playerCellX - lowCellRadius; cx <= playerCellX + lowCellRadius; ++cx) {
-				const CellGrass* cellGrass = grassCellCache.Get(cx, cy);
-				if (!cellGrass)
+				const int32_t coverageIndex = NearCoverageIndex(worldQuadrantX, worldQuadrantY, origin);
+				if (nearCoveredQuadrants[coverageIndex])
 					continue;
 
-				for (uint32_t j = 0; j < 4; ++j) {
-					const int32_t worldQuadrantX = cx * 2 + static_cast<int32_t>(j % 2);
-					const int32_t worldQuadrantY = cy * 2 + static_cast<int32_t>(j / 2);
-					const int32_t md = std::max(std::abs(playerQuadrantX - worldQuadrantX), std::abs(playerQuadrantY - worldQuadrantY));
-					if (md < PGrassCommon::MidTierQuadrantRadius - 2 || md > nearCoverageRadius)
-						continue;
-
-					const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + nearCoverageRadius);
-					const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + nearCoverageRadius);
-					const uint32_t coverageIndex = coverageY * nearCoverageDiameter + coverageX;
-					if (nearCoveredQuadrants[coverageIndex])
-						continue;
-
-					quadrant.cellX = cx;
-					quadrant.cellY = cy;
-					quadrant.x = j % 2;
-					quadrant.y = j / 2;
-					quadrant.nearCovered = true;
-					quadrant.cacheVersion = cellGrass->quadrantCacheVersions[j];
-					quadrant.grassIds = cellGrass->ids[j].data();
-					quadrant.occupancyRows = cellGrass->occupancy[j].data();
-					quadrant.heights = cellGrass->heights[j].data();
-					quadrant.worldPos = float2{ worldQuadrantX * 2048.0f, worldQuadrantY * 2048.0f };
-					quadrant.minHeight = cellGrass->minHeights[j];
-					quadrant.maxHeight = cellGrass->maxHeights[j];
-
-					nearCoveredQuadrants[coverageIndex] = true;
-					quadrantsLowLOD.push_back(quadrant);
-					if (md <= PGrassCommon::LowTierQuadrantRadius)
-						quadrantsPresence.push_back(quadrant);
-				}
+				const auto quadrant = MakeStreamedQuadrant(*cellGrass, cx, cy, j, true);
+				nearCoveredQuadrants[coverageIndex] = true;
+				quadrantsLowLOD.push_back(quadrant);
+				if (md <= PGrassCommon::LowTierQuadrantRadius)
+					quadrantsPresence.push_back(quadrant);
 			}
 		}
-
-		++quadrantsHighVersion;
-		++quadrantsMidVersion;
-		++quadrantsLowVersion;
-
-		// Retain recently unloaded LAND cells across grid boundaries.
-		EvictGrassMapCache();
-
-		uint64_t presenceContentHash = PGrassCommon::GrassHashOffsetBasis;
-		const size_t presenceCount = quadrantsPresence.size();
-		PGrassCommon::GrassHashValue(presenceContentHash, presenceCount);
-		for (const auto& presenceQuadrant : quadrantsPresence) {
-			const uint64_t cellKey = PGrassCommon::GrassCellKey(presenceQuadrant.cellX, presenceQuadrant.cellY);
-			const uint64_t quadrantKey = PGrassCommon::GrassQuadrantKey(presenceQuadrant.x, presenceQuadrant.y);
-			PGrassCommon::GrassHashValue(presenceContentHash, cellKey);
-			PGrassCommon::GrassHashValue(presenceContentHash, quadrantKey);
-			PGrassCommon::GrassHashValue(presenceContentHash, presenceQuadrant.cacheVersion);
-		}
-
-		// Rebuild the presence texture only when its window or cached LAND data changes.
-		if (grassPresenceOriginQuadX != presenceOriginQuadX || grassPresenceOriginQuadY != presenceOriginQuadY || grassPresenceContentHash != presenceContentHash) {
-			std::fill(grassPresenceStaging.begin(), grassPresenceStaging.end(), uint8_t{ 0 });
-
-			for (const auto& presenceQuadrant : quadrantsPresence) {
-				if (!presenceQuadrant.grassIds)
-					continue;
-
-				const int32_t worldQuadrantX = presenceQuadrant.cellX * 2 + static_cast<int32_t>(presenceQuadrant.x);
-				const int32_t worldQuadrantY = presenceQuadrant.cellY * 2 + static_cast<int32_t>(presenceQuadrant.y);
-				const int32_t sx0 = (worldQuadrantX - presenceOriginQuadX) * (PGrassCommon::QuadrantGrassPitch - 1);
-				const int32_t sy0 = (worldQuadrantY - presenceOriginQuadY) * (PGrassCommon::QuadrantGrassPitch - 1);
-
-				if (sx0 < 0 || sy0 < 0 ||
-					sx0 + static_cast<int32_t>(PGrassCommon::QuadrantGrassPitch) > static_cast<int32_t>(grassPresenceDim) || sy0 + static_cast<int32_t>(PGrassCommon::QuadrantGrassPitch) > static_cast<int32_t>(grassPresenceDim))
-					continue;
-
-				for (uint32_t row = 0; row < PGrassCommon::QuadrantGrassPitch; ++row) {
-					uint8_t* dstRow = grassPresenceStaging.data() + static_cast<size_t>(sy0 + row) * grassPresenceDim + sx0;
-					std::memcpy(dstRow, presenceQuadrant.grassIds + row * PGrassCommon::QuadrantGrassPitch, PGrassCommon::QuadrantGrassPitch);
-				}
-			}
-
-			// Use the generator's one-neighbour fill. Read only the original map so the fill cannot spread farther.
-			const auto sourcePresence = grassPresenceStaging;
-			const int32_t worldSampleBaseX = presenceOriginQuadX * static_cast<int32_t>(PGrassCommon::QuadrantGrassPitch - 1);
-			const int32_t worldSampleBaseY = presenceOriginQuadY * static_cast<int32_t>(PGrassCommon::QuadrantGrassPitch - 1);
-			for (uint32_t y = 0; y < grassPresenceDim; ++y) {
-				for (uint32_t x = 0; x < grassPresenceDim; ++x) {
-					const size_t sample = static_cast<size_t>(y) * grassPresenceDim + x;
-					if (sourcePresence[sample] == 0) {
-						grassPresenceStaging[sample] = PGrassCommon::FindAdjacentGrassId(sourcePresence.data(), grassPresenceDim, grassPresenceDim, x, y,
-							worldSampleBaseX + static_cast<int32_t>(x), worldSampleBaseY + static_cast<int32_t>(y));
-					}
-				}
-			}
-
-			grassPresenceOriginQuadX = presenceOriginQuadX;
-			grassPresenceOriginQuadY = presenceOriginQuadY;
-			grassPresenceContentHash = presenceContentHash;
-			grassPresenceUploadDirty = true;
-		}
-		nearVisibleStamp = currentNearStamp;
 	}
 
-	// Stream Far LAND data with bounded request work and rebuild its quadrant list only when the cache changes.
-	if (landWorldSpace) {
-		const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
-		const int32_t loadedGridLength = farGridCells ? farGridCells->length : 5;
-		const int32_t loadedCellRadius = loadedGridLength / 2;
-		const int32_t extraRadius = std::clamp(settings.grassCellRadius, 0,
-			std::max(0, PGrassCommon::FarCellRadiusCap - PGrassCommon::FarStreamGuardCells - loadedCellRadius));
-		const int32_t radius = std::min(loadedCellRadius + std::max(extraRadius, 1) + PGrassCommon::FarStreamGuardCells, PGrassCommon::FarCellRadiusCap);
-		const auto& cameraPosAdjust = globals::game::frameBufferCached.GetCameraPosAdjust();
+	++quadrantsHighVersion;
+	++quadrantsMidVersion;
+	++quadrantsLowVersion;
 
-		static const std::vector<std::pair<int32_t, int32_t>> farRequestOffsets = [] {
-			std::vector<std::pair<int32_t, int32_t>> offsets;
-			offsets.reserve(static_cast<size_t>((PGrassCommon::FarCellRadiusCap * 2 + 1) * (PGrassCommon::FarCellRadiusCap * 2 + 1)));
-			offsets.emplace_back(0, 0);
-			for (int32_t ring = 1; ring <= PGrassCommon::FarCellRadiusCap; ++ring)
-				for (int32_t y = -ring; y <= ring; ++y)
-					for (int32_t x = -ring; x <= ring; ++x)
-						if (std::max(std::abs(x), std::abs(y)) == ring)
-							offsets.emplace_back(x, y);
-			return offsets;
-		}();
+	// Retain recently unloaded LAND cells across grid boundaries.
+	EvictGrassMapCache();
+}
 
-		if (farRequestWorldSpace != landWorldSpace || farRequestCenterX != playerCellX || farRequestCenterY != playerCellY || farRequestRadius != radius) {
-			farRequestWorldSpace = landWorldSpace;
-			farRequestCenterX = playerCellX;
-			farRequestCenterY = playerCellY;
-			farRequestRadius = radius;
-			farRequestCursor = 0;
+void ProceduralGrass::RebuildGrassPresence(const int32_t originQuadX, const int32_t originQuadY)
+{
+	uint64_t contentHash = PGrassCommon::GrassHashOffsetBasis;
+	PGrassCommon::GrassHashValue(contentHash, quadrantsPresence.size());
+	for (const auto& quadrant : quadrantsPresence) {
+		PGrassCommon::GrassHashValue(contentHash, PGrassCommon::GrassCellKey(quadrant.cellX, quadrant.cellY));
+		PGrassCommon::GrassHashValue(contentHash, PGrassCommon::GrassQuadrantKey(quadrant.x, quadrant.y));
+		PGrassCommon::GrassHashValue(contentHash, quadrant.cacheVersion);
+	}
+
+	// Rebuild the presence texture only when its window or cached LAND data changes.
+	if (grassPresenceOriginQuadX == originQuadX && grassPresenceOriginQuadY == originQuadY && grassPresenceContentHash == contentHash)
+		return;
+
+	std::fill(grassPresenceStaging.begin(), grassPresenceStaging.end(), uint8_t{ 0 });
+	constexpr int32_t pitch = static_cast<int32_t>(PGrassCommon::QuadrantGrassPitch);
+	const int32_t dim = static_cast<int32_t>(grassPresenceDim);
+	for (const auto& quadrant : quadrantsPresence) {
+		if (!quadrant.grassIds)
+			continue;
+
+		const int32_t sx0 = (quadrant.cellX * 2 + static_cast<int32_t>(quadrant.x) - originQuadX) * (pitch - 1);
+		const int32_t sy0 = (quadrant.cellY * 2 + static_cast<int32_t>(quadrant.y) - originQuadY) * (pitch - 1);
+		if (sx0 < 0 || sy0 < 0 || sx0 + pitch > dim || sy0 + pitch > dim)
+			continue;
+
+		for (int32_t row = 0; row < pitch; ++row) {
+			uint8_t* dstRow = grassPresenceStaging.data() + static_cast<size_t>(sy0 + row) * grassPresenceDim + sx0;
+			std::memcpy(dstRow, quadrant.grassIds + row * pitch, static_cast<size_t>(pitch));
 		}
+	}
 
-		const size_t activeOffsetCount = static_cast<size_t>((radius * 2 + 1) * (radius * 2 + 1));
-		constexpr size_t farRequestBudget = 12;
-		constexpr size_t farProbeBudget = 64;
-		size_t queued = 0;
-		const size_t probeCount = std::min(activeOffsetCount, farProbeBudget);
-		for (size_t probe = 0; probe < probeCount && queued < farRequestBudget; ++probe) {
-			if (farRequestCursor >= activeOffsetCount)
-				farRequestCursor = 0;
-			const auto [dx, dy] = farRequestOffsets[farRequestCursor++];
-			queued += grassCellCache.Request(playerCellX + dx, playerCellY + dy) ? 1u : 0u;
-		}
-
-		constexpr float farVisibilityMotionStep = 8.0f;
-		const int32_t cameraBucketX = static_cast<int32_t>(std::floor(cameraPosAdjust.x / farVisibilityMotionStep));
-		const int32_t cameraBucketY = static_cast<int32_t>(std::floor(cameraPosAdjust.y / farVisibilityMotionStep));
-		uint64_t currentFarStamp = PGrassCommon::GrassHashOffsetBasis;
-		PGrassCommon::GrassHashValue(currentFarStamp, worldSpaceIdentity);
-		PGrassCommon::GrassHashValue(currentFarStamp, playerQuadrantX);
-		PGrassCommon::GrassHashValue(currentFarStamp, playerQuadrantY);
-		PGrassCommon::GrassHashValue(currentFarStamp, playerCellX);
-		PGrassCommon::GrassHashValue(currentFarStamp, playerCellY);
-		PGrassCommon::GrassHashValue(currentFarStamp, radius);
-		PGrassCommon::GrassHashValue(currentFarStamp, quadrantsLowVersion);
-		PGrassCommon::GrassHashValue(currentFarStamp, cameraBucketX);
-		PGrassCommon::GrassHashValue(currentFarStamp, cameraBucketY);
-		const uint64_t readyVersion = grassCellCache.GetReadyVersion();
-		PGrassCommon::GrassHashValue(currentFarStamp, readyVersion);
-
-		if (currentFarStamp != farVisibleStamp) {
-			size_t quadrantCount = 0;
-			bool contentChanged = false;
-			const float farFallbackStart = PGrassCommon::HighTierQuadrantRadius * 2048.0f;
-			const float farFallbackStartSq = farFallbackStart * farFallbackStart;
-
-			for (int32_t cy = playerCellY - radius; cy <= playerCellY + radius; ++cy) {
-				for (int32_t cx = playerCellX - radius; cx <= playerCellX + radius; ++cx) {
-					const CellGrass* cellGrass = grassCellCache.Get(cx, cy);
-					if (!cellGrass)
-						continue;
-
-					for (uint32_t j = 0; j < 4 && quadrantCount < PGrassCommon::FarQuadrantCount; ++j) {
-						const int32_t worldQuadrantX = cx * 2 + static_cast<int32_t>(j % 2);
-						const int32_t worldQuadrantY = cy * 2 + static_cast<int32_t>(j / 2);
-						const int32_t md = std::max(std::abs(playerQuadrantX - worldQuadrantX), std::abs(playerQuadrantY - worldQuadrantY));
-						bool nearCovered = false;
-						if (md <= nearCoverageRadius) {
-							const uint32_t coverageX = static_cast<uint32_t>(worldQuadrantX - playerQuadrantX + nearCoverageRadius);
-							const uint32_t coverageY = static_cast<uint32_t>(worldQuadrantY - playerQuadrantY + nearCoverageRadius);
-							const uint32_t coverageIndex = coverageY * nearCoverageDiameter + coverageX;
-							nearCovered = nearCoveredQuadrants[coverageIndex];
-						}
-
-						const float worldX = worldQuadrantX * 2048.0f;
-						const float worldY = worldQuadrantY * 2048.0f;
-						const float farthestX = std::max(std::abs(worldX - cameraPosAdjust.x), std::abs(worldX + 2048.0f - cameraPosAdjust.x));
-						const float farthestY = std::max(std::abs(worldY - cameraPosAdjust.y), std::abs(worldY + 2048.0f - cameraPosAdjust.y));
-						if (nearCovered && farthestX * farthestX + farthestY * farthestY < farFallbackStartSq)
-							continue;
-
-						quadrant.cellX = cx;
-						quadrant.cellY = cy;
-						quadrant.x = j % 2;
-						quadrant.y = j / 2;
-						quadrant.cacheVersion = cellGrass->quadrantCacheVersions[j];
-						quadrant.nearCovered = nearCovered;
-						quadrant.grassIds = cellGrass->ids[j].data();
-						quadrant.occupancyRows = cellGrass->occupancy[j].data();
-						quadrant.heights = cellGrass->heights[j].data();
-						quadrant.worldPos = float2{ worldX, worldY };
-						quadrant.minHeight = cellGrass->minHeights[j];
-						quadrant.maxHeight = cellGrass->maxHeights[j];
-						if (quadrantCount < quadrantsFarLOD.size()) {
-							auto& previous = quadrantsFarLOD[quadrantCount];
-							contentChanged |= previous.cellX != quadrant.cellX || previous.cellY != quadrant.cellY ||
-							                  previous.x != quadrant.x || previous.y != quadrant.y || previous.cacheVersion != quadrant.cacheVersion ||
-							                  previous.nearCovered != quadrant.nearCovered || previous.grassIds != quadrant.grassIds ||
-							                  previous.occupancyRows != quadrant.occupancyRows || previous.heights != quadrant.heights ||
-							                  previous.worldPos != quadrant.worldPos || previous.minHeight != quadrant.minHeight || previous.maxHeight != quadrant.maxHeight;
-							previous = quadrant;
-						} else {
-							quadrantsFarLOD.push_back(quadrant);
-							contentChanged = true;
-						}
-						++quadrantCount;
-					}
-				}
+	// Use the generator's one-neighbour fill. Read only the original map so the fill cannot spread farther.
+	const auto sourcePresence = grassPresenceStaging;
+	const int32_t worldSampleBaseX = originQuadX * (pitch - 1);
+	const int32_t worldSampleBaseY = originQuadY * (pitch - 1);
+	for (uint32_t y = 0; y < grassPresenceDim; ++y) {
+		for (uint32_t x = 0; x < grassPresenceDim; ++x) {
+			const size_t sample = static_cast<size_t>(y) * grassPresenceDim + x;
+			if (sourcePresence[sample] == 0) {
+				grassPresenceStaging[sample] = PGrassCommon::FindAdjacentGrassId(sourcePresence.data(), grassPresenceDim, grassPresenceDim, x, y,
+					worldSampleBaseX + static_cast<int32_t>(x), worldSampleBaseY + static_cast<int32_t>(y));
 			}
-
-			farVisibleStamp = currentFarStamp;
-			contentChanged |= quadrantCount != quadrantsFarLOD.size();
-			quadrantsFarLOD.resize(quadrantCount);
-			if (contentChanged)
-				++quadrantsFarVersion;
 		}
-	} else {
+	}
+
+	grassPresenceOriginQuadX = originQuadX;
+	grassPresenceOriginQuadY = originQuadY;
+	grassPresenceContentHash = contentHash;
+	grassPresenceUploadDirty = true;
+}
+
+void ProceduralGrass::UpdateFarQuadrants(RE::TESWorldSpace* landWorldSpace, const RE::GridCellArray* cells, const VisibilityOrigin& origin)
+{
+	if (!landWorldSpace) {
 		farRequestWorldSpace = nullptr;
 		farRequestCenterX = (std::numeric_limits<int32_t>::min)();
 		farRequestCenterY = (std::numeric_limits<int32_t>::min)();
@@ -656,9 +549,104 @@ void ProceduralGrass::GetVisibleQuadrants()
 			farVisibleStamp = (std::numeric_limits<uint64_t>::max)();
 			++quadrantsFarVersion;
 		}
+		return;
 	}
 
-	grassCellCache.EvictUntouched();
+	// Stream Far LAND data with bounded request work and rebuild its quadrant list only when the cache changes.
+	const int32_t loadedGridLength = cells ? static_cast<int32_t>(cells->length) : 5;
+	const int32_t loadedCellRadius = loadedGridLength / 2;
+	const int32_t extraRadius = std::clamp(settings.grassCellRadius, 0,
+		std::max(0, PGrassCommon::FarCellRadiusCap - PGrassCommon::FarStreamGuardCells - loadedCellRadius));
+	const int32_t radius = std::min(loadedCellRadius + std::max(extraRadius, 1) + PGrassCommon::FarStreamGuardCells, PGrassCommon::FarCellRadiusCap);
+	const auto& cameraPosAdjust = globals::game::frameBufferCached.GetCameraPosAdjust();
 
-	globals::profiler->EndPass();
+	static const std::vector<std::pair<int32_t, int32_t>> farRequestOffsets = [] {
+		std::vector<std::pair<int32_t, int32_t>> offsets;
+		offsets.reserve(static_cast<size_t>((PGrassCommon::FarCellRadiusCap * 2 + 1) * (PGrassCommon::FarCellRadiusCap * 2 + 1)));
+		offsets.emplace_back(0, 0);
+		for (int32_t ring = 1; ring <= PGrassCommon::FarCellRadiusCap; ++ring)
+			for (int32_t y = -ring; y <= ring; ++y)
+				for (int32_t x = -ring; x <= ring; ++x)
+					if (std::max(std::abs(x), std::abs(y)) == ring)
+						offsets.emplace_back(x, y);
+		return offsets;
+	}();
+
+	if (farRequestWorldSpace != landWorldSpace || farRequestCenterX != origin.cellX || farRequestCenterY != origin.cellY || farRequestRadius != radius) {
+		farRequestWorldSpace = landWorldSpace;
+		farRequestCenterX = origin.cellX;
+		farRequestCenterY = origin.cellY;
+		farRequestRadius = radius;
+		farRequestCursor = 0;
+	}
+
+	const size_t activeOffsetCount = static_cast<size_t>((radius * 2 + 1) * (radius * 2 + 1));
+	constexpr size_t farRequestBudget = 12;
+	constexpr size_t farProbeBudget = 64;
+	size_t queued = 0;
+	const size_t probeCount = std::min(activeOffsetCount, farProbeBudget);
+	for (size_t probe = 0; probe < probeCount && queued < farRequestBudget; ++probe) {
+		if (farRequestCursor >= activeOffsetCount)
+			farRequestCursor = 0;
+		const auto [dx, dy] = farRequestOffsets[farRequestCursor++];
+		queued += grassCellCache.Request(origin.cellX + dx, origin.cellY + dy) ? 1u : 0u;
+	}
+
+	constexpr float farVisibilityMotionStep = 8.0f;
+	uint64_t currentFarStamp = PGrassCommon::GrassHashOffsetBasis;
+	PGrassCommon::GrassHashValue(currentFarStamp, reinterpret_cast<uintptr_t>(landWorldSpace));
+	PGrassCommon::GrassHashValue(currentFarStamp, origin.quadrantX);
+	PGrassCommon::GrassHashValue(currentFarStamp, origin.quadrantY);
+	PGrassCommon::GrassHashValue(currentFarStamp, origin.cellX);
+	PGrassCommon::GrassHashValue(currentFarStamp, origin.cellY);
+	PGrassCommon::GrassHashValue(currentFarStamp, radius);
+	PGrassCommon::GrassHashValue(currentFarStamp, quadrantsLowVersion);
+	PGrassCommon::GrassHashValue(currentFarStamp, static_cast<int32_t>(std::floor(cameraPosAdjust.x / farVisibilityMotionStep)));
+	PGrassCommon::GrassHashValue(currentFarStamp, static_cast<int32_t>(std::floor(cameraPosAdjust.y / farVisibilityMotionStep)));
+	PGrassCommon::GrassHashValue(currentFarStamp, grassCellCache.GetReadyVersion());
+	if (currentFarStamp == farVisibleStamp)
+		return;
+
+	size_t quadrantCount = 0;
+	bool contentChanged = false;
+	const float farFallbackStart = PGrassCommon::HighTierQuadrantRadius * 2048.0f;
+	const float farFallbackStartSq = farFallbackStart * farFallbackStart;
+
+	for (int32_t cy = origin.cellY - radius; cy <= origin.cellY + radius; ++cy) {
+		for (int32_t cx = origin.cellX - radius; cx <= origin.cellX + radius; ++cx) {
+			const CellGrass* cellGrass = grassCellCache.Get(cx, cy);
+			if (!cellGrass)
+				continue;
+
+			for (uint32_t j = 0; j < 4 && quadrantCount < PGrassCommon::FarQuadrantCount; ++j) {
+				const int32_t worldQuadrantX = cx * 2 + static_cast<int32_t>(j % 2);
+				const int32_t worldQuadrantY = cy * 2 + static_cast<int32_t>(j / 2);
+				const int32_t coverageIndex = NearCoverageIndex(worldQuadrantX, worldQuadrantY, origin);
+				const bool nearCovered = coverageIndex >= 0 && nearCoveredQuadrants[coverageIndex];
+
+				const float worldX = worldQuadrantX * 2048.0f;
+				const float worldY = worldQuadrantY * 2048.0f;
+				const float farthestX = std::max(std::abs(worldX - cameraPosAdjust.x), std::abs(worldX + 2048.0f - cameraPosAdjust.x));
+				const float farthestY = std::max(std::abs(worldY - cameraPosAdjust.y), std::abs(worldY + 2048.0f - cameraPosAdjust.y));
+				if (nearCovered && farthestX * farthestX + farthestY * farthestY < farFallbackStartSq)
+					continue;
+
+				const auto quadrant = MakeStreamedQuadrant(*cellGrass, cx, cy, j, nearCovered);
+				if (quadrantCount < quadrantsFarLOD.size()) {
+					contentChanged |= quadrantsFarLOD[quadrantCount] != quadrant;
+					quadrantsFarLOD[quadrantCount] = quadrant;
+				} else {
+					quadrantsFarLOD.push_back(quadrant);
+					contentChanged = true;
+				}
+				++quadrantCount;
+			}
+		}
+	}
+
+	farVisibleStamp = currentFarStamp;
+	contentChanged |= quadrantCount != quadrantsFarLOD.size();
+	quadrantsFarLOD.resize(quadrantCount);
+	if (contentChanged)
+		++quadrantsFarVersion;
 }

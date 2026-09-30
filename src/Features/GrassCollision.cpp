@@ -219,7 +219,6 @@ void GrassCollision::Update()
 
 		prevCellID = cellID;
 		prevEyePosNI = eyePosNI;
-
 	}
 
 	BindGrassShaderResources(globals::d3d::context);
@@ -298,8 +297,7 @@ void GrassCollision::SetupResources()
 			.Texture2D = { .MipSlice = 0 }
 		};
 
-		collisionTexture = new Texture2D(texDesc);
-		Util::SetResourceName(collisionTexture->resource.get(), "GrassCollision::Collision");
+		collisionTexture = new Texture2D(texDesc, "GrassCollision::Collision");
 		collisionTexture->CreateSRV(srvDesc);
 		collisionTexture->CreateUAV(uavDesc);
 	}

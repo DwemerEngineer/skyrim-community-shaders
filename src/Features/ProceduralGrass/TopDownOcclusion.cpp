@@ -2,7 +2,7 @@
 
 #include "Globals.h"
 #include "Utils/D3D.h"
-#include "Utils/game.h"
+#include "Utils/Game.h"
 
 #include <d3dcompiler.h>
 
@@ -113,8 +113,8 @@ void TopDownOcclusion::SetupResources()
 	rasterDesc.DepthClipEnable = FALSE;
 	device->CreateRasterizerState(&rasterDesc, noCull.put());
 
-	heightCB = new ConstantBuffer(ConstantBufferDesc<HeightCB>());
-	padCB = new ConstantBuffer(ConstantBufferDesc<PadCB>());
+	heightCB = new ConstantBuffer(ConstantBufferDesc<HeightCB>(), "TopDownOcclusion::HeightCB");
+	padCB = new ConstantBuffer(ConstantBufferDesc<PadCB>(), "TopDownOcclusion::PadCB");
 
 	CompileShaders();
 }
@@ -237,7 +237,7 @@ void TopDownOcclusion::CollectFrom(RE::NiAVObject* a_object)
 
 	if (auto* geometry = a_object->AsGeometry()) {
 		auto* triShape = geometry->AsTriShape();
-		if (!triShape || geometry->worldBound.radius <= minOccluderRadius)
+		if (!triShape || geometry->worldBound.radius <= MinOccluderRadius)
 			return;
 
 		RE::BSFadeNode* fadeNode = nullptr;

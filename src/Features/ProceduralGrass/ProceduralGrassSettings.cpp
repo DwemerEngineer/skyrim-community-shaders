@@ -29,6 +29,56 @@ namespace
 		return std::all_of(value.begin(), value.end(), [](const auto& component) { return component.is_number(); });
 	}
 
+	/** @brief Draws the enable checkbox for one override key, seeding it from @p base when first ticked. */
+	template <class T>
+	bool DrawOverrideToggle(nlohmann::json& ov, const char* key, const T& base)
+	{
+		bool has = ov.contains(key);
+		if (ImGui::Checkbox(std::format("##en_{}", key).c_str(), &has)) {
+			if (has)
+				ov[key] = base;
+			else
+				ov.erase(key);
+		}
+		ImGui::SameLine();
+		return has;
+	}
+
+	void DrawOverrideFloat(nlohmann::json& ov, const char* key, const char* label, float base, float mn, float mx, const char* fmt = "%.2f")
+	{
+		const bool has = DrawOverrideToggle(ov, key, base);
+		ImGui::BeginDisabled(!has);
+		float val = has && ov[key].is_number() ? ov[key].get<float>() : base;
+		if (ImGui::SliderFloat(label, &val, mn, mx, fmt) && has)
+			ov[key] = val;
+		ImGui::EndDisabled();
+	}
+
+	void DrawOverrideFloat2(nlohmann::json& ov, const char* key, const char* label, float2 base, float mn, float mx)
+	{
+		const bool has = DrawOverrideToggle(ov, key, base);
+		ImGui::BeginDisabled(!has);
+		float2 val = base;
+		if (has && IsNumericArray(ov[key], 2))
+			ov[key].get_to(val);
+		if (ImGui::SliderFloat2(label, &val.x, mn, mx, "%.2f") && has)
+			ov[key] = val;
+		ImGui::EndDisabled();
+	}
+
+	void DrawOverrideFloat3(nlohmann::json& ov, const char* key, const char* label, float3 base, float mn, float mx, bool asColor)
+	{
+		const bool has = DrawOverrideToggle(ov, key, base);
+		ImGui::BeginDisabled(!has);
+		float3 val = base;
+		if (has && IsNumericArray(ov[key], 3))
+			ov[key].get_to(val);
+		const bool changed = asColor ? ImGui::ColorEdit3(label, &val.x) : ImGui::SliderFloat3(label, &val.x, mn, mx, "%.2f");
+		if (changed && has)
+			ov[key] = val;
+		ImGui::EndDisabled();
+	}
+
 	bool IsValidGrassTypeOverride(const std::string_view key, const nlohmann::json& value)
 	{
 		if (key == "SubsurfaceOpacity")
@@ -332,13 +382,6 @@ void ProceduralGrass::DrawSettings()
 		ImGui::SliderFloat(T("feature.procedural_grass.wind_speed", "Wind Speed"), &settings.windSpeed, 0.0f, 1.0f);
 		DrawSettingDescription(T("feature.procedural_grass.wind_speed_tooltip", "Controls how quickly wind waves move through the grass."));
 
-		ImGui::SliderFloat(T("feature.procedural_grass.phase_offset", "Phase Offset"), &settings.phaseOffset, 0.0f, 10.0f);
-		DrawSettingDescription(T("feature.procedural_grass.phase_offset_tooltip", "Legacy wind control retained for configuration compatibility; currently unused."));
-		ImGui::SliderFloat(T("feature.procedural_grass.phase_lag", "Phase Lag"), &settings.phaseLag, 0.0f, 1.0f);
-		DrawSettingDescription(T("feature.procedural_grass.phase_lag_tooltip", "Legacy wind control retained for configuration compatibility; currently unused."));
-		ImGui::SliderFloat(T("feature.procedural_grass.spatial_frequency", "Spatial Freq"), &settings.spatialFreq, 0.0f, 100.0f);
-		DrawSettingDescription(T("feature.procedural_grass.spatial_frequency_tooltip", "Legacy wind control retained for configuration compatibility; currently unused."));
-
 		ImGui::SeparatorText(T("feature.procedural_grass.occlusion_section", "Occlusion"));
 
 		ImGui::SliderFloat(T("feature.procedural_grass.occluder_padding", "Occluder Padding (units)"), &settings.occlusionPadding, 0.0f, 128.0f, "%.0f");
@@ -382,80 +425,156 @@ void ProceduralGrass::DrawSettings()
 
 	ImGui::Separator();
 
-	if (ImGui::CollapsingHeader("Debug")) {
-		bool invalidate = false;
-		invalidate |= ImGui::Checkbox("Ignore grass map (LTEX)", &settings.debugIgnoreGrassMap);
-		DrawSettingDescription(T("feature.procedural_grass.debug_ignore_grass_map_tooltip", "Generates grass without consulting landscape texture grass assignments."));
-		ImGui::Checkbox("Ignore object occlusion", &settings.debugIgnoreObjectOcclusion);
-		DrawSettingDescription(T("feature.procedural_grass.debug_ignore_occlusion_tooltip", "Disables removal of grass beneath or inside occluding objects."));
-		ImGui::SliderFloat("Grass map edge noise (units)", &settings.grassMapEdgeNoise, 0.0f, 256.0f, "%.0f");
-		DrawSettingDescription(T("feature.procedural_grass.debug_edge_noise_tooltip", "Jitters grass-map sampling near texture boundaries to soften distribution edges."));
-		if (ImGui::SliderFloat("Occlusion half extent", &settings.occlusionHalfExtent, 1024.0f, 16384.0f, "%.0f"))
-			globals::topDownOcclusion->SetHalfExtent(settings.occlusionHalfExtent);
-		DrawSettingDescription(T("feature.procedural_grass.debug_occlusion_extent_tooltip", "Sets the half-width of the world-space object-occlusion window."));
-		{
-			const auto td = globals::topDownOcclusion;
-			const auto centre = td->GetWindowCentre();
-			ImGui::Text("Occlusion map: %s   %u x %u", td->IsReady() ? "ready" : "NOT READY", td->GetMapDim(), td->GetMapDim());
-			ImGui::Text("Window centre: %.0f, %.0f   half extent %.0f   %.1f units/texel",
-				centre.x, centre.y, td->GetHalfExtent(), td->GetHalfExtent() * 2.0f / td->GetMapDim());
-			ImGui::Text("Occluders drawn: %u", td->GetDrawCount());
-		}
-		ImGui::Checkbox("Disable ALL generator culls", &settings.debugDisableAllCulls);
-		DrawSettingDescription(T("feature.procedural_grass.debug_disable_culls_tooltip", "Disables generator rejection tests for debugging."));
-		ImGui::Checkbox("Ignore preprocessed-node check", &settings.debugIgnorePreProcessedFlag);
-		DrawSettingDescription(T("feature.procedural_grass.debug_ignore_preprocessed_tooltip", "Includes LAND meshes that are not marked as preprocessed."));
-		if (invalidate) {
-			ClearGrassMapCache();
-		}
+	DrawDebugSettings();
+}
 
-		size_t grassSet = 0;
-		size_t grassTotal = 0;
-		for (const auto& entry : grassMapCache)
-			for (const auto& quadrant : entry.second.quadrants) {
-				grassTotal += quadrant.ids.size();
-				for (const auto id : quadrant.ids)
-					grassSet += id != 0;
-			}
+void ProceduralGrass::DrawDebugSettings()
+{
+	if (!ImGui::CollapsingHeader(T("feature.procedural_grass.debug", "Debug")))
+		return;
 
-		const auto heightMap = globals::terrainHeightMap;
-		const auto cached = heightMap->GetCached();
-		ImGui::Text("Height map ready: %s", heightMap->IsReady() ? "yes" : "NO");
-		ImGui::Text("Height map worldspace: %s", cached ? cached->worldspace.c_str() : "<none>");
-		const auto posRange = heightMap->GetPosRange();
-		ImGui::Text("Height map range: %.1f .. %.1f", posRange.x, posRange.y);
-		if (const auto pc = RE::PlayerCharacter::GetSingleton()) {
-			const auto playerPos = pc->GetPosition();
-			ImGui::Text("Player Z: %.1f", playerPos.z);
-
-			if (const auto landZ = GetLandHeightAt(playerPos.x, playerPos.y))
-				ImGui::Text("LAND Z at player: %.1f  (delta %.1f)", *landZ, *landZ - playerPos.z);
-			else
-				ImGui::Text("LAND Z at player: <no cached quadrant>");
-		}
-
-		ImGui::Text("LAND raw[0]: %.1f   raw min: %.1f", landHeightDebug.rawFirst, landHeightDebug.rawMin);
-		ImGui::Text("LAND heightExtents: %.1f .. %.1f", landHeightDebug.extents.x, landHeightDebug.extents.y);
-		ImGui::Text("LAND anchor applied: %.1f   mesh world Z: %.1f", landHeightDebug.anchor, landHeightDebug.meshWorldZ);
-
-		ImGui::Separator();
-
-		ImGui::Text("Blades generated  high: %u  mid: %u  low: %u  far: %u",
-			grassRendererHighLOD->ReadBladeCount(),
-			grassRendererMidLOD->ReadBladeCount(),
-			grassRendererLowLOD->ReadBladeCount(),
-			grassRendererFarLOD->ReadBladeCount());
-		ImGui::Text("Quadrants  high: %zu  mid: %zu  low: %zu  far: %zu",
-			quadrantsHighLOD.size(), quadrantsMidLOD.size(), quadrantsLowLOD.size(), quadrantsFarLOD.size());
-		ImGui::Text("cells %u -> exterior %u -> land %u -> loadedData %u -> mesh %u -> preProcessed %u",
-			quadrantReject.cells, quadrantReject.withExterior, quadrantReject.withLand,
-			quadrantReject.withLoadedData, quadrantReject.withMesh, quadrantReject.preProcessed);
-
-		ImGui::Separator();
-
-		ImGui::Text("Grass quadrants cached: %zu", grassMapCache.size());
-		ImGui::Text("Samples growing grass: %zu / %zu (%.1f%%)", grassSet, grassTotal, grassTotal ? 100.0 * grassSet / grassTotal : 0.0);
+	bool invalidate = false;
+	invalidate |= ImGui::Checkbox(T("feature.procedural_grass.debug_ignore_grass_map", "Ignore grass map (LTEX)"), &settings.debugIgnoreGrassMap);
+	DrawSettingDescription(T("feature.procedural_grass.debug_ignore_grass_map_tooltip", "Generates grass without consulting landscape texture grass assignments."));
+	ImGui::Checkbox(T("feature.procedural_grass.debug_ignore_occlusion", "Ignore object occlusion"), &settings.debugIgnoreObjectOcclusion);
+	DrawSettingDescription(T("feature.procedural_grass.debug_ignore_occlusion_tooltip", "Disables removal of grass beneath or inside occluding objects."));
+	ImGui::SliderFloat(T("feature.procedural_grass.debug_edge_noise", "Grass map edge noise (units)"), &settings.grassMapEdgeNoise, 0.0f, 256.0f, "%.0f");
+	DrawSettingDescription(T("feature.procedural_grass.debug_edge_noise_tooltip", "Jitters grass-map sampling near texture boundaries to soften distribution edges."));
+	if (ImGui::SliderFloat(T("feature.procedural_grass.debug_occlusion_extent", "Occlusion half extent"), &settings.occlusionHalfExtent, 1024.0f, 16384.0f, "%.0f"))
+		globals::topDownOcclusion->SetHalfExtent(settings.occlusionHalfExtent);
+	DrawSettingDescription(T("feature.procedural_grass.debug_occlusion_extent_tooltip", "Sets the half-width of the world-space object-occlusion window."));
+	{
+		const auto td = globals::topDownOcclusion;
+		const auto centre = td->GetWindowCentre();
+		ImGui::Text(T("feature.procedural_grass.debug_occlusion_map", "Occlusion map: %s   %u x %u"), td->IsReady() ? T("feature.procedural_grass.debug_ready", "ready") : T("feature.procedural_grass.debug_not_ready", "NOT READY"), td->GetMapDim(), td->GetMapDim());
+		ImGui::Text(T("feature.procedural_grass.debug_window_centre", "Window centre: %.0f, %.0f   half extent %.0f   %.1f units/texel"),
+			centre.x, centre.y, td->GetHalfExtent(), td->GetHalfExtent() * 2.0f / td->GetMapDim());
+		ImGui::Text(T("feature.procedural_grass.debug_occluders_drawn", "Occluders drawn: %u"), td->GetDrawCount());
 	}
+	ImGui::Checkbox(T("feature.procedural_grass.debug_disable_culls", "Disable ALL generator culls"), &settings.debugDisableAllCulls);
+	DrawSettingDescription(T("feature.procedural_grass.debug_disable_culls_tooltip", "Disables generator rejection tests for debugging."));
+	ImGui::Checkbox(T("feature.procedural_grass.debug_ignore_preprocessed", "Ignore preprocessed-node check"), &settings.debugIgnorePreProcessedFlag);
+	DrawSettingDescription(T("feature.procedural_grass.debug_ignore_preprocessed_tooltip", "Includes LAND meshes that are not marked as preprocessed."));
+	if (invalidate) {
+		ClearGrassMapCache();
+	}
+
+	size_t grassSet = 0;
+	size_t grassTotal = 0;
+	for (const auto& entry : grassMapCache)
+		for (const auto& quadrant : entry.second.quadrants) {
+			grassTotal += quadrant.ids.size();
+			for (const auto id : quadrant.ids)
+				grassSet += id != 0;
+		}
+
+	const auto heightMap = globals::terrainHeightMap;
+	const auto cached = heightMap->GetCached();
+	ImGui::Text(T("feature.procedural_grass.debug_height_map_ready", "Height map ready: %s"), heightMap->IsReady() ? T("common.yes", "Yes") : T("common.no", "No"));
+	ImGui::Text(T("feature.procedural_grass.debug_height_map_worldspace", "Height map worldspace: %s"), cached ? cached->worldspace.c_str() : T("feature.procedural_grass.debug_none", "<none>"));
+	const auto posRange = heightMap->GetPosRange();
+	ImGui::Text(T("feature.procedural_grass.debug_height_map_range", "Height map range: %.1f .. %.1f"), posRange.x, posRange.y);
+	if (const auto pc = RE::PlayerCharacter::GetSingleton()) {
+		const auto playerPos = pc->GetPosition();
+		ImGui::Text(T("feature.procedural_grass.debug_player_z", "Player Z: %.1f"), playerPos.z);
+
+		if (const auto landZ = GetLandHeightAt(playerPos.x, playerPos.y))
+			ImGui::Text(T("feature.procedural_grass.debug_land_z", "LAND Z at player: %.1f  (delta %.1f)"), *landZ, *landZ - playerPos.z);
+		else
+			ImGui::TextUnformatted(T("feature.procedural_grass.debug_land_z_missing", "LAND Z at player: <no cached quadrant>"));
+	}
+
+	ImGui::Text(T("feature.procedural_grass.debug_land_raw", "LAND raw[0]: %.1f   raw min: %.1f"), landHeightDebug.rawFirst, landHeightDebug.rawMin);
+	ImGui::Text(T("feature.procedural_grass.debug_land_extents", "LAND heightExtents: %.1f .. %.1f"), landHeightDebug.extents.x, landHeightDebug.extents.y);
+	ImGui::Text(T("feature.procedural_grass.debug_land_anchor", "LAND anchor applied: %.1f   mesh world Z: %.1f"), landHeightDebug.anchor, landHeightDebug.meshWorldZ);
+
+	ImGui::Separator();
+
+	ImGui::Text(T("feature.procedural_grass.debug_blade_counts", "Blades generated  high: %u  mid: %u  low: %u  far: %u"),
+		grassRendererHighLOD->ReadBladeCount(),
+		grassRendererMidLOD->ReadBladeCount(),
+		grassRendererLowLOD->ReadBladeCount(),
+		grassRendererFarLOD->ReadBladeCount());
+	ImGui::Text(T("feature.procedural_grass.debug_quadrant_counts", "Quadrants  high: %zu  mid: %zu  low: %zu  far: %zu"),
+		quadrantsHighLOD.size(), quadrantsMidLOD.size(), quadrantsLowLOD.size(), quadrantsFarLOD.size());
+	ImGui::Text(T("feature.procedural_grass.debug_quadrant_rejects", "cells %u -> exterior %u -> land %u -> loadedData %u -> mesh %u -> preProcessed %u"),
+		quadrantReject.cells, quadrantReject.withExterior, quadrantReject.withLand,
+		quadrantReject.withLoadedData, quadrantReject.withMesh, quadrantReject.preProcessed);
+
+	ImGui::Separator();
+
+	ImGui::Text(T("feature.procedural_grass.debug_quadrants_cached", "Grass quadrants cached: %zu"), grassMapCache.size());
+	ImGui::Text(T("feature.procedural_grass.debug_grass_samples", "Samples growing grass: %zu / %zu (%.1f%%)"), grassSet, grassTotal, grassTotal ? 100.0 * grassSet / grassTotal : 0.0);
+}
+
+void ProceduralGrass::DrawTypeOverrides(nlohmann::json& ov) const
+{
+	const auto& s = settings;
+	ImGui::SeparatorText(T("feature.procedural_grass.shape_section", "Shape"));
+	DrawOverrideFloat(ov, "Height", T("feature.procedural_grass.height", "Height"), s.grassHeight, 0.0f, 150.0f, "%.1f");
+	DrawOverrideFloat(ov, "Width", T("feature.procedural_grass.width", "Width"), s.grassWidth, 0.0f, 10.0f, "%.1f");
+	DrawOverrideFloat(ov, "Stiffness", T("feature.procedural_grass.k1", "K1"), s.stiffness, -10.0f, 10.0f);
+	DrawOverrideFloat(ov, "TipWeight", T("feature.procedural_grass.k2", "K2"), s.tipWeight, -10.0f, 10.0f);
+	DrawOverrideFloat(ov, "Mid", T("feature.procedural_grass.mid", "Mid"), s.mid, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "RotationalStiffness", T("feature.procedural_grass.rotational_stiffness", "Rotational Stiffness"), s.rotationalStiffness, 0.0f, 10.0f);
+
+	ImGui::SeparatorText(T("feature.procedural_grass.slope_section", "Slope"));
+	DrawOverrideFloat(ov, "MinSlope", T("feature.procedural_grass.min_slope", "Min Slope (deg)"), s.grassMinSlope, 0.0f, 90.0f, "%.0f");
+	DrawOverrideFloat(ov, "MaxSlope", T("feature.procedural_grass.max_slope", "Max Slope (deg)"), s.grassMaxSlope, 0.0f, 90.0f, "%.0f");
+
+	ImGui::SeparatorText(T("feature.procedural_grass.clump_section", "Clump"));
+	DrawOverrideFloat(ov, "ClumpDistanceFactor", T("feature.procedural_grass.clump_distance", "Clump Distance"), s.clumpDistanceFactor, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "ClumpFacingFactor", T("feature.procedural_grass.clump_facing", "Clump Facing"), s.clumpFacingFactor, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "ClumpHeightFactor", T("feature.procedural_grass.clump_height", "Clump Height"), s.clumpHeightFactor, 0.0f, 2.0f);
+	DrawOverrideFloat(ov, "ClumpAOStrength", T("feature.procedural_grass.clump_ao", "Clump AO"), s.clumpAOStrength, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "ClumpColorStrength", T("feature.procedural_grass.clump_colour", "Clump Colour"), s.grassClumpColorStrength, 0.0f, 1.0f);
+
+	ImGui::SeparatorText(T("feature.procedural_grass.colour_section", "Colour"));
+	DrawOverrideFloat3(ov, "BaseColor", T("feature.procedural_grass.base_color", "Base Color"), s.baseColor, 0.0f, 1.0f, true);
+	DrawOverrideFloat3(ov, "TipColor", T("feature.procedural_grass.tip_color", "Tip Color"), s.tipColor, 0.0f, 1.0f, true);
+	DrawOverrideFloat3(ov, "ColorTipDry", T("feature.procedural_grass.dried_tip_tint", "Dried Tip Tint"), s.grassColorTipDry, 0.0f, 2.0f, false);
+	DrawOverrideFloat3(ov, "ColorCool", T("feature.procedural_grass.cool_tint", "Cool/Green Tint"), s.grassColorCool, 0.0f, 2.0f, false);
+	DrawOverrideFloat3(ov, "ColorWarm", T("feature.procedural_grass.warm_tint", "Warm/Straw Tint"), s.grassColorWarm, 0.0f, 2.0f, false);
+	DrawOverrideFloat(ov, "HueVariation", T("feature.procedural_grass.hue_variation", "Hue Variation"), s.grassColorHueVariation, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "ValueVariation", T("feature.procedural_grass.brightness_variation", "Brightness Variation"), s.grassColorValueVariation, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "TipDryStrength", T("feature.procedural_grass.tip_dry_strength", "Tip Dry Strength"), s.grassColorTipDryStrength, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "MottleStrength", T("feature.procedural_grass.mottle_strength", "Mottle Strength"), s.grassColorMottleStrength, 0.0f, 0.5f);
+
+	ImGui::SeparatorText(T("feature.procedural_grass.lighting_section", "Lighting"));
+	DrawOverrideFloat(ov, "MinAO", T("feature.procedural_grass.baked_min_ao", "Baked Min AO"), s.ao, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "Specular", T("feature.procedural_grass.specular", "Specular"), s.specular, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "WaxSheenStrength", T("feature.procedural_grass.wax_sheen_strength", "Wax Sheen Strength"), s.waxSheenStrength, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "WaxRoughnessMultiplier", T("feature.procedural_grass.wax_roughness_multiplier", "Wax Roughness Multiplier"), s.waxRoughnessMultiplier, 0.0f, 2.0f);
+	DrawOverrideFloat(ov, "CurvedNormalStrength", T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), s.curvedNormalStrength, 0.0f, 1.0f);
+	DrawOverrideFloat2(ov, "SubsurfaceOpacity", T("feature.procedural_grass.subsurface_base_tip", "Subsurface (Base>Tip)"), s.subsurfaceOpacity, 0.0f, 1.0f);
+	DrawOverrideFloat3(ov, "SubsurfaceTint", T("feature.procedural_grass.subsurface_color", "Subsurface Color"), s.grassSubsurfaceTint, 0.0f, 2.0f, false);
+	DrawOverrideFloat3(ov, "BaseMinTipRoughness", T("feature.procedural_grass.roughness", "Roughness (Base>Min>Tip)"), s.baseMinTipRoughness, 0.0f, 1.0f, false);
+	DrawOverrideFloat(ov, "TipRoughnessStart", T("feature.procedural_grass.roughness_tip_start", "Roughness Tip Start"), s.tipRoughnessStart, 0.05f, 0.95f);
+
+	DrawOverrideFloat(ov, "AmbientFlatten", T("feature.procedural_grass.ambient_flatten", "Ambient Flatten"), s.grassAmbientFlatten, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "Wrap", T("feature.procedural_grass.terminator_wrap", "Terminator Wrap"), s.grassWrap, 0.0f, 1.0f);
+
+	DrawOverrideFloat(ov, "BounceStrength", T("feature.procedural_grass.ground_bounce", "Ground Bounce"), s.grassBounceStrength, 0.0f, 2.0f);
+	DrawOverrideFloat3(ov, "BounceColor", T("feature.procedural_grass.ground_bounce_tint", "Ground Bounce Tint"), s.grassBounceColor, 0.0f, 2.0f, false);
+	DrawOverrideFloat(ov, "SpecOcclusion", T("feature.procedural_grass.specular_occlusion", "Specular Occlusion"), s.grassSpecOcclusion, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "AmbientDesat", T("feature.procedural_grass.ambient_desaturation", "Ambient Desaturation"), s.grassAmbientDesat, 0.0f, 1.0f);
+
+	ImGui::SeparatorText(T("feature.procedural_grass.surface_section", "Surface"));
+	DrawOverrideFloat(ov, "BlotchStrength", T("feature.procedural_grass.blotch_strength", "Blotch Strength"), s.grassBlotchStrength, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "BlotchScale", T("feature.procedural_grass.blotch_scale", "Blotch Scale"), s.grassBlotchScale, 0.25f, 4.0f);
+	DrawOverrideFloat(ov, "SpeckleStrength", T("feature.procedural_grass.grain_strength", "Grain Strength"), s.grassSpeckleStrength, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "SpeckleScale", T("feature.procedural_grass.grain_scale", "Grain Scale"), s.grassSpeckleScale, 0.25f, 4.0f);
+
+	ImGui::SeparatorText(T("feature.procedural_grass.veins_section", "Veins"));
+	DrawOverrideFloat3(ov, "VeinTint", T("feature.procedural_grass.vein_tint", "Vein Tint"), s.grassVeinTint, 0.0f, 2.0f, false);
+	DrawOverrideFloat(ov, "VeinAlbedoStrength", T("feature.procedural_grass.vein_tint_strength", "Vein Tint Strength"), s.grassVeinAlbedoStrength, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "VeinNormalStrength", T("feature.procedural_grass.vein_normal_strength", "Vein Normal Strength"), s.grassVeinNormalStrength, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "VeinRippleDepth", T("feature.procedural_grass.vein_ripple_depth", "Vein Ripple Depth"), s.grassVeinRippleDepth, 0.0f, 1.0f);
+	DrawOverrideFloat(ov, "VeinWiggleAmount", T("feature.procedural_grass.vein_micro_wiggle", "Vein Micro-Wiggle"), s.grassVeinWiggleAmount, 0.0f, 0.25f);
+
+	ImGui::Spacing();
+	if (ImGui::Button(T("feature.procedural_grass.clear_overrides", "Clear all overrides")))
+		ov = nlohmann::json::object();
 }
 
 void ProceduralGrass::DrawGrassTypeEditor()
@@ -475,132 +594,6 @@ void ProceduralGrass::DrawGrassTypeEditor()
 			"grass variants: {} / {}."),
 		std::make_format_args(allocatedGrassVariants, maxGrassVariants));
 	ImGui::TextWrapped("%s", grassTypesDescription.c_str());
-
-	const auto& s = settings;
-
-	const auto fFloat = [](nlohmann::json& ov, const char* key, const char* label, float base, float mn, float mx, const char* fmt = "%.2f") {
-		bool has = ov.contains(key);
-		if (ImGui::Checkbox(std::format("##en_{}", key).c_str(), &has)) {
-			if (has)
-				ov[key] = base;
-			else
-				ov.erase(key);
-		}
-		ImGui::SameLine();
-		ImGui::BeginDisabled(!has);
-		float val = has && ov[key].is_number() ? ov[key].get<float>() : base;
-		if (ImGui::SliderFloat(label, &val, mn, mx, fmt) && has)
-			ov[key] = val;
-		ImGui::EndDisabled();
-	};
-
-	const auto fFloat2 = [](nlohmann::json& ov, const char* key, const char* label, float2 base, float mn, float mx) {
-		bool has = ov.contains(key);
-		if (ImGui::Checkbox(std::format("##en_{}", key).c_str(), &has)) {
-			if (has)
-				ov[key] = base;
-			else
-				ov.erase(key);
-		}
-		ImGui::SameLine();
-		ImGui::BeginDisabled(!has);
-		float2 val = base;
-		if (has && IsNumericArray(ov[key], 2))
-			ov[key].get_to(val);
-		if (ImGui::SliderFloat2(label, &val.x, mn, mx, "%.2f") && has)
-			ov[key] = val;
-		ImGui::EndDisabled();
-	};
-
-	const auto fFloat3 = [](nlohmann::json& ov, const char* key, const char* label, float3 base, float mn, float mx, bool asColor) {
-		bool has = ov.contains(key);
-		if (ImGui::Checkbox(std::format("##en_{}", key).c_str(), &has)) {
-			if (has)
-				ov[key] = base;
-			else
-				ov.erase(key);
-		}
-		ImGui::SameLine();
-		ImGui::BeginDisabled(!has);
-		float3 val = base;
-		if (has && IsNumericArray(ov[key], 3))
-			ov[key].get_to(val);
-		bool changed = asColor ? ImGui::ColorEdit3(label, &val.x) : ImGui::SliderFloat3(label, &val.x, mn, mx, "%.2f");
-		if (changed && has)
-			ov[key] = val;
-		ImGui::EndDisabled();
-	};
-
-	const auto renderOverrides = [&](nlohmann::json& ov) {
-		ImGui::SeparatorText(T("feature.procedural_grass.shape_section", "Shape"));
-		fFloat(ov, "Height", T("feature.procedural_grass.height", "Height"), s.grassHeight, 0.0f, 150.0f, "%.1f");
-		fFloat(ov, "Width", T("feature.procedural_grass.width", "Width"), s.grassWidth, 0.0f, 10.0f, "%.1f");
-		fFloat(ov, "Stiffness", T("feature.procedural_grass.k1", "K1"), s.stiffness, -10.0f, 10.0f);
-		fFloat(ov, "TipWeight", T("feature.procedural_grass.k2", "K2"), s.tipWeight, -10.0f, 10.0f);
-		fFloat(ov, "Mid", T("feature.procedural_grass.mid", "Mid"), s.mid, 0.0f, 1.0f);
-		fFloat(ov, "RotationalStiffness", T("feature.procedural_grass.rotational_stiffness", "Rotational Stiffness"), s.rotationalStiffness, 0.0f, 10.0f);
-
-		ImGui::SeparatorText(T("feature.procedural_grass.slope_section", "Slope"));
-		fFloat(ov, "MinSlope", T("feature.procedural_grass.min_slope", "Min Slope (deg)"), s.grassMinSlope, 0.0f, 90.0f, "%.0f");
-		fFloat(ov, "MaxSlope", T("feature.procedural_grass.max_slope", "Max Slope (deg)"), s.grassMaxSlope, 0.0f, 90.0f, "%.0f");
-
-		ImGui::SeparatorText(T("feature.procedural_grass.clump_section", "Clump"));
-		fFloat(ov, "ClumpDistanceFactor", T("feature.procedural_grass.clump_distance", "Clump Distance"), s.clumpDistanceFactor, 0.0f, 1.0f);
-		fFloat(ov, "ClumpFacingFactor", T("feature.procedural_grass.clump_facing", "Clump Facing"), s.clumpFacingFactor, 0.0f, 1.0f);
-		fFloat(ov, "ClumpHeightFactor", T("feature.procedural_grass.clump_height", "Clump Height"), s.clumpHeightFactor, 0.0f, 2.0f);
-		fFloat(ov, "ClumpAOStrength", T("feature.procedural_grass.clump_ao", "Clump AO"), s.clumpAOStrength, 0.0f, 1.0f);
-		fFloat(ov, "ClumpColorStrength", T("feature.procedural_grass.clump_colour", "Clump Colour"), s.grassClumpColorStrength, 0.0f, 1.0f);
-
-		ImGui::SeparatorText(T("feature.procedural_grass.colour_section", "Colour"));
-		fFloat3(ov, "BaseColor", T("feature.procedural_grass.base_color", "Base Color"), s.baseColor, 0.0f, 1.0f, true);
-		fFloat3(ov, "TipColor", T("feature.procedural_grass.tip_color", "Tip Color"), s.tipColor, 0.0f, 1.0f, true);
-		fFloat3(ov, "ColorTipDry", T("feature.procedural_grass.dried_tip_tint", "Dried Tip Tint"), s.grassColorTipDry, 0.0f, 2.0f, false);
-		fFloat3(ov, "ColorCool", T("feature.procedural_grass.cool_tint", "Cool/Green Tint"), s.grassColorCool, 0.0f, 2.0f, false);
-		fFloat3(ov, "ColorWarm", T("feature.procedural_grass.warm_tint", "Warm/Straw Tint"), s.grassColorWarm, 0.0f, 2.0f, false);
-		fFloat(ov, "HueVariation", T("feature.procedural_grass.hue_variation", "Hue Variation"), s.grassColorHueVariation, 0.0f, 1.0f);
-		fFloat(ov, "ValueVariation", T("feature.procedural_grass.brightness_variation", "Brightness Variation"), s.grassColorValueVariation, 0.0f, 1.0f);
-		fFloat(ov, "TipDryStrength", T("feature.procedural_grass.tip_dry_strength", "Tip Dry Strength"), s.grassColorTipDryStrength, 0.0f, 1.0f);
-		fFloat(ov, "MottleStrength", T("feature.procedural_grass.mottle_strength", "Mottle Strength"), s.grassColorMottleStrength, 0.0f, 0.5f);
-
-		ImGui::SeparatorText(T("feature.procedural_grass.lighting_section", "Lighting"));
-		fFloat(ov, "MinAO", T("feature.procedural_grass.baked_min_ao", "Baked Min AO"), s.ao, 0.0f, 1.0f);
-		fFloat(ov, "Specular", T("feature.procedural_grass.specular", "Specular"), s.specular, 0.0f, 1.0f);
-		fFloat(ov, "WaxSheenStrength", T("feature.procedural_grass.wax_sheen_strength", "Wax Sheen Strength"), s.waxSheenStrength, 0.0f, 1.0f);
-		fFloat(ov, "WaxRoughnessMultiplier", T("feature.procedural_grass.wax_roughness_multiplier", "Wax Roughness Multiplier"), s.waxRoughnessMultiplier, 0.0f, 2.0f);
-		fFloat(ov, "CurvedNormalStrength", T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), s.curvedNormalStrength, 0.0f, 1.0f);
-		fFloat2(ov, "SubsurfaceOpacity", T("feature.procedural_grass.subsurface_base_tip", "Subsurface (Base>Tip)"), s.subsurfaceOpacity, 0.0f, 1.0f);
-		fFloat3(ov, "SubsurfaceTint", T("feature.procedural_grass.subsurface_color", "Subsurface Color"), s.grassSubsurfaceTint, 0.0f, 2.0f, false);
-		fFloat3(ov, "BaseMinTipRoughness", T("feature.procedural_grass.roughness", "Roughness (Base>Min>Tip)"), s.baseMinTipRoughness, 0.0f, 1.0f, false);
-		fFloat(ov, "TipRoughnessStart", T("feature.procedural_grass.roughness_tip_start", "Roughness Tip Start"), s.tipRoughnessStart, 0.05f, 0.95f);
-
-		fFloat(ov, "AmbientFlatten", T("feature.procedural_grass.ambient_flatten", "Ambient Flatten"), s.grassAmbientFlatten, 0.0f, 1.0f);
-		fFloat(ov, "Wrap", T("feature.procedural_grass.terminator_wrap", "Terminator Wrap"), s.grassWrap, 0.0f, 1.0f);
-
-		fFloat(ov, "BounceStrength", T("feature.procedural_grass.ground_bounce", "Ground Bounce"), s.grassBounceStrength, 0.0f, 2.0f);
-		fFloat3(ov, "BounceColor", T("feature.procedural_grass.ground_bounce_tint", "Ground Bounce Tint"), s.grassBounceColor, 0.0f, 2.0f, false);
-		fFloat(ov, "SpecOcclusion", T("feature.procedural_grass.specular_occlusion", "Specular Occlusion"), s.grassSpecOcclusion, 0.0f, 1.0f);
-		fFloat(ov, "AmbientDesat", T("feature.procedural_grass.ambient_desaturation", "Ambient Desaturation"), s.grassAmbientDesat, 0.0f, 1.0f);
-
-		ImGui::SeparatorText(T("feature.procedural_grass.surface_wind_section", "Surface & Wind"));
-		fFloat(ov, "BlotchStrength", T("feature.procedural_grass.blotch_strength", "Blotch Strength"), s.grassBlotchStrength, 0.0f, 1.0f);
-		fFloat(ov, "BlotchScale", T("feature.procedural_grass.blotch_scale", "Blotch Scale"), s.grassBlotchScale, 0.25f, 4.0f);
-		fFloat(ov, "SpeckleStrength", T("feature.procedural_grass.grain_strength", "Grain Strength"), s.grassSpeckleStrength, 0.0f, 1.0f);
-		fFloat(ov, "SpeckleScale", T("feature.procedural_grass.grain_scale", "Grain Scale"), s.grassSpeckleScale, 0.25f, 4.0f);
-		fFloat(ov, "SpatialFreq", T("feature.procedural_grass.spatial_frequency", "Spatial Freq"), s.spatialFreq, 0.0f, 100.0f);
-		fFloat(ov, "PhaseOffset", T("feature.procedural_grass.phase_offset", "Phase Offset"), s.phaseOffset, 0.0f, 10.0f);
-		fFloat(ov, "PhaseLag", T("feature.procedural_grass.phase_lag", "Phase Lag"), s.phaseLag, 0.0f, 1.0f);
-
-		ImGui::SeparatorText(T("feature.procedural_grass.veins_section", "Veins"));
-		fFloat3(ov, "VeinTint", T("feature.procedural_grass.vein_tint", "Vein Tint"), s.grassVeinTint, 0.0f, 2.0f, false);
-		fFloat(ov, "VeinAlbedoStrength", T("feature.procedural_grass.vein_tint_strength", "Vein Tint Strength"), s.grassVeinAlbedoStrength, 0.0f, 1.0f);
-		fFloat(ov, "VeinNormalStrength", T("feature.procedural_grass.vein_normal_strength", "Vein Normal Strength"), s.grassVeinNormalStrength, 0.0f, 1.0f);
-		fFloat(ov, "VeinRippleDepth", T("feature.procedural_grass.vein_ripple_depth", "Vein Ripple Depth"), s.grassVeinRippleDepth, 0.0f, 1.0f);
-		fFloat(ov, "VeinWiggleAmount", T("feature.procedural_grass.vein_micro_wiggle", "Vein Micro-Wiggle"), s.grassVeinWiggleAmount, 0.0f, 0.25f);
-
-		ImGui::Spacing();
-		if (ImGui::Button(T("feature.procedural_grass.clear_overrides", "Clear all overrides")))
-			ov = nlohmann::json::object();
-	};
 
 	static char filter[128] = "";
 	ImGui::InputTextWithHint(T("feature.procedural_grass.filter", "Filter"), T("feature.procedural_grass.filter_hint", "editor id / plugin"), filter, sizeof(filter));
@@ -685,7 +678,7 @@ void ProceduralGrass::DrawGrassTypeEditor()
 					T("feature.procedural_grass.overrides_count", "Overrides ({} set)"),
 					std::make_format_args(overrideCount));
 				if (ImGui::TreeNode("Overrides", "%s", overridesLabel.c_str())) {
-					renderOverrides(def.overrides);
+					DrawTypeOverrides(def.overrides);
 					ImGui::TreePop();
 				}
 				ImGui::EndDisabled();
@@ -810,9 +803,6 @@ void ProceduralGrass::LoadSettings(json& o_json)
 	// Wind / animation
 	settings.windAngle = o_json.value("WindAngle", settings.windAngle);
 	settings.windSpeed = o_json.value("WindSpeed", settings.windSpeed);
-	settings.spatialFreq = o_json.value("SpatialFreq", settings.spatialFreq);
-	settings.phaseOffset = o_json.value("PhaseOffset", settings.phaseOffset);
-	settings.phaseLag = o_json.value("PhaseLag", settings.phaseLag);
 	windDirection = float2(std::cos(settings.windAngle), std::sin(settings.windAngle));
 
 	// Occlusion / misc
@@ -936,9 +926,6 @@ void ProceduralGrass::SaveSettings(json& o_json)
 	// Wind / animation
 	o_json["WindAngle"] = settings.windAngle;
 	o_json["WindSpeed"] = settings.windSpeed;
-	o_json["SpatialFreq"] = settings.spatialFreq;
-	o_json["PhaseOffset"] = settings.phaseOffset;
-	o_json["PhaseLag"] = settings.phaseLag;
 
 	// Occlusion / misc
 	o_json["OcclusionClearance"] = settings.occlusionClearance;

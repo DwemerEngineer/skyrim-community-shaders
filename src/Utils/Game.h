@@ -167,6 +167,12 @@ namespace Util
 	bool IsInterior();
 
 	/**
+	 * @brief Follows parent worldspaces that supply this worldspace's LAND data.
+	 * @return The worldspace owning the terrain records, or nullptr for a null input.
+	 */
+	RE::TESWorldSpace* GetLandDataWorldspace(RE::TESWorldSpace* worldSpace);
+
+	/**
 	 * @brief Converts a 2D world position to cell coordinates.
 	 *
 	 * @param worldPos The world position as a 2D point.

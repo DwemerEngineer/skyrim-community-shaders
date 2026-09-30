@@ -78,7 +78,7 @@ private:
 
 	std::unordered_map<uint64_t, std::unique_ptr<CellGrass>> ready;  // main-thread only
 	std::unordered_map<uint64_t, uint64_t> lastTouched;              // key -> frame, main-thread only
-	std::unordered_set<uint64_t> pending;                           // enqueued keys, main-thread only
+	std::unordered_set<uint64_t> pending;                            // enqueued keys, main-thread only
 
 	std::mutex completedMutex;
 	std::deque<std::tuple<uint64_t, uint64_t, std::unique_ptr<CellGrass>>> completed;  // key, generation, data

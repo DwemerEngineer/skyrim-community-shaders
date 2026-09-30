@@ -11,8 +11,7 @@ RWTexture2D<float4> DistantAmbientLUT : register(u0);
 
 static const uint LUT_DIM = 32;
 
-[numthreads(8, 8, 1)] void main(uint3 dispatchID : SV_DispatchThreadID)
-{
+[numthreads(8, 8, 1)] void main(uint3 dispatchID : SV_DispatchThreadID) {
 	if (any(dispatchID.xy >= LUT_DIM))
 		return;
 

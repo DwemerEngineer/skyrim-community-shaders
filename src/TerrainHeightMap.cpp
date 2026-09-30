@@ -6,16 +6,6 @@
 #include "Globals.h"
 #include "Util.h"
 
-namespace
-{
-	RE::TESWorldSpace* ResolveLandWorldspace(RE::TESWorldSpace* worldspace)
-	{
-		while (worldspace && worldspace->parentWorld && worldspace->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData))
-			worldspace = worldspace->parentWorld;
-		return worldspace;
-	}
-}
-
 void TerrainHeightMap::ParseHeightmapPath(std::filesystem::path p, bool xlodgen_style)
 {
 	auto filename = p.filename();
@@ -103,7 +93,7 @@ void TerrainHeightMap::Discover()
 bool TerrainHeightMap::IsReady() const
 {
 	if (auto tes = RE::TES::GetSingleton())
-		if (auto worldspace = ResolveLandWorldspace(tes->GetRuntimeData2().worldSpace))
+		if (auto worldspace = Util::GetLandDataWorldspace(tes->GetRuntimeData2().worldSpace))
 			return cachedHeightmap && cachedHeightmap->worldspace == worldspace->GetFormEditorID();
 	return false;
 }
@@ -114,7 +104,7 @@ void TerrainHeightMap::LoadForCurrentWorldspace()
 	if (!tes)
 		return;
 
-	auto worldspace = ResolveLandWorldspace(tes->GetRuntimeData2().worldSpace);
+	auto worldspace = Util::GetLandDataWorldspace(tes->GetRuntimeData2().worldSpace);
 
 	if (!worldspace)
 		return;

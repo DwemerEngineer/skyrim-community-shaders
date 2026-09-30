@@ -213,6 +213,26 @@ private:
 	ID3D11VertexShader* GetOuterVS();
 	ID3D11PixelShader* GetPS(bool noWetness = false, bool noLocalLights = false, bool innerHigh = false);
 
+	/** @brief Patches kept per compact Far quadrant for the given keep fraction. */
+	uint32_t CompactPatchCount(float compactKeep) const;
+	/** @brief Stages and uploads per-quadrant grass cells, heights, occupancy and tile bounds when their inputs change. */
+	void UploadQuadrantInputs(const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion, int32_t cellXOffset, int32_t cellYOffset,
+		const float4& lodFadeIn, const float4& lodFadeOut, float tileReach);
+	/** @brief Packs one quadrant's 2x2 LAND grass ids per cell, filling bare samples from a neighbour. */
+	void StageQuadrantGrassCells(uint32_t index, const PGrassCommon::Quadrant& quadrant);
+	/** @brief Stages conservative per-tile LAND height bounds that cover jittered and clumped roots. */
+	void StageTileHeightBounds(uint32_t index, const PGrassCommon::Quadrant& quadrant, float tileReach);
+	/** @brief Rebuilds the per-quadrant Voronoi feature cache when content or grid size changes. */
+	void UpdateClumpFeatureCache(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion, float clumpGridSize);
+	/** @brief Rebuilds Low's cached base placements when content changes. */
+	void UpdatePlacementCache(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion);
+	/** @brief Returns the cached occupied tiles of a quadrant, recomputing them when its grass map changes. */
+	const OccupancyCacheEntry& GetOccupiedTiles(const PGrassCommon::Quadrant& quadrant, float edgeNoise);
+	/** @brief Culls quadrants and tiles on the CPU and uploads the generator's work list. */
+	void BuildVisibleWorkList(const std::vector<PGrassCommon::Quadrant>& quadrants, const WorkListState& state);
+	/** @brief Binds generator inputs and dispatches full, compact and batch-argument passes. */
+	void DispatchGeneration(ID3D11DeviceContext* ctx, ID3D11ComputeShader* bladeGenerator, ID3D11ComputeShader* batchArgsGenerator, float clumpGridSize, float compactKeep);
+
 	static std::string BuildDefineList(std::span<const std::pair<const char*, const char*>> defines);
 
 	template <class ShaderT>

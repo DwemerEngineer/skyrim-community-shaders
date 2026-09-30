@@ -14,7 +14,7 @@ float LoadPresenceCoverage(int2 sample, int dimension)
 {
 	if (any(sample < 0) || any(sample >= dimension))
 		return 0.0f;
-	
+
 	return GrassPresenceTexture[sample] != 0 ? 1.0f : 0.0f;
 }
 
@@ -53,9 +53,7 @@ float QuinticSmoothstep(float value)
 	return value2 * value * (value * (value * 6.0f - 15.0f) + 10.0f);
 }
 
-[numthreads(8, 8, 1)]
-void main(uint3 threadID : SV_DispatchThreadID)
-{
+[numthreads(8, 8, 1)] void main(uint3 threadID : SV_DispatchThreadID) {
 	uint densityDimension = (uint)grassAOParams.x;
 	if (any(threadID.xy >= densityDimension))
 		return;

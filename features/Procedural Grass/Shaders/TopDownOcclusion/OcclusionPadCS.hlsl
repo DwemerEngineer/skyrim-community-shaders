@@ -1,5 +1,5 @@
 // source unpadded heights
-Texture2D<float> InHigh : register(t0); 
+Texture2D<float> InHigh : register(t0);
 Texture2D<float> InLow : register(t1);
 // output padded heights
 RWTexture2D<float> OutHigh : register(u0);
@@ -14,8 +14,7 @@ cbuffer PadCB : register(b0)
 static const float EMPTY_HIGH = -1.0e30f;
 static const float EMPTY_LOW = 1.0e30f;
 
-[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID)
-{
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
 	uint2 dim = padDim.xy;
 	if (id.x >= dim.x || id.y >= dim.y)
 		return;
@@ -27,7 +26,8 @@ static const float EMPTY_LOW = 1.0e30f;
 	float hi = EMPTY_HIGH;
 	float lo = EMPTY_LOW;
 	// Read every texel in the horizontal or vertical padding span, clamping at map edges.
-	[loop] for (int offset = -radius; offset <= radius; offset++) {
+	[loop] for (int offset = -radius; offset <= radius; offset++)
+	{
 		int2 sampleCoord = clamp(int2(id.xy) + axis * offset, int2(0, 0), maxCoord);
 		hi = max(hi, InHigh[sampleCoord]);
 		lo = min(lo, InLow[sampleCoord]);

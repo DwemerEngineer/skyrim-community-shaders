@@ -173,6 +173,8 @@ namespace PGrassCommon
 		float2 worldPos;       // cached lower-left world XY
 		float minHeight;       // QuadrantNoHeight when unavailable
 		float maxHeight;
+
+		bool operator==(const Quadrant&) const = default;
 	};
 
 	static constexpr float QuadrantNoHeight = -3.0e38f;
@@ -256,15 +258,12 @@ namespace PGrassCommon
 		float clumpFacingFactor;
 		float clumpAOStrength;
 		float clumpColorStrength;
-
-		float spatialFreq;
-		float phaseOffset;
-		float phaseLag;
-
 		float minAO;
 		float specular;
+		float pad0;
 
 		float2 minMaxSubsurfaceOpacity;
+		float2 pad1;
 		float4 grassSurfParams;           // x: wax sheen strength, y: ambient normal flatten, z: wrap amount, w: wax roughness multiplier
 		float4 baseMinTipRoughnessStart;  // roughness at the base, at the smoothest point, and at the tip and t at which roughness bottoms out and starts climbing to the tip
 		float4 midRoughnessPolynomial;    // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}
@@ -283,6 +282,9 @@ namespace PGrassCommon
 		float4 grassSubsurfaceColor;  // rgb: subsurface/translucency tint
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassType);
+	// HLSL cbuffer packing keeps float2 inside one 16-byte register, so these offsets must match it.
+	static_assert(offsetof(GrassType, minMaxSubsurfaceOpacity) == 64);
+	static_assert(offsetof(GrassType, grassSurfParams) == 80);
 	static_assert(sizeof(GrassType) == 320);
 
 	// Slot 0 = bare, slot 1 = the base/default type, leaving 126 total slots for loaded per-texture variants.

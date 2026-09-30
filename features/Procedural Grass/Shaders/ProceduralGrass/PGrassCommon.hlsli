@@ -70,15 +70,12 @@ struct GrassType
 	float clumpFacingFactor;
 	float clumpAOStrength;
 	float clumpColorStrength;
-
-	float spatialFreq;
-	float phaseOffset;
-	float phaseLag;
-
 	float minAO;
 	float specular;
+	float pad0;
 
 	float2 minMaxSubsurfaceOpacity;
+	float2 pad1;
 	float4 grassSurfParams;           // x: wax sheen strength, y: ambient normal flatten, z: wrap amount, w: wax roughness multiplier
 	float4 baseMinTipRoughnessStart;  // roughness at the base, at the smoothest point, and at the tip and t at which roughness bottoms out and starts climbing to the tip
 	float4 midRoughnessPolynomial;    // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}

@@ -106,9 +106,6 @@ public:
 		// Wind / animation
 		float windAngle = 0.0f;
 		float windSpeed = 0.4f;
-		float spatialFreq = 1.0f;
-		float phaseOffset = 0.5f;
-		float phaseLag = 0.5f;
 
 		// Occlusion / placement
 		float occlusionClearance = 100.0f;  // Underside clearance in world units
@@ -147,6 +144,10 @@ public:
 
 	/** @brief Draws the per-type overrides and landscape-texture mix editor. */
 	void DrawGrassTypeEditor();
+	/** @brief Draws debug toggles and diagnostic readouts. The blade counts stall on GPU readback. */
+	void DrawDebugSettings();
+	/** @brief Draws the per-field override editor for one grass type variant. */
+	void DrawTypeOverrides(nlohmann::json& ov) const;
 
 	virtual void LoadSettings(json& o_json) override;
 	virtual void SaveSettings(json& o_json) override;
@@ -213,7 +214,6 @@ private:
 
 	ID3D11RasterizerState* noCullRS = nullptr;
 	ID3D11RasterizerState* noCullScissorRS = nullptr;
-	ID3D11DepthStencilState* depthOnDSS = nullptr;
 	ID3D11DepthStencilState* depthWriteDS = nullptr;
 	ID3D11DepthStencilState* depthEqualDS = nullptr;
 	ID3D11BlendState* depthOnlyBlend = nullptr;
@@ -381,9 +381,44 @@ private:
 	static void CopyDepthBuffer(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer);
 	static void SetViewport(ID3D11DeviceContext* ctx, float2 size);
 
+	/** @brief Creates the batched per-tier blade index buffers. */
+	void CreateIndexBuffers();
+	/** @brief Creates the samplers, rasterizer, depth-stencil and blend states used by the grass passes. */
+	void CreatePipelineStates();
+	/** @brief Creates the material detail, density, distant-ambient and presence textures. */
+	void CreateGrassTextures();
+
 	void PostDepthRendering();
+	/** @brief Player position in quadrant and cell units for one visibility update. */
+	struct VisibilityOrigin
+	{
+		int32_t quadrantX;
+		int32_t quadrantY;
+		int32_t cellX;
+		int32_t cellY;
+	};
+	// Near tiers cover Low's radius plus a streaming guard; Low's cached-LAND ring spans the same area in cells.
+	static constexpr int32_t NearCoverageRadius = PGrassCommon::LowTierQuadrantRadius + PGrassCommon::LowTierStreamGuardQuadrants;
+	static constexpr int32_t NearCoverageDiameter = NearCoverageRadius * 2 + 1;
+	static constexpr int32_t LowCellRadius = (NearCoverageRadius + 1) / 2;
+
+	/** @brief Rebuilds the per-tier quadrant lists when loaded or streamed LAND changes. */
 	void GetVisibleQuadrants();
+	/** @brief Hashes everything the near quadrant lists depend on, so unchanged frames skip the rebuild. */
+	uint64_t ComputeNearVisibilityStamp(RE::TESWorldSpace* landWorldSpace, const RE::GridCellArray* cells, const VisibilityOrigin& origin);
+	/** @brief Rebuilds High, Mid, Low and presence quadrants from the loaded grid and Low's streamed ring. */
+	void RebuildNearQuadrants(const RE::GridCellArray* cells, const VisibilityOrigin& origin);
+	/** @brief Refreshes the terrain-darkening grass-id window when its origin or content changes. */
+	void RebuildGrassPresence(int32_t originQuadX, int32_t originQuadY);
+	/** @brief Streams Far LAND cells and rebuilds the Far quadrant list when the cache changes. */
+	void UpdateFarQuadrants(RE::TESWorldSpace* landWorldSpace, const RE::GridCellArray* cells, const VisibilityOrigin& origin);
+	/** @brief Index into nearCoveredQuadrants, or -1 outside the near coverage window. */
+	static int32_t NearCoverageIndex(int32_t worldQuadrantX, int32_t worldQuadrantY, const VisibilityOrigin& origin);
 	void PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer);
+	/** @brief Rebuilds the per-type render and generator tables and the culling bounds derived from them. */
+	void ResolveGrassTypes(bool prelinearizeTypeColors, float typeColorGamma);
+	/** @brief Inverts the terrain-blend opacity curve into the High depth pass's base cutoff when blend settings change. */
+	void UpdateDepthBaseCutoff();
 	/**
 	 * @brief Generates one group of tiers. High and Mid run first so their depth can occlude Low and Far generation.
 	 * @param nearTiers True for High and Mid; false for Low and Far.

@@ -12,13 +12,13 @@ cbuffer HeightCB : register(b0)
 
 struct VS_INPUT
 {
-	float4 Position : POSITION;
+	float4 Position: POSITION;
 };
 
 struct VS_OUTPUT
 {
-	float4 Position : SV_POSITION;
-	float WorldZ : TEXCOORD0;
+	float4 Position: SV_POSITION;
+	float WorldZ: TEXCOORD0;
 };
 
 VS_OUTPUT main(VS_INPUT input)
@@ -27,7 +27,7 @@ VS_OUTPUT main(VS_INPUT input)
 	float3 worldPos = float3(dot(WorldRow0, localPos), dot(WorldRow1, localPos), dot(WorldRow2, localPos));
 
 	VS_OUTPUT output;
-    output.Position = float4((worldPos.xy - WindowCentre) / HalfExtent * float2(1.0f, -1.0f), 0.5f, 1.0f); // Flip y so world +Y runs down the texture.
+	output.Position = float4((worldPos.xy - WindowCentre) / HalfExtent * float2(1.0f, -1.0f), 0.5f, 1.0f);  // Flip y so world +Y runs down the texture.
 	output.WorldZ = worldPos.z;
 	return output;
 }
