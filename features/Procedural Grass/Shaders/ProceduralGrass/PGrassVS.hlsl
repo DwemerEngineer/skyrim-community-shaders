@@ -38,7 +38,7 @@ struct VS_OUTPUT
 #	elif defined(MID_LOD)
 	nointerpolation float4 WindRootPosition: TEXCOORD2;  // xy: tip wind offset; zw: root camera-relative XY
 #	elif defined(LOW_LOD)
-	nointerpolation float2 RootPosition: TEXCOORD2;  // camera-relative blade root XY
+	nointerpolation float4 RootPosition: TEXCOORD2;  // xy: camera-relative blade root XY; zw: root pixel for screen-space shadows
 #	endif
 #	if defined(MID_LOD)
 	float2 BladeTDepth: TEXCOORD3;                 // x: Bezier t; y: positive view depth
@@ -394,7 +394,10 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #		elif defined(MID_LOD)
 	o.WindRootPosition = float4(windOffset, rootViewPosition.xy);
 #		elif defined(LOW_LOD)
-	o.RootPosition = rootViewPosition.xy;
+	// Low has no depth prepass; the PS reads screen-space shadows where the root meets the ground.
+	float4 rootClip = mul(FrameBuffer::CameraViewProj, float4(rootViewPosition, 1.0f));
+	float2 rootPixel = (rootClip.xy / max(rootClip.w, 1.0f) * float2(0.5f, -0.5f) + 0.5f) / dynamicResolutionInverted;
+	o.RootPosition = float4(rootViewPosition.xy, rootPixel);
 #		endif
 #		if defined(LOW_LOD)
 	o.BezierTipAndMid = tip;

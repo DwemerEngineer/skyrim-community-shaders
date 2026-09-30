@@ -77,7 +77,7 @@ struct PS_INPUT
 #	elif defined(MID_LOD)
 	nointerpolation float4 WindRootPosition: TEXCOORD2;  // xy: tip wind offset; zw: root camera-relative XY
 #	elif defined(LOW_LOD)
-	nointerpolation float2 RootPosition: TEXCOORD2;  // camera-relative blade root XY
+	nointerpolation float4 RootPosition: TEXCOORD2;  // xy: camera-relative blade root XY; zw: root pixel for screen-space shadows
 #	endif
 #	if defined(MID_LOD)
 	float2 BladeTDepth: TEXCOORD3;                 // x: Bezier t; y: positive view depth
@@ -592,7 +592,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if defined(MID_LOD)
 	float2 densityUV = (input.WindRootPosition.zw + FrameBuffer::CameraPosAdjust.xy - occlusionParams.xy) * occlusionInvExtent + 0.5f;
 #	else
-	float2 densityUV = (input.RootPosition + FrameBuffer::CameraPosAdjust.xy - occlusionParams.xy) * occlusionInvExtent + 0.5f;
+	float2 densityUV = (input.RootPosition.xy + FrameBuffer::CameraPosAdjust.xy - occlusionParams.xy) * occlusionInvExtent + 0.5f;
 #	endif
 	if (densityUV.x == saturate(densityUV.x) && densityUV.y == saturate(densityUV.y)) {
 		float bladeCount = GrassDensityTexture[uint2(densityUV * grassAOParams.x)];
@@ -611,8 +611,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float4 shadowColor = 1.0;
 
-	float2 adjustedShadowUV = screenUV;
-	float2 shadowUV = FrameBuffer::GetDynamicResolutionAdjustedScreenPosition(adjustedShadowUV);
+#if defined(LOW_LOD) && !defined(FAR_LOD)
+	// Low writes depth only in this pass, so screen-space shadow inputs at its own pixels describe what lies behind
+	// the blade. Sample them at the root, where the blade meets ground that was in the prepass depth.
+	float2 shadowPixel = clamp(input.RootPosition.zw, 0.0f, rcp(dynamicResolutionInverted) - 1.0f);
+#else
+	float2 shadowPixel = input.Position.xy;
+#endif
+	float2 shadowUV = FrameBuffer::GetDynamicResolutionAdjustedScreenPosition(shadowPixel * dynamicResolutionInverted);
 	shadowColor = TexShadowMaskSampler.Sample(SampShadowMaskSampler, shadowUV);
 
 	MaterialProperties material = (MaterialProperties)0;
@@ -761,7 +767,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float dirDetailShadow = 1.0;
 #if defined(SCREEN_SPACE_SHADOWS) && !defined(FAR_LOD)
-	dirDetailShadow = ScreenSpaceShadows::GetScreenSpaceShadow(input.Position.xyz, screenUV, screenNoise);
+	dirDetailShadow = ScreenSpaceShadows::GetScreenSpaceShadow(float3(shadowPixel, input.Position.z), screenUV, screenNoise);
 #endif
 
 #if defined(HIGH_LOD)
@@ -770,7 +776,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if defined(MID_LOD)
 	float3 shadowPosition = float3(input.WindRootPosition.zw, cameraRelativePosition.z - sideAndBladeT.z);
 #	else
-	float3 shadowPosition = float3(input.RootPosition, cameraRelativePosition.z - sideAndBladeT.z);
+	float3 shadowPosition = float3(input.RootPosition.xy, cameraRelativePosition.z - sideAndBladeT.z);
 #	endif
 	float dirShadow = ShadowSampling::GetWorldShadow(shadowPosition, FrameBuffer::CameraPosAdjust.xyz);
 #else

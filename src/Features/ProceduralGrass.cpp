@@ -688,15 +688,15 @@ void ProceduralGrass::PostDepthRendering()
 
 	PostDepthRenderPrep(ctx, renderer);
 	GenerateBlades(ctx, true);
-	RenderDepth(ctx, true);
+	RenderDepth(ctx);
 	// High and Mid form a dense wall close to the camera; rebuild Hi-Z so Low and Far generation can reject blades behind it.
 	if (grassHiZ->HasCurrentSceneDepth() && !grassHiZ->Build(globals::d3d::device, ctx, true)) {
 		// An unbound pyramid reads as zero depth and would reject everything.
 		grassGlobalsStaging->grassHiZParams = float4::Zero;
 		grassGlobalsCB->Update(*grassGlobalsStaging);
 	}
+	// Low writes depth in its deferred pass; its PS samples screen-space shadows at the blade root instead.
 	GenerateBlades(ctx, false);
-	RenderDepth(ctx, false);
 	CopyDepthBuffer(ctx, renderer);
 
 	// Merge grass depth after terrain blending so grass does not appear transparent over terrain.
@@ -1124,7 +1124,7 @@ void ProceduralGrass::UnbindGeneratorResources(ID3D11DeviceContext* ctx)
 	ctx->CSSetShader(nullptr, nullptr, 0);
 }
 
-void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx, const bool nearTiers) const
+void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx) const
 {
 	const auto& mainDepth = globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 	ctx->OMSetRenderTargets(0, nullptr, mainDepth.views[0]);
@@ -1139,19 +1139,13 @@ void ProceduralGrass::RenderDepth(ID3D11DeviceContext* ctx, const bool nearTiers
 	ctx->VSSetConstantBuffers(8, 1, &grassCB);
 	ctx->PSSetConstantBuffers(8, 1, &grassCB);
 
-	// Screen-space lighting needs blade depth before the shadow and occlusion passes.
-	if (nearTiers) {
-		globals::profiler->BeginPass("ProceduralGrass::High Depth");
-		grassRendererHighLOD->RenderDepth(ctx, depthClipPS);
-		globals::profiler->EndPass();
-		globals::profiler->BeginPass("ProceduralGrass::Mid Depth");
-		grassRendererMidLOD->RenderDepth(ctx);
-		globals::profiler->EndPass();
-	} else {
-		globals::profiler->BeginPass("ProceduralGrass::Low Depth");
-		grassRendererLowLOD->RenderDepth(ctx);
-		globals::profiler->EndPass();
-	}
+	// Screen-space lighting needs near blade depth before the shadow and occlusion passes.
+	globals::profiler->BeginPass("ProceduralGrass::High Depth");
+	grassRendererHighLOD->RenderDepth(ctx, depthClipPS);
+	globals::profiler->EndPass();
+	globals::profiler->BeginPass("ProceduralGrass::Mid Depth");
+	grassRendererMidLOD->RenderDepth(ctx);
+	globals::profiler->EndPass();
 
 	ID3D11ShaderResourceView* nullBladeSRV = nullptr;
 	ctx->VSSetShaderResources(0, 1, &nullBladeSRV);
@@ -1437,6 +1431,8 @@ void ProceduralGrass::RenderGrass(ID3D11DeviceContext* ctx) const
 	ctx->OMSetBlendState(defaultBlend, nullptr, 0xFFFFFFFF);
 
 	grassRendererMidLOD->RenderGrass(ctx);
+	// Low has no depth prepass: its PS is cheap, so one pass with depth writes replaces a second full vertex pass.
+	ctx->OMSetDepthStencilState(depthWriteDS, 0);
 	grassRendererLowLOD->RenderGrass(ctx);
 
 	ID3D11ShaderResourceView* nullSRV = nullptr;

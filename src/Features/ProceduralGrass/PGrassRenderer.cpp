@@ -120,12 +120,15 @@ PGrassRenderer<QuadrantCount, PatchBladeCount>::PGrassRenderer(const uint32_t gr
 	GetBladeGeneratorCS();
 	if (extraDefine)
 		GetBladeGeneratorCS(true);
-	if (std::string_view(lodDefine) == "HIGH_LOD")
-		GetVertexShader(true, false);
+	// Only High and Mid have a depth prepass.
+	const bool hasDepthPrepass = !UsesBatchedLow() && !extraDefine;
 	GetVertexShader(false, false);
+	if (hasDepthPrepass)
+		GetVertexShader(true, false);
 	if (outerVertexIndicesBuffer) {
-		GetVertexShader(true, true);
 		GetVertexShader(false, true);
+		if (hasDepthPrepass)
+			GetVertexShader(true, true);
 	}
 
 	bool noWetness = false;

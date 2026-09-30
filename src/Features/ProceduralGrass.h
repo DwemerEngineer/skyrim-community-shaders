@@ -424,8 +424,8 @@ private:
 	 * @param nearTiers True for High and Mid; false for Low and Far.
 	 */
 	void GenerateBlades(ID3D11DeviceContext* ctx, bool nearTiers) const;
-	/** @brief Renders High and Mid depth, or Low depth when @p nearTiers is false. */
-	void RenderDepth(ID3D11DeviceContext* ctx, bool nearTiers) const;
+	/** @brief Renders High and Mid depth. Low and Far write depth in their colour passes. */
+	void RenderDepth(ID3D11DeviceContext* ctx) const;
 	static void UnbindGeneratorResources(ID3D11DeviceContext* ctx);
 
 	void DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const;
