@@ -47,7 +47,7 @@ public:
 
 	/** @brief World space to normalised heightmap scale; xy maps to UV, z to elevation. */
 	float3 GetScale() const;
-	/** @brief World space to heightmap UV offset; pairs with the xy of @ref GetScale. */
+	/** @brief World space to heightmap UV offset, aligning texel centres with terrain vertices; pairs with the xy of @ref GetScale. */
 	float2 GetOffset() const;
 	/** @brief The world-space Z range the texel values were authored against. */
 	float2 GetZRange() const;

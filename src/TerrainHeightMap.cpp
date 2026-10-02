@@ -174,8 +174,10 @@ float2 TerrainHeightMap::GetOffset() const
 	if (!cachedHeightmap)
 		return {};
 
+	// Texel centres lie on terrain vertices anchored at the south-west corner.
 	const auto scale = GetScale();
-	return { -cachedHeightmap->pos0.x * scale.x, -cachedHeightmap->pos0.y * scale.y };
+	const float2 halfTexel = texHeightMap ? float2{ 0.5f / texHeightMap->desc.Width, -0.5f / texHeightMap->desc.Height } : float2{};
+	return float2{ -cachedHeightmap->pos0.x * scale.x, -cachedHeightmap->pos0.y * scale.y } + halfTexel;
 }
 
 float2 TerrainHeightMap::GetPosRange() const
