@@ -37,7 +37,26 @@ cbuffer GrassGlobals : register(b8)
 	uint occlusionMapDim;
 	float4 frustumPlaneExtent;  // Left, right, bottom, top clip-plane extents for a unit world-space box.
 	float4 grassHiZBounds;      // x: Far radius, y: near-tier clump reach, z: wind reach, w: High depth base cutoff; negative disables.
+	float4 loadedLandBounds;    // xy: world min, zw: world max of the cells with attached LAND; terrain LOD is rendered outside.
+	int4 terrainLiftOrigin;     // xy: world cell at the terrain lift map's window origin, zw: last frame's origin
+	uint terrainLiftPhase;      // The quarter of the terrain lift map refreshed this frame
+	float midCandidateSpacing;  // World spacing of Mid's candidate lattice, before its two base blades and slope fill.
+	uint2 _padTerrainLift;
 }
+
+// The terrain lift map stores rendered surface height multiplied by its validity weight, alongside the weight.
+// It wraps a camera-centred window of world-aligned cells, so texels keep their values as the camera moves.
+static const float TerrainLiftMax = 160.0f;
+static const float TerrainLiftCellSize = 256.0f;
+static const int TerrainLiftDim = 512;
+
+#if defined(LOW_LOD)
+/** @brief Keeps roots on LOD terrain at the loaded ring's edge and reaches LAND before the Mid handoff. */
+float GetTerrainLiftBlend(float squareDistance)
+{
+	return smoothstep(6144.0f, 8192.0f, squareDistance);
+}
+#endif
 
 #if defined(FAR_LOD)
 float GetFarPerformanceKeep(float lodDistance, float projectionScale)
@@ -107,6 +126,20 @@ float ApproximateGrassDistance(float2 offset)
 	return max(distanceXY.x, distanceXY.y) + min(distanceXY.x, distanceXY.y) * 0.375f;
 }
 
+#if defined(FAR_LOD)
+/** @brief Returns widening and thinning compensation after Far has cleared Low's square fade band. */
+float2 GetFarCoverage(float2 lodOffset, float projectionScale)
+{
+	float2 distanceXY = abs(lodOffset);
+	float squareDistance = max(distanceXY.x, distanceXY.y);
+	float widthT = saturate((squareDistance - farParams.x) * farParams.y);
+	float keep = GetFarPerformanceKeep(ApproximateGrassDistance(lodOffset), projectionScale);
+	float compensation = min(rcp(max(keep, 0.5f)), 2.0f);
+	float compensationBlend = smoothstep(0.0f, 1.0f, (squareDistance - farParams.x) * (1.0f / 4096.0f));
+	return float2(widthT, lerp(1.0f, compensation, compensationBlend));
+}
+#endif
+
 #if defined(CSHADER) || defined(DEPTH) || defined(MID_VERTEX)
 struct GrassGeneratorType
 {
@@ -136,7 +169,7 @@ struct Blade
 	uint posXY;            // camera-relative x/y as two f16 values
 	uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
 	uint facingTilt;       // 4x UNORM8 mapped to [-1,1]: facing.xy, tilt sin/cos
-	uint seedAndType;      // high 8: clump density; next 16: Voronoi-cell appearance seed; low 8: grass type
+	uint seedAndType;      // high 8: clump density; bits 20-23: bend; bits 8-15: clump seed; low 8: type
 };
 #else
 struct Blade

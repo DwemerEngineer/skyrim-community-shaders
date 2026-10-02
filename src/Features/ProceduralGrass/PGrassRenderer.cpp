@@ -246,6 +246,13 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetDensity(uint32_t grassDe
 	density = grassDensity;
 	patchesPerQuadrant = grassDensity * grassDensity / 4;
 	densityString = std::to_string(grassDensity);
+	if (extraDefine) {
+		farMidDensity = static_cast<uint32_t>(globals::features::proceduralGrass.settings.midGrassDensity);
+		const float densityRatio = static_cast<float>(farMidDensity) / static_cast<float>(grassDensity);
+		// Mid emits two base blades and at most one slope blade per patch. Bound shared memory for custom densities.
+		slopeExtraBlades = static_cast<uint32_t>(std::clamp(std::ceil(3.0f * densityRatio * densityRatio) - 1.0f, 2.0f, 15.0f));
+		slopeExtraBladesString = std::to_string(slopeExtraBlades);
+	}
 	hasCachedWorkList = false;
 	const uint32_t patchesPerRow = density / 2u;
 	const uint32_t patchRows = (patchesPerQuadrant + patchesPerRow - 1u) / patchesPerRow;
@@ -356,6 +363,8 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 	const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, const float frustumPadding,
 	const bool disableGeneratorCulls, const float fadeInPositionPadding, const float compactStartDistance, const float compactKeep)
 {
+	if (extraDefine && farMidDensity != static_cast<uint32_t>(globals::features::proceduralGrass.settings.midGrassDensity))
+		SetDensity(density);
 	auto* bladeGenerator = GetBladeGeneratorCS();
 	auto* batchArgsGenerator = batchArgsBuffer ? GetBatchArgsCS() : nullptr;
 	if (!bladeGenerator || (batchArgsBuffer && !batchArgsGenerator)) {
@@ -691,10 +700,9 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::BuildVisibleWorkList(const 
 										  [](const uint16_t row) { return row == 0xFFFFu; }))
 			flags |= WorkFullGrass;
 		if (extraDefine) {
-			const float extraRange = lodFadeOut.x + 4096.0f + 1448.0f;
-			const float dx = worldX + 1024.0f - lodOrigin.x;
-			const float dy = worldY + 1024.0f - lodOrigin.y;
-			if (dx * dx + dy * dy <= extraRange * extraRange)
+			// Far's extra fill fades on the same square distance as the Low handoff.
+			const float extraRange = lodFadeOut.x + 6144.0f;
+			if (std::max(std::abs(closestDx), std::abs(closestDy)) <= extraRange)
 				flags |= WorkAllowSlopeExtras;
 		}
 
@@ -1021,8 +1029,9 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::AppendFeatureDefines(Shader
 		if (featureName == "SKYLIGHTING" && !globals::features::skylighting.texProbeArray)
 			continue;
 		// Simple lighting keeps only the colour-space and shadowing features it evaluates.
+		// Far evaluates screen-space shadows only as Low's statistical stand-in, so it needs the define but not skylighting.
 		if (simpleLighting && featureName != "LINEAR_LIGHTING" && featureName != "TERRAIN_SHADOWS" && featureName != "CLOUD_SHADOWS" &&
-			(extraDefine || (featureName != "SKYLIGHTING" && featureName != "SCREEN_SPACE_SHADOWS")))
+			featureName != "SCREEN_SPACE_SHADOWS" && (extraDefine || featureName != "SKYLIGHTING"))
 			continue;
 		defines.push_back({ featureName.data(), nullptr });
 	}

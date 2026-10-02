@@ -99,7 +99,7 @@ struct QuadrantData
 
 cbuffer QuadrantData : register(b7)
 {
-	float4 lodFadeIn;  // x: fade-in start, y: inverse range, z: Far seam-fill retention, w: fade-out endpoint
+	float4 lodFadeIn;  // x: fade-in start, y: inverse range, z: sparse Far extra retention, w: fade-out endpoint
 	float4 lodFadeOut;
 	QuadrantData data[QUADRANT_DATA_SIZE];
 }
@@ -189,6 +189,17 @@ Texture2D<uint> GrassDensityTexture : register(t7);
 #endif
 
 Texture2D<float> GrassHiZ : register(t8);  // Shared current-frame scene-depth pyramid.
+#if defined(LOW_LOD)
+Texture2D<float> TerrainSurfaceHeight : register(t9);  // Surface height multiplied by its validity weight; see PGrassTerrainLiftCS.
+Texture2D<float> TerrainSurfaceWeight : register(t10);
+
+/** @brief Returns how far generated roots can be raised around a box reaching `reach` from `world2D`. */
+float GetTerrainLiftReach(float2 world2D, float reach)
+{
+	float2 offset = abs(world2D - grassLodOrigin);
+	return TerrainLiftMax * GetTerrainLiftBlend(max(offset.x, offset.y) + reach);
+}
+#endif
 
 static const uint WORK_QUADRANT_MASK = 0xFFFu;
 static const uint WORK_LANE_SHIFT = 12u;
@@ -336,10 +347,66 @@ bool IsVolumeOccluded(float3 centre, float radius, float minDistance, bool culls
 	return nearestDepth > tileMax + 2.0e-6f;
 }
 
+#if defined(FAR_LOD)
+/** @brief Reconstructs the camera-relative position of one Hi-Z texel; w is zero when the texel is sky or offscreen. */
+float4 GetHiZScenePosition(int2 texel)
+{
+	if (any(texel < 0) || any(texel >= int2(grassHiZParams.xy)))
+		return 0.0f;
+	float depth = GrassHiZ.Load(int3(texel, 0));
+	if (depth >= 1.0f)
+		return 0.0f;
+	float2 ndc = (float2(texel) + 0.5f) / grassHiZParams.xy * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
+	float4 position = mul(FrameBuffer::CameraViewProjInverse, float4(ndc, depth, 1.0f));
+	if (abs(position.w) < 1.0e-8f)
+		return 0.0f;
+	return float4(position.xyz / position.w, 1.0f);
+}
+
+/**
+ * @brief Detects a Far root covered from close by a steep or tall surface.
+ * Distant LOD rocks and ledges are missing from the top-down occlusion map, so blades rooted under them would pierce
+ * their tops. Shallow surfaces near the ground are terrain and leave the blade alone.
+ */
+bool IsRootUnderObject(float3 rootView, float2 terrainSlope)
+{
+	if (grassHiZParams.w < 1.0f || !HasForwardPerspective())
+		return false;
+
+	float4 rootClip = mul(FrameBuffer::CameraViewProj, float4(rootView, 1.0f));
+	if (rootClip.w <= 1.0f)
+		return false;
+	float2 uv = rootClip.xy / rootClip.w * float2(0.5f, -0.5f) + 0.5f;
+	if (any(uv < 0.0f) || any(uv >= 1.0f))
+		return false;
+	int2 depthTexel = int2(uv * grassHiZParams.xy);
+	if (GrassHiZ.Load(int3(depthTexel, 0)) >= rootClip.z / rootClip.w)
+		return false;
+
+	float4 scenePosition = GetHiZScenePosition(depthTexel);
+	if (scenePosition.w == 0.0f)
+		return false;
+	float2 sceneRootOffset = scenePosition.xy - rootView.xy;
+	float sceneGroundHeight = scenePosition.z - (rootView.z + dot(terrainSlope, sceneRootOffset));
+	if (sceneGroundHeight <= 16.0f || dot(sceneRootOffset, sceneRootOffset) >= 768.0f * 768.0f)
+		return false;
+	if (sceneGroundHeight > 64.0f)
+		return true;
+
+	// Rock, ledge, and trunk faces are steep; low shallow surfaces are terrain.
+	float4 sceneRight = GetHiZScenePosition(depthTexel + int2(1, 0));
+	float4 sceneDown = GetHiZScenePosition(depthTexel + int2(0, 1));
+	if (sceneRight.w == 0.0f || sceneDown.w == 0.0f)
+		return true;
+	float3 sceneNormal = cross(sceneRight.xyz - scenePosition.xyz, sceneDown.xyz - scenePosition.xyz);
+	return abs(sceneNormal.z) < 0.7f * length(sceneNormal);
+}
+#endif
+
 #if defined(LOW_LOD)
 // Rejects one finished blade whose projected root-to-tip rectangle is entirely behind Hi-Z.
 // Patch and tile spheres overlap nearby silhouettes, so this catches distant blades hidden behind nearer grass and terrain.
-bool IsBladeOccluded(float3 rootView, float3 tipView, float radius, float depthMargin, bool cullsDisabled)
+bool IsBladeOccluded(float3 rootView, float3 tipView, float radius, bool cullsDisabled)
 {
 	if (cullsDisabled || grassHiZParams.w < 1.0f || !HasForwardPerspective())
 		return false;
@@ -348,8 +415,7 @@ bool IsBladeOccluded(float3 rootView, float3 tipView, float radius, float depthM
 	const float4 clipTip = mul(FrameBuffer::CameraViewProj, float4(tipView, 1.0f));
 	const float3 clipWAxis = FrameBuffer::CameraViewProj[3].xyz;
 	const float minClipW = min(clipRoot.w, clipTip.w) - radius * length(clipWAxis);
-	const float minRenderedW = minClipW - depthMargin;
-	if (minRenderedW <= 1.0f)
+	if (minClipW <= 1.0f)
 		return false;
 
 	// Bound each endpoint's width sphere, then take the rectangle covering the whole segment.
@@ -380,7 +446,7 @@ bool IsBladeOccluded(float3 rootView, float3 tipView, float radius, float depthM
 	const int2 sampleMin = clamp(int2(floor(uvMin * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
 	const int2 sampleMax = clamp(int2(floor(uvMax * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
 
-	const float nearestDepth = FrameBuffer::CameraProj._m22 + FrameBuffer::CameraProj._m23 / minRenderedW;
+	const float nearestDepth = FrameBuffer::CameraProj._m22 + FrameBuffer::CameraProj._m23 / minClipW;
 	return nearestDepth > LoadHiZMax3x3(sampleMin, sampleMax, mip) + 2.0e-6f;
 }
 #endif
@@ -413,7 +479,11 @@ bool IsPatchOccluded(float2 worldXY, float terrainZ, float2 terrainSlope, uint q
 #	endif
 	// Expanded LAND bounds cover displaced roots and extras across changes in terrain slope.
 	const float minHeight = min(terrainZ, heightBounds.x);
+#	if defined(LOW_LOD)
+	const float maxHeight = max(terrainZ, heightBounds.y) + GetTerrainLiftReach(worldXY, radius);
+#	else
 	const float maxHeight = max(terrainZ, heightBounds.y);
+#	endif
 	const float verticalReach = (maxHeight - minHeight) * 0.5f + radius;
 	radius = length(float2(radius, verticalReach));
 	const float3 centre = float3(worldXY, (minHeight + maxHeight + bladeHeight) * 0.5f) - FrameBuffer::CameraPosAdjust.xyz;
@@ -427,6 +497,10 @@ bool IsPatchOccluded(float2 worldXY, float terrainZ, float2 terrainSlope, uint q
 // Tests a quadrant-local box of blade roots, padded by the blade geometry radius, against Hi-Z.
 bool IsRootBoxOccluded(uint quadrant, float2 localMin, float2 localMax, float2 heightBounds, float geometryRadius, float minDistanceFloor, float minDistanceScale, bool cullsDisabled)
 {
+#if defined(LOW_LOD)
+	float2 boxReach = (localMax - localMin) * 0.5f + geometryRadius;
+	heightBounds.y += GetTerrainLiftReach(data[quadrant].quadWorldPos + (localMin + localMax) * 0.5f, max(boxReach.x, boxReach.y));
+#endif
 	float3 reach = float3((localMax - localMin) * 0.5f + geometryRadius, (heightBounds.y - heightBounds.x) * 0.5f + geometryRadius);
 	float radius = length(reach);
 	float bladeHeight = max(grassAOParams.w, 64.0f);
@@ -525,6 +599,24 @@ float TerrainHeightSlopeAt(out float2 slope, float2 world2D, float2 quadWorldPos
 	slope = float2(hR - coarseHeight, hU - coarseHeight) * (1.0f / eps);
 	return coarseHeight;
 }
+
+#if defined(LOW_LOD)
+/**
+ * @brief Returns how far to raise a root onto the rendered terrain at a world position, blended between map cells.
+ * Both distant tiers use the same surface throughout their overlap. Interpolate the surface, not offsets from
+ * LAND, so a detailed hill crest cannot inherit a neighbour's lift. Approach distance controls the transition;
+ * loading a cell or standing still does not advance it.
+ */
+float GetTerrainLift(float2 world2D, float landHeight)
+{
+	float2 uv = frac(world2D * (1.0f / (TerrainLiftCellSize * TerrainLiftDim)));
+	float height = TerrainSurfaceHeight.SampleLevel(LinearSampler, uv, 0);
+	float weight = TerrainSurfaceWeight.SampleLevel(LinearSampler, uv, 0);
+	float2 offset = abs(world2D - grassLodOrigin);
+	float lift = weight > 1.0e-3f ? height / weight - landHeight : 0.0f;
+	return clamp(lift, 0.0f, TerrainLiftMax) * GetTerrainLiftBlend(max(offset.x, offset.y));
+}
+#endif
 
 Texture2D<float> OcclusionMaskHigh : register(t2);
 Texture2D<float> OcclusionMaskLow : register(t4);
@@ -671,11 +763,8 @@ bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar
 	float handoffDistance = max(lodOffset.x, lodOffset.y);
 	float inRamp = 1.0f;
 	if (nearCovered) {
-		// Bring Far in before Low's cutoff so the tiers overlap.
-		float handoffRamp = saturate((handoffDistance - lodFadeIn.x) * lodFadeIn.y + 0.25f);
-		float fallbackRamp = saturate((handoffDistance - (lodFadeIn.x - 2.0f * rcp(lodFadeIn.y))) * (lodFadeIn.y * 0.5f));
-		float fallbackKeep = lodFadeIn.z * 0.25f * fallbackRamp;
-		inRamp = max(handoffRamp, fallbackKeep);
+		// Use the complement of Low's fade-out throughout their shared band.
+		inRamp = smoothstep(0.0f, 1.0f, (handoffDistance - lodFadeIn.x) * lodFadeIn.y);
 	}
 
 	float fullKeepRadius = min(lodFadeOut.x, farParams.x);
@@ -802,6 +891,12 @@ bool PassesBladeLOD(float2 bladeWorldPos2D, bool cullsDisabled)
 #		endif
 
 #		if defined(LOW_LOD)
+	// Mid is only generated in the loaded cells. Beyond them Low has no tier to hand off to, so it stays whole
+	// rather than thinning toward a Mid that is not there.
+	if (any(bladeWorldPos2D < loadedLandBounds.xy) || any(bladeWorldPos2D > loadedLandBounds.zw)) {
+		lodFadeInStartSq = 0.0f;
+		lodFadeInEndSq = 0.0f;
+	}
 	if (lodDistanceSq <= lodFadeInStartSq)
 		return false;
 #		endif
@@ -814,9 +909,9 @@ bool PassesBladeLOD(float2 bladeWorldPos2D, bool cullsDisabled)
 		return dither <= lodFadeOut.z;
 
 	float lodDistance = sqrt(lodDistanceSq);
-	float inRamp = saturate((lodDistance - lodFadeIn.x) * lodFadeIn.y);
+	float inRamp = lodDistanceSq >= lodFadeInEndSq ? 1.0f : saturate((lodDistance - lodFadeIn.x) * lodFadeIn.y);
 #		if defined(LOW_LOD)
-	float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodFadeOutDistance - lodFadeOut.x) * lodFadeOut.y));
+	float outRamp = lerp(1.0f, lodFadeOut.z, smoothstep(0.0f, 1.0f, (lodFadeOutDistance - lodFadeOut.x) * lodFadeOut.y));
 #		else
 	float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodDistance - lodFadeOut.x) * lodFadeOut.y));
 #		endif
@@ -889,7 +984,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 	if (!insideFrustum) {
 		float widthExtent = generatorType.width * 2.5f * 1.3f * 32.0f * 2.0f;
-		float geometryExtent = generatorType.height + widthExtent;
+		float geometryExtent = generatorType.height + widthExtent + GetTerrainLiftReach(bladeWorldPos2D, 0.0f);
 		if (!cullsDisabled && IsOutsideFrustum(viewPos, geometryExtent))
 			return false;
 	}
@@ -948,6 +1043,9 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 		widthExtent *= 1.0f + miscParams.z;
 #	endif
 		float geometryExtent = generatorType.height + widthExtent;
+#	if defined(LOW_LOD)
+		geometryExtent += GetTerrainLiftReach(bladeWorldPos2D, 0.0f);
+#	endif
 		if (!cullsDisabled && IsOutsideFrustum(viewPos, geometryExtent))
 			return false;
 	}
@@ -960,6 +1058,17 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	// Preserve grass beneath overhangs when there is still vertical room for part of the blade.
 	if (!cullsDisabled && objectClearance <= occlusionParams.w)
 		return false;
+#endif
+
+#if defined(LOW_LOD)
+	if (!cullsDisabled) {
+		viewPos.z += GetTerrainLift(bladeWorldPos2D, bladeWorldZ);
+#	if defined(FAR_LOD)
+		// Test the raised root: terrain LOD that the lift accounts for must not count as an object above it.
+		if (IsRootUnderObject(viewPos, terrainSlope))
+			return false;
+#	endif
+	}
 #endif
 
 	// Height generation is deferred until after rejection because the frustum test uses type bounds.
@@ -1042,7 +1151,8 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 #if defined(HIGH_LOD)
 	float appearanceDistance = ApproximateGrassDistance(bladeWorldPos2D - grassLodOrigin);
-	outerGeometry = appearanceDistance >= 1024.0f;
+	float detailFade = 1.0f - smoothstep(512.0f, 1536.0f, appearanceDistance);
+	outerGeometry = float(hash.z) * UINT_TO_FLOAT >= detailFade;
 	float distanceWidth = lerp(0.4f, 1.0f, saturate((appearanceDistance - 1024.0f) * (1.0f / 3072.0f)));
 	storedWidth *= distanceWidth;
 	uint packedWidth = (uint)round(saturate(storedWidth) * 255.0f);
@@ -1124,21 +1234,19 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	b.facingTilt = packedDirections.x | packedDirections.y << 8 | packedDirections.z << 16 | packedDirections.w << 24;
 
 	uint packedClumpDensity = (uint)round(clumpDensity * 255.0f);
-	b.seedAndType = packedClumpDensity << 24 | (clumpRand & 0xFFFFu) << 8 | (type & 0xFFu);
+	uint packedRandBend = (uint)round(saturate(float(tiltHash.y) * UINT_TO_FLOAT) * 15.0f);
+	b.seedAndType = packedClumpDensity << 24 | packedRandBend << 20 | (clumpRand & 0xFFu) << 8 | (type & 0xFFu);
 
-	// Mirror the Far VS: packed root and directions, distance widening, coverage compensation, and edge depth margin.
+	// Mirror the Far VS: packed root and directions, distance widening, and coverage compensation.
 	float3 packedRoot = float3(f16tof32(b.posXY >> 16), f16tof32(b.posXY), f16tof32(b.posZWidthHeight >> 16));
 	float4 packedDirectionValues = float4(packedDirections) * (2.0f / 255.0f) - 1.0f;
 	float2 farTip = packedDirectionValues.zw * (generatorType.height * float(packedHeight) * (1.0f / 255.0f));
 	float3 packedTip = packedRoot + float3(packedDirectionValues.xy * farTip.x, farTip.y);
 	float2 farRootOffset = packedRoot.xy + FrameBuffer::CameraPosAdjust.xy - grassLodOrigin;
-	float farRootDistance = ApproximateGrassDistance(farRootOffset);
-	float farCoverage = min(rcp(max(GetFarPerformanceKeep(farRootDistance, FrameBuffer::CameraProj._m00), 0.5f)), 2.0f);
+	float2 farCoverage = GetFarCoverage(farRootOffset, FrameBuffer::CameraProj._m00);
 	float farWidth = generatorType.width * 2.5f * lerp(0.45f, 1.3f, float(packedWidth) * (1.0f / 255.0f)) *
-	                 lerp(2.0f, 32.0f, saturate((farRootDistance - farParams.x) * farParams.y)) * farCoverage;
-	float farEdgeDistance = max(abs(farRootOffset.x), abs(farRootOffset.y));
-	float farDepthMargin = farEdgeDistance > farParams.x - 2048.0f ? 128.0f * smoothstep(farParams.x - 2048.0f, farParams.x, farEdgeDistance) : 0.0f;
-	if (IsBladeOccluded(packedRoot, packedTip, farWidth + 1.0f, farDepthMargin, cullsDisabled))
+	                 lerp(2.0f, 32.0f, farCoverage.x) * farCoverage.y;
+	if (IsBladeOccluded(packedRoot, packedTip, farWidth + 1.0f, cullsDisabled))
 		return false;
 #else
 	uint packedRandBend = (uint)round(saturate(float(tiltHash.y) * UINT_TO_FLOAT) * 15.0f);
@@ -1183,20 +1291,13 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float2 packedFacingValue = float2(packedFacing) * (1.0f / 127.0f);
 	float packedWidthValue = f16tof32(f32tof16(lowRandWidth));
 	float2 lowBaseAxis = float2(-packedFacingValue.y, packedFacingValue.x) * packedWidthValue;
-	float2 terrainEdgeOffset = float2(f16tof32(b.posXY >> 16), f16tof32(b.posXY)) + FrameBuffer::CameraPosAdjust.xy - grassLodOrigin;
-	float terrainEdgeDistance = max(abs(terrainEdgeOffset.x), abs(terrainEdgeOffset.y));
-	float terrainLODDepthMargin = 0.0f;
-	[branch] if (terrainEdgeDistance > farParams.x - 2048.0f)
-		terrainLODDepthMargin = 128.0f * smoothstep(farParams.x - 2048.0f, farParams.x, terrainEdgeDistance);
-	uint packedTerrainMargin = (uint)round(terrainLODDepthMargin * (2047.0f / 128.0f));
-	// Low reuses these packed geometry inputs in both depth and colour draws.
-	b.posZWidthHeight = f32tof16(viewPos.z) << 16 | packedTerrainMargin << 5 | packedRandBend << 1 | storedHeight;
+	b.posZWidthHeight = f32tof16(viewPos.z) << 16 | packedRandBend << 1 | storedHeight;
+	float3 packedRoot = float3(f16tof32(b.posXY >> 16), f16tof32(b.posXY), f16tof32(b.posZWidthHeight >> 16));
 
 	// Test the geometry the VS will draw: packed root, tip along the facing, and view-thickened width.
-	float3 packedRoot = float3(f16tof32(b.posXY >> 16), f16tof32(b.posXY), f16tof32(b.posZWidthHeight >> 16));
 	float3 packedTip = packedRoot + float3(packedFacingValue * lowTip.x, lowTip.y);
 	float bladeRadius = packedWidthValue * (1.0f + miscParams.z) + 1.0f;
-	if (IsBladeOccluded(packedRoot, packedTip, bladeRadius, terrainLODDepthMargin, cullsDisabled))
+	if (IsBladeOccluded(packedRoot, packedTip, bladeRadius, cullsDisabled))
 		return false;
 #	endif
 
@@ -1227,7 +1328,8 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 	uint2 packedTilt = (uint2)round(saturate(float2(tiltSin, tiltCos) * 0.5f + 0.5f) * 255.0f);
 	uint packedWorldShadow = (uint)round(saturate(worldShadow) * 255.0f);
-	b.tipDir = packedTilt.x | packedTilt.y << 8 | packedWorldShadow << 16;
+	uint packedDetailFade = (uint)round(detailFade * 255.0f);
+	b.tipDir = packedTilt.x | packedTilt.y << 8 | packedWorldShadow << 16 | packedDetailFade << 24;
 #	elif defined(MID_LOD)
 	uint2 packedTilt = (uint2)round(saturate(float2(tiltSin, tiltCos) * 0.5f + 0.5f) * 255.0f);
 	float appearanceDistance = ApproximateGrassDistance(bladeWorldPos2D - grassLodOrigin);
@@ -1294,6 +1396,15 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 }
 
 #if defined(LOW_LOD) && !defined(FAR_LOD) && SLOPE_EXTRA_BLADES > 0
+/** @brief Matches Mid's two base blades and slope fill without applying a second density fade. */
+float GetLowExtraKeep(float terrainNormalZ)
+{
+	float slopeKeep = saturate(rcp(max(terrainNormalZ, 0.05f)) - 1.0f);
+	float densityRatio = BLADE_TO_WORLD / max(midCandidateSpacing, 1.0f);
+	densityRatio *= densityRatio;
+	return saturate((densityRatio * (2.0f + slopeKeep) - 1.0f) / SLOPE_EXTRA_BLADES);
+}
+
 void AppendLowBlade(Blade blade, bool outerGeometry)
 {
 	uint slot;
@@ -1323,17 +1434,37 @@ void GenerateLowExtra(uint3 dispatch, uint extraTask)
 	uint3 candidateHash = ExtraCandidateHash(patchPos, extraIndex, quadrantData.quadrantHash);
 	float2 candidateQuadPos = ExtraCandidateQuadPos(patchPos, candidateHash);
 	float2 candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
+	float terrainNormalZ = rsqrt(dot(setup.terrainSlope, setup.terrainSlope) + 1.0f);
+	if (!cullsDisabled && float(candidateHash.z) * UINT_TO_FLOAT > GetLowExtraKeep(terrainNormalZ))
+		return;
 	float2 candidateMapSamplePos = GrassMapSamplePos(candidateQuadPos, candidateHash);
 	uint packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
 	if (!cullsDisabled && packedGrassCell == 0u)
 		return;
 	float candidateWorldZ = setup.baseWorldZ + dot(setup.terrainSlope, candidateWorldPos - setup.baseWorldPos2D);
-	float terrainNormalZ = rsqrt(dot(setup.terrainSlope, setup.terrainSlope) + 1.0f);
 	Blade blade;
 	bool outerGeometry;
 	if (BuildBlade(candidateHash, candidateMapSamplePos, candidateWorldPos, candidateWorldZ,
 			setup.terrainSlope, terrainNormalZ, quadrantData.quadWorldPos, quadrant, hasLand, packedGrassCell, cullsDisabled, insideFrustum, false, blade, outerGeometry))
 		AppendLowBlade(blade, outerGeometry);
+}
+#endif
+
+#if defined(FAR_LOD) && SLOPE_EXTRA_BLADES > 0
+/** @brief Retains matching candidate counts until Low is gone, then gradually returns to sparse Far fill. */
+float GetFarExtraCount(float2 world2D, float terrainNormalZ)
+{
+	float slopeKeep = saturate(rcp(max(terrainNormalZ, 0.05f)) - 1.0f);
+	float densityRatio = BLADE_TO_WORLD / max(midCandidateSpacing, 1.0f);
+	densityRatio *= densityRatio;
+	float seamExtras = clamp(densityRatio * (2.0f + slopeKeep) - 1.0f, 0.0f, SLOPE_EXTRA_BLADES);
+	float distantExtras = 2.0f * max(saturate(lodFadeIn.z + 2.0f * slopeKeep), farParams.w);
+	float2 offset = abs(world2D - grassLodOrigin);
+	float squareDistance = max(offset.x, offset.y);
+	float handoffEnd = lodFadeOut.x;
+	float distantBlend = smoothstep(handoffEnd, handoffEnd + 4096.0f, squareDistance);
+	float extraFade = 1.0f - smoothstep(handoffEnd + 4096.0f, handoffEnd + 6144.0f, squareDistance);
+	return lerp(seamExtras, distantExtras, distantBlend) * extraFade;
 }
 #endif
 
@@ -1533,13 +1664,18 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 
 #	if SLOPE_EXTRA_BLADES > 0
 	// Reject slope extras before grass typing, clumping, LOD, occlusion, wind, and packing.
+#		if defined(FAR_LOD)
+	float farExtraCount = allowSlopeExtras ? GetFarExtraCount(baseWorldPos2D, terrainNormalZ) : 0.0f;
+#		else
 	float baseSlopeKeep = saturate(1.0f / max(terrainNormalZ, 0.05f) - 1.0f);
-#		if defined(LOW_LOD)
-	// Fill distant hills more strongly without reserving more candidate slots.
-	baseSlopeKeep = saturate(baseSlopeKeep * 2.0f);
 #		endif
 	// Keep one emit path and let FXC choose the legal loop form for each permutation.
-	for (uint candidateIndex = 0; candidateIndex < 1 + SLOPE_EXTRA_BLADES; ++candidateIndex) {
+	uint candidateCount = 1u + SLOPE_EXTRA_BLADES;
+#		if defined(FAR_LOD)
+	if (!cullsDisabled)
+		candidateCount = 1u + uint(ceil(farExtraCount));
+#		endif
+	for (uint candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
 		bool isBase = candidateIndex == 0;
 		uint3 candidateHash = baseHash;
 		float2 candidateWorldPos = baseWorldPos2D;
@@ -1561,15 +1697,14 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 			candidateValid = PassesEarlyFarLOD(candidateWorldPos, nearCovered, compactFar, cullsDisabled);
 			if (!candidateValid)
 				continue;
-			packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
-			if (!cullsDisabled && packedGrassCell == 0u)
-				continue;
 
-			float slopeKeep = baseSlopeKeep;
-			float extraKeep = max(saturate(lodFadeIn.z + slopeKeep), farParams.w);
+			float extraKeep = saturate(farExtraCount - float(emitExtraIndex));
 			float keepRand = float(Random::pcg3d(uint3(asuint(candidateWorldPos), SLOPE_EXTRA_SEED_BASE + emitExtraIndex)).x) * UINT_TO_FLOAT;
 
 			if (!cullsDisabled && keepRand > extraKeep)
+				continue;
+			packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
+			if (!cullsDisabled && packedGrassCell == 0u)
 				continue;
 #		else
 			if ((emitExtraIndex % PATCH_BLADE_COUNT) != bladeIndex)

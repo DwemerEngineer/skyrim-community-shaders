@@ -146,6 +146,9 @@ namespace PGrassCommon
 	static constexpr int32_t LowTierStreamGuardQuadrants = 1;
 	static constexpr int32_t FarStreamGuardCells = 1;
 	static constexpr float FarUnloadFadeWidth = 2048.0f;
+	// Terrain lift map; mirrors PGrassCommon.hlsli. The window spans the Far radius cap on every side of the camera.
+	static constexpr int32_t TerrainLiftDim = 512;
+	static constexpr float TerrainLiftCellSize = 256.0f;
 
 	// Quadrants in an md<=r square (r in each of x and y), one per tier's renderer buffer.
 	constexpr uint32_t QuadrantSquare(int32_t r) { return static_cast<uint32_t>((2 * r + 1) * (2 * r + 1)); }
@@ -231,13 +234,18 @@ namespace PGrassCommon
 		float2 grassLodOrigin;       // camera XY with a small dead zone, preventing stationary camera sway from moving LOD bands
 		float windRotationScale;
 		uint32_t occlusionMapDim;
-		float4 frustumPlaneExtent;  // L1 extent of left, right, bottom, and top clip planes.
-		float4 grassHiZBounds;      // x: Far radius, y: near-tier clump reach, z: wind reach, w: High depth base cutoff; negative disables.
+		float4 frustumPlaneExtent;     // L1 extent of left, right, bottom, and top clip planes.
+		float4 grassHiZBounds;         // x: Far radius, y: near-tier clump reach, z: wind reach, w: High depth base cutoff; negative disables.
+		float4 loadedLandBounds;       // xy: world min, zw: world max of the cells with attached LAND; terrain LOD is rendered outside.
+		int32_t terrainLiftOrigin[4];  // xy: world cell at the terrain lift map's window origin, zw: last frame's origin
+		uint32_t terrainLiftPhase;     // The quarter of the terrain lift map refreshed this frame
+		float midCandidateSpacing;     // World spacing of Mid's candidate lattice, before its two base blades and slope fill.
+		uint32_t _padTerrainLift[2];
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassGlobals);
 	static_assert(offsetof(GrassGlobals, grassPBRLightingScale) == 60);
 	static_assert(offsetof(GrassGlobals, grassFrameLight) == 112);
-	static_assert(sizeof(GrassGlobals) == 288);
+	static_assert(sizeof(GrassGlobals) == 336);
 
 	struct alignas(16) GrassType
 	{

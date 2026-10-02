@@ -89,7 +89,7 @@ public:
 		float grassTerrainBlendHeight = 2.0f;
 		float grassTerrainBlendNormal = 0.8f;
 		float grassTerrainBlendRough = 0.7f;
-		float grassAOStrength = 0.6f;  // Terrain darkening. 0 disables it.
+		float grassAOStrength = 0.8f;  // Terrain darkening. 0 disables it.
 		float grassAODensity = 12.0f;  // Blades per full-coverage density texel
 
 		// Clump
@@ -227,6 +227,15 @@ private:
 	Texture2D* grassMaterialDetailTexture = nullptr;
 	Texture2D* distantAmbientLUT = nullptr;
 	mutable ID3D11ComputeShader* distantAmbientLUTCS = nullptr;
+	// Rendered terrain LOD height on a wrapping world-aligned grid: the measurements, then the height and validity
+	// weight the generator samples to raise Low and Far roots onto it.
+	Texture2D* terrainLiftMeasuredTexture = nullptr;
+	Texture2D* terrainLiftTexture = nullptr;
+	Texture2D* terrainLiftWeightTexture = nullptr;
+	ID3D11ComputeShader* terrainLiftCS = nullptr;
+	int32_t terrainLiftOriginCell[2] = { 0, 0 };
+	bool terrainLiftOriginValid = false;
+	uint32_t terrainLiftHeightMapGeneration = 0;
 	mutable uint32_t distantAmbientLUTFrame = UINT32_MAX;
 	ID3D11VertexShader* densityAOVS = nullptr;
 	ID3D11PixelShader* densityAOPS = nullptr;
@@ -430,6 +439,8 @@ private:
 
 	void DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const;
 	void UpdateDistantAmbientLUT(ID3D11DeviceContext* ctx) const;
+	/** @brief Refreshes a quarter of the terrain lift map from the copied scene depth. */
+	void UpdateTerrainLift(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const;
 	void RenderGrass(ID3D11DeviceContext* ctx) const;
 
 public:

@@ -9,6 +9,7 @@
 Texture2D<float> DepthTexture : register(t0);
 Texture2D<uint> GrassDensityTexture : register(t1);
 Texture2D<float> TerrainHeightTexture : register(t2);
+Texture2D<float> RenderedDepthTexture : register(t3);
 SamplerState LinearSampler : register(s0);
 
 float SampleDensity(float2 densityUV)
@@ -47,7 +48,8 @@ float StableFarDensity(float2 worldPosition)
 
 float4 main(float4 position : SV_POSITION) : SV_Target0
 {
-	float depth = DepthTexture.Load(int3(position.xy, 0));
+	// Low writes depth after the blended copy was made. Shade its drawn height, not the terrain behind it.
+	float depth = min(DepthTexture.Load(int3(position.xy, 0)), RenderedDepthTexture.Load(int3(position.xy, 0)));
 
 	if (depth >= 1.0f)
 		return 1.0f;

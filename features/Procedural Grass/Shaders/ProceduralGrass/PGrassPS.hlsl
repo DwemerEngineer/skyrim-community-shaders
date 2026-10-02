@@ -64,7 +64,8 @@ struct PS_INPUT
 #if defined(FAR_LOD)
 	float4 CameraPositionSide: TEXCOORD0;                // xyz: camera-relative position; w: across-blade coordinate
 	float4 BladeTColor: TEXCOORD1;                       // x: actual blade parameter; yzw: stabilized base-to-tip colour
-	nointerpolation uint4 PackedBladeParams: TEXCOORD2;  // facing/tilt, seed/type, root Z/width/height, two f16 Far ramps
+	nointerpolation uint4 PackedBladeParams: TEXCOORD2;  // facing/tilt, seed/type, root Z/width/height, f16 Far ramp/base half-width
+	nointerpolation float2 RootPixel: TEXCOORD3;         // Pixel where the blade root meets the ground
 #else
 	float4 CameraRelativePosition: TEXCOORD0;  // xyz: camera-relative position; w: across-blade coordinate
 #	if defined(HIGH_LOD)
@@ -73,14 +74,14 @@ struct PS_INPUT
 	float BladeT: TEXCOORD1;
 #	endif
 #	if defined(HIGH_LOD)
-	nointerpolation float4 WindLodDensity: TEXCOORD2;  // xy: tip wind offset; w: canopy density and shadow
+	nointerpolation float4 WindLodDensity: TEXCOORD2;  // xy: tip wind offset; z: detail fade; w: canopy density and shadow
 #	elif defined(MID_LOD)
 	nointerpolation float4 WindRootPosition: TEXCOORD2;  // xy: tip wind offset; zw: root camera-relative XY
 #	elif defined(LOW_LOD)
-	nointerpolation float4 RootPosition: TEXCOORD2;  // xy: camera-relative blade root XY; zw: root pixel for screen-space shadows
+	nointerpolation float4 RootPosition: TEXCOORD2;  // xy: camera-relative blade root XY; zw: root pixel for the shadow mask
 #	endif
 #	if defined(MID_LOD)
-	float2 BladeTDepth: TEXCOORD3;                 // x: Bezier t; y: positive view depth
+	float3 BladeTDepth: TEXCOORD3;                 // x: Bezier t; y: positive view depth; z: root camera-relative height
 	nointerpolation uint MaterialData: TEXCOORD7;  // clump seed/density and double-blade flag
 #	elif !defined(LOW_LOD)
 	float4 AOThicknessRoughness: TEXCOORD3;  // xyz: AO, thickness, roughness; w: root-relative height, or Bezier t for Mid
@@ -118,7 +119,11 @@ struct PS_OUTPUT
 };
 
 Texture2D<float4> DistantAmbientLUT : register(t73);
+#if defined(LOW_LOD)
+Texture2D<float> GrassSceneDepth : register(t74);
+#endif
 #if defined(FAR_LOD)
+Texture2D<float> GrassScreenAO : register(t76);
 #elif defined(HIGH_LOD)
 Texture2DArray<float4> GrassMaterialDetailTexture : register(t75);
 #endif
@@ -146,6 +151,62 @@ float GrassValueNoise(float2 p)
 	float d = GrassNoiseHash(fl + float2(1.0, 1.0));
 	return lerp(lerp(a, b, fr.x), lerp(c, d, fr.x), fr.y);
 }
+
+#if defined(LOW_LOD)
+/**
+ * @brief Finds the root pixel and how much nearer geometry obscures it.
+ * They shade before writing depth, so their own pixels describe whatever lies behind the blade. The root pixel shows
+ * the ground the blade stands on unless nearer terrain or grass covers it, and that surface's shadows do not apply.
+ * @param coverWeight How surely something stands in front of the root, which within grass range is nearer grass.
+ * @param distantForegroundWeight How far a nearer surface is from sharing the root's shadows at all.
+ */
+float2 GetDistantShadowPixel(float2 rootPixel, float3 rootPosition, out float coverWeight, out float distantForegroundWeight)
+{
+	rootPixel = clamp(rootPixel, 0.0f, rcp(dynamicResolutionInverted) - 1.0f);
+	float rootViewDepth = dot(FrameBuffer::CameraViewProj[3], float4(rootPosition, 1.0f));
+	float sceneViewDepth = SharedData::GetScreenDepth(GrassSceneDepth.Load(int3(rootPixel, 0)));
+	// Rendered terrain can sit somewhat above LAND, so only clearly nearer surfaces hide the root.
+	float foregroundMargin = max(64.0f, rootViewDepth * 0.03f);
+	// Terrain is drawn from triangles and roots from the heightmap, so bare ground misses the root's depth slightly.
+	float coverMargin = max(24.0f, rootViewDepth * 0.004f);
+	coverWeight = smoothstep(coverMargin, coverMargin * 2.0f, rootViewDepth - sceneViewDepth);
+	distantForegroundWeight = smoothstep(foregroundMargin * 4.0f, foregroundMargin * 8.0f, rootViewDepth - sceneViewDepth);
+	return rootPixel;
+}
+#endif
+
+#if defined(FAR_LOD)
+/** @brief Returns the camera-relative position of the scene surface at a pixel. */
+float3 GetScenePosition(int2 pixel)
+{
+	float2 ndc = (float2(pixel) + 0.5f) * dynamicResolutionInverted * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
+	float4 position = mul(FrameBuffer::CameraViewProjInverse, float4(ndc, GrassSceneDepth.Load(int3(pixel, 0)), 1.0f));
+	return position.xyz / position.w;
+}
+
+/**
+ * @brief Returns how much of the sun reaches the ground at a root, from the slope of the scene depth around it.
+ * The shadow mask ends at the shadow distance, and blade lighting does not depend on which way the ground faces, so
+ * without this distant grass on slopes turned away from a low sun stays fully lit while the terrain under it darkens.
+ */
+float GetGroundSunFacing(float2 rootPixel, float3 lightDirection)
+{
+	static const int SlopeStep = 4;
+	int2 pixel = int2(rootPixel);
+	float3 centre = GetScenePosition(pixel);
+	float3 across = GetScenePosition(pixel + int2(SlopeStep, 0)) - centre;
+	float3 beyond = GetScenePosition(pixel - int2(0, SlopeStep)) - centre;
+	// A neighbour on another surface says nothing about this slope; leave such roots lit.
+	float reach = length(centre) * 0.1f;
+	if (dot(across, across) > reach * reach || dot(beyond, beyond) > reach * reach)
+		return 1.0f;
+	float3 groundNormal = cross(across, beyond);
+	groundNormal *= groundNormal.z < 0.0f ? -1.0f : 1.0f;
+	float facing = dot(groundNormal, lightDirection) * rsqrt(max(dot(groundNormal, groundNormal), 1.0e-8f));
+	// Blades stand above the ground, so they keep catching the sun until the slope turns clearly away from it.
+	return smoothstep(-0.1f, 0.1f, facing);
+}
+#endif
 
 #if defined(SKYLIGHTING) && defined(LOW_LOD)
 sh2 SampleLowSkylighting(float3 positionMS, float3 positionOffset, uint3 arrayOrigin)
@@ -285,8 +346,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	uint packedPositionWidthHeight = input.PackedBladeParams.z;
 	uint grassTypeIndex = packedSeedAndType & 0xFFu;
 	float clumpDensity = float(packedSeedAndType >> 24) * (1.0f / 255.0f);
-	float farWidthT = f16tof32(input.PackedBladeParams.w);
-	float tipMatch = f16tof32(input.PackedBladeParams.w >> 16);
+	float farWidthT = f16tof32(input.PackedBladeParams.w & 0xFFFFu);
+	// Far's base occlusion sits a little under Low's and holds with distance: easing it off as the triangles widen
+	// left distant grass visibly brighter than the near tiers, most of all under a low sun.
+	static const float farCanopyOcclusionScale = 0.8f;
 #else
 	uint grassTypeIndex = (uint)input.BladeParams.z;
 #endif
@@ -298,7 +361,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	packedDirections = packedDirections * (2.0f / 255.0f) - 1.0f;
 
 	float2 facing = packedDirections.xy;
-	float2 derivative = packedDirections.zw;  // Tangent normalization absorbs the omitted height scale.
+	float2 tiltDir = packedDirections.zw;
 	float3 cameraRelativePosition = input.CameraPositionSide.xyz;
 	float3 previousCameraRelativePosition = cameraRelativePosition + (FrameBuffer::CameraPosAdjust.xyz - FrameBuffer::CameraPreviousPosAdjust.xyz);
 	float viewDepth = mul(FrameBuffer::CameraView, float4(cameraRelativePosition, 1.0f)).z;
@@ -309,15 +372,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float appearanceT = 0.25f * (along + 1.0f);
 
 	float randHeight = bladeType.height * float(packedPositionWidthHeight & 0xFFu) * (1.0f / 255.0f);
-	float bladeHeight = lerp(appearanceT, along, tipMatch) * derivative.y * randHeight;
+	float2 tip = tiltDir * randHeight;
+	float randBend = bladeType.stiffness * (0.25f + float((packedSeedAndType >> 20) & 0xFu) * (1.6f / 15.0f));
+	float2 midPoint = tip * bladeType.mid + float2(-tip.y, tip.x) * randBend;
+	// Shade the simplified geometry with the same authored curve as Low.
+	float2 derivative = 2.0f * (1.0f - along) * midPoint + 2.0f * along * (tip - midPoint);
+	float bladeHeight = 2.0f * (1.0f - along) * along * midPoint.y + along * along * tip.y;
 	float3 sideAndBladeT = float3(across, along, bladeHeight);
 
 	// Match Low's authored roughness curve at the shared stabilized blade sample.
 	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity);
-
-	uint bladeSeed = (packedSeedAndType >> 8) & 0xFFFFu;
-	float bladeRand = (float(bladeSeed & 0xFFu) + 0.5f) * (1.0f / 256.0f);
-	float bladeRand2 = (float(bladeSeed >> 8) + 0.5f) * (1.0f / 256.0f);
 #else
 	float3 cameraRelativePosition = input.CameraRelativePosition.xyz;
 #	if defined(MID_LOD) || defined(LOW_LOD)
@@ -402,18 +466,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #if defined(HIGH_LOD)
 	static const float detailedSpecularWeight = 1.0f;
 #	if defined(HIGH_INNER)
-	static const float detailFade = 1.0f;
+	float detailFade = input.WindLodDensity.z;
 #	else
 	static const float detailFade = 0.0f;
 #	endif
 #elif defined(MID_LOD)
 	static const float SPECULAR_FADE_START = 4096.0f;
 	static const float SPECULAR_FADE_END = 6144.0f;
-	static const float DETAIL_FADE_START = 1024.0f;
-	static const float DETAIL_FADE_END = 3072.0f;
 	float rootDistance = float(bladeRandBits >> 16) * (6144.0f / 65535.0f);
 	float detailedSpecularWeight = 1.0f - smoothstep(SPECULAR_FADE_START, SPECULAR_FADE_END, rootDistance);
-	float detailFade = saturate((DETAIL_FADE_END - rootDistance) * (1.0f / (DETAIL_FADE_END - DETAIL_FADE_START)));
+	// Fade surface detail over the same range as High's generator, so Mid adds none beyond High's outer blades.
+	float detailFade = 1.0f - smoothstep(512.0f, 1536.0f, rootDistance);
 #else
 	static const float detailedSpecularWeight = 0.0f;
 #endif
@@ -431,10 +494,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 worldSpaceViewDirection = -normalize(cameraRelativePosition);
 
 	float4 baseColor = float4(baseToTipColor, 1.0f);
-#if defined(FAR_LOD)
-	// Restore Low's sunlit tip contrast at the handoff, then shed it across early Far.
-	baseColor.rgb *= 1.0f + 0.15f * tipMatch * smoothstep(0.55f, 0.95f, along);
-#endif
 	float4 rawRMAOS = float4(aoThicknessRoughness.z, 0.0f, aoThicknessRoughness.x, bladeType.specular);
 
 	// Reconstruct the blade basis and curve its normal toward the visible edge.
@@ -611,15 +670,52 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float4 shadowColor = 1.0;
 
-#if defined(LOW_LOD) && !defined(FAR_LOD)
-	// Low writes depth only in this pass, so screen-space shadow inputs at its own pixels describe what lies behind
-	// the blade. Sample them at the root, where the blade meets ground that was in the prepass depth.
-	float2 shadowPixel = clamp(input.RootPosition.zw, 0.0f, rcp(dynamicResolutionInverted) - 1.0f);
+#if defined(FAR_LOD)
+	// Remove both the straight tip offset and the base-side offset to recover the actual root for shadows.
+	float baseHalfWidth = f16tof32(input.PackedBladeParams.w >> 16);
+	float2 baseSideOffset = float2(-facing.y, facing.x) * (baseHalfWidth * (1.0f - along) * (across * 2.0f - 1.0f));
+	float3 rootPosition = cameraRelativePosition - float3(facing * (along * tip.x) + baseSideOffset, along * tip.y);
+	float rootCoverWeight;
+	float rootDistantForegroundWeight;
+	float2 shadowPixel = GetDistantShadowPixel(input.RootPixel, rootPosition, rootCoverWeight, rootDistantForegroundWeight);
+#elif defined(LOW_LOD)
+	// Low's straight blade rises t * tip, so its root lies directly below this pixel's position.
+	float3 rootPosition = float3(input.RootPosition.xy, cameraRelativePosition.z - along * lowTip.y);
+	float rootCoverWeight;
+	float rootDistantForegroundWeight;
+	float2 shadowPixel = GetDistantShadowPixel(input.RootPosition.zw, rootPosition, rootCoverWeight, rootDistantForegroundWeight);
 #else
 	float2 shadowPixel = input.Position.xy;
 #endif
 	float2 shadowUV = FrameBuffer::GetDynamicResolutionAdjustedScreenPosition(shadowPixel * dynamicResolutionInverted);
 	shadowColor = TexShadowMaskSampler.Sample(SampShadowMaskSampler, shadowUV);
+#if defined(LOW_LOD)
+	// Nearer grass covering the root stands in the same shadows, so its mask value still applies. This pixel's own
+	// mask value does not: it belongs to whatever lies behind the blade, which at a grazing distance is far beyond it.
+	// A surface much nearer than the root says nothing about it, so the blade is left lit.
+	shadowColor = lerp(shadowColor, 1.0f, rootDistantForegroundWeight);
+	// The mask keeps applying beyond the loaded cells: object LOD casts there what the objects themselves cast once
+	// their cells load.
+#endif
+#if defined(FAR_LOD)
+	// Within the shadow distance the mask already holds the terrain's own shadow; the slope term takes over as Far
+	// leaves the range Low covers.
+	float groundSunFade = smoothstep(0.0f, 0.1f, farWidthT) * (1.0f - rootCoverWeight);
+	[branch] if (groundSunFade > 0.0f)
+		shadowColor.x *= lerp(1.0f, GetGroundSunFacing(shadowPixel, SharedData::DirLightDirection.xyz), groundSunFade);
+#endif
+
+#if defined(LOW_LOD)
+	// Match the darker lower blades on Mid while preserving the lit tips.
+	static const float LowContactOcclusionBase = 0.62f;
+	// Mid's tips sit in each other's screen-space shadows, so Low's tips stay short of fully open.
+	static const float LowContactOcclusionTip = 0.9f;
+	float lowContactOcclusion = lerp(LowContactOcclusionBase, LowContactOcclusionTip, smoothstep(0.0f, 0.9f, along));
+#	if defined(FAR_LOD)
+	lowContactOcclusion = lerp(1.0f, lowContactOcclusion, farCanopyOcclusionScale);
+#	endif
+	rawRMAOS.z *= lowContactOcclusion;
+#endif
 
 	MaterialProperties material = (MaterialProperties)0;
 	material.Noise = screenNoise;
@@ -766,21 +862,83 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float dirDiffuseNdotL = saturate(abs(dot(worldSpaceNormal, dirLightDirection)));
 
 	float dirDetailShadow = 1.0;
-#if defined(SCREEN_SPACE_SHADOWS) && !defined(FAR_LOD)
+#if defined(SCREEN_SPACE_SHADOWS) && !defined(LOW_LOD)
 	dirDetailShadow = ScreenSpaceShadows::GetScreenSpaceShadow(float3(shadowPixel, input.Position.z), screenUV, screenNoise);
+#elif defined(SCREEN_SPACE_SHADOWS)
+	// Low and Far are absent from the depth that screen-space shadows trace, so they take what terrain and objects
+	// cast onto the ground at the root, the same shadows Mid shows there. Object LOD casts much the same shadows as the
+	// objects it stands for, so these carry on past the loaded cells and fade where the trace's depth-space thickness
+	// turns distant silhouettes into long false shadows.
+	// Blades shadowing each other is reproduced statistically: some blades stay lit, some are fully shadowed, and the
+	// rest are shadowed up to a random height, so lower blade sections are shadowed more often. The lit share follows
+	// the sun's elevation, as neighbouring blades block more of a low sun.
+	// Bare ground at the root shows exactly what is cast onto it. Where nearer grass covers the root, the texture holds
+	// that grass's blades shadowing each other, which the pattern below already stands for. Reading it would make Low
+	// darker wherever Mid is present than where it is not, such as before a cell loads, so covered roots stay unshadowed
+	// here and the covering Mid blades carry the shadow.
+	float rootDetailShadow = lerp(ScreenSpaceShadows::ScreenSpaceShadowsTexture.Load(int3(shadowPixel + 0.5f, 0)).x, 1.0f, rootCoverWeight);
+	float detailShadowFade = saturate(3.0f - length(rootPosition.xy) * (2.0f / farParams.x));
+	// Terrain LOD blocks are four cells wide and meet at small steps, which the trace turns into dark streaks along
+	// the seam that vanish when the cells load. Beyond the loaded cells, skip the strip a seam's streak covers.
+	static const float TerrainLodBlockSize = 16384.0f;
+	float2 rootWorldXY = rootPosition.xy + FrameBuffer::CameraPosAdjust.xy;
+	[flatten] if (any(rootWorldXY < loadedLandBounds.xy) || any(rootWorldXY > loadedLandBounds.zw))
+	{
+		float2 seamDistance = abs(frac(rootWorldXY * (1.0f / TerrainLodBlockSize) + 0.5f) - 0.5f) * TerrainLodBlockSize;
+		detailShadowFade *= smoothstep(384.0f, 512.0f, min(seamDistance.x, seamDistance.y));
+	}
+	else
+	{
+		// Mid blades also shadow the ground between them, so inside Mid's range even an uncovered root reads blade
+		// shadows that the pattern below stands for. Mid thins out across its handoff to Low, which spans the last
+		// MidHandoffBand units before MidHandoffEnd; take the trace only over the outer half of that band.
+		static const float MidHandoffEnd = 8192.0f;
+		static const float MidHandoffBand = 2048.0f;
+		float midThinning = saturate((length(rootWorldXY - grassLodOrigin) - (MidHandoffEnd - MidHandoffBand)) * (1.0f / MidHandoffBand));
+		detailShadowFade *= smoothstep(0.5f, 1.0f, midThinning);
+	}
+	dirDetailShadow = lerp(1.0f, rootDetailShadow, detailShadowFade * (1.0f - rootDistantForegroundWeight));
+	static const float BladeSunBlocking = 0.2f;
+	float sunHeight = max(abs(dirLightDirection.z), 0.05f);
+	// Shadowed blade sections face away from the sun, so they are hidden with the sun behind the camera and in full
+	// view when facing it. Mid's screen-space shadows show the same swing, so the pattern follows the view direction.
+	float sunFacingView = 1.0f - smoothstep(0.0f, 0.9f, dot(worldSpaceViewDirection, dirLightDirection));
+	// Blades block more of a lower sun, up to the reach of the screen-space trace this stands in for.
+	static const float BladeSunBlockingLimit = 3.0f;
+	float bladeSunVisibility = exp(-BladeSunBlocking * sunFacingView * min(sqrt(saturate(1.0f - sunHeight * sunHeight)) / sunHeight, BladeSunBlockingLimit));
+	float lowShadowLit = bladeSunVisibility * bladeSunVisibility;
+	float lowShadowFull = 0.85f * pow(1.0f - bladeSunVisibility, 1.5f);
+	float lowShadowPartial = max(1.0f - lowShadowLit - lowShadowFull, 1.0e-3f);
+	static const float LowShadowMaxLine = 0.8f;
+	// The clump seed and per-blade bend are stable across frames, unlike the f16 camera-relative root.
+#	if defined(FAR_LOD)
+	uint lowShadowSeed = (packedSeedAndType >> 8) & 0xFFu | ((packedSeedAndType >> 20) & 0xFu) << 8;
+#	else
+	uint lowShadowSeed = (lowBladeData >> 8) & 0xFFFu;
+#	endif
+	float lowShadowRandom = GrassNoiseHash(float2(lowShadowSeed, 0.0f));
+	float lowShadowLine = (lowShadowRandom - lowShadowLit) * (LowShadowMaxLine / lowShadowPartial);
+	lowShadowLine = lowShadowRandom >= 1.0f - lowShadowFull ? 2.0f : lowShadowLine;
+	float bladeShadow = smoothstep(lowShadowLine - 0.05f, lowShadowLine + 0.05f, along);
+#	if defined(FAR_LOD)
+	// Widened Far triangles stand in for several blades, so ease toward the pattern's expected visibility.
+	float expectedLowShadow = lowShadowLit + lowShadowPartial * saturate(along * (1.0f / LowShadowMaxLine));
+	bladeShadow = lerp(bladeShadow, expectedLowShadow, smoothstep(0.0f, 1.0f, farWidthT));
+#	endif
+	dirDetailShadow *= bladeShadow;
+#endif
+#if defined(LOW_LOD)
+	dirDetailShadow *= lowContactOcclusion;
 #endif
 
 #if defined(HIGH_LOD)
 	float dirShadow = cachedWorldShadow;
-#elif defined(MID_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
-#	if defined(MID_LOD)
-	float3 shadowPosition = float3(input.WindRootPosition.zw, cameraRelativePosition.z - sideAndBladeT.z);
-#	else
-	float3 shadowPosition = float3(input.RootPosition.xy, cameraRelativePosition.z - sideAndBladeT.z);
-#	endif
+#elif defined(MID_LOD)
+	// The authored lighting curve does not describe the drawn height after Mid morphs to Low's straight profile.
+	float3 shadowPosition = float3(input.WindRootPosition.zw, input.BladeTDepth.z);
 	float dirShadow = ShadowSampling::GetWorldShadow(shadowPosition, FrameBuffer::CameraPosAdjust.xyz);
 #else
-	float dirShadow = ShadowSampling::GetWorldShadow(cameraRelativePosition, FrameBuffer::CameraPosAdjust.xyz);
+	float dirShadow = ShadowSampling::GetWorldShadow(rootPosition, FrameBuffer::CameraPosAdjust.xyz);
 #endif
 	// Keep world shadow in radiance and pass canopy visibility separately for transmission.
 	float dirSurfaceShadow = shadowColor.x * canopySunShadow;
@@ -954,12 +1112,25 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Match the deferred density shadow without its four integer density reads.
 	float densityShadowOuterStart = saturate(1.0f - 4096.0f * farParams.y);
 	float densityShadowOuterFade = 1.0f - smoothstep(densityShadowOuterStart, 1.0f, farWidthT);
-	float densityShadow = lerp(1.0f, 0.875f, smoothstep(0.0f, 0.2f, farWidthT)) * densityShadowOuterFade;
-	float densityShadowHeight = 1.0f - 0.75f * saturate(sideAndBladeT.z / max(grassAOParams.w, 1.0f));
+	float densityShadow = densityShadowOuterFade;
+	// The deferred pass darkens by the drawn height above terrain.
+	float rootHeight = cameraRelativePosition.z - f16tof32(packedPositionWidthHeight >> 16);
+	float densityShadowHeight = farCanopyOcclusionScale * (1.0f - saturate(rootHeight / max(grassAOParams.w, 1.0f)));
 	psout.Diffuse.xyz *= saturate(1.0f - densityShadow * saturate(grassAOParams.y) * densityShadowHeight);
 
+	// Far bypasses deferred composite; apply its AO the same way using the existing mask at the terrain root.
+	// Grass writes no ambient mask, so the composite applies sqrt(AO) to all of its diffuse.
+	// An unbound mask reads zero, preserving visibility when SSGI is disabled.
+	float screenAO = 1.0f - farCanopyOcclusionScale * saturate(GrassScreenAO[uint2(shadowPixel)]);
+	float3 linDiffuse = Color::IrradianceToLinear(psout.Diffuse.xyz);
+	[branch] if (screenAO < 1.0f)
+	{
+		float3 linAlbedo = Color::IrradianceToLinear(indirectLobeWeights.diffuse / Color::PBRLightingScale);
+		linDiffuse *= sqrt(MultiBounceAO(linAlbedo, screenAO));
+	}
+
 	// Far runs after deferred composite, so resolve diffuse and specular in the same order here.
-	psout.Diffuse.xyz = Color::IrradianceToGamma(Color::IrradianceToLinear(psout.Diffuse.xyz) + specularColor);
+	psout.Diffuse.xyz = Color::IrradianceToGamma(linDiffuse + specularColor);
 #	endif
 #endif
 

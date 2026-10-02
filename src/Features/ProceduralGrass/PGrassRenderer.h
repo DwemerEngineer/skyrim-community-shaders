@@ -79,6 +79,7 @@ private:
 	uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade);  // High stores SH, Mid stores the probe root; either may include collision. Far is 16 bytes.
 	std::string densityString;
 	uint32_t slopeExtraBlades = 0;
+	uint32_t farMidDensity = 0;  // Mid density used to size Far's shared-band candidate slots.
 	std::string patchBladeCountString = std::to_string(PatchBladeCount);
 	std::string slopeExtraBladesString = "0";
 	std::string bladeBatchSizeString;
