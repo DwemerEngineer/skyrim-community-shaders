@@ -66,6 +66,7 @@ void GrassCellCache::BeginFrame(RE::TESWorldSpace* landWorldSpace)
 	// Worldspace changed, so bump the generation to drop in-flight worker results on drain, then clear.
 	generation.fetch_add(1, std::memory_order_relaxed);
 	worldSpace = landWorldSpace;
+
 	auto loadedFiles = std::make_shared<std::vector<RE::TESFile*>>();
 	if (landWorldSpace) {
 		if (const auto dataHandler = RE::TESDataHandler::GetSingleton()) {
@@ -75,11 +76,13 @@ void GrassCellCache::BeginFrame(RE::TESWorldSpace* landWorldSpace)
 			}
 		}
 	}
+
 	files = std::move(loadedFiles);
 	ready.clear();
 	lastTouched.clear();
 	pending.clear();
 	++readyVersion;
+
 	{
 		std::scoped_lock lock(completedMutex);
 		completed.clear();
@@ -244,13 +247,16 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out, int32_t c
 	using OpacityGrid = std::array<float, kQuadrantSamples>;
 	using TextureGrid = std::array<RE::TESLandTexture*, PGrassCommon::LandscapeOverlayCount>;
 	using LayerOpacityGrid = std::array<OpacityGrid, PGrassCommon::LandscapeOverlayCount>;
+
 	std::array<RE::TESLandTexture*, 4> baseTexture{};
 	std::array<TextureGrid, 4> layerTextures{};
 	std::array<LayerOpacityGrid, 4> layerOpacity{};
 	std::array<OpacityGrid, 4> totalOpacity{};
 	std::array<std::array<bool, PGrassCommon::LandscapeOverlayCount>, 4> seenLayer{};
+
 	const auto defaultLandTexture = PGrassCommon::GetDefaultLandTexture();
 	const float texturePctThreshold = PGrassCommon::GetGrassTexturePctThreshold();
+
 	const auto getPolicy = [&](const RE::TESLandTexture* texture) -> const GrassTexturePolicy* {
 		if (!texture)
 			return nullptr;
@@ -258,6 +264,7 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out, int32_t c
 			return &it->second;
 		return nullptr;
 	};
+
 	const auto growsGrass = [&](const RE::TESLandTexture* texture) {
 		if (!texture)
 			return false;
@@ -265,6 +272,7 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out, int32_t c
 			return policy->total > 0.0f && PGrassCommon::HasWeightedGrass(policy->ids, policy->cumulative);
 		return !texture->textureGrassList.empty();
 	};
+
 	const auto selectType = [&](const RE::TESLandTexture* texture, uint32_t quadrant, uint32_t sample) -> uint8_t {
 		if (const auto policy = getPolicy(texture); policy && policy->total > 0.0f)
 			return PGrassCommon::SelectWeightedGrass(policy->ids, policy->cumulative, policy->total,

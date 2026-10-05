@@ -34,26 +34,32 @@ void GenerateLowExtra(uint3 dispatch, uint extraTask)
 	uint activePatch = extraTask / SLOPE_EXTRA_BLADES;
 	uint extraIndex = extraTask % SLOPE_EXTRA_BLADES;
 	LowPatchSetup setup = LowPatchSetups[activePatch];
+
 	uint bladeTask = VisibleBladeTasks[dispatch.z];
 	uint quadrant = bladeTask & WORK_QUADRANT_MASK;
 	bool hasLand = (bladeTask & WORK_HAS_LAND) != 0u;
 	bool insideFrustum = (bladeTask & WORK_INSIDE_FRUSTUM) != 0u;
 	bool cullsDisabled = debugFlags.x > 0.5f;
 	QuadrantData quadrantData = data[quadrant];
+
 	uint2 patchPos = uint2(setup.patch % PATCHES_PER_ROW, setup.patch / PATCHES_PER_ROW);
 	uint3 candidateHash = ExtraCandidateHash(patchPos, extraIndex, quadrantData.quadrantHash);
 	float2 candidateQuadPos = ExtraCandidateQuadPos(patchPos, candidateHash);
 	float2 candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
+
 	float terrainNormalZ = rsqrt(dot(setup.terrainSlope, setup.terrainSlope) + 1.0f);
 	if (!cullsDisabled && float(candidateHash.z) * UINT_TO_FLOAT > GetLowExtraCount(terrainNormalZ) - float(extraIndex))
 		return;
+
 	float2 candidateMapSamplePos = GrassMapSamplePos(candidateQuadPos, candidateHash);
 	uint packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
 	if (!cullsDisabled && packedGrassCell == 0u)
 		return;
+
 	float candidateWorldZ = setup.baseWorldZ + dot(setup.terrainSlope, candidateWorldPos - setup.baseWorldPos2D);
 	Blade blade;
 	bool outerGeometry;
+
 	if (BuildBlade(candidateHash, candidateMapSamplePos, candidateWorldPos, candidateWorldZ,
 			setup.terrainSlope, terrainNormalZ, quadrantData.quadWorldPos, quadrant, hasLand, packedGrassCell, cullsDisabled, insideFrustum, false, blade, outerGeometry))
 		AppendLowBlade(blade, outerGeometry);
@@ -223,15 +229,18 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 	if (!useBasePath)
 		return;
 #		endif
+
 	if (IsFarPatchBoundsOccluded(patchPos, quadrant, hasLand, cullsDisabled))
 		return;
 #	elif defined(LOW_LOD) && SLOPE_EXTRA_BLADES > 0
 	if (!useBasePath && !cullsDisabled) {
 		bool anyExtraGrass = false;
+
 		[unroll] for (uint extraIndex = 0u; extraIndex < SLOPE_EXTRA_BLADES; ++extraIndex)
 		{
 			uint3 extraHash = ExtraCandidateHash(patchPos, extraIndex, quadrantHash);
 			float2 extraQuadPos = ExtraCandidateQuadPos(patchPos, extraHash);
+
 			if (LoadGrassCell(GrassMapSamplePos(extraQuadPos, extraHash), quadrant) != 0u) {
 				anyExtraGrass = true;
 				break;

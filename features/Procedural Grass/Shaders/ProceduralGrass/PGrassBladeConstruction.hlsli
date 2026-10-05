@@ -53,6 +53,7 @@ bool PassesBladeLOD(float2 bladeWorldPos2D, bool cullsDisabled)
 	float lodDistance = length(lodOffset);
 	float inRamp = saturate((lodDistance - lodFadeIn.x) * lodFadeIn.y);
 	float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodDistance - lodFadeOut.x) * lodFadeOut.y));
+
 	float dither = LodDither(bladeWorldPos2D);
 	return !((inRamp < 1.0f && dither <= 1.0f - inRamp) || dither > outRamp);
 #	else
@@ -62,9 +63,11 @@ bool PassesBladeLOD(float2 bladeWorldPos2D, bool cullsDisabled)
 #		else
 	float lodFadeOutDistanceSq = lodDistanceSq;
 #		endif
+
 	float lodFadeInEnd = lodFadeIn.x + rcp(max(lodFadeIn.y, 1.0e-6f));
 	float lodFadeInStartSq = lodFadeIn.x * lodFadeIn.x;
 	float lodFadeInEndSq = lodFadeInEnd * lodFadeInEnd;
+
 #		if defined(LOW_LOD)
 	bool beforeFadeOut = lodFadeOutDistance <= lodFadeOut.x;
 	bool afterFadeOut = lodFadeOutDistance >= lodFadeIn.w;
@@ -82,6 +85,7 @@ bool PassesBladeLOD(float2 bladeWorldPos2D, bool cullsDisabled)
 		lodFadeInStartSq = 0.0f;
 		lodFadeInEndSq = 0.0f;
 	}
+
 	if (lodDistanceSq <= lodFadeInStartSq)
 		return false;
 #		endif
@@ -183,6 +187,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float clumpDist;
 	float2 clumpDir;
 	Random::FindNearestVoronoi2D(bladeWorldPos2D * generatorType.inverseClumpGridSize, clumpRand, clumpDist, clumpDir);
+
 	// Height, facing, lean, and colour belong to the whole Voronoi cell. Only the pull and base AO fall off with distance.
 	float clumpDensity = 1.0f - smoothstep(0.15f, 0.50f, clumpDist);
 
@@ -280,6 +285,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float2 clumpFacingDir = clumpDir * -sign(generatorType.clumpFacingFactor);
 	clumpedAngle = Math::LerpAngle(clumpedAngle, atan2(clumpFacingDir.y, clumpFacingDir.x), abs(generatorType.clumpFacingFactor));
 #endif
+
 	// Every tier shares the per-clump lean, since a common direction changes how distant clumps shade.
 	[branch] if (generatorType.clumpLeanFactor > 0.0f)
 	{

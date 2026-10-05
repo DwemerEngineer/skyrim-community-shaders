@@ -185,6 +185,7 @@ struct Blade
 	uint facingTilt;       // 4x UNORM8 mapped to [-1,1]: facing.xy, tilt sin/cos
 	uint seedAndType;      // high 8: clump density; bits 20-23: bend; bits 8-15: clump seed; low 8: type
 };
+
 #else
 struct Blade
 {
@@ -194,12 +195,14 @@ struct Blade
 	uint previousWind;     // tier-specific geometry and motion data
 	uint hashClumpAndGrassType;
 	uint tipDir;
+
 #	if defined(MID_LOD)
 	float3 skylightingRoot;  // Preserve the generator's full-precision probe position.
 #	elif !defined(LOW_LOD)
 	uint skylightingSH0;  // x/y as f16
 	uint skylightingSH1;  // z/w as f16
 #	endif
+
 #	if defined(PGRASS_CACHED_COLLISION)
 #		if defined(MID_LOD)
 	uint collisionData;  // current x and y as f16, with current z in previousWind

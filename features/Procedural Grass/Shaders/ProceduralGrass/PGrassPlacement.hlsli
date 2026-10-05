@@ -153,6 +153,7 @@ bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar
 	outRamp *= unloadRamp;
 	float projectedKeep = GetFarPerformanceKeep(lodDistance, FrameBuffer::CameraProj._m00);
 	float keep = min(inRamp, outRamp) * projectedKeep;
+
 	// Ease back to radial thinning after Low is gone, including at diagonal corners.
 	float handoffEnd = lodFadeIn.x + rcp(max(lodFadeIn.y, 1.0e-6f));
 	float seamKeep = inRamp * (1.0f - saturate((handoffDistance - handoffEnd) * lodFadeIn.y)) * unloadRamp;

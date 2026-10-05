@@ -7,6 +7,7 @@ namespace PGrassCommon
 	inline constexpr uint32_t GrassMaterialDetailDim = 64;
 	inline constexpr uint32_t GrassMaterialDetailVariants = 4;
 	inline constexpr float GrassMaterialDetailNormalRange = 1.25f;
+
 	/** @brief Returns the game's default landscape texture used when a LAND quadrant has no base texture. */
 	RE::TESLandTexture* GetDefaultLandTexture();
 	float GetGrassTexturePctThreshold();
@@ -82,6 +83,7 @@ namespace PGrassCommon
 	static constexpr uint32_t QuadrantGrassPitch = 17;
 	static constexpr uint32_t QuadrantGrassSamples = QuadrantGrassPitch * QuadrantGrassPitch;
 	static constexpr uint32_t QuadrantCellPitch = QuadrantGrassPitch - 1;
+
 	// The terrain material uses one base texture and five overlay slots.
 	static constexpr uint32_t LandscapeOverlayCount = 5;
 	using QuadrantOccupancy = std::array<uint16_t, QuadrantCellPitch>;
@@ -149,6 +151,7 @@ namespace PGrassCommon
 	static constexpr int32_t LowTierStreamGuardQuadrants = 1;
 	static constexpr int32_t FarStreamGuardCells = 1;
 	static constexpr float FarUnloadFadeWidth = 2048.0f;
+
 	// Terrain lift map; mirrors PGrassCommon.hlsli. The window spans the Far radius cap on every side of the camera.
 	static constexpr int32_t TerrainLiftDim = 512;
 	static constexpr float TerrainLiftCellSize = 256.0f;
@@ -292,6 +295,7 @@ namespace PGrassCommon
 		float4 grassSubsurfaceColor;  // rgb: linear scattering tint divided by the reference blade colour, w: reserved
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassType);
+
 	// HLSL cbuffer packing keeps float2 inside one 16-byte register, so these offsets must match it.
 	static_assert(offsetof(GrassType, minMaxSubsurfaceOpacity) == 64);
 	static_assert(offsetof(GrassType, grassSurfParams) == 80);

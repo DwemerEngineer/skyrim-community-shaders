@@ -116,6 +116,7 @@ PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& 
 	t.clumpDistanceFactor = ov.value("ClumpDistanceFactor", s.clumpDistanceFactor);
 	t.clumpFacingFactor = ov.value("ClumpFacingFactor", s.clumpFacingFactor);
 	t.clumpLeanFactor = ov.value("ClumpLeanFactor", s.clumpLeanFactor);
+
 	// Keep interpolated clump heights within the type bounds.
 	t.clumpHeightFactor = std::clamp(ov.value("ClumpHeightFactor", s.clumpHeightFactor), 0.0f, 1.0f);
 	t.clumpAOStrength = ov.value("ClumpAOStrength", s.clumpAOStrength);
@@ -131,15 +132,18 @@ PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& 
 		std::clamp(ov.value("TransmissionStrength", s.grassTransmissionStrength), 0.0f, 2.0f),
 		0.0f,
 		ov.value("SheenRoughness", s.sheenRoughness));
+
 	const float3 rough = ov.value("BaseMinTipRoughness", s.baseMinTipRoughness);
 	const float roughnessStart = ov.value("TipRoughnessStart", s.tipRoughnessStart);
 	t.baseMinTipRoughnessStart = float4(rough.x, rough.y, rough.z, roughnessStart);
+
 	// Fit Mid roughness at its three vertex positions to avoid evaluating both smoothstep curves in the vertex shader.
 	const float roughnessAtMidFirst = std::lerp(rough.x, rough.y, Util::Smoothstep(0.0f, roughnessStart, 0.5f));
 	const float roughnessAtMid = std::lerp(roughnessAtMidFirst, rough.z, Util::Smoothstep(rough.x, 1.0f, 0.5f));
 	const float baseToMid = roughnessAtMid - rough.x;
 	const float baseToTip = rough.z - rough.x;
 	t.midRoughnessPolynomial = float4(2.0f * baseToTip - 8.0f * baseToMid, 8.0f * baseToMid - baseToTip, rough.x, 0.0f);
+
 	t.grassTypeLightParams = float4(
 		ov.value("BounceStrength", s.grassBounceStrength),
 		0.0f,
@@ -185,6 +189,7 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 
 	std::vector<uint8_t> detailData(GrassMaterialDetailDim * GrassMaterialDetailDim * 4u);
 	const uint32_t activeTypeCount = std::min<uint32_t>(static_cast<uint32_t>(typeAllocation.size()) + 2u, MaxGrassTypes);
+
 	// Slot 0 is bare; only generated grass needs material detail.
 	for (uint32_t typeIndex = 1; typeIndex < activeTypeCount; ++typeIndex) {
 		const auto& type = resolvedGrassTypes.grassType[typeIndex];
@@ -202,8 +207,10 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 
 			for (uint32_t y = 0; y < GrassMaterialDetailDim; ++y) {
 				const float along = (static_cast<float>(y) + 0.5f) * (1.0f / GrassMaterialDetailDim);
+
 				for (uint32_t x = 0; x < GrassMaterialDetailDim; ++x) {
 					const float across = (static_cast<float>(x) + 0.5f) * (1.0f / GrassMaterialDetailDim);
+
 					const float blotch = SampleGrassMaterialDetail(across * 0.125f * blotchScale + noiseOffsetX,
 						along * 0.5f * blotchScale + noiseOffsetY, false);
 					const float grain = SampleGrassMaterialDetail(across * 6.0f * speckleScale + noiseOffsetX * 1.7f,
@@ -218,6 +225,7 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 
 					const float normalOffset = (across - 0.5f) * 2.0f * vein * veinStrength +
 					                           std::sin(along * 40.0f + phase) * veinWiggleAmount;
+
 					const uint32_t index = (y * GrassMaterialDetailDim + x) * 4u;
 					detailData[index] = encodeUNorm8(blotch);
 					detailData[index + 1u] = encodeUNorm8(grain);
@@ -250,19 +258,23 @@ void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors, const
 		tint.y = std::pow(std::abs(tint.y), typeColorGamma);
 		tint.z = std::pow(std::abs(tint.z), typeColorGamma);
 	};
+
 	const uint32_t activeTypeCount = std::min<uint32_t>(static_cast<uint32_t>(typeAllocation.size()) + 2u, MaxGrassTypes);
 	for (uint32_t i = 1; i < activeTypeCount; ++i) {
 		auto& type = resolvedGrassTypes.grassType[i];
+
 		// Anchor the scattering tint at the same area-weighted colour used to stabilize blade appearance.
 		float4 referenceColor(
 			std::lerp(type.baseColor.x, type.tipColor.x, 1.0f / 3.0f),
 			std::lerp(type.baseColor.y, type.tipColor.y, 1.0f / 3.0f),
 			std::lerp(type.baseColor.z, type.tipColor.z, 1.0f / 3.0f), 0.0f);
+
 		if (prelinearizeTypeColors) {
 			convertTint(type.grassSubsurfaceColor);
 			convertTint(type.grassBounceColor);
 			convertTint(referenceColor);
 		}
+
 		// Precompute the colour ratio on type updates; the pixel shader only multiplies to retain material detail.
 		type.grassSubsurfaceColor.x /= std::max(referenceColor.x, 1e-4f);
 		type.grassSubsurfaceColor.y /= std::max(referenceColor.y, 1e-4f);
@@ -299,6 +311,7 @@ void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors, const
 	grassTypesArrayCB->Update(resolvedGrassTypes);
 	grassGeneratorTypesCB->Update(resolvedGeneratorTypes);
 	UpdateGrassMaterialDetailTexture();
+
 	// View thickening scales with blade width.
 	nearQuadrantFrustumPadding = maxClumpPull + maxCurveReach + maxNearWidth * (1.0f + settings.grassViewThicken);
 	farQuadrantFrustumPadding = maxHeight + maxFarWidth;

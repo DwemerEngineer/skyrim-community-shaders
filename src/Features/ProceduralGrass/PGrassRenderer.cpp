@@ -75,6 +75,7 @@ namespace PGrassRendererQuads
 		const float minZ = quadrant.minHeight - 256.0f;
 		const float maxZ = quadrant.maxHeight + 300.0f;
 		const float3 center = { quadrant.worldPos.x + 1024.0f - cameraPosAdjust.x, quadrant.worldPos.y + 1024.0f - cameraPosAdjust.y, (minZ + maxZ) * 0.5f - cameraPosAdjust.z };
+
 		// The top and bottom side planes have a Z component, so include the blade envelope on every axis.
 		const float3 extent = { 1024.0f + geometryPadding, 1024.0f + geometryPadding, (maxZ - minZ) * 0.5f + geometryPadding };
 
@@ -112,6 +113,7 @@ PGrassRenderer<QuadrantCount, PatchBladeCount>::PGrassRenderer(const uint32_t gr
 	GetBladeGeneratorCS();
 	if (extraDefine)
 		GetBladeGeneratorCS(true);
+
 	// Only High and Mid have a depth prepass.
 	const bool hasDepthPrepass = !UsesBatchedLow() && !extraDefine;
 	GetVertexShader(false, false);
@@ -238,24 +240,30 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetDensity(uint32_t grassDe
 	density = grassDensity;
 	patchesPerQuadrant = grassDensity * grassDensity / 4;
 	densityString = std::to_string(grassDensity);
+
 	if (SizesExtraSlotsToMid()) {
 		const auto& grassSettings = globals::features::proceduralGrass.settings;
 		extraSlotMidDensity = static_cast<uint32_t>(grassSettings.midGrassDensity);
 		extraSlotFill = std::clamp(grassSettings.distantFill, 0.0f, 1.0f);
+
 		const float densityRatio = static_cast<float>(extraSlotMidDensity) / static_cast<float>(grassDensity);
 		// Mid emits two base blades and at most one slope blade per patch. Reserve only the slots that fill can use:
 		// every slot costs shared memory and candidate work whether or not it emits a blade.
 		float extraSlots = extraSlotFill * (3.0f * densityRatio * densityRatio - 1.0f);
+
 		// Far's sparse fill beyond the Low handoff uses up to two slots.
 		if (extraDefine)
 			extraSlots = std::max(extraSlots, 2.0f * extraSlotFill);
+
 		slopeExtraBlades = static_cast<uint32_t>(std::clamp(std::ceil(extraSlots), 1.0f, 15.0f));
 		slopeExtraBladesString = std::to_string(slopeExtraBlades);
 	}
+
 	hasCachedWorkList = false;
 	const uint32_t patchesPerRow = density / 2u;
 	const uint32_t patchRows = (patchesPerQuadrant + patchesPerRow - 1u) / patchesPerRow;
 	const float patchWorldSize = 4096.0f / static_cast<float>(density);
+
 	for (uint32_t tileY = 0; tileY < OccupancyTilesPerAxis; ++tileY) {
 		for (uint32_t tileX = 0; tileX < OccupancyTilesPerAxis; ++tileX) {
 			tileLocalBounds[tileY * OccupancyTilesPerAxis + tileX] = {
@@ -266,6 +274,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetDensity(uint32_t grassDe
 			};
 		}
 	}
+
 	occupancyCache.clear();
 
 	ResetBladeCapacity();
@@ -367,18 +376,22 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 		if (extraSlotMidDensity != static_cast<uint32_t>(grassSettings.midGrassDensity) || extraSlotFill != std::clamp(grassSettings.distantFill, 0.0f, 1.0f))
 			SetDensity(density);
 	}
+
 	auto* bladeGenerator = GetBladeGeneratorCS();
 	auto* batchArgsGenerator = batchArgsBuffer ? GetBatchArgsCS() : nullptr;
+
 	if (!bladeGenerator || (batchArgsBuffer && !batchArgsGenerator)) {
 		const uint32_t emptyArgs[10] = {
 			vertexIndicesBuffer->desc.ByteWidth / sizeof(uint16_t), 0, 0, 0, 0,
 			outerVertexIndicesBuffer ? outerVertexIndicesBuffer->desc.ByteWidth / sizeof(uint16_t) : 0, 0, 0, 0, 0
 		};
 		ctx->UpdateSubresource(argsBuffer->resource.get(), 0, nullptr, emptyArgs, 0, 0);
+
 		if (batchArgsBuffer) {
 			const uint32_t emptyBatchArgs[10]{};
 			ctx->UpdateSubresource(batchArgsBuffer->resource.get(), 0, nullptr, emptyBatchArgs, 0, 0);
 		}
+
 		return;
 	}
 
@@ -392,6 +405,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 		globals::game::frameBufferCached.GetCameraViewProjUnjittered().Transpose(), globals::game::frameBufferCached.GetCameraPosAdjust(),
 		lodOrigin, lodFadeIn, lodFadeOut, frustumPadding, fadeInPositionPadding, compactStartDistance, compactKeep,
 		globals::features::proceduralGrass.settings.grassMapEdgeNoise, disableGeneratorCulls };
+
 	// CPU visibility depends only on these inputs. Wind and Hi-Z still run in the generator every frame.
 	if (!hasCachedWorkList || !(workListState == lastWorkListState))
 		BuildVisibleWorkList(quadrants, workListState);
@@ -502,28 +516,34 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::StageTileHeightBounds(const
 {
 	// Include neighboring LAND samples reached by candidate jitter and clump displacement.
 	const uint32_t sampleReach = static_cast<uint32_t>(std::ceil(tileReach / 128.0f));
+
 	for (uint32_t tileY = 0; tileY < OccupancyTilesPerAxis; ++tileY) {
 		for (uint32_t tileX = 0; tileX < OccupancyTilesPerAxis; ++tileX) {
 			float2 bounds = float2(QuadrantNoHeight, QuadrantNoHeight);
+
 			if (quadrant.heights) {
 				const uint32_t minX = tileX > sampleReach ? tileX - sampleReach : 0u;
 				const uint32_t minY = tileY > sampleReach ? tileY - sampleReach : 0u;
 				const uint32_t maxX = std::min(tileX + sampleReach + 1u, QuadrantGrassPitch - 1u);
 				const uint32_t maxY = std::min(tileY + sampleReach + 1u, QuadrantGrassPitch - 1u);
+
 				float maxDeltaX = 0.0f;
 				float maxDeltaY = 0.0f;
 				bounds = float2(std::numeric_limits<float>::max(), -std::numeric_limits<float>::max());
+
 				for (uint32_t y = minY; y <= maxY; ++y) {
 					for (uint32_t x = minX; x <= maxX; ++x) {
 						const float height = quadrant.heights[y * QuadrantGrassPitch + x];
 						bounds.x = std::min(bounds.x, height);
 						bounds.y = std::max(bounds.y, height);
+
 						if (!extraDefine && x > minX)
 							maxDeltaX = std::max(maxDeltaX, std::abs(height - quadrant.heights[y * QuadrantGrassPitch + x - 1u]));
 						if (!extraDefine && y > minY)
 							maxDeltaY = std::max(maxDeltaY, std::abs(height - quadrant.heights[(y - 1u) * QuadrantGrassPitch + x]));
 					}
 				}
+
 				// Near roots can extend their sampled terrain plane after jitter and clump displacement.
 				if (!extraDefine) {
 					const float extension = (maxDeltaX + maxDeltaY) * (tileReach / 128.0f);
@@ -531,6 +551,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::StageTileHeightBounds(const
 					bounds.y += extension;
 				}
 			}
+
 			tileHeightBoundsStaging[index * OccupancyTileCount + tileY * OccupancyTilesPerAxis + tileX] = bounds;
 		}
 	}
@@ -1030,6 +1051,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::AppendFeatureDefines(Shader
 			continue;
 		if (featureName == "SKYLIGHTING" && !globals::features::skylighting.texProbeArray)
 			continue;
+
 		// Simple lighting keeps only the colour-space and shadowing features it evaluates.
 		// Far evaluates screen-space shadows only as Low's statistical stand-in, so it needs the define but not skylighting.
 		if (simpleLighting && featureName != "LINEAR_LIGHTING" && featureName != "TERRAIN_SHADOWS" && featureName != "CLOUD_SHADOWS" &&

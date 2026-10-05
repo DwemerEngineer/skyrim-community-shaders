@@ -284,6 +284,7 @@ std::vector<uint16_t> ProceduralGrass::CreateVertexIndicesArray(uint16_t vertCou
 				indices.push_back(a);
 				return;
 			}
+
 			// Otherwise use c as the provoking vertex.
 			indices.push_back(c);
 			indices.push_back(a);

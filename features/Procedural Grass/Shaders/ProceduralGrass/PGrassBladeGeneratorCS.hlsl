@@ -260,6 +260,7 @@ bool ResolveTilePatch(uint bladeTask, inout uint patch)
 
 [numthreads(TG_DIM_X, TG_DIM_Y, 1)] void main(uint3 dispatch : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex) {
 	uint tileTask = VisibleBladeTasks[dispatch.z];
+
 	if (groupIndex == 0u) {
 		GroupTileOccluded = 0u;
 		if (grassHiZParams.w >= 1.0f && debugFlags.x <= 0.5f) {
@@ -270,6 +271,7 @@ bool ResolveTilePatch(uint bladeTask, inout uint patch)
 				GroupTileOccluded = IsFarGroupOccluded(tileTask, groupID.x) ? 1u : 0u;
 #endif
 		}
+
 #if defined(LOW_LOD) && !defined(FAR_LOD) && SLOPE_EXTRA_BLADES > 0
 		LowActiveCount = 0u;
 		LowInnerCount = 0u;
@@ -277,9 +279,11 @@ bool ResolveTilePatch(uint bladeTask, inout uint patch)
 		GroupOutputBase = 0u;
 #endif
 	}
+
 	GroupMemoryBarrierWithGroupSync();
 	if (GroupTileOccluded != 0u)
 		return;
+
 	uint2 emittedBladeCounts;
 	GenerateThreadBlades(dispatch, groupIndex, emittedBladeCounts);
 

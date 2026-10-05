@@ -21,6 +21,7 @@ ByteAddressBuffer IndirectArgs : register(t1);
 GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
 	GrassTierIO o;
+
 #if defined(BLADE_BATCH_SIZE)
 	// Each instance draws a fixed batch of blades; discard the final batch's unused tail.
 #	if defined(MID_VERTEX)
@@ -30,8 +31,10 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #	else
 	const uint verticesPerBlade = 4u;
 #	endif
+
 	instanceID = instanceID * BLADE_BATCH_SIZE + vertexID / verticesPerBlade;
 	vertexID %= verticesPerBlade;
+
 #	if defined(LOW_OUTER_VERTEX)
 	[branch] if (instanceID >= IndirectArgs.Load(24u))
 #	else
@@ -42,14 +45,17 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 		o.Position = float4(0.0f, 0.0f, 0.0f, 1.0f);
 		return o;
 	}
+
 #	if defined(LOW_OUTER_VERTEX)
 	instanceID += IndirectArgs.Load(36u);
 #	endif
 #endif
+
 #if defined(HIGH_OUTER_VERTEX)
 	// D3D11 does not add StartInstanceLocation to SV_InstanceID. Outer High lives at the tail of the shared blade buffer.
 	instanceID += IndirectArgs.Load(36u);
 #endif
+
 	Blade blade = Blades[instanceID];
 
 #if defined(HIGH_OUTER_VERTEX)
@@ -58,23 +64,27 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	static const float DOUBLE_LEVELS = 1.0f;
 	static const float MID_LEVEL = 1.0f;
 	bool isBlade1 = vertexID >= 4u;
+
 #elif defined(HIGH_VERTEX)
 	static const float LEVELS = 7.0f;
 	static const float DOUBLE_LEVELS = 4.0f;
 	static const float MID_LEVEL = 3.0f;
 	bool isBlade1 = vertexID >> 3;
+
 #elif defined(FAR_VERTEX)
 	// Far uses one tapered triangle.
 	static const float LEVELS = 1.0f;
 	static const float DOUBLE_LEVELS = 1.0f;
 	static const float MID_LEVEL = 1.0f;
 	bool isBlade1 = false;
+
 #elif defined(MID_VERTEX)
 	// Mid uses base, midpoint, and tip. Double blades use one triangle per half.
 	static const float LEVELS = 2.0f;
 	static const float DOUBLE_LEVELS = 1.0f;
 	static const float MID_LEVEL = 1.0f;
 	bool isBlade1 = vertexID >> 2;
+
 #else  // LOW_VERTEX
 	bool isBlade1 = false;
 #endif
@@ -143,15 +153,18 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	uint packedBladeData = blade.previousWind >> 16;
 	uint packedBladeColor = packedBladeData & 0xFFFu;
 	float randBend = bladeType.stiffness * (0.25f + float(packedBladeData >> 12) * (1.6f / 15.0f));
+
 #		if defined(HIGH_LOD)
 	float clumpDensity = float((hashClumpAndGrassType >> 16) & 0xFu) * (1.0f / 15.0f);
 #		else
 	float clumpDensity = float(hashClumpAndGrassType >> 24) * (1.0f / 255.0f);
 #		endif
+
 	uint2 packedTilt = uint2(blade.tipDir & 0xFFu, (blade.tipDir >> 8) & 0xFFu);
 	tiltDir = float2(packedTilt) * (2.0f / 255.0f) - 1.0f;
 #	endif
 #endif
+
 #if !defined(LOW_LOD) || defined(FAR_LOD)
 	float randHeight = bladeType.height * (blade.posZWidthHeight & 0xFFu) * (1.0f / 255.0f);
 	float widthScale = ((blade.posZWidthHeight >> 8) & 0xFFu) * (1.0f / 255.0f);
@@ -160,6 +173,7 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	float distanceWidth = lerp(0.4f, 1.0f, saturate((rootDistance - 1024.0f) * (1.0f / 3072.0f)));
 	widthScale *= distanceWidth;
 #	endif
+
 	float randWidth = bladeType.width * 2.5f * lerp(0.45f, 1.3f, widthScale);
 #endif
 
@@ -203,6 +217,7 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	float level = abs(rung - doubleBlade * MID_LEVEL);
 	float t = level * invBladeLevels;
 #endif
+
 	// Stabilize material sampling around the tapered blade's area-weighted mean.
 	float appearanceT = 0.25f * (t + 1.0f);
 
@@ -233,19 +248,23 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	// Far has only base and tip vertices, so its profile is a straight tapered segment.
 	float2 bladePosition = t * tip;
 	float taper = randWidth * (1.0f - t);
+
 #elif defined(LOW_VERTEX)
 	// Low has only base and tip vertices. The generator shares the packed base axis with both draws.
 	float2 bladePosition = t * tip;
 	float lowTaperScale = lerp(1.0f, 0.06f, t);
 	float taper = randWidth * lowTaperScale;
 	float2 bladeAxis = rotateFirstBlade ? float2(-facing.y, facing.x) * randWidth : baseAxis;
+
 #else
 	float t2 = t * t;
 	float midWeight = mad(-2.0f, t2, 2.0f * t);
 	float2 bladePosition = mad(midPoint, midWeight, t2 * tip);
+
 	// Interpolate t squared to t to the fourth power across the fixed rungs without evaluating pow.
 	float taperScale = mad(widthScale, t2 - 1.0f, 1.0f);
 	float taper = randWidth * mad(-t2, taperScale, 1.0f);
+
 #	if defined(MID_VERTEX)
 	// Morph to Low's straight profile before Mid fades out.
 	bladePosition = lerp(bladePosition, t * tip, lowGeometryBlend);
@@ -311,24 +330,29 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #endif
 
 	o.Position = clipPosition;
+
 #if defined(DEPTH)
 #	if defined(DEPTH_CLIP)
 	o.BladeHeight = bladePosition.y;
 #	endif
 #else
+
 #	if defined(FAR_LOD)
 	o.CameraPositionSide = float4(viewPos.xyz, mad(sideSign, 0.5f, 0.5f));
 	o.PackedBladeParams = uint4(blade.facingTilt, blade.seedAndType, blade.posZWidthHeight, f32tof16(farWidthT) | (f32tof16(randWidth) << 16));
 	float4 rootClip = mul(FrameBuffer::CameraViewProj, float4(rootViewPosition, 1.0f));
 	o.RootPixel = (rootClip.xy / max(rootClip.w, 1.0f) * float2(0.5f, -0.5f) + 0.5f) / dynamicResolutionInverted;
+
 #	else
 	// Reuse w components for side, Bezier t, and root-relative height.
 	o.CameraRelativePosition = float4(viewPos.xyz, mad(sideSign, 0.5f, 0.5f));
+
 #		if defined(HIGH_LOD)
 	o.PreviousCameraRelativePosition = float4(previousViewPos.xyz, t);
 #		elif defined(LOW_LOD)
 	o.BladeT = t;
 #		endif
+
 #		if defined(HIGH_LOD)
 	o.WindLodDensity = float4(windOffset, float(blade.tipDir >> 24) * (1.0f / 255.0f), float(packedCanopyShadow));
 #		elif defined(MID_LOD)
@@ -339,11 +363,13 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	float2 rootPixel = (rootClip.xy / max(rootClip.w, 1.0f) * float2(0.5f, -0.5f) + 0.5f) / dynamicResolutionInverted;
 	o.RootPosition = float4(rootViewPosition.xy, rootPixel);
 #		endif
+
 #		if defined(LOW_LOD)
 	o.BezierTipAndMid = tip;
 #		else
 	o.BezierTipAndMid = float4(tip, midPoint);
 #		endif
+
 #		if defined(MID_LOD)
 	o.BladeTDepth = float3(t, clipPosition.w, rootViewPosition.z);
 	o.MaterialData = clumpSeed | (hashClumpAndGrassType >> 24) << 8 | uint(doubleBlade) << 16;
@@ -378,6 +404,7 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #		else
 	float detailRand = frac((float)packedBladeColor * 0.61803398875f + 0.17f);
 	float detailRand2 = frac((float)packedBladeColor * 0.38196601125f + 0.61f);
+
 	// Pack facing, type, and pixel-shader detail data into one flat interpolator.
 	o.BladeParams = float4(facing, float(grassTypeIndex),
 		asfloat((f32tof16(detailRand) << 16) | f32tof16(detailRand2)));

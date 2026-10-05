@@ -60,17 +60,22 @@ bool IsVolumeOccluded(float3 centre, float radius, float minDistance, bool culls
 	const float2 ndc = clipCentre.xy / clipCentre.w;
 	const float2 uv = ndc * float2(0.5f, -0.5f) + 0.5f;
 	const float2 screenRadius = radius * float2(length(FrameBuffer::CameraViewProj[0].xyz - ndc.x * clipWAxis), length(FrameBuffer::CameraViewProj[1].xyz - ndc.y * clipWAxis)) * (0.5f / minClipW);
+
 	float2 uvMin = uv - screenRadius - rcp(hiZSize);
 	float2 uvMax = uv + screenRadius + rcp(hiZSize);
 	if (any(uvMax <= 0.0f) || any(uvMin >= 1.0f))
 		return false;
+
 	uvMin = max(uvMin, 0.0f);
 	uvMax = min(uvMax, 1.0f);
+
 	const float2 spanTexels = (uvMax - uvMin) * hiZSize;
 	const float wantedMip = ceil(log2(max(max(spanTexels.x, spanTexels.y), 1.0f)));
+
 	// A failed reduction leaves only the base texture; avoid scanning it for large bounds.
 	if (wantedMip > 0.0f && grassHiZParams.w < 2.0f)
 		return false;
+
 	const int mip = min((int)wantedMip, (int)grassHiZParams.w - 1);
 	const float mipScale = exp2((float)mip);
 	const int2 minTexel = int2(floor(uvMin * hiZSize / mipScale));
@@ -213,13 +218,16 @@ bool IsPatchOccluded(float2 worldXY, float terrainZ, float2 terrainSlope, uint q
 #if defined(MID_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
 	if (cullsDisabled || !hasLand || grassHiZParams.w < 1.0f)
 		return false;
+
 	const float2 tilePosition = (worldXY - data[quadrant].quadWorldPos) / QUADRANT_GRASS_SPACING;
 	if (any(tilePosition < 0.0f) || any(tilePosition >= float(OCCUPANCY_TILES_PER_AXIS)))
 		return false;
+
 	const uint2 tileXY = uint2(tilePosition);
 	float2 heightBounds;
 	if (!ResolveTileHeightBounds(quadrant, tileXY.y * OCCUPANCY_TILES_PER_AXIS + tileXY.x, heightBounds))
 		return false;
+
 	const float bladeHeight = max(grassAOParams.w, 64.0f);
 	float radius = max(grassHiZParams.z, 96.0f);
 #	if defined(LOW_LOD)
@@ -228,6 +236,7 @@ bool IsPatchOccluded(float2 worldXY, float terrainZ, float2 terrainSlope, uint q
 #	else
 	radius += grassHiZBounds.y * length(terrainSlope) + grassHiZBounds.z;
 #	endif
+
 	// Expanded LAND bounds cover displaced roots and extras across changes in terrain slope.
 	const float minHeight = min(terrainZ, heightBounds.x);
 #	if defined(LOW_LOD)
@@ -235,10 +244,12 @@ bool IsPatchOccluded(float2 worldXY, float terrainZ, float2 terrainSlope, uint q
 #	else
 	const float maxHeight = max(terrainZ, heightBounds.y);
 #	endif
+
 	const float verticalReach = (maxHeight - minHeight) * 0.5f + radius;
 	radius = length(float2(radius, verticalReach));
 	const float3 centre = float3(worldXY, (minHeight + maxHeight + bladeHeight) * 0.5f) - FrameBuffer::CameraPosAdjust.xyz;
 	const float minDistance = max(512.0f, radius * 1.5f);
+
 	return IsVolumeOccluded(centre, radius, minDistance, cullsDisabled);
 #else
 	return false;
@@ -263,11 +274,13 @@ bool IsOccupiedTileOccluded(uint bladeTask)
 {
 	if ((bladeTask & (WORK_OCCUPIED_TILE | WORK_HAS_LAND)) != (WORK_OCCUPIED_TILE | WORK_HAS_LAND))
 		return false;
+
 	uint quadrant = bladeTask & WORK_QUADRANT_MASK;
 	uint tile = (bladeTask >> WORK_TILE_SHIFT) & WORK_TILE_MASK;
 	float2 heightBounds;
 	if (!ResolveTileHeightBounds(quadrant, tile, heightBounds))
 		return false;
+
 	float geometryRadius =
 #if defined(FAR_LOD)
 		max(grassHiZBounds.x, 96.0f);
@@ -276,9 +289,11 @@ bool IsOccupiedTileOccluded(uint bladeTask)
 #else
 		max(grassHiZParams.z, 96.0f);
 #endif
+
 	// Roots jitter up to one patch beyond the tile.
 	float2 tileMin = float2(tile % OCCUPANCY_TILES_PER_AXIS, tile / OCCUPANCY_TILES_PER_AXIS) * QUADRANT_GRASS_SPACING - 2.0f * BLADE_TO_WORLD;
 	float2 tileMax = tileMin + QUADRANT_GRASS_SPACING + 4.0f * BLADE_TO_WORLD;
+
 	return IsRootBoxOccluded(quadrant, tileMin, tileMax, heightBounds, geometryRadius, 768.0f, 2.0f, debugFlags.x > 0.5f);
 }
 

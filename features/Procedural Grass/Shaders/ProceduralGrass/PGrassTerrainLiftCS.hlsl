@@ -85,6 +85,7 @@ float MeasureHeight(float2 world2D, float previous)
 		else
 			highLift = probeLift;
 	}
+
 	// Use the first uncovered height; a lower estimate can bury short Far blades.
 	return landHeight + highLift + 1.0f;
 }

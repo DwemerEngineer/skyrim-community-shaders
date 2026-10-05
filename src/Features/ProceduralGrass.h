@@ -132,6 +132,7 @@ public:
 			bool noGrass = false;
 			nlohmann::json overrides = nlohmann::json::object();
 		};
+
 		// Keyed by "plugin|0xLOCALID" (LandTextureKey).
 		std::unordered_map<std::string, std::vector<GrassTypeDef>> textureTypes;
 
@@ -150,6 +151,7 @@ public:
 	void DrawGrassTypeEditor();
 	/** @brief Draws debug toggles and diagnostic readouts. The blade counts stall on GPU readback. */
 	void DrawDebugSettings();
+
 	/** @brief Draws the per-field override editor for one grass type variant. */
 	void DrawTypeOverrides(nlohmann::json& ov) const;
 
@@ -231,6 +233,7 @@ private:
 	Texture2D* grassMaterialDetailTexture = nullptr;
 	Texture2D* distantAmbientLUT = nullptr;
 	mutable ID3D11ComputeShader* distantAmbientLUTCS = nullptr;
+
 	// Rendered terrain LOD on a wrapping world-aligned grid: measurements, lift, and the surface height bounding it.
 	Texture2D* terrainLiftMeasuredTexture = nullptr;
 	Texture2D* terrainLiftTexture = nullptr;
@@ -239,13 +242,17 @@ private:
 	int32_t terrainLiftOriginCell[2] = { 0, 0 };
 	bool terrainLiftOriginValid = false;
 	uint32_t terrainLiftHeightMapGeneration = 0;
+
 	mutable uint32_t distantAmbientLUTFrame = UINT32_MAX;
+
 	ID3D11VertexShader* densityAOVS = nullptr;
 	ID3D11PixelShader* densityAOPS = nullptr;
 	ID3D11PixelShader* depthClipPS = nullptr;
+
 	float depthBlendStrength = -1.0f;
 	float depthBlendHeight = -1.0f;
 	float depthBaseCutoff = -1.0f;
+
 	static constexpr uint32_t grassDensityDim = 256;
 	static constexpr uint32_t distantAmbientLUTDim = 32;
 
@@ -285,6 +292,7 @@ private:
 		uint64_t cacheVersion = 0;
 		std::array<uint8_t, PGrassCommon::QuadrantGrassSamples> ids{};
 		PGrassCommon::QuadrantOccupancy occupancy{};
+
 		/** @brief World Z per LAND vertex. All values are QuadrantNoHeight when unavailable. */
 		std::array<float, PGrassCommon::QuadrantGrassSamples> heights{};
 		float minHeight = PGrassCommon::QuadrantNoHeight;
@@ -313,6 +321,7 @@ private:
 	float2 grassLodOrigin = float2(0.0f, 0.0f);
 	bool grassLodOriginInitialized = false;
 	float nearQuadrantFrustumPadding = 0.0f;
+
 	// Heap-allocated because the 16-byte-aligned struct would pad the feature object.
 	std::unique_ptr<PGrassCommon::GrassGlobals> grassGlobalsStaging = std::make_unique<PGrassCommon::GrassGlobals>();
 	float nearHiZRadius = 0.0f;
@@ -397,6 +406,7 @@ private:
 	void CreateIndexBuffers();
 	/** @brief Creates the samplers, rasterizer, depth-stencil and blend states used by the grass passes. */
 	void CreatePipelineStates();
+
 	/** @brief Creates the material detail, density, distant-ambient and presence textures. */
 	void CreateGrassTextures();
 	void CompileSupportShaders();
@@ -410,6 +420,7 @@ private:
 		int32_t cellX;
 		int32_t cellY;
 	};
+
 	// Near tiers cover Low's radius plus a streaming guard; Low's cached-LAND ring spans the same area in cells.
 	static constexpr int32_t NearCoverageRadius = PGrassCommon::LowTierQuadrantRadius + PGrassCommon::LowTierStreamGuardQuadrants;
 	static constexpr int32_t NearCoverageDiameter = NearCoverageRadius * 2 + 1;
@@ -417,32 +428,44 @@ private:
 
 	/** @brief Rebuilds the per-tier quadrant lists when loaded or streamed LAND changes. */
 	void GetVisibleQuadrants();
+
 	/** @brief Hashes everything the near quadrant lists depend on, so unchanged frames skip the rebuild. */
 	uint64_t ComputeNearVisibilityStamp(RE::TESWorldSpace* landWorldSpace, const RE::GridCellArray* cells, const VisibilityOrigin& origin);
+
 	/** @brief Rebuilds High, Mid, Low and presence quadrants from the loaded grid and Low's streamed ring. */
 	void RebuildNearQuadrants(const RE::GridCellArray* cells, const VisibilityOrigin& origin);
+
 	/** @brief Refreshes the terrain-darkening grass-id window when its origin or content changes. */
 	void RebuildGrassPresence(int32_t originQuadX, int32_t originQuadY);
+
 	/** @brief Streams Far LAND cells and rebuilds the Far quadrant list when the cache changes. */
 	void UpdateFarQuadrants(RE::TESWorldSpace* landWorldSpace, const RE::GridCellArray* cells, const VisibilityOrigin& origin);
+
 	/** @brief Index into nearCoveredQuadrants, or -1 outside the near coverage window. */
 	static int32_t NearCoverageIndex(int32_t worldQuadrantX, int32_t worldQuadrantY, const VisibilityOrigin& origin);
+
 	void PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer);
+
 	/** @brief Rebuilds the per-type render and generator tables and the culling bounds derived from them. */
 	void ResolveGrassTypes(bool prelinearizeTypeColors, float typeColorGamma);
+
 	/** @brief Inverts the terrain-blend opacity curve into the High depth pass's base cutoff when blend settings change. */
 	void UpdateDepthBaseCutoff();
+
 	/**
 	 * @brief Generates one group of tiers. High and Mid run first so their depth can occlude Low and Far generation.
 	 * @param nearTiers True for High and Mid; false for Low and Far.
 	 */
 	void GenerateBlades(ID3D11DeviceContext* ctx, bool nearTiers) const;
+
 	/** @brief Renders High and Mid depth. Low and Far write depth in their colour passes. */
 	void RenderDepth(ID3D11DeviceContext* ctx) const;
+
 	static void UnbindGeneratorResources(ID3D11DeviceContext* ctx);
 
 	void DeferredRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const;
 	void UpdateDistantAmbientLUT(ID3D11DeviceContext* ctx) const;
+
 	/** @brief Refreshes a quarter of the terrain lift map from the copied scene depth. */
 	void UpdateTerrainLift(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const;
 	void RenderGrass(ID3D11DeviceContext* ctx) const;

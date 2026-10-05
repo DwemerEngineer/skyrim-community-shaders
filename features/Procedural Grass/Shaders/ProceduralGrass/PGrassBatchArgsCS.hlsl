@@ -7,6 +7,7 @@ RWByteAddressBuffer BatchArgs : register(u0);
 	if (segment != 0u)
 		return;
 #endif
+
 	// Separate lanes keep FXC from eliminating the outer draw's stores during inlining.
 	uint offset = segment * 20u;
 	uint bladeCount = BladeArgs.Load(offset + 4u);

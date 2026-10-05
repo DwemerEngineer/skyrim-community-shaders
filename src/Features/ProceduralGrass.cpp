@@ -119,15 +119,18 @@ void ProceduralGrass::PostDepthRendering()
 	PostDepthRenderPrep(ctx, renderer);
 	GenerateBlades(ctx, true);
 	RenderDepth(ctx);
+
 	// High and Mid form a dense wall close to the camera; rebuild Hi-Z so Low and Far generation can reject blades behind it.
 	if (grassHiZ->HasCurrentSceneDepth() && !grassHiZ->Build(globals::d3d::device, ctx, true)) {
 		// An unbound pyramid reads as zero depth and would reject everything.
 		grassGlobalsStaging->grassHiZParams = float4::Zero;
 		grassGlobalsCB->Update(*grassGlobalsStaging);
 	}
+
 	// The terrain lift map measures rendered terrain from this copy; the bound depth target cannot be sampled.
 	CopyDepthBuffer(ctx, renderer);
 	UpdateTerrainLift(ctx, renderer);
+
 	// Low writes depth in its deferred pass; its PS samples the shadow mask at the blade root instead.
 	GenerateBlades(ctx, false);
 
@@ -213,10 +216,12 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 		previousWindDirection = windDirection;
 		previousWindSpeed = settings.windSpeed;
 	}
+
 	// Resolve frame-uniform TRUE_PBR lighting conversions once.
 	constexpr float vanillaPBRLightingScale = 0.65f;
 	const float grassLightingScale = prelinearizeTypeColors ? std::pow(vanillaPBRLightingScale, typeColorGamma) : vanillaPBRLightingScale;
 	float3 resolvedDirLightColor = float3::Zero;
+
 	if (const auto shaderManager = globals::game::smState) {
 		if (const auto shadowSceneNode = shaderManager->shadowSceneNode[0]) {
 			const auto sunLight = shadowSceneNode->GetRuntimeData().sunLight;
@@ -226,6 +231,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 					float sunlightScale = 1.0f;
 					if (const auto imageSpaceManager = globals::game::imageSpaceManager)
 						sunlightScale = imageSpaceManager->GetRuntimeData().data.baseData.hdr.sunlightScale;
+
 					const float rawLightScale = lightData.fade * sunlightScale;
 					const float3 rawDirLightColor = float3(lightData.diffuse.red, lightData.diffuse.green, lightData.diffuse.blue) * rawLightScale;
 
@@ -286,6 +292,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	};
 	grassGlobals.frustumPlaneExtent = float4(clipPlaneExtent(0, 1.0f), clipPlaneExtent(0, -1.0f),
 		clipPlaneExtent(1, 1.0f), clipPlaneExtent(1, -1.0f));
+
 	// Convert viewport-space SV_Position to normalized coordinates before dynamic-resolution adjustment.
 	grassGlobals.dynamicResolutionInverted = float2(1.0f / renderSize.x, 1.0f / renderSize.y);
 
@@ -305,6 +312,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	grassGlobals.occlusionInvExtent = 1.0f / (topDown->GetHalfExtent() * 2.0f);
 	grassGlobals.occlusionMapDim = topDown->GetMapDim();
 	const auto window = topDown->GetWindowCentre();
+
 	// z is underside clearance. A large negative value disables object culling.
 	grassGlobals.occlusionParams = float4(window.x, window.y, settings.debugIgnoreObjectOcclusion ? -1.0e9f : settings.occlusionClearance, settings.occlusionBias);
 
@@ -459,6 +467,7 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx, const bool nearTi
 	const float radiusEdge = farStart + std::max(farExtraCells, 1) * 4096.0f;
 	const float4 noFadeIn = float4(0.0f, 1.0e9f, 0.0f, highToMid + quad);
 	const float farPatchDensity = static_cast<float>(FarPatchDensity());
+
 	// Preserve sparse Far's base density after the shared tier handoff.
 	const float farBaseExtraKeep = std::clamp(
 		((settings.lowGrassDensity * settings.lowGrassDensity) / (farPatchDensity * farPatchDensity) - 1.0f) * 0.5f,
@@ -483,6 +492,7 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx, const bool nearTi
 		ID3D11ShaderResourceView* densitySRV = grassDensityTexture->srv.get();
 		ctx->CSSetShaderResources(7, 1, &densitySRV);
 	}
+
 	// The density gather and the Hi-Z rebuild both use CS t0 and b0.
 	ID3D11ShaderResourceView* heightMapSRV = globals::terrainHeightMap->GetSRV();
 	ctx->CSSetShaderResources(0, 1, &heightMapSRV);
@@ -920,17 +930,20 @@ void ProceduralGrass::ForwardRenderFar() const
 	auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 	ctx->OMSetRenderTargets(1, &main.RTV, mainDepth.views[0]);
 	ctx->OMSetBlendState(defaultBlend, nullptr, 0xFFFFFFFF);
+
 	// Opaque depth makes Far output independent of append order.
 	ctx->OMSetDepthStencilState(depthWriteDS, 0);
 	ID3D11ShaderResourceView* screenAO = std::get<0>(globals::features::screenSpaceGI.GetOutputTextures());
 	ctx->PSSetShaderResources(76, 1, &screenAO);
 	ID3D11ShaderResourceView* sceneDepthSRV = Util::GetCurrentSceneDepthSRV(false);
 	ctx->PSSetShaderResources(74, 1, &sceneDepthSRV);
+
 	// Far reads the shadows cast onto its roots; rebind them in case a later pass replaced the slot.
 	if (const auto* screenSpaceShadowsTexture = globals::features::screenSpaceShadows.screenSpaceShadowsTexture) {
 		ID3D11ShaderResourceView* screenSpaceShadowsSRV = screenSpaceShadowsTexture->srv.get();
 		ctx->PSSetShaderResources(45, 1, &screenSpaceShadowsSRV);
 	}
+
 	grassRendererFarLOD->RenderGrass(ctx);
 
 	ID3D11ShaderResourceView* nullSRV = nullptr;
@@ -939,6 +952,7 @@ void ProceduralGrass::ForwardRenderFar() const
 	ctx->PSSetShaderResources(71, 4, nullGrassSRVs);
 	ctx->PSSetShaderResources(76, 1, &nullSRV);
 	ctx->OMSetRenderTargets(0, nullptr, nullptr);
+
 	// Transparent effects need the depth written by Low and Far, just as the hardware depth test does.
 	ID3D11ShaderResourceView* previousEffectDepthSRV = nullptr;
 	ID3D11ShaderResourceView* previousSceneDepthSRV = nullptr;
@@ -946,20 +960,25 @@ void ProceduralGrass::ForwardRenderFar() const
 	ctx->PSGetShaderResources(17, 1, &previousSceneDepthSRV);
 	ctx->PSSetShaderResources(3, 1, &nullSRV);
 	ctx->PSSetShaderResources(17, 1, &nullSRV);
+
 	auto& terrainBlending = globals::features::terrainBlending;
 	if (terrainBlending.loaded && terrainBlending.settings.Enabled)
 		terrainBlending.MergeSceneDepthIntoBlend();
 	else
 		CopyDepthBuffer(ctx, renderer);
+
 	ctx->PSSetShaderResources(3, 1, &previousEffectDepthSRV);
 	ctx->PSSetShaderResources(17, 1, &previousSceneDepthSRV);
 	Util::ReleaseAndNull(previousEffectDepthSRV);
 	Util::ReleaseAndNull(previousSceneDepthSRV);
+
 	ctx->RSSetState(oldRS);
 	ctx->OMSetDepthStencilState(oldDSS, oldRef);
 	ctx->OMSetBlendState(oldBS, oldBlendFactor, oldSampleMask);
+
 	Util::ReleaseAndNull(oldRS);
 	Util::ReleaseAndNull(oldDSS);
 	Util::ReleaseAndNull(oldBS);
+
 	globals::profiler->EndPass();
 }

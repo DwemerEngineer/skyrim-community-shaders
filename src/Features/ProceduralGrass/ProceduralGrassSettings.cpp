@@ -49,18 +49,22 @@ namespace
 		v("TipWeight", s.tipWeight);
 		v("Mid", s.mid);
 		v("RotationalStiffness", s.rotationalStiffness);
+
 		v("BakedMinAO", s.ao);
 		v("Specular", s.specular);
 		v("SpecularAnisotropy", s.specularAnisotropy);
 		v("SheenStrength", s.sheenStrength);
 		v("SheenRoughness", s.sheenRoughness);
 		v("CurvedNormalStrength", s.curvedNormalStrength);
+
 		v("SubsurfaceOpacity", s.subsurfaceOpacity);
 		v("SubsurfaceTint", s.grassSubsurfaceTint);
 		v("TransmissionStrength", s.grassTransmissionStrength);
+
 		v("Roughness", s.baseMinTipRoughness);
 		v("RoughnessTipStart", s.tipRoughnessStart);
 		v("ClumpAOStrength", s.clumpAOStrength);
+
 		// Colour
 		v("BaseColor", s.baseColor);
 		v("TipColor", s.tipColor);
@@ -71,6 +75,7 @@ namespace
 		v("ColorCool", s.grassColorCool);
 		v("ColorWarm", s.grassColorWarm);
 		v("ColorTipDry", s.grassColorTipDry);
+
 		// Detail / lighting
 		v("BaseAO", s.grassBaseAO);
 		v("ClumpColorStrength", s.grassClumpColorStrength);
@@ -79,17 +84,20 @@ namespace
 		v("BounceStrength", s.grassBounceStrength);
 		v("BounceColor", s.grassBounceColor);
 		v("AmbientDesat", s.grassAmbientDesat);
+
 		// Surface texture
 		v("BlotchStrength", s.grassBlotchStrength);
 		v("BlotchScale", s.grassBlotchScale);
 		v("SpeckleStrength", s.grassSpeckleStrength);
 		v("SpeckleScale", s.grassSpeckleScale);
+
 		// Vein detail
 		v("VeinTint", s.grassVeinTint);
 		v("VeinAlbedoStrength", s.grassVeinAlbedoStrength);
 		v("VeinNormalStrength", s.grassVeinNormalStrength);
 		v("VeinRippleDepth", s.grassVeinRippleDepth);
 		v("VeinWiggleAmount", s.grassVeinWiggleAmount);
+
 		// Terrain blend / shadow
 		v("TerrainBlendStrength", s.grassTerrainBlendStrength);
 		v("TerrainBlendHeight", s.grassTerrainBlendHeight);
@@ -97,19 +105,23 @@ namespace
 		v("TerrainBlendRough", s.grassTerrainBlendRough);
 		v("TerrainShadowStrength", s.grassAOStrength);
 		v("TerrainShadowDensity", s.grassAODensity);
+
 		// Clump
 		v("ClumpGridSize", s.clumpGridSize);
 		v("ClumpDistanceFactor", s.clumpDistanceFactor);
 		v("ClumpFacingFactor", s.clumpFacingFactor);
 		v("ClumpLeanFactor", s.clumpLeanFactor);
 		v("ClumpHeightFactor", s.clumpHeightFactor);
+
 		// Slope
 		v("MinSlope", s.grassMinSlope);
 		v("MaxSlope", s.grassMaxSlope);
 		v("SlopeFacing", s.grassSlopeFacing);
+
 		// Wind / animation
 		v("WindAngle", s.windAngle);
 		v("WindSpeed", s.windSpeed);
+
 		// Occlusion / misc
 		v("OcclusionClearance", s.occlusionClearance);
 		v("OcclusionHalfExtent", s.occlusionHalfExtent);
@@ -117,6 +129,7 @@ namespace
 		v("OcclusionBias", s.occlusionBias);
 		v("GrassMapEdgeNoise", s.grassMapEdgeNoise);
 		v("ViewThicken", s.grassViewThicken);
+
 		// Per-LOD densities and far-tier controls
 		v("MidDensity", s.midGrassDensity);
 		v("LowDensity", s.lowGrassDensity);
@@ -124,6 +137,7 @@ namespace
 		v("FarRadius", s.grassCellRadius);
 		v("FarEdgeDensity", s.farDensityFalloff);
 		v("DistantFill", s.distantFill);
+
 		// Debug
 		v("DebugIgnoreGrassMap", s.debugIgnoreGrassMap);
 		v("DebugIgnoreObjectOcclusion", s.debugIgnoreObjectOcclusion);
@@ -138,6 +152,7 @@ namespace
 	template <class SettingsT, class Visitor>
 	void ForEachTypeOverride(SettingsT& s, Visitor&& v)
 	{
+
 		v.Section(T("feature.procedural_grass.shape_section", "Shape"));
 		v("Height", s.grassHeight, T("feature.procedural_grass.height", "Height"), 0.0f, 150.0f, "%.1f");
 		v("Width", s.grassWidth, T("feature.procedural_grass.width", "Width"), 0.0f, 10.0f, "%.1f");
@@ -145,9 +160,11 @@ namespace
 		v("TipWeight", s.tipWeight, T("feature.procedural_grass.k2", "K2"), -10.0f, 10.0f);
 		v("Mid", s.mid, T("feature.procedural_grass.mid", "Mid"), 0.0f, 1.0f);
 		v("RotationalStiffness", s.rotationalStiffness, T("feature.procedural_grass.rotational_stiffness", "Rotational Stiffness"), 0.0f, 10.0f);
+
 		v.Section(T("feature.procedural_grass.slope_section", "Slope"));
 		v("MinSlope", s.grassMinSlope, T("feature.procedural_grass.min_slope", "Min Slope (deg)"), 0.0f, 90.0f, "%.0f");
 		v("MaxSlope", s.grassMaxSlope, T("feature.procedural_grass.max_slope", "Max Slope (deg)"), 0.0f, 90.0f, "%.0f");
+
 		v.Section(T("feature.procedural_grass.clump_section", "Clump"));
 		v("ClumpGridSize", s.clumpGridSize, T("feature.procedural_grass.clump_grid_size", "Clump Grid Size"), ProceduralGrass::MinClumpGridSize, ProceduralGrass::MaxClumpGridSize, "%.0f");
 		v("ClumpDistanceFactor", s.clumpDistanceFactor, T("feature.procedural_grass.clump_distance", "Clump Distance"), 0.0f, 1.0f);
@@ -156,6 +173,7 @@ namespace
 		v("ClumpHeightFactor", s.clumpHeightFactor, T("feature.procedural_grass.clump_height", "Clump Height"), 0.0f, 1.0f);
 		v("ClumpAOStrength", s.clumpAOStrength, T("feature.procedural_grass.clump_ao", "Clump AO"), 0.0f, 1.0f);
 		v("ClumpColorStrength", s.grassClumpColorStrength, T("feature.procedural_grass.clump_colour", "Clump Colour"), 0.0f, 1.0f);
+
 		v.Section(T("feature.procedural_grass.colour_section", "Colour"));
 		v("BaseColor", s.baseColor, T("feature.procedural_grass.base_color", "Base Color"), 0.0f, 1.0f, nullptr);
 		v("TipColor", s.tipColor, T("feature.procedural_grass.tip_color", "Tip Color"), 0.0f, 1.0f, nullptr);
@@ -166,6 +184,7 @@ namespace
 		v("ValueVariation", s.grassColorValueVariation, T("feature.procedural_grass.brightness_variation", "Brightness Variation"), 0.0f, 1.0f);
 		v("TipDryStrength", s.grassColorTipDryStrength, T("feature.procedural_grass.tip_dry_strength", "Tip Dry Strength"), 0.0f, 1.0f);
 		v("MottleStrength", s.grassColorMottleStrength, T("feature.procedural_grass.mottle_strength", "Mottle Strength"), 0.0f, 0.5f);
+
 		v.Section(T("feature.procedural_grass.lighting_section", "Lighting"));
 		v("MinAO", s.ao, T("feature.procedural_grass.baked_min_ao", "Baked Min AO"), 0.0f, 1.0f);
 		v("Specular", s.specular, T("feature.procedural_grass.specular", "Specular"), 0.0f, 1.0f);
@@ -181,11 +200,13 @@ namespace
 		v("BounceStrength", s.grassBounceStrength, T("feature.procedural_grass.ground_bounce", "Ground Bounce"), 0.0f, 2.0f);
 		v("BounceColor", s.grassBounceColor, T("feature.procedural_grass.ground_bounce_tint", "Ground Bounce Tint"), 0.0f, 2.0f);
 		v("AmbientDesat", s.grassAmbientDesat, T("feature.procedural_grass.ambient_desaturation", "Ambient Desaturation"), 0.0f, 1.0f);
+
 		v.Section(T("feature.procedural_grass.surface_section", "Surface"));
 		v("BlotchStrength", s.grassBlotchStrength, T("feature.procedural_grass.blotch_strength", "Blotch Strength"), 0.0f, 1.0f);
 		v("BlotchScale", s.grassBlotchScale, T("feature.procedural_grass.blotch_scale", "Blotch Scale"), 0.25f, 4.0f);
 		v("SpeckleStrength", s.grassSpeckleStrength, T("feature.procedural_grass.grain_strength", "Grain Strength"), 0.0f, 1.0f);
 		v("SpeckleScale", s.grassSpeckleScale, T("feature.procedural_grass.grain_scale", "Grain Scale"), 0.25f, 4.0f);
+
 		v.Section(T("feature.procedural_grass.veins_section", "Veins"));
 		v("VeinTint", s.grassVeinTint, T("feature.procedural_grass.vein_tint", "Vein Tint"), 0.0f, 2.0f);
 		v("VeinAlbedoStrength", s.grassVeinAlbedoStrength, T("feature.procedural_grass.vein_tint_strength", "Vein Tint Strength"), 0.0f, 1.0f);
@@ -220,24 +241,29 @@ namespace
 		void operator()(const char* key, const T& base, const char* label, float mn, float mx, const char* fmt = "%.2f") const
 		{
 			bool has = ov.contains(key);
+
 			if (ImGui::Checkbox(std::format("##en_{}", key).c_str(), &has)) {
 				if (has)
 					ov[key] = base;
 				else
 					ov.erase(key);
 			}
+
 			ImGui::SameLine();
 			ImGui::BeginDisabled(!has);
 			T val = has && IsValidOverrideValue<T>(ov[key]) ? ov[key].get<T>() : base;
 			bool changed;
+
 			if constexpr (std::is_same_v<T, float>)
 				changed = ImGui::SliderFloat(label, &val, mn, mx, fmt);
 			else if constexpr (std::is_same_v<T, float2>)
 				changed = ImGui::SliderFloat2(label, &val.x, mn, mx, fmt);
 			else
 				changed = fmt ? ImGui::SliderFloat3(label, &val.x, mn, mx, fmt) : ImGui::ColorEdit3(label, &val.x);
+
 			if (changed && has)
 				ov[key] = val;
+
 			ImGui::EndDisabled();
 		}
 	};
@@ -428,6 +454,7 @@ void ProceduralGrass::DrawSettings()
 			SettingSlider(T("feature.procedural_grass.sheen_roughness", "Sheen Roughness"), settings.sheenRoughness, 0.0f, 1.0f, T("feature.procedural_grass.sheen_roughness_tooltip", "Low values give a fibre-like sheen concentrated at grazing angles; high values give a broader, dusty sheen."));
 			SettingSlider(T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), settings.curvedNormalStrength, 0.0f, 1.0f, T("feature.procedural_grass.curved_normal_strength_tooltip", "How far the blade rolls across its width, as the angle its edges turn away from the middle (1 = 90 degrees). Sky light and screen-space GI see twice this roll, so the curvature still shows without direct light."));
 			SettingSlider3(T("feature.procedural_grass.roughness", "Roughness (Base>Min>Tip)"), settings.baseMinTipRoughness, 0.0f, 1.0f, T("feature.procedural_grass.roughness_tooltip", "Sets roughness at the blade base, minimum point, and tip."));
+
 			// Kept off 0 and 1 so neither smoothstep in the vertex shader collapses to a zero-width range.
 			SettingSlider(T("feature.procedural_grass.roughness_tip_start", "Roughness Tip Start"), settings.tipRoughnessStart, 0.05f, 0.95f, T("feature.procedural_grass.roughness_tip_start_tooltip", "Sets where roughness begins transitioning toward the tip value."));
 			SettingSlider(T("feature.procedural_grass.clump_ao_strength", "Clump AO Strength"), settings.clumpAOStrength, 0.0f, 1.0f, T("feature.procedural_grass.clump_ao_tooltip", "Darkens blade bases toward each clump's center, where blades crowd together. Blade tips stay lit."));

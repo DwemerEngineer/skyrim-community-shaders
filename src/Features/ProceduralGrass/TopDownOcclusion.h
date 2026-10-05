@@ -13,6 +13,7 @@ class TopDownOcclusion
 public:
 	void SetupResources();
 	void ClearShaderCache();
+
 	/** @brief Drops captured geometry and rendered maps after a load or scene transition. */
 	void Invalidate();
 
@@ -78,6 +79,7 @@ private:
 	uint32_t snapDim = 1024;
 	float halfExtent = 4096.0f;
 	float2 windowCentre = { 0.0f, 0.0f };
+
 	// Skip tiny clutter whose occlusion would not visibly remove grass.
 	static constexpr float MinOccluderRadius = 8.0f;
 	float paddingWorld = 8.0f;
