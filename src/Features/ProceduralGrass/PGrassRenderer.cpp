@@ -246,11 +246,18 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetDensity(uint32_t grassDe
 	density = grassDensity;
 	patchesPerQuadrant = grassDensity * grassDensity / 4;
 	densityString = std::to_string(grassDensity);
-	if (extraDefine) {
-		farMidDensity = static_cast<uint32_t>(globals::features::proceduralGrass.settings.midGrassDensity);
-		const float densityRatio = static_cast<float>(farMidDensity) / static_cast<float>(grassDensity);
-		// Mid emits two base blades and at most one slope blade per patch. Bound shared memory for custom densities.
-		slopeExtraBlades = static_cast<uint32_t>(std::clamp(std::ceil(3.0f * densityRatio * densityRatio) - 1.0f, 2.0f, 15.0f));
+	if (SizesExtraSlotsToMid()) {
+		const auto& grassSettings = globals::features::proceduralGrass.settings;
+		extraSlotMidDensity = static_cast<uint32_t>(grassSettings.midGrassDensity);
+		extraSlotFill = std::clamp(grassSettings.distantFill, 0.0f, 1.0f);
+		const float densityRatio = static_cast<float>(extraSlotMidDensity) / static_cast<float>(grassDensity);
+		// Mid emits two base blades and at most one slope blade per patch. Reserve only the slots that fill can use:
+		// every slot costs shared memory and candidate work whether or not it emits a blade.
+		float extraSlots = extraSlotFill * (3.0f * densityRatio * densityRatio - 1.0f);
+		// Far's sparse fill beyond the Low handoff uses up to two slots.
+		if (extraDefine)
+			extraSlots = std::max(extraSlots, 2.0f * extraSlotFill);
+		slopeExtraBlades = static_cast<uint32_t>(std::clamp(std::ceil(extraSlots), 1.0f, 15.0f));
 		slopeExtraBladesString = std::to_string(slopeExtraBlades);
 	}
 	hasCachedWorkList = false;
@@ -363,8 +370,11 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 	const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, const float frustumPadding,
 	const bool disableGeneratorCulls, const float fadeInPositionPadding, const float compactStartDistance, const float compactKeep)
 {
-	if (extraDefine && farMidDensity != static_cast<uint32_t>(globals::features::proceduralGrass.settings.midGrassDensity))
-		SetDensity(density);
+	if (SizesExtraSlotsToMid()) {
+		const auto& grassSettings = globals::features::proceduralGrass.settings;
+		if (extraSlotMidDensity != static_cast<uint32_t>(grassSettings.midGrassDensity) || extraSlotFill != std::clamp(grassSettings.distantFill, 0.0f, 1.0f))
+			SetDensity(density);
+	}
 	auto* bladeGenerator = GetBladeGeneratorCS();
 	auto* batchArgsGenerator = batchArgsBuffer ? GetBatchArgsCS() : nullptr;
 	if (!bladeGenerator || (batchArgsBuffer && !batchArgsGenerator)) {

@@ -101,8 +101,9 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	Blade blade = Blades[instanceID];
 
 #if defined(HIGH_OUTER_VERTEX)
-	static const float LEVELS = 3.0f;
-	static const float DOUBLE_LEVELS = 2.0f;
+	// Outer High shares Mid's shape: base, midpoint, and tip, with one triangle per half of a double blade.
+	static const float LEVELS = 2.0f;
+	static const float DOUBLE_LEVELS = 1.0f;
 	static const float MID_LEVEL = 1.0f;
 	bool isBlade1 = vertexID >= 4u;
 #elif defined(HIGH_VERTEX)
@@ -218,7 +219,7 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #elif defined(MID_LOD)
 	// Mid keeps half of High's candidate lattice, so double width to preserve projected coverage.
 	randWidth *= 2.0f;
-	float lowGeometryBlend = smoothstep(4096.0f, 6144.0f, rootDistance);
+	float lowGeometryBlend = GetMidLowBlend(rootDistance);
 #endif
 
 #if defined(FAR_VERTEX)
@@ -400,11 +401,17 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	o.BladeTDepth = float3(t, clipPosition.w, rootViewPosition.z);
 	o.MaterialData = clumpSeed | (hashClumpAndGrassType >> 24) << 8 | uint(doubleBlade) << 16;
 #		elif !defined(LOW_LOD)
+#			if defined(HIGH_OUTER_VERTEX)
+	// Outer High and Mid share geometry and the same sampled roughness curve.
+	float roughness = mad(mad(bladeType.midRoughnessPolynomial.x, appearanceT, bladeType.midRoughnessPolynomial.y), appearanceT * appearanceT, bladeType.midRoughnessPolynomial.z);
+#			else
 	float roughness = lerp(bladeType.baseMinTipRoughnessStart.x, bladeType.baseMinTipRoughnessStart.y, smoothstep(0.0f, bladeType.baseMinTipRoughnessStart.w, appearanceT));
 	roughness = lerp(roughness, bladeType.baseMinTipRoughnessStart.z, smoothstep(bladeType.baseMinTipRoughnessStart.x, 1.0f, appearanceT));
+#			endif
 
-	float bladeAO = lerp(bladeType.minAO, 1.0f, appearanceT);
-	float clumpAO = lerp(1.0f, bladeType.minAO, clumpDensity * bladeType.clumpAOStrength);
+	// Occlusion follows the blade's real height in the canopy; only colour uses the stabilized sample.
+	float bladeAO = lerp(bladeType.minAO, 1.0f, t);
+	float clumpAO = GetClumpAO(bladeType, clumpDensity, t);
 	float heightOrT = bladePosition.y;
 	o.AOThicknessRoughness = float4(bladeAO * clumpAO, lerp(bladeType.minMaxSubsurfaceOpacity.x, bladeType.minMaxSubsurfaceOpacity.y, appearanceT), roughness, heightOrT);
 #		endif

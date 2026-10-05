@@ -79,7 +79,8 @@ private:
 	uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade);  // High stores SH, Mid stores the probe root; either may include collision. Far is 16 bytes.
 	std::string densityString;
 	uint32_t slopeExtraBlades = 0;
-	uint32_t farMidDensity = 0;  // Mid density used to size Far's shared-band candidate slots.
+	uint32_t extraSlotMidDensity = 0;  // Mid density and distant fill the extra candidate slots were sized for.
+	float extraSlotFill = -1.0f;
 	std::string patchBladeCountString = std::to_string(PatchBladeCount);
 	std::string slopeExtraBladesString = "0";
 	std::string bladeBatchSizeString;
@@ -188,6 +189,8 @@ private:
 	}
 	bool UsesSimpleLighting() const;
 	bool UsesBatchedLow() const { return std::string_view(vertCountDefine) == "LOW_VERTEX"; }
+	/** @brief Low and Far size their extra candidate slots from the Mid density they fill toward. */
+	bool SizesExtraSlotsToMid() const { return extraDefine || UsesBatchedLow(); }
 	bool UsesBatchedDraws() const { return UsesBatchedLow() || std::string_view(vertCountDefine) == "MID_VERTEX"; }
 	void AppendVertexShaderDefines(ShaderDefines& defines) const;
 

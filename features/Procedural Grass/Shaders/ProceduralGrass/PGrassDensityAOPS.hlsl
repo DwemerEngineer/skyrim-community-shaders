@@ -3,6 +3,7 @@
 #define FRAMEBUFFER
 #include "Common/FrameBuffer.hlsli"
 #include "Common/Random.hlsli"
+#include "Common/Color.hlsli"
 
 #include "ProceduralGrass/PGrassCommon.hlsli"
 
@@ -92,5 +93,6 @@ float4 main(float4 position : SV_POSITION) : SV_Target0
 	float heightFraction = saturate((world.z - terrainZ) / max(grassAOParams.w, 1.0f));
 	ao *= 1.0f - heightFraction;
 
-	return saturate(1.0f - ao);
+	// The composite encodes resolved lighting; encode the attenuation for its multiplicative blend too.
+	return Color::IrradianceToGamma(saturate(1.0f - ao));
 }

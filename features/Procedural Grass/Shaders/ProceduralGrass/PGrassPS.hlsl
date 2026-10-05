@@ -119,9 +119,7 @@ struct PS_OUTPUT
 };
 
 Texture2D<float4> DistantAmbientLUT : register(t73);
-#if defined(LOW_LOD)
 Texture2D<float> GrassSceneDepth : register(t74);
-#endif
 #if defined(FAR_LOD)
 Texture2D<float> GrassScreenAO : register(t76);
 #elif defined(HIGH_LOD)
@@ -240,6 +238,79 @@ sh2 SampleLowSkylighting(float3 positionMS, float3 positionOffset, uint3 arrayOr
 }
 #endif
 
+#if defined(SCREEN_SPACE_SHADOWS) && (defined(MID_LOD) || defined(LOW_LOD) || (defined(HIGH_LOD) && !defined(HIGH_INNER)))
+/**
+ * @brief Statistical stand-in for blades shadowing each other in screen space.
+ * Some blades stay lit, some are fully shadowed, and the rest are shadowed up to a random height, so lower blade sections
+ * are shadowed more often. The lit share follows the sun's elevation, as neighbouring blades block more of a low sun.
+ * @param viewDirection Direction from the blade toward the camera
+ * @param lightDirection Direction toward the sun
+ * @param seed Stable per-blade random seed
+ * @param along Position along the blade [0,1]
+ * @param expectedBlend Blend toward the pattern's expected visibility, for geometry standing in for several blades
+ * @return Sun visibility from neighbouring blades
+ */
+float GetBladeShadowPattern(float3 viewDirection, float3 lightDirection, uint seed, float along, float expectedBlend)
+{
+	static const float BladeSunBlocking = 0.2f;
+	float sunHeight = max(abs(lightDirection.z), 0.05f);
+	// Shadowed blade sections face away from the sun, so they are hidden with the sun behind the camera and in full
+	// view when facing it. Mid's screen-space shadows show the same swing, so the pattern follows the view direction.
+	float sunFacingView = 1.0f - smoothstep(0.0f, 0.9f, dot(viewDirection, lightDirection));
+	// Blades block more of a lower sun, up to the reach of the screen-space trace this stands in for.
+	static const float BladeSunBlockingLimit = 3.0f;
+	float bladeSunVisibility = exp(-BladeSunBlocking * sunFacingView * min(sqrt(saturate(1.0f - sunHeight * sunHeight)) / sunHeight, BladeSunBlockingLimit));
+	float shadowLit = bladeSunVisibility * bladeSunVisibility;
+	float shadowFull = 0.85f * pow(saturate(1.0f - bladeSunVisibility), 1.5f);
+	float shadowPartial = max(1.0f - shadowLit - shadowFull, 1.0e-3f);
+	static const float ShadowMaxLine = 0.8f;
+	float shadowRandom = GrassNoiseHash(float2(seed, 0.0f));
+	float shadowLine = (shadowRandom - shadowLit) * (ShadowMaxLine / shadowPartial);
+	shadowLine = shadowRandom >= 1.0f - shadowFull ? 2.0f : shadowLine;
+	float bladeShadow = smoothstep(shadowLine - 0.05f, shadowLine + 0.05f, along);
+	float expectedShadow = shadowLit + shadowPartial * saturate(along * (1.0f / ShadowMaxLine));
+	return lerp(bladeShadow, expectedShadow, expectedBlend);
+}
+#endif
+
+/**
+ * @brief Share of the ambient sky a blade surface still sees through the canopy around it.
+ * A surface takes most of its skylight from around the direction halfway between its normal and straight up. The
+ * blades above hide more of that sky the flatter the direction runs, so surfaces deep in the canopy that face sideways
+ * or down, toward neighbouring blades and the ground, darken while those facing up keep their light. Overcast skies
+ * light every direction almost equally, so this is what keeps a blade's shape without direct sun.
+ * @param normal Surface normal
+ * @param canopyOverhead Canopy above the surface, from 0 at the top to 1 at the base of dense grass
+ * @return Sky visibility [0,1]
+ */
+// Extinction of a narrow beam, a reflection or the sun's direct path, through the canopy above a point, per unit of
+// canopyOverhead along a vertical path, and the lowest elevation such a path is evaluated at.
+static const float CanopyReflectionExtinction = 4.0f;
+static const float CanopyReflectionMinElevation = 0.05f;
+// Probability that scattered light escapes the canopy instead of meeting another blade.
+static const float CanopyScatterEscape = 0.5f;
+
+float GetCanopySkyVisibility(float3 normal, float canopyOverhead)
+{
+	static const float MinSkyElevation = 0.1f;
+	// Unit surface normals give the halfway elevation directly, including the closed-sky limit when pointing down.
+	float skyElevation = max(sqrt(saturate(0.5f * (1.0f + normal.z))), MinSkyElevation);
+	return exp2(-canopyOverhead * grassLightParams.y * (1.0f / skyElevation - 1.0f));
+}
+
+/**
+ * @brief Ambient sky light a blade surface receives inside the canopy, relative to the open sky.
+ * The sky the canopy hides is not lost: the blades hiding it scatter it on, so it arrives as grass-coloured light.
+ * @param normal Surface normal
+ * @param canopyOverhead Canopy above the surface, from 0 at the top to 1 at the base of dense grass
+ * @param canopyFill Share of the hidden sky the canopy scatters on toward the surface
+ * @return Sky light per channel [0,1]
+ */
+float3 GetCanopySkyLight(float3 normal, float canopyOverhead, float3 canopyFill)
+{
+	return lerp(canopyFill, 1.0f, GetCanopySkyVisibility(normal, canopyOverhead));
+}
+
 float3 GetStableClumpColor(GrassType bladeType, uint seed)
 {
 	float colorRandom = (float(seed) + 0.5f) * (1.0f / 256.0f);
@@ -249,95 +320,95 @@ float3 GetStableClumpColor(GrassType bladeType, uint seed)
 	return lerp(1.0f, tint * value, bladeType.clumpColorStrength);
 }
 
-float3 GetDistantAOThicknessRoughness(GrassType bladeType, float appearanceT, float clumpDensity)
+float3 GetDistantAOThicknessRoughness(GrassType bladeType, float appearanceT, float clumpDensity, float along)
 {
-	float roughness = lerp(bladeType.baseMinTipRoughnessStart.x, bladeType.baseMinTipRoughnessStart.y,
-		smoothstep(0.0f, bladeType.baseMinTipRoughnessStart.w, appearanceT));
-	roughness = lerp(roughness, bladeType.baseMinTipRoughnessStart.z,
-		smoothstep(bladeType.baseMinTipRoughnessStart.x, 1.0f, appearanceT));
-	float clumpAO = lerp(1.0f, bladeType.minAO, clumpDensity * bladeType.clumpAOStrength);
-	return float3(lerp(bladeType.minAO, 1.0f, appearanceT) * clumpAO,
-		lerp(bladeType.minMaxSubsurfaceOpacity.x, bladeType.minMaxSubsurfaceOpacity.y, appearanceT), roughness);
+	// Low and Far interpolate the same endpoint material that Mid reaches as its geometry becomes straight.
+	float2 rungT = float2(0.25f, 0.5f);
+	float2 rungRoughness = mad(mad(bladeType.midRoughnessPolynomial.x, rungT, bladeType.midRoughnessPolynomial.y), rungT * rungT, bladeType.midRoughnessPolynomial.z);
+	float baseAO = bladeType.minAO * GetClumpAO(bladeType, clumpDensity, 0.0f);
+	return float3(lerp(baseAO, 1.0f, along),
+		lerp(bladeType.minMaxSubsurfaceOpacity.x, bladeType.minMaxSubsurfaceOpacity.y, appearanceT), lerp(rungRoughness.x, rungRoughness.y, along));
 }
 
-void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, float diffuseNdotL, float diffuseWrap, float detailedSpecularWeight, float3 transmissionNormal, float waxSheenStrength, float waxRoughnessMultiplier)
+float3 GetDistantBladeColor(GrassType bladeType, float3 clumpColor, float along)
+{
+	// Far interpolates these stabilized colour samples between its base and tip vertices.
+	float3 baseColor = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, 0.25f) * (1.0f - 0.5f * grassLightParams.w);
+	float3 tipColor = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, 0.5f);
+	return lerp(baseColor, tipColor, along) * clumpColor;
+}
+
+void GetGrassScatteringAlbedos(float3 baseColor, float3 scatteringColor, float opaqueFraction, float transmissionStrength,
+	out float3 reflectionAlbedo, out float3 transmissionAlbedo)
+{
+	// Blender PR #157469 uses one scattering albedo for both thin-subsurface lobes.
+	// OpenPBR: R = S*(1-g)/2, T = S*(1+g)/2. Strength 0..2 maps to g=-1..1 independently of coverage.
+	float subsurfaceWeight = 1.0f - saturate(opaqueFraction);
+	float transmittedShare = saturate(0.5f * transmissionStrength);
+	transmissionAlbedo = scatteringColor * (subsurfaceWeight * transmittedShare);
+	reflectionAlbedo = baseColor * (1.0f - subsurfaceWeight) + scatteringColor * (subsurfaceWeight * (1.0f - transmittedShare));
+}
+
+void GetDiffuseLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, float normalDotLight,
+	float3 reflectionAlbedo, float3 transmissionAlbedo, float3 surfaceThroughput)
 {
 	lightingOutput = (DirectLightingOutput)0;
+	// Use Blender's zero-diffuse-roughness limit: Lambert reflection and transmission on opposite hemispheres.
+	float2 diffuseCosines = max(float2(normalDotLight, -normalDotLight), 0.0f);
+	float3 irradiance = context.lightColor * context.detailedShadow * BRDF::Diffuse_Lambert() * surfaceThroughput;
+	// Combine the scattered lobes so the wetness layer attenuates both together.
+	lightingOutput.diffuse = (reflectionAlbedo * diffuseCosines.x + transmissionAlbedo * diffuseCosines.y) * irradiance;
+}
+
+void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, float diffuseNdotL,
+	float3 reflectionAlbedo, float3 transmissionAlbedo,
+	float3 specularNormal, float3 specularTangent, float specularRoughness, float specularAnisotropy, float specularSlopeVariance, float3 specularAlbedo, float3 fuzzNormal, float fuzzNdotV, float fuzzAlbedo, float fuzzRoughness)
+{
 	const float3 detailedLightColor = context.lightColor * context.detailedShadow;
-	const float3 N = context.worldNormal;
 	const float3 V = context.viewDir;
 	const float3 L = context.lightDir;
-	const float3 H = context.halfVector;
-	const float satVdotH = saturate(dot(V, H));
-	const float satNdotV = saturate(abs(dot(N, V)) + EPSILON_DOT_CLAMP);
-	const float satNdotH = saturate(abs(dot(N, H)));
 
-	float horizontalHalf2 = dot(H.xy, H.xy);
-	float verticalHalf2 = H.z * H.z;
-	float canopyLobe = lerp(horizontalHalf2 * horizontalHalf2 * 0.375f, verticalHalf2 * verticalHalf2, 0.25f);
-	canopyLobe = saturate(canopyLobe * (8.0f / 3.0f));
-	canopyLobe *= lerp(0.14f, 0.055f, saturate(material.Roughness));
-	float3 canopyF = BRDF::F_Schlick(material.F0, satVdotH);
-	float3 canopySpecular = canopyF * canopyLobe * diffuseNdotL;
-
-	detailedSpecularWeight = saturate(detailedSpecularWeight);
-	float3 fresnel = canopyF;
-	float3 directSpecular = canopySpecular;
-	[branch] if (detailedSpecularWeight > 0.0f)
+	// OpenPBR specular: one GGX lobe on the blade's own specular normal, roughened with distance like the sky reflection.
+	// The sun reflects off individual blades even at distance; treating the canopy top as one surface would turn a low sun
+	// into a glare band that neighbouring blades actually hide. The normal faces the viewer, so light reaching only the
+	// far side of the blade transmits instead of reflecting.
+	// The blade's parallel veins tilt its surface across the width, so the lobe stretches across the blade and the sun
+	// reflects off blade fronts over a wider range of orientations.
+	float specularNdotL = saturate(dot(specularNormal, L));
+	float3 specularF;
+#if defined(FAR_LOD)
+	// The canopy has no anisotropy; evaluate the isotropic limit without the tangent frame.
+	float3 halfVector = V + L;
+	float halfLengthSquared = dot(halfVector, halfVector);
+	float specularNdotV = dot(specularNormal, V);
+	float3 directSpecular = 0.0f;
+	[branch] if (specularNdotL > 0.0f && specularNdotV > 0.0f && halfLengthSquared > 1e-8f)
 	{
-		float detailNdotL = saturate(abs(dot(N, L)));
-		float3 detailedF;
-		float3 detailedSpecular = PBR::SpecularMicrofacet(material.Roughness, material.F0, detailNdotL, satNdotV, satNdotH, satVdotH, detailedF) * detailNdotL;
-		// Keep the detailed tip highlight from overpowering the broad canopy response.
-		detailedSpecular = min(detailedSpecular, canopySpecular * 6.0f);
-		fresnel = lerp(canopyF, detailedF, detailedSpecularWeight);
-		directSpecular = lerp(canopySpecular, detailedSpecular, detailedSpecularWeight);
+		float3 H = halfVector * rsqrt(halfLengthSquared);
+		float alpha = max(specularRoughness * specularRoughness, 1e-3f);
+		float roughness = sqrt(sqrt(alpha * alpha + specularSlopeVariance));
+		float distribution = BRDF::D_GGX(roughness, saturate(dot(specularNormal, H)));
+		float visibility = BRDF::Vis_SmithJoint(roughness, saturate(specularNdotV) + EPSILON_DOT_CLAMP, specularNdotL);
+		specularF = BRDF::F_Schlick(material.F0, saturate(dot(V, H)));
+		directSpecular = distribution * visibility * specularF * specularNdotL;
 	}
-
-	float waxNdotL = saturate(abs(dot(N, L)));
-	float waxNdotV = saturate(abs(dot(N, V)) + EPSILON_DOT_CLAMP);
-	float3 waxF0 = float3(0.035f, 0.035f, 0.035f);
-	float waxRoughness = saturate(material.Roughness * waxRoughnessMultiplier);
-#if defined(LOW_LOD)
-	float3 waxSpecular = BRDF::F_Schlick(waxF0, satVdotH) * canopyLobe * lerp(1.15f, 0.75f, waxRoughness) * waxNdotL;
 #else
-	float waxNdotH = saturate(abs(dot(N, H)));
-	float3 waxFresnel;
-	float3 waxSpecular = PBR::SpecularMicrofacet(waxRoughness, waxF0, waxNdotL, waxNdotV, waxNdotH, satVdotH, waxFresnel) * waxNdotL;
+	float3 directSpecular = PBR::SpecularMicrofacetAnisotropic(specularRoughness, specularAnisotropy, material.F0, specularNormal, specularTangent, V, L, specularF, specularSlopeVariance) * specularNdotL;
 #endif
-	float waxGrazing = 1.0f - waxNdotV;
-	float waxWeight = waxSheenStrength * lerp(0.15f, 1.0f, smoothstep(0.10f, 0.70f, waxGrazing));
-	float3 diffuseEnergy = 1.0f - fresnel;
 
-	// Keep reflected lighting two-sided; transmission uses the signed sheet hemisphere.
-	float wrappedDiffuseNdotL = saturate((diffuseNdotL + diffuseWrap) / (1.0f + diffuseWrap));
-	float3 baseDiffuse = wrappedDiffuseNdotL * BRDF::Diffuse_Lambert() * diffuseEnergy;
+	// OpenPBR fuzz sits over the whole blade: it reflects fuzzAlbedo of the light and passes the rest untinted.
+	float fuzzThroughput = 1.0f - fuzzAlbedo;
+	float fuzzReflection = fuzzAlbedo * PBR::FuzzLobe(L, V, fuzzNormal, fuzzNdotV, fuzzRoughness);
 
-	// Transfer diffuse energy into the wax lobe instead of adding energy.
-	float3 waxTransfer = min(waxSpecular * waxWeight, baseDiffuse * 0.35f);
-	lightingOutput.diffuse = (baseDiffuse - waxTransfer) * detailedLightColor;
-	lightingOutput.specular = (directSpecular + waxTransfer) * detailedLightColor;
-
-	float sheetNdotL = dot(transmissionNormal, L);
-	float frontVisibility = smoothstep(-0.10f, 0.10f, sheetNdotL);
-	if ((PBRFlags & PBR::Flags::Subsurface) != 0) {
-		// Keep a small wrapped shoulder at grazing angles on the back hemisphere.
-		float wrappedBackNdotL = saturate((-sheetNdotL + diffuseWrap * 0.35f) / (1.0f + diffuseWrap * 0.35f));
-		float backVisibility = 1.0f - frontVisibility;
-		wrappedBackNdotL *= backVisibility;
-		float thinness = saturate(1.0f - material.Thickness);
-		float forwardScatter = pow(saturate(-dot(V, L)), 4.0f);
-		float transmissionAmount = wrappedBackNdotL * thinness * lerp(1.0f, 1.75f, forwardScatter);
-		float3 transmissionTint = saturate(material.SubsurfaceColor * 1.20f);
-		float transmissionShadow = lerp(context.softShadow, 1.0f, thinness * 0.35f);
-		float3 sheetTransmission = transmissionTint * context.lightColor * transmissionShadow *
-		                           BRDF::Diffuse_Lambert() * diffuseEnergy * transmissionAmount;
-		lightingOutput.transmission = sheetTransmission;
-	}
+	GetDiffuseLightInputProcGrass(lightingOutput, context, diffuseNdotL, reflectionAlbedo, transmissionAlbedo,
+		(1.0f - specularAlbedo) * fuzzThroughput);
+	lightingOutput.specular = (directSpecular * fuzzThroughput + fuzzReflection) * detailedLightColor;
 }
 
 PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 {
+	// Terrain Blending offsets the hardware depth. Test the visible surface before shading any tier.
+	clip(GrassSceneDepth.Load(int3(input.Position.xy, 0)) + (2.0f / 16777215.0f) - input.Position.z);
 	PS_OUTPUT psout;
 
 #if defined(FAR_LOD)
@@ -347,9 +418,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	uint grassTypeIndex = packedSeedAndType & 0xFFu;
 	float clumpDensity = float(packedSeedAndType >> 24) * (1.0f / 255.0f);
 	float farWidthT = f16tof32(input.PackedBladeParams.w & 0xFFFFu);
-	// Far's base occlusion sits a little under Low's and holds with distance: easing it off as the triangles widen
-	// left distant grass visibly brighter than the near tiers, most of all under a low sun.
-	static const float farCanopyOcclusionScale = 0.8f;
+	// Start with Low's occlusion; only ease it once Far has cleared the handoff.
+	float farCanopyOcclusionScale = lerp(1.0f, 0.8f, smoothstep(0.0f, 1.0f, farWidthT));
 #else
 	uint grassTypeIndex = (uint)input.BladeParams.z;
 #endif
@@ -377,11 +447,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float2 midPoint = tip * bladeType.mid + float2(-tip.y, tip.x) * randBend;
 	// Shade the simplified geometry with the same authored curve as Low.
 	float2 derivative = 2.0f * (1.0f - along) * midPoint + 2.0f * along * (tip - midPoint);
-	float bladeHeight = 2.0f * (1.0f - along) * along * midPoint.y + along * along * tip.y;
+	float bladeHeight = along * tip.y;
 	float3 sideAndBladeT = float3(across, along, bladeHeight);
 
 	// Match Low's authored roughness curve at the shared stabilized blade sample.
-	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity);
+	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity, along);
 #else
 	float3 cameraRelativePosition = input.CameraRelativePosition.xyz;
 #	if defined(MID_LOD) || defined(LOW_LOD)
@@ -389,7 +459,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(MID_LOD)
 	float along = input.BladeTDepth.x;
 	float2 derivative = 2.0f * (1.0f - along) * input.BezierTipAndMid.zw + 2.0f * along * (input.BezierTipAndMid.xy - input.BezierTipAndMid.zw);
-	float bladeHeight = 2.0f * (1.0f - along) * along * input.BezierTipAndMid.w + along * along * input.BezierTipAndMid.y;
+	// Canopy lighting follows the drawn height, including Mid's morph toward Low.
+	float bladeHeight = cameraRelativePosition.z - input.BladeTDepth.z;
 #		else
 	float along = input.BladeT;
 	uint lowBladeData = asuint(input.BladeParams.w);
@@ -397,7 +468,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float lowRandBend = bladeType.stiffness * (0.25f + float((lowBladeData >> 16) & 0xFu) * (1.6f / 15.0f));
 	float2 lowMidPoint = lowTip * bladeType.mid + float2(-lowTip.y, lowTip.x) * lowRandBend;
 	float2 derivative = 2.0f * (1.0f - along) * lowMidPoint + 2.0f * along * (lowTip - lowMidPoint);
-	float bladeHeight = 2.0f * (1.0f - along) * along * lowMidPoint.y + along * along * lowTip.y;
+	float bladeHeight = along * lowTip.y;
 #		endif
 	float3 sideAndBladeT = float3(input.CameraRelativePosition.w, along, bladeHeight);
 #	else
@@ -410,25 +481,26 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if defined(LOW_LOD)
 	float appearanceT = 0.25f * (along + 1.0f);
 	float clumpDensity = float(lowBladeData >> 24) * (1.0f / 255.0f);
-	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity);
+	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity, along);
 
 	uint clumpSeed = (lowBladeData >> 8) & 0xFFu;
 	float3 stableClumpColor = GetStableClumpColor(bladeType, clumpSeed);
-	float3 tipDryMul = lerp(1.0f, bladeType.grassColorTipDry.rgb,
-		smoothstep(0.5f, 1.0f, appearanceT) * bladeType.grassColorVar.z);
-	float baseShade = lerp(1.0f - grassLightParams.w, 1.0f, smoothstep(0.0f, 0.5f, appearanceT));
-	float3 baseToTipColor = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, appearanceT) * stableClumpColor * tipDryMul * baseShade;
+	float3 baseToTipColor = GetDistantBladeColor(bladeType, stableClumpColor, along);
 #	elif defined(MID_LOD)
 	float appearanceT = 0.25f * (along + 1.0f);
+	float rootDistance = float(asuint(input.BladeParams.w) >> 16) * (6144.0f / 65535.0f);
+	float lowMaterialBlend = GetMidLowBlend(rootDistance);
 	float clumpDensity = float((input.MaterialData >> 8) & 0xFFu) * (1.0f / 255.0f);
-	float clumpAO = lerp(1.0f, bladeType.minAO, clumpDensity * bladeType.clumpAOStrength);
 	bool doubleBlade = (input.MaterialData & (1u << 16)) != 0u;
 	float segmentWidth = doubleBlade ? 1.0f : 0.5f;
 	float segmentStart = doubleBlade ? 0.0f : step(0.5f, along) * 0.5f;
-	float2 rungT = 0.25f + 0.25f * float2(segmentStart, segmentStart + segmentWidth);
+	// Match outer High's material interpolation at the original geometry rungs.
+	float2 rungAlong = float2(segmentStart, segmentStart + segmentWidth);
+	float2 rungT = 0.25f + 0.25f * rungAlong;
 	float rungBlend = (along - segmentStart) / segmentWidth;
 	float2 rungRoughness = mad(mad(bladeType.midRoughnessPolynomial.x, rungT, bladeType.midRoughnessPolynomial.y), rungT * rungT, bladeType.midRoughnessPolynomial.z);
-	float3 aoThicknessRoughness = float3(lerp(bladeType.minAO, 1.0f, appearanceT) * clumpAO,
+	float2 rungAO = lerp(bladeType.minAO, 1.0f, rungAlong) * float2(GetClumpAO(bladeType, clumpDensity, rungAlong.x), GetClumpAO(bladeType, clumpDensity, rungAlong.y));
+	float3 aoThicknessRoughness = float3(lerp(rungAO.x, rungAO.y, rungBlend),
 		lerp(bladeType.minMaxSubsurfaceOpacity.x, bladeType.minMaxSubsurfaceOpacity.y, appearanceT), lerp(rungRoughness.x, rungRoughness.y, rungBlend));
 	uint clumpSeed = input.MaterialData & 0xFFu;
 	float3 stableClumpColor = GetStableClumpColor(bladeType, clumpSeed);
@@ -437,6 +509,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 rungColor0 = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, rungT.x) * stableClumpColor * rungShade.x;
 	float3 rungColor1 = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, rungT.y) * stableClumpColor * rungShade.y;
 	float3 baseToTipColor = lerp(rungColor0, rungColor1, rungBlend);
+	// Blend complete material samples so both halves agree at the middle rung throughout the morph.
+	[branch] if (lowMaterialBlend > 0.0f && !doubleBlade)
+	{
+		aoThicknessRoughness = lerp(aoThicknessRoughness, GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity, along), lowMaterialBlend);
+		baseToTipColor = lerp(baseToTipColor, GetDistantBladeColor(bladeType, stableClumpColor, along), lowMaterialBlend);
+	}
 	float viewDepth = input.BladeTDepth.y;
 #	else
 	float3 aoThicknessRoughness = input.AOThicknessRoughness.xyz;
@@ -471,10 +549,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	static const float detailFade = 0.0f;
 #	endif
 #elif defined(MID_LOD)
-	static const float SPECULAR_FADE_START = 4096.0f;
-	static const float SPECULAR_FADE_END = 6144.0f;
-	float rootDistance = float(bladeRandBits >> 16) * (6144.0f / 65535.0f);
-	float detailedSpecularWeight = 1.0f - smoothstep(SPECULAR_FADE_START, SPECULAR_FADE_END, rootDistance);
+	float detailedSpecularWeight = 1.0f - lowMaterialBlend;
 	// Fade surface detail over the same range as High's generator, so Mid adds none beyond High's outer blades.
 	float detailFade = 1.0f - smoothstep(512.0f, 1536.0f, rootDistance);
 #else
@@ -496,8 +571,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float4 baseColor = float4(baseToTipColor, 1.0f);
 	float4 rawRMAOS = float4(aoThicknessRoughness.z, 0.0f, aoThicknessRoughness.x, bladeType.specular);
 
-	// Reconstruct the blade basis and curve its normal toward the visible edge.
-	float3 bitangent = float3(-facing.y, facing.x, 0.0f);
+	// Reconstruct the blade basis and orient both sides of its rolled surface consistently.
+	float3 bitangent = normalize(float3(-facing.y, facing.x, 0.0f));
 	float3 tangent = float3(facing * derivative.x, derivative.y);
 #if defined(HIGH_LOD)
 	// Position uses windOffset * t^2, so its tangent gains the derivative 2t * windOffset.
@@ -507,15 +582,29 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #endif
 	tangent = normalize(tangent);
 	float3 normal = cross(-bitangent, tangent);
+	float normalLengthSquared = dot(normal, normal);
+	// Wind can align the tangent with the blade width; reflection still needs a unit sheet normal.
+	normal = normalLengthSquared > 1e-8f ? normal * rsqrt(normalLengthSquared) : cross(-bitangent, float3(0.0f, 0.0f, 1.0f));
 	float side = across * 2.0f - 1.0f;
+	float3 bladePlaneNormal = normal;
+	// Triangle winding can disagree with this reconstructed basis after bending; use the view-facing sheet side.
+	float faceSign = dot(normal, worldSpaceViewDirection) >= 0.0f ? 1.0f : -1.0f;
+	float3 transmissionNormal = normal * faceSign;
 
-	float3 edgeNormal = bitangent * sign(side);
-	float3 curvedNormal = normalize(lerp(normal, edgeNormal, bladeType.grassVeinParams2.w * abs(side)));
-	float3 worldSpaceNormal = frontFace ? curvedNormal : reflect(curvedNormal, normal);
-	float3 bladePlaneNormal = normalize(normal);
-	// SV_IsFrontFace follows triangle winding, which does not reliably identify the transmission hemisphere here.
-	float3 transmissionNormal = dot(bladePlaneNormal, worldSpaceViewDirection) >= 0.0f ? bladePlaneNormal : -bladePlaneNormal;
-	float3 screenSpaceNormal = normalize(FrameBuffer::WorldToView(worldSpaceNormal, false));
+	// A rolled blade's surface turns steadily across its width, so the normal tilts in proportion to the distance from
+	// the midrib, up to the edge angle the strength sets as a fraction of 90 degrees.
+	// Folded double blades reverse triangle winding on one half. Curvature follows the rendered face, not the sheet basis.
+	float curveSign = frontFace ? 1.0f : -1.0f;
+	float curveAngle = side * bladeType.grassVeinParams2.w * Math::HALF_PI * curveSign;
+	float3 worldSpaceNormal = transmissionNormal * cos(curveAngle) + bitangent * sin(curveAngle);
+	// Sky light barely changes around the horizon, so turning an upright blade's normal across its width hardly changes
+	// the ambient it receives, and the screen-space GI is the only indirect light that responds, darkening the side
+	// turned toward neighbouring blades. The indirect lighting takes twice the roll, up to edge-on, so the curvature
+	// reads under sky light as it does under sunlight; direct light and reflections keep the authored roll.
+	static const float IndirectCurvatureScale = 2.0f;
+	float indirectCurveAngle = clamp(curveAngle * IndirectCurvatureScale, -Math::HALF_PI, Math::HALF_PI);
+	float3 indirectCurveOffset = bitangent * (sin(indirectCurveAngle) - sin(curveAngle)) +
+	                             transmissionNormal * (cos(indirectCurveAngle) - cos(curveAngle));
 
 #if defined(HIGH_LOD)
 	float groundProximity = 1.0 - smoothstep(0.0, max(grassTerrainBlend.y, 0.01), sideAndBladeT.z);
@@ -537,7 +626,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	static const float MaterialDetailNormalRange = 1.25f;
 	float vein = materialDetail.z * detailFade;
 	float veinNormalOffset = (materialDetail.w * 2.0f - 1.0f) * MaterialDetailNormalRange * detailFade;
-	worldSpaceNormal = normalize(worldSpaceNormal + bitangent * veinNormalOffset);
+	worldSpaceNormal = normalize(worldSpaceNormal + bitangent * (veinNormalOffset * curveSign));
 #	else
 	float vein = 0.0f;
 #	endif
@@ -566,14 +655,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float microWiggle = sin(along * WigglePeriod + bladeRand * Math::TAU) * bladeType.grassVeinParams2.z * detailFade;
 		float3 veinOffset = bitangent * ((across - 0.5) * 2.0 * vein * veinStrength + microWiggle);
 
-		worldSpaceNormal = normalize(worldSpaceNormal + veinOffset);
+		worldSpaceNormal = normalize(worldSpaceNormal + veinOffset * curveSign);
 	}
 #endif
 
 	// Turn the base normal toward the ground plane so it shades like terrain, not an edge-on blade.
 	worldSpaceNormal = normalize(lerp(worldSpaceNormal, float3(0.0, 0.0, 1.0), groundBlend * grassTerrainBlend.z));
+	float3 indirectNormal = normalize(worldSpaceNormal + indirectCurveOffset * (1.0f - groundBlend * grassTerrainBlend.z));
 
-	screenSpaceNormal = normalize(FrameBuffer::WorldToView(worldSpaceNormal, false));
+	// The deferred composite's screen-space GI reads this normal.
+	float3 screenSpaceNormal = normalize(FrameBuffer::WorldToView(indirectNormal, false));
 
 #if !defined(LOW_LOD) && !defined(HIGH_LOD)
 	[branch] if (detailFade > 0.0)
@@ -636,7 +727,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	baseColor.rgb = Color::ColorToLinear(baseColor.rgb);
 
 	float canopyHeight01 = saturate(sideAndBladeT.z / max(bladeType.height, 1.0));
-	float canopyAO = lerp(1.0 - grassLightParams.y, 1.0, canopyHeight01);
+	// The sky the canopy hides depends on which way the surface faces, so GetCanopySkyVisibility applies it below.
+	float canopyAO = 1.0f;
 
 #if defined(HIGH_LOD)
 	uint packedCanopyShadow = (uint)input.WindLodDensity.w;
@@ -666,7 +758,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #endif
 
 	float canopyOverhead = (1.0 - canopyHeight01) * lerp(0.4, 1.0, canopyDensity);
-	float canopySunShadow = exp2(-canopyOverhead * grassLightParams.z);
 
 	float4 shadowColor = 1.0;
 
@@ -705,13 +796,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		shadowColor.x *= lerp(1.0f, GetGroundSunFacing(shadowPixel, SharedData::DirLightDirection.xyz), groundSunFade);
 #endif
 
-#if defined(LOW_LOD)
+#if defined(MID_LOD) || defined(LOW_LOD)
 	// Match the darker lower blades on Mid while preserving the lit tips.
 	static const float LowContactOcclusionBase = 0.62f;
 	// Mid's tips sit in each other's screen-space shadows, so Low's tips stay short of fully open.
 	static const float LowContactOcclusionTip = 0.9f;
 	float lowContactOcclusion = lerp(LowContactOcclusionBase, LowContactOcclusionTip, smoothstep(0.0f, 0.9f, along));
-#	if defined(FAR_LOD)
+#	if defined(MID_LOD)
+	lowContactOcclusion = lerp(1.0f, lowContactOcclusion, lowMaterialBlend);
+#	elif defined(FAR_LOD)
 	lowContactOcclusion = lerp(1.0f, lowContactOcclusion, farCanopyOcclusionScale);
 #	endif
 	rawRMAOS.z *= lowContactOcclusion;
@@ -727,13 +820,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	material.F0 = lerp(saturate(rawRMAOS.w), Color::IrradianceToLinear(baseColor.xyz), material.Metallic);
 	material.F0 = lerp(material.F0, material.F0 * 1.12, vein * 0.25);
 	baseColor.xyz *= 1 - material.Metallic;
-	material.BaseColor = baseColor.xyz;
-	// Scale transmission by albedo so dark blades remain energy bounded.
-	material.SubsurfaceColor = saturate(bladeType.grassSubsurfaceColor.rgb * baseColor.rgb * bladeType.grassTypeLightParams.y);
-	material.Thickness = aoThicknessRoughness.y;
+	material.Thickness = saturate(aoThicknessRoughness.y);
 
 	float3 specularColorPBR = 0;
-	float3 transmissionColor = 0;
 	float pbrGlossiness = 1 - material.Roughness;
 
 #if defined(SKYLIGHTING) && !defined(FAR_LOD)
@@ -857,13 +946,70 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	waterRoughnessSpecular = 1.0 - wetnessGlossinessSpecular * 0.9;
 #endif
 
+#if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
+	[branch] if (wetnessGlossinessAlbedo > 0.0)
+	{
+		float porosity = 1.0 - saturate(sqrt(material.Metallic));
+		float wetnessDarkeningAmount = porosity * wetnessGlossinessAlbedo;
+		float3 wetBaseColor = Color::LLLinearToGamma(baseColor.xyz);
+		wetBaseColor = lerp(wetBaseColor, pow(abs(wetBaseColor), 1.0 + wetnessDarkeningAmount), 0.8);
+		baseColor.xyz = Color::LLGammaToLinear(wetBaseColor);
+	}
+#endif
+
+	material.BaseColor = saturate(baseColor.xyz);
+	// The independent scattering tint retains the same base-to-tip variation, veins and wetness as the diffuse base.
+	float3 scatteringColor = saturate(material.BaseColor * bladeType.grassSubsurfaceColor.rgb);
+	float3 reflectionAlbedo, transmissionAlbedo;
+	GetGrassScatteringAlbedos(material.BaseColor, scatteringColor, material.Thickness, bladeType.grassSurfParams.y,
+		reflectionAlbedo, transmissionAlbedo);
+
 	float3 dirLightColor = grassFrameLight.xyz;
 	float3 dirLightDirection = SharedData::DirLightDirection.xyz;
-	float dirDiffuseNdotL = saturate(abs(dot(worldSpaceNormal, dirLightDirection)));
+	// Preserve the signed curve and vein tilt of the visible face.
+	float shadingNormalSheet = dot(worldSpaceNormal, bladePlaneNormal);
+	float3 shadingNormalTilt = worldSpaceNormal - bladePlaneNormal * shadingNormalSheet;
+	// Use the same restrained tilt as the specular lobe for direct light; the full roll makes thin blades look tubular.
+	// Both sides retain their signed curvature, and a sheet component keeps the normal defined at edge-on views.
+	static const float DirectCurvature = 0.5f;
+	float3 visibleFaceNormal = normalize(transmissionNormal * max(abs(shadingNormalSheet), 1e-4f) + shadingNormalTilt * DirectCurvature);
+	// Light reflects diffusely only off the face it reaches; light on the far face passes through as transmission.
+	// Mirroring the far side's light onto the visible face lit the edge of a rolled blade that curves away from the
+	// light as if it faced it, and lit backlit blades twice.
+	float dirDiffuseNdotL = dot(visibleFaceNormal, dirLightDirection);
 
 	float dirDetailShadow = 1.0;
 #if defined(SCREEN_SPACE_SHADOWS) && !defined(LOW_LOD)
 	dirDetailShadow = ScreenSpaceShadows::GetScreenSpaceShadow(float3(shadowPixel, input.Position.z), screenUV, screenNoise);
+#	if defined(MID_LOD) || (defined(HIGH_LOD) && !defined(HIGH_INNER))
+	// The trace marches through the blades, which pack ever tighter on screen with distance, so farther out it reads
+	// them as deep shadows that shift as the camera moves. Hand over to the statistical shadowing Low uses; the shadow
+	// mask still carries what terrain and objects cast. High's outer blades reach into the same range, and where they
+	// meet Mid both must shadow alike: the light the trace blocks returns as deep green canopy scatter, so a darker trace
+	// shows as a colour step at the tier boundary wherever the direct light is weak.
+	static const float MidPatternStart = 2048.0f;
+	static const float MidPatternEnd = 4096.0f;
+#		if defined(HIGH_LOD)
+	float rootDistance = ApproximateGrassDistance(cameraRelativePosition.xy + FrameBuffer::CameraPosAdjust.xy - grassLodOrigin);
+#		endif
+	float midPatternBlend = smoothstep(MidPatternStart, MidPatternEnd, rootDistance);
+	// Keep traced shadows on resolved blades. The taper correction lets thin tips reach the statistical pattern first.
+	float widthFootprint = length(float2(ddx(across), ddy(across))) / max(1.0f - along, 1e-3f);
+	midPatternBlend *= smoothstep(0.5f, 1.0f, widthFootprint);
+	// Finish the shadow handoff with the geometry and material morph to Low.
+	midPatternBlend = lerp(midPatternBlend, 1.0f, GetMidLowBlend(rootDistance));
+	[branch] if (midPatternBlend > 0.0f)
+	{
+#		if defined(HIGH_LOD)
+		// High blades carry no clump seed; the low bits of their random value are as stable.
+		uint midShadowSeed = bladeRandBits & 0xFFFu;
+#		else
+		uint midShadowSeed = (input.MaterialData & 0xFFu) | ((bladeRandBits & 0xFu) << 8);
+#		endif
+		float midBladeShadow = GetBladeShadowPattern(worldSpaceViewDirection, dirLightDirection, midShadowSeed, along, 0.0f);
+		dirDetailShadow = lerp(dirDetailShadow, midBladeShadow, midPatternBlend);
+	}
+#	endif
 #elif defined(SCREEN_SPACE_SHADOWS)
 	// Low and Far are absent from the depth that screen-space shadows trace, so they take what terrain and objects
 	// cast onto the ground at the root, the same shadows Mid shows there. Object LOD casts much the same shadows as the
@@ -898,36 +1044,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		detailShadowFade *= smoothstep(0.5f, 1.0f, midThinning);
 	}
 	dirDetailShadow = lerp(1.0f, rootDetailShadow, detailShadowFade * (1.0f - rootDistantForegroundWeight));
-	static const float BladeSunBlocking = 0.2f;
-	float sunHeight = max(abs(dirLightDirection.z), 0.05f);
-	// Shadowed blade sections face away from the sun, so they are hidden with the sun behind the camera and in full
-	// view when facing it. Mid's screen-space shadows show the same swing, so the pattern follows the view direction.
-	float sunFacingView = 1.0f - smoothstep(0.0f, 0.9f, dot(worldSpaceViewDirection, dirLightDirection));
-	// Blades block more of a lower sun, up to the reach of the screen-space trace this stands in for.
-	static const float BladeSunBlockingLimit = 3.0f;
-	float bladeSunVisibility = exp(-BladeSunBlocking * sunFacingView * min(sqrt(saturate(1.0f - sunHeight * sunHeight)) / sunHeight, BladeSunBlockingLimit));
-	float lowShadowLit = bladeSunVisibility * bladeSunVisibility;
-	float lowShadowFull = 0.85f * pow(1.0f - bladeSunVisibility, 1.5f);
-	float lowShadowPartial = max(1.0f - lowShadowLit - lowShadowFull, 1.0e-3f);
-	static const float LowShadowMaxLine = 0.8f;
 	// The clump seed and per-blade bend are stable across frames, unlike the f16 camera-relative root.
 #	if defined(FAR_LOD)
 	uint lowShadowSeed = (packedSeedAndType >> 8) & 0xFFu | ((packedSeedAndType >> 20) & 0xFu) << 8;
+	// Widened Far triangles stand in for several blades, so ease toward the pattern's expected visibility.
+	float lowShadowExpectedBlend = smoothstep(0.0f, 1.0f, farWidthT);
 #	else
 	uint lowShadowSeed = (lowBladeData >> 8) & 0xFFFu;
+	static const float lowShadowExpectedBlend = 0.0f;
 #	endif
-	float lowShadowRandom = GrassNoiseHash(float2(lowShadowSeed, 0.0f));
-	float lowShadowLine = (lowShadowRandom - lowShadowLit) * (LowShadowMaxLine / lowShadowPartial);
-	lowShadowLine = lowShadowRandom >= 1.0f - lowShadowFull ? 2.0f : lowShadowLine;
-	float bladeShadow = smoothstep(lowShadowLine - 0.05f, lowShadowLine + 0.05f, along);
-#	if defined(FAR_LOD)
-	// Widened Far triangles stand in for several blades, so ease toward the pattern's expected visibility.
-	float expectedLowShadow = lowShadowLit + lowShadowPartial * saturate(along * (1.0f / LowShadowMaxLine));
-	bladeShadow = lerp(bladeShadow, expectedLowShadow, smoothstep(0.0f, 1.0f, farWidthT));
-#	endif
-	dirDetailShadow *= bladeShadow;
+	dirDetailShadow *= GetBladeShadowPattern(worldSpaceViewDirection, dirLightDirection, lowShadowSeed, along, lowShadowExpectedBlend);
 #endif
-#if defined(LOW_LOD)
+#if defined(MID_LOD) || defined(LOW_LOD)
 	dirDetailShadow *= lowContactOcclusion;
 #endif
 
@@ -940,17 +1068,77 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #else
 	float dirShadow = ShadowSampling::GetWorldShadow(rootPosition, FrameBuffer::CameraPosAdjust.xyz);
 #endif
-	// Keep world shadow in radiance and pass canopy visibility separately for transmission.
-	float dirSurfaceShadow = shadowColor.x * canopySunShadow;
+	// World shadows attenuate all direct light; canopy visibility applies to the blade lobes.
+	float dirSurfaceShadow = shadowColor.x;
 	float dirDetailedVisibility = dirSurfaceShadow * dirDetailShadow;
 
 	float3 diffuseColor = 0;
 
 	DirectContext directContext = CreateDirectLightingContext(worldSpaceNormal, worldSpaceNormal, worldSpaceNormal, worldSpaceViewDirection, worldSpaceViewDirection, dirLightDirection, dirLightDirection, dirLightColor * dirShadow, dirDetailedVisibility, dirSurfaceShadow);
 	DirectLightingOutput dirLighting;
-	float bladeTipWeight = smoothstep(0.40f, 0.85f, along);
-	float bladeHighlightWeight = detailedSpecularWeight * bladeTipWeight;
-	GetDirectLightInputProcGrass(dirLighting, directContext, material, dirDiffuseNdotL, bladeType.grassSurfParams.z, bladeHighlightWeight, transmissionNormal, bladeType.grassSurfParams.x, bladeType.grassSurfParams.w);
+	// The blade's waxy cuticle is its OpenPBR specular interface. Up close the lobe follows each blade. Farther away the
+	// visible surface is the canopy top, so the normal turns up, and the spread of blade normals across the hemisphere
+	// roughens the lobe by adding slope variances, as OpenPBR's coat roughening does.
+	static const float CanopyRoughness = 0.8f;
+#if defined(FAR_LOD)
+	// Far starts beyond the individual-blade reflection range.
+	static const float canopyBlend = 1.0f;
+#else
+	float canopyBlend = smoothstep(256.0f, 4096.0f, length(cameraRelativePosition));
+#endif
+	// The specular takes half of the shading normal's curvature and veins. The flat sheet normal spreads the sun evenly
+	// over an aligned blade, which reads as a paler blade, not a highlight; the full curvature narrows highlights to
+	// slivers along the edges. Half keeps them wide while they still shade across the blade.
+	// Only part of the in-plane tilt is added to the viewer-facing sheet normal. Blending the two normals instead cancels
+	// near edge-on views, where each can face a different side, and leaves a normal along the blade's width.
+	static const float SpecularCurvature = 0.5f;
+	float3 specularNormal = normalize(transmissionNormal * max(abs(shadingNormalSheet), 1e-4f) + shadingNormalTilt * (SpecularCurvature * (1.0f - canopyBlend)));
+	float3 canopyNormal = lerp(specularNormal, float3(0.0f, 0.0f, 1.0f), canopyBlend);
+	float canopyNormalLengthSquared = dot(canopyNormal, canopyNormal);
+	canopyNormal = canopyNormalLengthSquared > 1e-8f ? canopyNormal * rsqrt(canopyNormalLengthSquared) : float3(0.0f, 0.0f, 1.0f);
+	canopyNormal = dot(canopyNormal, worldSpaceViewDirection) < 0.0f ? -canopyNormal : canopyNormal;
+	float canopyNdotV = clamp(dot(canopyNormal, worldSpaceViewDirection), EPSILON_DOT_CLAMP, 1.0f);
+	float canopySlopeVariance = canopyBlend * CanopyRoughness * CanopyRoughness * CanopyRoughness * CanopyRoughness;
+	// Blades are often thinner than a pixel and turn sharply across it. Facing the sun, a blade seen edge-on reflects
+	// nearly all of it, so without anti-aliasing its highlight collapses into single bright pixels that flicker as the
+	// blades sway and the camera moves.
+	static const float SpecularAntiAliasingPixelVariance = 0.5f;
+	static const float SpecularAntiAliasingMaxVariance = 0.3f;
+	float specularAntiAliasingVariance = PBR::SpecularAntiAliasingVariance(ddx(specularNormal), ddy(specularNormal),
+		SpecularAntiAliasingPixelVariance, SpecularAntiAliasingMaxVariance);
+	float specularSlopeVariance = canopySlopeVariance + specularAntiAliasingVariance;
+	float canopyRoughness = PBR::AddRoughnessVariance(material.Roughness, specularSlopeVariance);
+	float3 specularAlbedo = PBR::SpecularDirectionalAlbedo(material.F0, canopyRoughness, canopyNdotV);
+
+	// OpenPBR fuzz: leaf hairs and wax bloom grow on the blade, so the fuzz layer inherits its substrate's curved normal,
+	// on the viewer's side. On the flat sheet normal every point of a blade shared one view angle, so blades seen edge-on
+	// turned grey along their whole length while their neighbours showed none. Across the roll the fuzz brightens where
+	// the surface turns away from the viewer instead. It takes the indirect lighting's roll, as most of the light it
+	// reflects is sky. Farther away the canopy top is the surface, so the roll fades with canopyBlend. Grass fibres are
+	// treated as white, so the fuzz reflects without tinting what it passes.
+	float indirectNormalSheet = dot(indirectNormal, bladePlaneNormal);
+	float3 indirectNormalTilt = indirectNormal - bladePlaneNormal * indirectNormalSheet;
+	float3 fuzzNormal = normalize(transmissionNormal * max(abs(indirectNormalSheet), 1e-4f) + indirectNormalTilt * (1.0f - canopyBlend));
+	float fuzzNdotV = clamp(dot(fuzzNormal, worldSpaceViewDirection), EPSILON_DOT_CLAMP, 1.0f);
+	float fuzzRoughness = clamp(bladeType.grassSurfParams.w, 0.01f, 1.0f);
+	float fuzzAlbedo = saturate(bladeType.grassSurfParams.x) * PBR::FuzzDirectionalAlbedo(fuzzNdotV, fuzzRoughness);
+	// The canopy roughening is isotropic, so the veins' anisotropy fades out where it takes over.
+	float specularAnisotropy = saturate(bladeType.specularAnisotropy) * (1.0f - canopyBlend);
+	float fuzzThroughput = 1.0f - fuzzAlbedo;
+	// The curvature tilts the specular normal across the blade, so keep the across-blade tangent perpendicular to it.
+	// Use a perpendicular axis if the normal nearly follows the blade width; its sign does not affect the lobe.
+	float3 acrossTangent = bitangent - specularNormal * dot(specularNormal, bitangent);
+	float3 tangentAxis = abs(specularNormal.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+	float3 specularTangent = normalize(dot(acrossTangent, acrossTangent) > 0.01f ? acrossTangent : cross(tangentAxis, specularNormal));
+	GetDirectLightInputProcGrass(dirLighting, directContext, material, dirDiffuseNdotL,
+		reflectionAlbedo, transmissionAlbedo,
+		specularNormal, specularTangent, material.Roughness, specularAnisotropy, specularSlopeVariance, specularAlbedo, fuzzNormal, fuzzNdotV, fuzzAlbedo, fuzzRoughness);
+	// A highlight needs the light's direct path through the canopy, while diffuse shading also takes the light the
+	// canopy scatters, so only the direct specular and sheen are occluded along the light. The path runs through more
+	// blades the lower the light stands, so highlights keep to the upper blade and a low sun glints only off the tips.
+	// Farther away the canopy top reflects it, so the occlusion fades with canopyBlend.
+	float canopyLightPath = canopyOverhead / max(dirLightDirection.z, CanopyReflectionMinElevation);
+	dirLighting.specular *= lerp(exp2(-canopyLightPath * CanopyReflectionExtinction), 1.0f, canopyBlend);
 
 #if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
 #	if defined(MID_LOD)
@@ -962,8 +1150,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #endif
 
 	diffuseColor += dirLighting.diffuse;
-	transmissionColor += dirLighting.transmission;
 	specularColorPBR += dirLighting.specular;
+
+	// Neighbouring blades scatter intercepted light. After each bounce, a share escapes and the rest meets another
+	// blade: e*a / (1 - (1-e)*a). This sums escaped light rather than counting it again in subsequent bounces, so the
+	// returned share cannot exceed the intercepted energy. Terrain and object shadows block its source light.
+	float3 canopySingleScatterAlbedo = saturate(reflectionAlbedo + transmissionAlbedo);
+	float3 canopyScatterAlbedo = CanopyScatterEscape * canopySingleScatterAlbedo /
+	                            (1.0f - (1.0f - CanopyScatterEscape) * canopySingleScatterAlbedo);
+	float canopyBlockedLight = saturate(1.0f - dirDetailShadow) * shadowColor.x * saturate(dirLightDirection.z);
+	// Surrounding grass scatters light toward both sides of the blade.
+	diffuseColor += dirLightColor * dirShadow * BRDF::Diffuse_Lambert() * canopyBlockedLight * canopyScatterAlbedo *
+	                (reflectionAlbedo + transmissionAlbedo) * (1.0f - specularAlbedo) * fuzzThroughput;
 
 #if defined(LIGHT_LIMIT_FIX) && !defined(LOW_LOD)
 	uint numClusteredLights = 0;
@@ -1018,46 +1216,36 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			DirectContext pointContext = CreateDirectLightingContext(worldSpaceNormal, worldSpaceNormal, worldSpaceNormal, worldSpaceViewDirection, worldSpaceViewDirection, normalizedLightDirection, normalizedLightDirection, lightColor, lightShadow, lightShadow);
 
 			DirectLightingOutput pointLighting = (DirectLightingOutput)0;
-			float pointDiffuseNdotL = saturate(abs(dot(worldSpaceNormal, normalizedLightDirection)));
-
-			PBR::GetDirectLightInputGrass(pointLighting, pointContext, material, false, pointDiffuseNdotL, pointDiffuseNdotL, bladeType.grassSurfParams.z);
+			float pointDiffuseNdotL = dot(visibleFaceNormal, normalizedLightDirection);
+			GetDiffuseLightInputProcGrass(pointLighting, pointContext, pointDiffuseNdotL,
+				reflectionAlbedo, transmissionAlbedo, (1.0f - specularAlbedo) * fuzzThroughput);
 #		if defined(WETNESS_EFFECTS)
 			if (waterRoughnessSpecular < 1.0)
 				EvaluateWetnessLighting(wetnessNormal, pointContext, waterRoughnessSpecular, pointLighting);
 #		endif
 			diffuseColor += pointLighting.diffuse * detailedSpecularWeight;
-			transmissionColor += pointLighting.transmission * detailedSpecularWeight;
 			specularColorPBR += pointLighting.specular * detailedSpecularWeight;
 		}
 	}
 #	endif
 #endif
 
-	float3 directionalAmbientColor = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(worldSpaceNormal), 0).rgb;
+	float3 directionalAmbientColor = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(indirectNormal), 0).rgb;
 	float ambientLuma = dot(directionalAmbientColor, float3(0.2126, 0.7152, 0.0722));
 	directionalAmbientColor = lerp(directionalAmbientColor, ambientLuma, bladeType.grassTypeLightParams.w);
 
 #if defined(SKYLIGHTING) && !defined(FAR_LOD)
-	float skylightingDiffuse = Skylighting::GetSkylightingDiffuse(skylightingSH, positionMSSkylight, worldSpaceNormal);
+	float skylightingDiffuse = Skylighting::GetSkylightingDiffuse(skylightingSH, positionMSSkylight, indirectNormal);
 #endif
 
-	directionalAmbientColor *= canopyAO;
+	// Ambient light the canopy hides is scattered on like sunlight, so hidden sky still arrives as grass-coloured light.
+	float3 canopyAmbientFill = canopyScatterAlbedo;
+	directionalAmbientColor *= canopyAO * GetCanopySkyLight(indirectNormal, canopyOverhead, canopyAmbientFill);
 
-#if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
-	[branch] if (wetnessGlossinessAlbedo > 0.0)
-	{
-		float porosity = 1.0 - saturate(sqrt(material.Metallic));
-		float wetnessDarkeningAmount = porosity * wetnessGlossinessAlbedo;
-		float3 wetBaseColor = Color::LLLinearToGamma(baseColor.xyz);
-		wetBaseColor = lerp(wetBaseColor, pow(abs(wetBaseColor), 1.0 + wetnessDarkeningAmount), 0.8);
-		baseColor.xyz = Color::LLGammaToLinear(wetBaseColor);
-	}
-#endif
-
-	material.BaseColor = baseColor.xyz;
 	IndirectLobeWeights indirectLobeWeights = (IndirectLobeWeights)0;
-	IndirectContext grassIndirectContext = CreateIndirectLightingContext(worldSpaceNormal, worldSpaceNormal, worldSpaceViewDirection);
-	PBR::GetIndirectLobeWeightsGrass(indirectLobeWeights, grassIndirectContext, material, true);
+	// Both ambient hemispheres use the same scattering budget and surface-layer attenuation as direct light.
+	float3 ambientScatteringThroughput = MultiBounceAO(material.BaseColor, material.AO) * (1.0f - specularAlbedo) * fuzzThroughput;
+	indirectLobeWeights.diffuse = reflectionAlbedo * ambientScatteringThroughput;
 
 #if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
 	float3 wetnessReflectance = 0.0;
@@ -1065,13 +1253,27 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	{
 		IndirectContext indirectContext = CreateIndirectLightingContext(worldSpaceNormal, worldSpaceNormal, worldSpaceViewDirection);
 		wetnessReflectance = GetWetnessIndirectLobeWeights(indirectLobeWeights, wetnessNormal, waterRoughnessSpecular, indirectContext);
+		ambientScatteringThroughput *= 1.0f - wetnessReflectance;
 	}
 #endif
 
 	// Direct irradiance uses albedo; ambient already contains the full indirect lobe.
 	float3 ambientDiffuseColor = directionalAmbientColor * indirectLobeWeights.diffuse;
-	float3 shadedDiffuseColor = diffuseColor.xyz * baseColor.xyz + ambientDiffuseColor + transmissionColor;
-	shadedDiffuseColor += directionalAmbientColor * bladeType.grassBounceColor.rgb * bladeType.grassTypeLightParams.x * (1.0 - canopyHeight01) * baseColor.xyz;
+	// The white fuzz reflects the ambient light over the hemisphere around its normal, occluded like the blade beneath.
+	float3 fuzzAmbient = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(fuzzNormal), 0).rgb * canopyAO *
+	                     GetCanopySkyLight(fuzzNormal, canopyOverhead, canopyAmbientFill) * material.AO;
+	ambientDiffuseColor += fuzzAmbient * fuzzAlbedo;
+	// The opposite hemisphere supplies diffuse transmission through the same blade material. Keep it at every tier;
+	// fading it out left Mid and Low darker than High under sky light. Both sides see the sky the canopy leaves them.
+	float3 backNormal = -indirectNormal;
+	float3 backAmbientColor = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(backNormal), 0).rgb;
+	backAmbientColor = lerp(backAmbientColor, dot(backAmbientColor, float3(0.2126, 0.7152, 0.0722)), bladeType.grassTypeLightParams.w);
+	ambientDiffuseColor += backAmbientColor * canopyAO * GetCanopySkyLight(backNormal, canopyOverhead, canopyAmbientFill) *
+	                       transmissionAlbedo * ambientScatteringThroughput;
+	float3 shadedDiffuseColor = diffuseColor.xyz + ambientDiffuseColor;
+	float3 bounceColor = directionalAmbientColor * bladeType.grassBounceColor.rgb * bladeType.grassTypeLightParams.x * (1.0 - canopyHeight01) * reflectionAlbedo;
+	float3 ambientBounceColor = bounceColor * (1.0f - specularAlbedo) * fuzzThroughput;
+	shadedDiffuseColor += ambientBounceColor;
 
 #if defined(SKYLIGHTING) && !defined(FAR_LOD)
 	Skylighting::ApplySkylighting(shadedDiffuseColor, ambientDiffuseColor, indirectLobeWeights.diffuse, skylightingDiffuse);
@@ -1079,11 +1281,35 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float grassLightingScale = grassFrameLight.w;
 	shadedDiffuseColor *= grassLightingScale;
+	// Screen-space AO occludes ambient light, not direct light. The composite applies it in full to the ambient part a
+	// material reports in Masks.z and only its square root to the rest; under sky light most of the grass's light is
+	// ambient, so without this its contact shadows between blades were halved.
+	float3 ambientShadedColor = (ambientDiffuseColor + ambientBounceColor) * grassLightingScale;
 
 	// The tighter specular lobe benefits from the authored AO that diffuse intentionally softens above.
-	float canopySpecOcclusion = lerp(1.0, canopyAO, bladeType.grassTypeLightParams.z);
-	float specOcclusion = canopySpecOcclusion * saturate(rawRMAOS.z);
-	specularColorPBR *= specOcclusion;
+	float specOcclusion = saturate(rawRMAOS.z);
+	// Direct specular is already occluded by its shadows; AO-based specular occlusion is for the sky reflection only.
+	// OpenPBR specular reflection of the environment: the specular albedo times the sky in the reflected direction.
+	// Every tier reads the same cached ambient sky, so the sheen cannot differ between tiers. The blade's AO occludes it
+	// through the standard specular occlusion, the same AO the ambient diffuse lobe uses.
+	float3 specularReflectDirection = reflect(-worldSpaceViewDirection, canopyNormal);
+	float3 specularSky = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(specularReflectDirection), 0).rgb;
+	float specularSkyOcclusion = SpecularOcclusion(canopyNdotV, canopyRoughness * canopyRoughness, material.AO);
+#if defined(SKYLIGHTING) && !defined(FAR_LOD)
+	specularSkyOcclusion *= Skylighting::GetSkylightingDiffuse(skylightingSH, positionMSSkylight, specularReflectDirection);
+#endif
+	// Inside the canopy a reflection meets neighbouring blades before the sky. Its path through the blades above
+	// lengthens as it flattens, and one that points down sees only the canopy and ground, which the ambient sky does
+	// not hold. The hidden share reflects the surrounding grass instead. Without this the blades mirror bright sky in
+	// every direction, which greys and flattens them under overcast light and swings with the view's elevation. Farther
+	// away the canopy top is the reflecting surface, so the occlusion fades with canopyBlend.
+	float canopyReflectionPath = canopyOverhead / max(specularReflectDirection.z, CanopyReflectionMinElevation);
+	float canopyReflectionVisibility = exp2(-canopyReflectionPath * CanopyReflectionExtinction) *
+	                                   smoothstep(-CanopyReflectionMinElevation, CanopyReflectionMinElevation, specularReflectDirection.z);
+	canopyReflectionVisibility = lerp(canopyReflectionVisibility, 1.0f, canopyBlend);
+	float3 canopyReflection = lerp(Color::IrradianceToLinear(ambientDiffuseColor),
+		Color::IrradianceToLinear(specularSky * Color::ReflectionNormalisationScale), canopyReflectionVisibility);
+	specularColorPBR += canopyReflection * specularAlbedo * fuzzThroughput * specularSkyOcclusion;
 	specularColorPBR *= grassLightingScale;
 	// Match the PBR scale removed from the deferred albedo buffer.
 	indirectLobeWeights.diffuse *= grassPBRLightingScale;
@@ -1116,21 +1342,25 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// The deferred pass darkens by the drawn height above terrain.
 	float rootHeight = cameraRelativePosition.z - f16tof32(packedPositionWidthHeight >> 16);
 	float densityShadowHeight = farCanopyOcclusionScale * (1.0f - saturate(rootHeight / max(grassAOParams.w, 1.0f)));
-	psout.Diffuse.xyz *= saturate(1.0f - densityShadow * saturate(grassAOParams.y) * densityShadowHeight);
+	float densityShadowScale = saturate(1.0f - densityShadow * saturate(grassAOParams.y) * densityShadowHeight);
 
-	// Far bypasses deferred composite; apply its AO the same way using the existing mask at the terrain root.
-	// Grass writes no ambient mask, so the composite applies sqrt(AO) to all of its diffuse.
-	// An unbound mask reads zero, preserving visibility when SSGI is disabled.
+	// Far bypasses deferred composite; apply its AO the same way using the existing mask at the terrain root: in full
+	// to the ambient part and its square root to the rest. An unbound mask reads zero, preserving visibility when SSGI
+	// is disabled.
 	float screenAO = 1.0f - farCanopyOcclusionScale * saturate(GrassScreenAO[uint2(shadowPixel)]);
 	float3 linDiffuse = Color::IrradianceToLinear(psout.Diffuse.xyz);
 	[branch] if (screenAO < 1.0f)
 	{
 		float3 linAlbedo = Color::IrradianceToLinear(indirectLobeWeights.diffuse / Color::PBRLightingScale);
-		linDiffuse *= sqrt(MultiBounceAO(linAlbedo, screenAO));
+		float3 multiBounceScreenAO = MultiBounceAO(linAlbedo, screenAO);
+		float3 farAmbient = min(ambientShadedColor, psout.Diffuse.xyz);
+		float3 farDirect = Color::IrradianceToGamma(Color::IrradianceToLinear(psout.Diffuse.xyz - farAmbient) * sqrt(multiBounceScreenAO));
+		linDiffuse = Color::IrradianceToLinear(farDirect + Color::IrradianceToGamma(Color::IrradianceToLinear(farAmbient) * multiBounceScreenAO));
 	}
 
 	// Far runs after deferred composite, so resolve diffuse and specular in the same order here.
-	psout.Diffuse.xyz = Color::IrradianceToGamma(linDiffuse + specularColor);
+	// The terrain-shadow pass attenuates resolved lighting, including specular, in linear space.
+	psout.Diffuse.xyz = Color::IrradianceToGamma((linDiffuse + specularColor) * densityShadowScale);
 #	endif
 #endif
 
@@ -1149,14 +1379,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #	endif
 
-	psout.Reflectance = float4(indirectLobeWeights.specular * specOcclusion * lerp(0.125f, 0.5f, dirSurfaceShadow), psout.Diffuse.w);
+	// Only wetness reaches the composite's reflections; the blade's own specular reflection is already in Specular.
+	psout.Reflectance = float4(indirectLobeWeights.specular * specOcclusion, psout.Diffuse.w);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), pbrGlossiness, psout.Diffuse.w);
-#	if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
-	float wetnessNormalAmount = saturate(dot(float3(0, 0, 1), wetnessNormal) * saturate(flatnessAmount));
-	psout.Masks = float4(0, 0, wetnessNormalAmount, psout.Diffuse.w);
-#	else
-	psout.Masks = float4(0, 0, 0, psout.Diffuse.w);
-#	endif
+	psout.Masks = float4(0, 0, Color::RGBToYCoCg(ambientShadedColor).x, psout.Diffuse.w);
 
 #endif
 

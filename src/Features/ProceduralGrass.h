@@ -22,6 +22,10 @@ public:
 				T("feature.procedural_grass.key_feature_3", "Real-time grass animation with wind effects") } };
 	};
 
+	// Clump grid sizes in world units; the generator divides by the grid size.
+	static constexpr float MinClumpGridSize = 16.0f;
+	static constexpr float MaxClumpGridSize = 512.0f;
+
 	struct Settings
 	{
 		bool Enabled = true;
@@ -34,41 +38,39 @@ public:
 		float tipWeight = 0.54f;
 		float mid = 0.73f;
 		float rotationalStiffness = 1.0f;
-		float ao = 0.10f;  // Minimum blade AO
-		float specular = 0.15f;
-		float waxSheenStrength = 0.08f;
-		float waxRoughnessMultiplier = 1.0f;
-		float curvedNormalStrength = 0.4f;
-		float2 subsurfaceOpacity = float2(0.8f, 0.60f);            // Base to tip
-		float3 grassSubsurfaceTint = float3(0.80f, 1.00f, 0.60f);  // Backlight tint
-		float3 baseMinTipRoughness = float3(0.55f, 0.45f, 0.55f);
+		float ao = 0.10f;                                          // Minimum blade AO
+		float specular = 0.08f;                                    // Specular reflectance at normal incidence
+		float specularAnisotropy = 0.6f;                           // OpenPBR specular anisotropy, stretched across the blade by its veins
+		float sheenStrength = 0.08f;                               // OpenPBR fuzz weight: coverage of the blade hairs and wax bloom
+		float sheenRoughness = 0.5f;                               // OpenPBR fuzz roughness: low is fibre-like, high is dusty
+		float curvedNormalStrength = 0.3f;                         // Edge tilt of the rolled cross-section as a fraction of 90 degrees
+		float2 subsurfaceOpacity = float2(0.5f, 0.30f);            // Opaque fraction of the base substrate, base to tip
+		float3 grassSubsurfaceTint = float3(0.50f, 0.54f, 0.38f);  // Scattering albedo at the stabilized blade colour
+		float grassTransmissionStrength = 1.5f;                 // Thin-subsurface anisotropy + 1; 0..2 splits scattering into reflection and transmission
+		float3 baseMinTipRoughness = float3(0.40f, 0.30f, 0.40f);
 		float tipRoughnessStart = 0.75f;
 		float clumpAOStrength = 0.5f;
 
 		// Colour
-		float3 baseColor = float3(0.100f, 0.160f, 0.055f);
-		float3 tipColor = float3(0.360f, 0.467f, 0.155f);
-		float grassColorHueVariation = 0.60f;                   // Per-blade hue variation
-		float grassColorValueVariation = 0.20f;                 // Per-blade brightness variation
-		float grassColorTipDryStrength = 0.35f;                 // Tip dry-tint strength
+		float3 baseColor = float3(0.115f, 0.135f, 0.080f);
+		float3 tipColor = float3(0.340f, 0.380f, 0.240f);
+		float grassColorHueVariation = 0.45f;                   // Per-blade hue variation
+		float grassColorValueVariation = 0.18f;                 // Per-blade brightness variation
+		float grassColorTipDryStrength = 0.20f;                 // Tip dry-tint strength
 		float grassColorMottleStrength = 0.15f;                 // Along-blade mottle strength
-		float3 grassColorCool = float3(0.72f, 0.80f, 0.70f);    // Cool blade tint
-		float3 grassColorWarm = float3(1.08f, 1.00f, 0.68f);    // Warm blade tint
-		float3 grassColorTipDry = float3(1.08f, 1.00f, 0.76f);  // Dry tip tint
+		float3 grassColorCool = float3(0.83f, 0.89f, 0.80f);    // Cool blade tint
+		float3 grassColorWarm = float3(1.02f, 1.00f, 0.84f);    // Warm blade tint
+		float3 grassColorTipDry = float3(1.04f, 1.02f, 0.88f);  // Dry tip tint
 
 		// Detail and lighting
 		float grassBaseAO = 0.35f;
 		float grassClumpColorStrength = 0.6f;
 
-		float grassAmbientFlatten = 0.7f;
-		float grassCanopySkyOcclusion = 0.0f;
+		float grassCanopySkyOcclusion = 1.0f;
 		float grassDensityAO = 0.2f;
-		float grassWrap = 1.0f;
 
 		float grassBounceStrength = 0.35f;
 		float3 grassBounceColor = float3(0.55f, 0.42f, 0.24f);
-		float grassSunSelfShadow = 0.0f;
-		float grassSpecOcclusion = 0.0f;
 		float grassAmbientDesat = 0.5f;
 
 		// Surface texture
@@ -78,8 +80,8 @@ public:
 		float grassSpeckleScale = 1.0f;
 
 		// Per-type vein detail
-		float3 grassVeinTint = float3(0.70f, 0.80f, 0.66f);  // albedo tint in the vein grooves
-		float grassVeinAlbedoStrength = 0.75f;               // how strongly the tint applies
+		float3 grassVeinTint = float3(0.76f, 0.82f, 0.68f);  // albedo tint in the vein grooves
+		float grassVeinAlbedoStrength = 0.55f;               // how strongly the tint applies
 		float grassVeinNormalStrength = 0.60f;               // vein normal-tilt amount
 		float grassVeinRippleDepth = 0.28f;                  // along-blade ripple modulation of the veins
 		float grassVeinWiggleAmount = 0.09f;                 // fine micro-wiggle of the surface normal
@@ -93,10 +95,11 @@ public:
 		float grassAODensity = 12.0f;  // Blades per full-coverage density texel
 
 		// Clump
-		int voronoiGridSize = 256;
-		float clumpDistanceFactor = 0.1f;
-		float clumpFacingFactor = 0.25f;
-		float clumpHeightFactor = 0.5f;
+		float clumpGridSize = 64.0f;        // Average spacing between Voronoi clump centres, in world units; about one tuft
+		float clumpDistanceFactor = 0.25f;  // Pull toward the clump centre
+		float clumpFacingFactor = 0.25f;    // Positive turns blades away from the clump centre, negative toward it
+		float clumpLeanFactor = 0.6f;       // Turns a clump's blades toward one shared direction
+		float clumpHeightFactor = 0.5f;     // Share of each blade's height taken from its clump
 
 		// Slope
 		float grassMinSlope = 0.0f;
@@ -121,6 +124,7 @@ public:
 		int farGrassDensity = 96;
 		int grassCellRadius = 6;
 		float farDensityFalloff = 0.15f;
+		float distantFill = 1.0f;  // Share of Mid's density that Low and Far extra blades make up. 1 matches Mid.
 
 		struct GrassTypeDef
 		{
@@ -227,11 +231,10 @@ private:
 	Texture2D* grassMaterialDetailTexture = nullptr;
 	Texture2D* distantAmbientLUT = nullptr;
 	mutable ID3D11ComputeShader* distantAmbientLUTCS = nullptr;
-	// Rendered terrain LOD height on a wrapping world-aligned grid: the measurements, then the height and validity
-	// weight the generator samples to raise Low and Far roots onto it.
+	// Rendered terrain LOD on a wrapping world-aligned grid: measurements, lift, and the surface height bounding it.
 	Texture2D* terrainLiftMeasuredTexture = nullptr;
 	Texture2D* terrainLiftTexture = nullptr;
-	Texture2D* terrainLiftWeightTexture = nullptr;
+	Texture2D* terrainLiftSurfaceTexture = nullptr;
 	ID3D11ComputeShader* terrainLiftCS = nullptr;
 	int32_t terrainLiftOriginCell[2] = { 0, 0 };
 	bool terrainLiftOriginValid = false;

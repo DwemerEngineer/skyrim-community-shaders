@@ -1,7 +1,6 @@
 cbuffer GrassGlobals : register(b8)
 {
-	float voronoiGridSize;
-	float inverseVoronoiGridSize;
+	float2 _padClumpGrid;  // Clump grid sizes are per grass type.
 	float cameraViewRow0Sum;
 	float cameraViewRow1Sum;
 	float2 dynamicResolutionInverted;
@@ -18,7 +17,7 @@ cbuffer GrassGlobals : register(b8)
 	float4 occlusionParams;  // xy: window centre in world space, z: underside clearance, w: top-height bias (world units)
 
 	float4 grassAOParams;     // x: density map dim, y: darken strength, z: blades-per-texel for full dark, w: canopy height (world units)
-	float4 grassLightParams;  // x: density AO, y: canopy sky occlusion, z: resolved sun-shadow exponent, w: base canopy shading
+	float4 grassLightParams;  // x: density AO, y: canopy sky occlusion, z: reserved, w: base canopy shading
 	float4 grassFrameLight;   // xyz: resolved TRUE_PBR directional light, w: resolved grass brightness scale
 
 	float4 farParams;          // x: thin start, y: inverse range, z: Far candidate spacing, w: Far performance keep
@@ -41,22 +40,21 @@ cbuffer GrassGlobals : register(b8)
 	int4 terrainLiftOrigin;     // xy: world cell at the terrain lift map's window origin, zw: last frame's origin
 	uint terrainLiftPhase;      // The quarter of the terrain lift map refreshed this frame
 	float midCandidateSpacing;  // World spacing of Mid's candidate lattice, before its two base blades and slope fill.
-	uint2 _padTerrainLift;
+	float distantFill;          // Share of Mid's density that Low and Far extra candidates make up; 1 matches Mid.
+	uint _padTerrainLift;
 }
 
-// The terrain lift map stores rendered surface height multiplied by its validity weight, alongside the weight.
+// The terrain lift map stores the lift above LAND multiplied by its validity weight, alongside the weight.
 // It wraps a camera-centred window of world-aligned cells, so texels keep their values as the camera moves.
 static const float TerrainLiftMax = 160.0f;
 static const float TerrainLiftCellSize = 256.0f;
 static const int TerrainLiftDim = 512;
 
-#if defined(LOW_LOD)
 /** @brief Keeps roots on LOD terrain at the loaded ring's edge and reaches LAND before the Mid handoff. */
 float GetTerrainLiftBlend(float squareDistance)
 {
 	return smoothstep(6144.0f, 8192.0f, squareDistance);
 }
-#endif
 
 #if defined(FAR_LOD)
 float GetFarPerformanceKeep(float lodDistance, float projectionScale)
@@ -91,14 +89,15 @@ struct GrassType
 	float clumpColorStrength;
 	float minAO;
 	float specular;
-	float pad0;
+	float clumpLeanFactor;
 
 	float2 minMaxSubsurfaceOpacity;
-	float2 pad1;
-	float4 grassSurfParams;           // x: wax sheen strength, y: ambient normal flatten, z: wrap amount, w: wax roughness multiplier
+	float clumpGridSize;
+	float specularAnisotropy;  // OpenPBR specular_roughness_anisotropy, stretched across the blade
+	float4 grassSurfParams;           // x: sheen (fuzz) strength, y: thin-subsurface anisotropy + 1, z: reserved, w: sheen roughness
 	float4 baseMinTipRoughnessStart;  // roughness at the base, at the smoothest point, and at the tip and t at which roughness bottoms out and starts climbing to the tip
 	float4 midRoughnessPolynomial;    // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}
-	float4 grassTypeLightParams;      // x: ground bounce, y: sky translucency, z: specular occlusion, w: ambient desaturation
+	float4 grassTypeLightParams;      // x: ground bounce, yz: reserved, w: ambient desaturation
 
 	float4 baseColor;
 	float4 tipColor;
@@ -110,7 +109,7 @@ struct GrassType
 	float4 grassTextureParams;    // x: blotch strength, y: blotch scale, z: speckle strength, w: speckle scale
 	float4 grassVeinParams;       // rgb: vein albedo tint, w: vein albedo strength
 	float4 grassVeinParams2;      // x: vein normal strength, y: ripple depth, z: micro-wiggle amount, w: curved normal strength
-	float4 grassSubsurfaceColor;  // rgb: subsurface/translucency tint
+	float4 grassSubsurfaceColor;  // rgb: linear scattering tint divided by the reference blade colour, w: reserved
 };
 
 #define GRASS_TYPE_COUNT 128
@@ -120,10 +119,22 @@ cbuffer GrassTypes : register(b9)
 	GrassType grassType[GRASS_TYPE_COUNT];
 }
 
+/** @brief Darkens blade bases toward a clump's centre, where blades crowd together, and leaves the tips lit. */
+float GetClumpAO(GrassType type, float clumpDensity, float bladeT)
+{
+	float baseWeight = 1.0f - saturate(bladeT);
+	return lerp(1.0f, type.minAO, clumpDensity * type.clumpAOStrength * baseWeight * baseWeight);
+}
+
 float ApproximateGrassDistance(float2 offset)
 {
 	float2 distanceXY = abs(offset);
 	return max(distanceXY.x, distanceXY.y) + min(distanceXY.x, distanceXY.y) * 0.375f;
+}
+
+float GetMidLowBlend(float rootDistance)
+{
+	return smoothstep(4096.0f, 6144.0f, rootDistance);
 }
 
 #if defined(FAR_LOD)
@@ -154,7 +165,10 @@ struct GrassGeneratorType
 	float clumpDistanceFactor;
 	float clumpHeightFactor;
 	float clumpFacingFactor;
-	float _pad1;
+	float clumpLeanFactor;
+	float clumpGridSize;
+	float inverseClumpGridSize;
+	float2 _pad1;
 };
 
 cbuffer GrassGeneratorTypes : register(b10)

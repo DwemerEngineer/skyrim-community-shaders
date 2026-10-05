@@ -190,8 +190,8 @@ Texture2D<uint> GrassDensityTexture : register(t7);
 
 Texture2D<float> GrassHiZ : register(t8);  // Shared current-frame scene-depth pyramid.
 #if defined(LOW_LOD)
-Texture2D<float> TerrainSurfaceHeight : register(t9);  // Surface height multiplied by its validity weight; see PGrassTerrainLiftCS.
-Texture2D<float> TerrainSurfaceWeight : register(t10);
+Texture2D<float> TerrainSurfaceLift : register(t9);
+Texture2D<float> TerrainSurfaceHeight : register(t10);
 
 /** @brief Returns how far generated roots can be raised around a box reaching `reach` from `world2D`. */
 float GetTerrainLiftReach(float2 world2D, float reach)
@@ -297,8 +297,8 @@ bool IsVolumeOccluded(float3 centre, float radius, float minDistance, bool culls
 	if (!HasForwardPerspective())
 		return false;
 
-	// Include half-packed root rounding in both the depth and screen bounds.
-	radius += length(max(abs(centre) + radius, 1.0f) * (1.0f / 1024.0f)) + 1.0f;
+	// Include half-packed root rounding and a small silhouette margin in both bounds.
+	radius += length(max(abs(centre) + radius, 1.0f) * (1.0f / 1024.0f)) + 8.0f;
 	const float4 clipCentre = mul(FrameBuffer::CameraViewProj, float4(centre, 1.0f));
 	const float3 clipWAxis = FrameBuffer::CameraViewProj[3].xyz;
 	const float minClipW = clipCentre.w - radius * length(clipWAxis);
@@ -411,6 +411,8 @@ bool IsBladeOccluded(float3 rootView, float3 tipView, float radius, bool cullsDi
 	if (cullsDisabled || grassHiZParams.w < 1.0f || !HasForwardPerspective())
 		return false;
 
+	// Leave a small margin around silhouette edges and half-packed roots.
+	radius += 8.0f;
 	const float4 clipRoot = mul(FrameBuffer::CameraViewProj, float4(rootView, 1.0f));
 	const float4 clipTip = mul(FrameBuffer::CameraViewProj, float4(tipView, 1.0f));
 	const float3 clipWAxis = FrameBuffer::CameraViewProj[3].xyz;
@@ -427,10 +429,10 @@ bool IsBladeOccluded(float3 rootView, float3 tipView, float radius, bool cullsDi
 	const float2 ndcMin = min(ndcRoot - extentRoot, ndcTip - extentTip);
 	const float2 ndcMax = max(ndcRoot + extentRoot, ndcTip + extentTip);
 
-	// Half a texel (two pixels) of padding covers TAA jitter.
+	// One Hi-Z texel covers TAA jitter and small changes at silhouette edges.
 	const float2 hiZSize = grassHiZParams.xy;
-	float2 uvMin = float2(ndcMin.x, -ndcMax.y) * 0.5f + 0.5f - 0.5f / hiZSize;
-	float2 uvMax = float2(ndcMax.x, -ndcMin.y) * 0.5f + 0.5f + 0.5f / hiZSize;
+	float2 uvMin = float2(ndcMin.x, -ndcMax.y) * 0.5f + 0.5f - 1.0f / hiZSize;
+	float2 uvMax = float2(ndcMax.x, -ndcMin.y) * 0.5f + 0.5f + 1.0f / hiZSize;
 	if (any(uvMax <= 0.0f) || any(uvMin >= 1.0f))
 		return false;
 	uvMin = max(uvMin, 0.0f);
@@ -603,17 +605,17 @@ float TerrainHeightSlopeAt(out float2 slope, float2 world2D, float2 quadWorldPos
 #if defined(LOW_LOD)
 /**
  * @brief Returns how far to raise a root onto the rendered terrain at a world position, blended between map cells.
- * Both distant tiers use the same surface throughout their overlap. Interpolate the surface, not offsets from
- * LAND, so a detailed hill crest cannot inherit a neighbour's lift. Approach distance controls the transition;
- * loading a cell or standing still does not advance it.
+ * Both distant tiers share the lift throughout their overlap. The surface height caps it at LAND crests;
+ * the lift prevents coarse height interpolation from raising roots in LAND depressions.
+ * Approach distance controls the transition, rather than time or cell loading.
  */
 float GetTerrainLift(float2 world2D, float landHeight)
 {
 	float2 uv = frac(world2D * (1.0f / (TerrainLiftCellSize * TerrainLiftDim)));
-	float height = TerrainSurfaceHeight.SampleLevel(LinearSampler, uv, 0);
-	float weight = TerrainSurfaceWeight.SampleLevel(LinearSampler, uv, 0);
+	float lift = TerrainSurfaceLift.SampleLevel(LinearSampler, uv, 0);
+	float surfaceHeight = TerrainSurfaceHeight.SampleLevel(LinearSampler, uv, 0);
 	float2 offset = abs(world2D - grassLodOrigin);
-	float lift = weight > 1.0e-3f ? height / weight - landHeight : 0.0f;
+	lift = min(lift, max(surfaceHeight - landHeight, 0.0f));
 	return clamp(lift, 0.0f, TerrainLiftMax) * GetTerrainLiftBlend(max(offset.x, offset.y));
 }
 #endif
@@ -661,6 +663,7 @@ void TryClumpCell(inout uint clumpRand, inout float clumpDistSq, inout float2 cl
 	}
 }
 
+// Every tier searches all nine cells, because cell-wide clump traits must match between tiers.
 void ComputeClump(out uint clumpRand, out float clumpDist, out float2 clumpDir, float2 worldPos, float inverseGridSize)
 {
 	float2 gridPos = worldPos * inverseGridSize;
@@ -670,21 +673,6 @@ void ComputeClump(out uint clumpRand, out float clumpDist, out float2 clumpDir, 
 	clumpDist = 1.0e30f;
 	clumpDir = float2(0.0f, 0.0f);
 	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell, gridPos);
-
-#if defined(FAR_LOD)
-	// Features across the farther cell boundaries are at least 0.5 cells away, where clump density is already zero.
-	// Check the four density-relevant cells plus the closer far cardinal to keep the distant appearance seed stable.
-	float2 cellFraction = gridPos - float2(gridCell);
-	int xNear = cellFraction.x < 0.5f ? -1 : 1;
-	int yNear = cellFraction.y < 0.5f ? -1 : 1;
-	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(xNear, 0), gridPos);
-	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(0, yNear), gridPos);
-	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(xNear, yNear), gridPos);
-
-	float farXDistance = max(cellFraction.x, 1.0f - cellFraction.x);
-	float farYDistance = max(cellFraction.y, 1.0f - cellFraction.y);
-	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + (farXDistance < farYDistance ? int2(-xNear, 0) : int2(0, -yNear)), gridPos);
-#else
 	[unroll] for (int y = -1; y <= 1; y++)
 	{
 		[unroll] for (int x = -1; x <= 1; x++)
@@ -693,7 +681,6 @@ void ComputeClump(out uint clumpRand, out float clumpDist, out float2 clumpDir, 
 				TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(x, y), gridPos);
 		}
 	}
-#endif
 
 	clumpDist = sqrt(clumpDist);
 }
@@ -840,6 +827,15 @@ float CalculateWindDisplacement(float2 worldPosition, float timer, float speed, 
 	return heightResponse * speed * gustStrength * ((gust1 + gust2) * 0.3f + gust0) * 0.5f;
 }
 
+/** @brief Turns an angle toward a target along the shorter arc and wraps the result to [0, TAU). */
+float TurnAngleToward(float angle, float target, float weight)
+{
+	float difference = target - angle;
+	difference -= Math::TAU * round(difference * (1.0f / Math::TAU));
+	float turned = angle + difference * weight;
+	return turned - Math::TAU * floor(turned * (1.0f / Math::TAU));
+}
+
 float CalculateWindAdjustedAngle(float clumpedAngle, float angle, float rotationScale, float rotationalStiffness, float scaledWidth, float bladeHeight)
 {
 	float diff = angle - clumpedAngle;
@@ -967,7 +963,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 #endif
 #if defined(LOW_LOD) && !defined(FAR_LOD)
 	// Clump density reaches zero at half a grid cell, bounding the inward fade's displacement.
-	float clumpReach = voronoiGridSize * 0.1125f * abs(generatorType.clumpDistanceFactor);
+	float clumpReach = generatorType.clumpGridSize * 0.1125f * abs(generatorType.clumpDistanceFactor);
 	float innerCullRadius = max(lodFadeIn.x - clumpReach - 1.0f, 0.0f);
 	float2 initialLodOffset = bladeWorldPos2D - grassLodOrigin;
 	if (!cullsDisabled && lodFadeIn.y > 0.0f && dot(initialLodOffset, initialLodOffset) < innerCullRadius * innerCullRadius)
@@ -997,7 +993,8 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	uint clumpRand;
 	float clumpDist;
 	float2 clumpDir;
-	ComputeClump(clumpRand, clumpDist, clumpDir, bladeWorldPos2D, inverseVoronoiGridSize);
+	ComputeClump(clumpRand, clumpDist, clumpDir, bladeWorldPos2D, generatorType.inverseClumpGridSize);
+	// Height, facing, lean, and colour belong to the whole Voronoi cell. Only the pull and base AO fall off with distance.
 	float clumpDensity = 1.0f - smoothstep(0.15f, 0.50f, clumpDist);
 
 	hash = Random::pcg3d(hash);
@@ -1008,7 +1005,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 #if !defined(FAR_LOD)
 	// Pull every near blade toward its Voronoi feature to hide the regular candidate lattice.
 	float clumpPull = lerp(0.025f, 0.225f, clumpDistRand);
-	float2 clumpDisplace = clumpDir * voronoiGridSize * clumpPull * generatorType.clumpDistanceFactor * clumpDensity;
+	float2 clumpDisplace = clumpDir * generatorType.clumpGridSize * clumpPull * generatorType.clumpDistanceFactor * clumpDensity;
 	bladeWorldPos2D += clumpDisplace;
 
 #	if defined(LOW_LOD)
@@ -1072,8 +1069,9 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 #endif
 
 	// Height generation is deferred until after rejection because the frustum test uses type bounds.
-	float clumpHeightRandom = float(clumpRand) * UINT_TO_FLOAT * clumpDensity;
-	float unscaledHeight = (0.45f + heightRand * 0.55f) - clumpHeightRandom * generatorType.clumpHeightFactor;
+	// Blades take a share of their clump's height, so neighbouring clumps stand at different heights.
+	float clumpHeightRandom = float(clumpRand) * UINT_TO_FLOAT;
+	float unscaledHeight = 0.45f + lerp(heightRand, clumpHeightRandom, generatorType.clumpHeightFactor) * 0.55f;
 	float randHeight = generatorType.height * unscaledHeight;
 	if (objectClearance < 1.0e29f) {
 		randHeight = min(randHeight, objectClearance - occlusionParams.w);
@@ -1087,41 +1085,23 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float scaledWidth = unscaledWidth * generatorType.width * 2.5f;
 
 	hash = Random::pcg3d(hash);
-	float randAngle = angleRand * Math::TAU;
-#if defined(FAR_LOD)
-	float clumpedAngle = randAngle;
-#else
-	float clumpAngle = atan2(-clumpDir.y, -clumpDir.x);
-	if (clumpAngle < 0.0f)
-		clumpAngle += Math::TAU;
-	float delta = clumpAngle - randAngle;
-	if (delta < 0.0f)
-		delta += Math::TAU;
-	else if (delta >= Math::TAU)
-		delta -= Math::TAU;
-	float clumpedAngle = randAngle + delta * generatorType.clumpFacingFactor * clumpDensity;
-	if (clumpedAngle < 0.0f)
-		clumpedAngle += Math::TAU;
-	else if (clumpedAngle >= Math::TAU)
-		clumpedAngle -= Math::TAU;
+	float clumpedAngle = angleRand * Math::TAU;
+#if !defined(FAR_LOD)
+	// Positive factors splay a clump away from its centre; negative factors turn it inward.
+	float2 clumpFacingDir = clumpDir * -sign(generatorType.clumpFacingFactor);
+	clumpedAngle = TurnAngleToward(clumpedAngle, atan2(clumpFacingDir.y, clumpFacingDir.x), abs(generatorType.clumpFacingFactor));
 #endif
+	// Every tier shares the per-clump lean, since a common direction changes how distant clumps shade.
+	[branch] if (generatorType.clumpLeanFactor > 0.0f)
+	{
+		uint leanState = clumpRand;
+		float clumpLeanAngle = float(Random::pcg(leanState)) * UINT_TO_FLOAT * Math::TAU;
+		clumpedAngle = TurnAngleToward(clumpedAngle, clumpLeanAngle, generatorType.clumpLeanFactor);
+	}
 	if (miscParams.y > 0.0f) {
 		float steepness = sqrt(saturate(1.0f - terrainNormalZ * terrainNormalZ));
-		if (steepness > 1e-4f) {
-			float downhillAngle = atan2(-terrainSlope.y, -terrainSlope.x);
-			if (downhillAngle < 0.0f)
-				downhillAngle += Math::TAU;
-			float slopeDifference = downhillAngle - clumpedAngle;
-			if (slopeDifference > Math::PI)
-				slopeDifference -= Math::TAU;
-			else if (slopeDifference < -Math::PI)
-				slopeDifference += Math::TAU;
-			clumpedAngle += slopeDifference * miscParams.y * steepness;
-			if (clumpedAngle < 0.0f)
-				clumpedAngle += Math::TAU;
-			else if (clumpedAngle >= Math::TAU)
-				clumpedAngle -= Math::TAU;
-		}
+		if (steepness > 1e-4f)
+			clumpedAngle = TurnAngleToward(clumpedAngle, atan2(-terrainSlope.y, -terrainSlope.x), miscParams.y * steepness);
 	}
 
 	// Turn toward the wind without rotating beyond it.
@@ -1269,7 +1249,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 		float clumpValueRand = (float((clumpRand >> 8) & 0xFFu) + 0.5f) * (1.0f / 256.0f);
 		float3 clumpTint = lerp(surfaceType.grassColorCool.rgb, surfaceType.grassColorWarm.rgb, clumpColorRand);
 		float clumpValue = 1.0f + (clumpValueRand * 2.0f - 1.0f) * surfaceType.grassColorVar.y * 0.75f;
-		perBladeColor *= lerp(1.0f, clumpTint * clumpValue, surfaceType.clumpColorStrength * clumpDensity);
+		perBladeColor *= lerp(1.0f, clumpTint * clumpValue, surfaceType.clumpColorStrength);
 
 		// Pack blade-wide colour variation. The pixel shader evaluates spatial blotch and grain detail.
 		uint3 packedColor = (uint3)round(saturate(perBladeColor * 0.5f) * 15.0f);
@@ -1396,13 +1376,17 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 }
 
 #if defined(LOW_LOD) && !defined(FAR_LOD) && SLOPE_EXTRA_BLADES > 0
-/** @brief Matches Mid's two base blades and slope fill without applying a second density fade. */
-float GetLowExtraKeep(float terrainNormalZ)
+/**
+ * @brief Returns how many extra blades a patch needs to match Mid's two base blades and slope fill.
+ * Slots below the count are always kept and the next one in proportion to the remainder, so the slot count only has
+ * to cover the largest count rather than dilute it.
+ */
+float GetLowExtraCount(float terrainNormalZ)
 {
 	float slopeKeep = saturate(rcp(max(terrainNormalZ, 0.05f)) - 1.0f);
 	float densityRatio = BLADE_TO_WORLD / max(midCandidateSpacing, 1.0f);
 	densityRatio *= densityRatio;
-	return saturate((densityRatio * (2.0f + slopeKeep) - 1.0f) / SLOPE_EXTRA_BLADES);
+	return clamp(distantFill * (densityRatio * (2.0f + slopeKeep) - 1.0f), 0.0f, SLOPE_EXTRA_BLADES);
 }
 
 void AppendLowBlade(Blade blade, bool outerGeometry)
@@ -1435,7 +1419,7 @@ void GenerateLowExtra(uint3 dispatch, uint extraTask)
 	float2 candidateQuadPos = ExtraCandidateQuadPos(patchPos, candidateHash);
 	float2 candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
 	float terrainNormalZ = rsqrt(dot(setup.terrainSlope, setup.terrainSlope) + 1.0f);
-	if (!cullsDisabled && float(candidateHash.z) * UINT_TO_FLOAT > GetLowExtraKeep(terrainNormalZ))
+	if (!cullsDisabled && float(candidateHash.z) * UINT_TO_FLOAT > GetLowExtraCount(terrainNormalZ) - float(extraIndex))
 		return;
 	float2 candidateMapSamplePos = GrassMapSamplePos(candidateQuadPos, candidateHash);
 	uint packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
@@ -1457,8 +1441,8 @@ float GetFarExtraCount(float2 world2D, float terrainNormalZ)
 	float slopeKeep = saturate(rcp(max(terrainNormalZ, 0.05f)) - 1.0f);
 	float densityRatio = BLADE_TO_WORLD / max(midCandidateSpacing, 1.0f);
 	densityRatio *= densityRatio;
-	float seamExtras = clamp(densityRatio * (2.0f + slopeKeep) - 1.0f, 0.0f, SLOPE_EXTRA_BLADES);
-	float distantExtras = 2.0f * max(saturate(lodFadeIn.z + 2.0f * slopeKeep), farParams.w);
+	float seamExtras = clamp(distantFill * (densityRatio * (2.0f + slopeKeep) - 1.0f), 0.0f, SLOPE_EXTRA_BLADES);
+	float distantExtras = min(2.0f * distantFill * max(saturate(lodFadeIn.z + 2.0f * slopeKeep), farParams.w), SLOPE_EXTRA_BLADES);
 	float2 offset = abs(world2D - grassLodOrigin);
 	float squareDistance = max(offset.x, offset.y);
 	float handoffEnd = lodFadeOut.x;
@@ -1605,27 +1589,15 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 	}
 
 #	if defined(FAR_LOD)
-	bool hasValidCandidate = useBasePath;
+	// The patch already passed the coarse grass check, and the candidate loop tests every extra itself, so a patch
+	// whose base failed is not scanned for a valid extra first.
 #		if SLOPE_EXTRA_BLADES > 0
-	if (!hasValidCandidate && allowSlopeExtras) {
-		for (uint extraIndex = 0; extraIndex < SLOPE_EXTRA_BLADES; ++extraIndex) {
-			if ((extraIndex % PATCH_BLADE_COUNT) != bladeIndex)
-				continue;
-
-			uint3 extraHash = ExtraCandidateHash(patchPos, extraIndex, quadrantHash);
-			float2 extraQuadPos = ExtraCandidateQuadPos(patchPos, extraHash);
-			float2 extraMapSamplePos = GrassMapSamplePos(extraQuadPos, extraHash);
-			if (!PassesEarlyFarLOD(extraQuadPos + quadrantData.quadWorldPos, nearCovered, compactFar, cullsDisabled))
-				continue;
-			if (cullsDisabled || LoadGrassCell(extraMapSamplePos, quadrant) != 0u) {
-				hasValidCandidate = true;
-				break;
-			}
-		}
-	}
-#		endif
-	if (!hasValidCandidate)
+	if (!useBasePath && !allowSlopeExtras)
 		return;
+#		else
+	if (!useBasePath)
+		return;
+#		endif
 	if (IsFarPatchBoundsOccluded(patchPos, quadrant, hasLand, cullsDisabled))
 		return;
 #	elif defined(LOW_LOD) && SLOPE_EXTRA_BLADES > 0
