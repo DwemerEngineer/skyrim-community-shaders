@@ -1,24 +1,10 @@
 #ifndef __PGRASS_BLADE_CONSTRUCTION_HLSLI__
 #define __PGRASS_BLADE_CONSTRUCTION_HLSLI__
 
-// Return smooth world-space variation from four integer hashes.
+// Smooth signed wind variation on a 512-unit world grid.
 float CalculateWindNoise(float2 worldPosition)
 {
-	static const float WIND_NOISE_CELL_SIZE = 512.0f;
-	float2 cellPosition = worldPosition * (1.0f / WIND_NOISE_CELL_SIZE);
-	int2 baseCell = int2(floor(cellPosition));
-	float2 cellFraction = frac(cellPosition);
-	float2 blend = cellFraction * cellFraction * (3.0f - 2.0f * cellFraction);
-
-	float2 noiseLower = float2(
-							Random::iqint3(asuint(baseCell)),
-							Random::iqint3(asuint(baseCell + int2(1, 0)))) *
-	                    UINT_TO_FLOAT;
-	float2 noiseUpper = float2(
-							Random::iqint3(asuint(baseCell + int2(0, 1))),
-							Random::iqint3(asuint(baseCell + int2(1, 1)))) *
-	                    UINT_TO_FLOAT;
-	return lerp(lerp(noiseLower.x, noiseLower.y, blend.x), lerp(noiseUpper.x, noiseUpper.y, blend.x), blend.y) * 2.0f - 1.0f;
+	return Random::ValueNoise2D(worldPosition * (1.0f / 512.0f)) * 2.0f - 1.0f;
 }
 
 // Vanilla grass's gust waveform with smooth field variation and stable per-blade offsets.
@@ -37,15 +23,6 @@ float CalculateWindDisplacement(float2 worldPosition, float timer, float speed, 
 	// Taller blades receive a stronger gust response. 150 units matches the maximum possible grass height.
 	float heightResponse = bladeHeight * lerp(0.55f, 1.20f, saturate(bladeHeight * (1.0f / 150.0f)));
 	return heightResponse * speed * gustStrength * ((gust1 + gust2) * 0.3f + gust0) * 0.5f;
-}
-
-/** @brief Turns an angle toward a target along the shorter arc and wraps the result to [0, TAU). */
-float TurnAngleToward(float angle, float target, float weight)
-{
-	float difference = target - angle;
-	difference -= Math::TAU * round(difference * (1.0f / Math::TAU));
-	float turned = angle + difference * weight;
-	return turned - Math::TAU * floor(turned * (1.0f / Math::TAU));
 }
 
 float CalculateWindAdjustedAngle(float clumpedAngle, float angle, float rotationScale, float rotationalStiffness, float scaledWidth, float bladeHeight)
@@ -205,7 +182,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	uint clumpRand;
 	float clumpDist;
 	float2 clumpDir;
-	ComputeClump(clumpRand, clumpDist, clumpDir, bladeWorldPos2D, generatorType.inverseClumpGridSize);
+	Random::FindNearestVoronoi2D(bladeWorldPos2D * generatorType.inverseClumpGridSize, clumpRand, clumpDist, clumpDir);
 	// Height, facing, lean, and colour belong to the whole Voronoi cell. Only the pull and base AO fall off with distance.
 	float clumpDensity = 1.0f - smoothstep(0.15f, 0.50f, clumpDist);
 
@@ -301,19 +278,19 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 #if !defined(FAR_LOD)
 	// Positive factors splay a clump away from its centre; negative factors turn it inward.
 	float2 clumpFacingDir = clumpDir * -sign(generatorType.clumpFacingFactor);
-	clumpedAngle = TurnAngleToward(clumpedAngle, atan2(clumpFacingDir.y, clumpFacingDir.x), abs(generatorType.clumpFacingFactor));
+	clumpedAngle = Math::LerpAngle(clumpedAngle, atan2(clumpFacingDir.y, clumpFacingDir.x), abs(generatorType.clumpFacingFactor));
 #endif
 	// Every tier shares the per-clump lean, since a common direction changes how distant clumps shade.
 	[branch] if (generatorType.clumpLeanFactor > 0.0f)
 	{
 		uint leanState = clumpRand;
 		float clumpLeanAngle = float(Random::pcg(leanState)) * UINT_TO_FLOAT * Math::TAU;
-		clumpedAngle = TurnAngleToward(clumpedAngle, clumpLeanAngle, generatorType.clumpLeanFactor);
+		clumpedAngle = Math::LerpAngle(clumpedAngle, clumpLeanAngle, generatorType.clumpLeanFactor);
 	}
 	if (miscParams.y > 0.0f) {
 		float steepness = sqrt(saturate(1.0f - terrainNormalZ * terrainNormalZ));
 		if (steepness > 1e-4f)
-			clumpedAngle = TurnAngleToward(clumpedAngle, atan2(-terrainSlope.y, -terrainSlope.x), miscParams.y * steepness);
+			clumpedAngle = Math::LerpAngle(clumpedAngle, atan2(-terrainSlope.y, -terrainSlope.x), miscParams.y * steepness);
 	}
 
 	// Turn toward the wind without rotating beyond it.

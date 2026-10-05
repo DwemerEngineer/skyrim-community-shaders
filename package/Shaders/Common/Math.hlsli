@@ -29,6 +29,15 @@ namespace Math
 	static const float HALF_PI = PI * 0.5f;                      // PI / 2
 	static const float TAU = PI * 2.0f;                          // PI * 2
 	static const float INV_PI = 1.0f / PI;                       // 1 / PI
+
+	/** @brief Turns an angle toward a target along the shorter arc and wraps the result to [0, TAU). */
+	float LerpAngle(float angle, float target, float weight)
+	{
+		float difference = target - angle;
+		difference -= TAU * round(difference * (1.0f / TAU));
+		float turned = angle + difference * weight;
+		return turned - TAU * floor(turned * (1.0f / TAU));
+	}
 }
 
 #endif  //__MATH_DEPENDENCY_HLSL__

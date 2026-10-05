@@ -63,46 +63,6 @@ float GetObjectClearance(float3 worldPos, bool cullsDisabled)
 	return clearance < occlusionParams.z ? clearance : 1.0e30f;
 }
 
-// Keep the nearest Voronoi feature, skipping cells whose closest point cannot beat the current best.
-void TryClumpCell(inout uint clumpRand, inout float clumpDistSq, inout float2 clumpDir, int2 cell, float2 gridPos)
-{
-	float2 cellMin = float2(cell);
-	float2 cellOffset = clamp(gridPos, cellMin, cellMin + 1.0f) - gridPos;
-	if (dot(cellOffset, cellOffset) >= clumpDistSq)
-		return;
-
-	uint3 hash = Random::pcg3d(uint3(asuint(cell), 0u));
-	float2 offset = cellMin + float2(hash.xy) * UINT_TO_FLOAT - gridPos;
-	float distanceSquared = dot(offset, offset);
-	if (distanceSquared < clumpDistSq) {
-		clumpDistSq = distanceSquared;
-		clumpDir = offset;
-		clumpRand = hash.z;
-	}
-}
-
-// Every tier searches all nine cells, because cell-wide clump traits must match between tiers.
-void ComputeClump(out uint clumpRand, out float clumpDist, out float2 clumpDir, float2 worldPos, float inverseGridSize)
-{
-	float2 gridPos = worldPos * inverseGridSize;
-	// Floor keeps the Voronoi grid continuous across negative world coordinates.
-	int2 gridCell = int2(floor(gridPos));
-	clumpRand = 0u;
-	clumpDist = 1.0e30f;
-	clumpDir = float2(0.0f, 0.0f);
-	TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell, gridPos);
-	[unroll] for (int y = -1; y <= 1; y++)
-	{
-		[unroll] for (int x = -1; x <= 1; x++)
-		{
-			if (x != 0 || y != 0)
-				TryClumpCell(clumpRand, clumpDist, clumpDir, gridCell + int2(x, y), gridPos);
-		}
-	}
-
-	clumpDist = sqrt(clumpDist);
-}
-
 uint LoadGrassCell(float2 quadLocalPos, uint quadrant)
 {
 	float2 grassSample = clamp(quadLocalPos / QUADRANT_GRASS_SPACING, 0.0f, QUADRANT_GRASS_PITCH - 1.001f);

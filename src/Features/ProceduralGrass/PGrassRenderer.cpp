@@ -13,21 +13,13 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "TerrainHeightMap.h"
+#include "Utils/D3D.h"
 
 using namespace PGrassCommon;
 using namespace PGrassRendererQuads;
 
 namespace
 {
-	template <class T>
-	void ReleaseAndNull(T*& resource)
-	{
-		if (resource) {
-			resource->Release();
-			resource = nullptr;
-		}
-	}
-
 	bool IsOccupiedGrassTile(const uint16_t* occupancyRows, const uint32_t patchStartX, const uint32_t patchEndX, const uint32_t patchStartY,
 		const uint32_t patchEndY, const uint32_t density, const float edgeNoise)
 	{
@@ -278,9 +270,9 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetDensity(uint32_t grassDe
 
 	ResetBladeCapacity();
 
-	ReleaseAndNull(bladeGeneratorCS);
+	Util::ReleaseAndNull(bladeGeneratorCS);
 	bladeGeneratorCompileAttempted = false;
-	ReleaseAndNull(compactBladeGeneratorCS);
+	Util::ReleaseAndNull(compactBladeGeneratorCS);
 	compactBladeGeneratorCompileAttempted = false;
 }
 
@@ -344,25 +336,25 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetThreadGroupSize(uint32_t
 	hasCachedWorkList = false;
 	threadGroupSizeString = std::to_string(threadGroupSize);
 
-	ReleaseAndNull(bladeGeneratorCS);
+	Util::ReleaseAndNull(bladeGeneratorCS);
 	bladeGeneratorCompileAttempted = false;
-	ReleaseAndNull(compactBladeGeneratorCS);
+	Util::ReleaseAndNull(compactBladeGeneratorCS);
 	compactBladeGeneratorCompileAttempted = false;
 }
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
 void PGrassRenderer<QuadrantCount, PatchBladeCount>::ClearShaderCache()
 {
-	ReleaseAndNull(bladeGeneratorCS);
+	Util::ReleaseAndNull(bladeGeneratorCS);
 	bladeGeneratorCompileAttempted = false;
-	ReleaseAndNull(compactBladeGeneratorCS);
+	Util::ReleaseAndNull(compactBladeGeneratorCS);
 	compactBladeGeneratorCompileAttempted = false;
-	ReleaseAndNull(batchArgsCS);
+	Util::ReleaseAndNull(batchArgsCS);
 	for (auto& vertexShader : vertexShaders)
-		ReleaseAndNull(vertexShader);
+		Util::ReleaseAndNull(vertexShader);
 
 	for (auto& pixelShader : pixelShaders)
-		ReleaseAndNull(pixelShader);
+		Util::ReleaseAndNull(pixelShader);
 }
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>

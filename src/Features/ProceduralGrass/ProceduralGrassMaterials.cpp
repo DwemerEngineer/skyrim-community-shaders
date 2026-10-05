@@ -1,5 +1,7 @@
 #include "Features/ProceduralGrass.h"
 
+#include "Utils/Math.h"
+
 #include <algorithm>
 #include <cmath>
 #include <numbers>
@@ -8,23 +10,13 @@ using namespace PGrassCommon;
 
 namespace
 {
-	uint32_t GrassMaterialDetailHash(uint32_t x, uint32_t y)
-	{
-		x ^= y * 0x9E3779B9u;
-		x ^= x >> 16;
-		x *= 0x7FEB352Du;
-		x ^= x >> 15;
-		x *= 0x846CA68Bu;
-		return x ^ (x >> 16);
-	}
-
 	float GrassMaterialDetailTexel(int32_t x, int32_t y, bool grain)
 	{
 		const uint32_t wrappedX = static_cast<uint32_t>(x) & (GrassMaterialDetailDim - 1u);
 		const uint32_t wrappedY = static_cast<uint32_t>(y) & (GrassMaterialDetailDim - 1u);
 		const uint32_t hash = grain ?
-		                          GrassMaterialDetailHash(wrappedX, wrappedY) :
-		                          GrassMaterialDetailHash(wrappedX / 8u, wrappedY / 8u);
+		                          Util::Hash2D(wrappedX, wrappedY) :
+		                          Util::Hash2D(wrappedX / 8u, wrappedY / 8u);
 		return static_cast<float>(hash >> 24) * (1.0f / 255.0f);
 	}
 
@@ -41,14 +33,6 @@ namespace
 		const float c = GrassMaterialDetailTexel(x0, y0 + 1, grain);
 		const float d = GrassMaterialDetailTexel(x0 + 1, y0 + 1, grain);
 		return std::lerp(std::lerp(a, b, fx), std::lerp(c, d, fx), fy);
-	}
-
-	float Smoothstep(float edge0, float edge1, float value)
-	{
-		if (edge0 == edge1)
-			return value < edge0 ? 0.0f : 1.0f;
-		const float t = std::clamp((value - edge0) / (edge1 - edge0), 0.0f, 1.0f);
-		return t * t * (3.0f - 2.0f * t);
 	}
 
 }
@@ -151,8 +135,8 @@ PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& 
 	const float roughnessStart = ov.value("TipRoughnessStart", s.tipRoughnessStart);
 	t.baseMinTipRoughnessStart = float4(rough.x, rough.y, rough.z, roughnessStart);
 	// Fit Mid roughness at its three vertex positions to avoid evaluating both smoothstep curves in the vertex shader.
-	const float roughnessAtMidFirst = std::lerp(rough.x, rough.y, Smoothstep(0.0f, roughnessStart, 0.5f));
-	const float roughnessAtMid = std::lerp(roughnessAtMidFirst, rough.z, Smoothstep(rough.x, 1.0f, 0.5f));
+	const float roughnessAtMidFirst = std::lerp(rough.x, rough.y, Util::Smoothstep(0.0f, roughnessStart, 0.5f));
+	const float roughnessAtMid = std::lerp(roughnessAtMidFirst, rough.z, Util::Smoothstep(rough.x, 1.0f, 0.5f));
 	const float baseToMid = roughnessAtMid - rough.x;
 	const float baseToTip = rough.z - rough.x;
 	t.midRoughnessPolynomial = float4(2.0f * baseToTip - 8.0f * baseToMid, 8.0f * baseToMid - baseToTip, rough.x, 0.0f);
@@ -211,10 +195,10 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 		const float veinWiggleAmount = type.grassVeinParams2.z;
 
 		for (uint32_t variant = 0; variant < GrassMaterialDetailVariants; ++variant) {
-			const uint32_t offsetHash = GrassMaterialDetailHash(typeIndex * GrassMaterialDetailVariants + variant, variant);
+			const uint32_t offsetHash = Util::Hash2D(typeIndex * GrassMaterialDetailVariants + variant, variant);
 			const float noiseOffsetX = static_cast<float>(offsetHash & 0xFFFFu) * (1.0f / 65536.0f);
 			const float noiseOffsetY = static_cast<float>(offsetHash >> 16) * (1.0f / 65536.0f);
-			const float phase = static_cast<float>(GrassMaterialDetailHash(variant, typeIndex) >> 8) * (std::numbers::pi_v<float> * 2.0f / 16777216.0f);
+			const float phase = static_cast<float>(Util::Hash2D(variant, typeIndex) >> 8) * (std::numbers::pi_v<float> * 2.0f / 16777216.0f);
 
 			for (uint32_t y = 0; y < GrassMaterialDetailDim; ++y) {
 				const float along = (static_cast<float>(y) + 0.5f) * (1.0f / GrassMaterialDetailDim);
@@ -225,11 +209,11 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 					const float grain = SampleGrassMaterialDetail(across * 6.0f * speckleScale + noiseOffsetX * 1.7f,
 						along * 26.0f * speckleScale + noiseOffsetY * 1.7f, true);
 
-					const float centreVein = 1.0f - Smoothstep(0.0f, 0.050f, std::abs(across - 0.5f));
-					const float sideVeinL = 1.0f - Smoothstep(0.0f, 0.032f, std::abs(across - 0.27f));
-					const float sideVeinR = 1.0f - Smoothstep(0.0f, 0.032f, std::abs(across - 0.73f));
+					const float centreVein = 1.0f - Util::Smoothstep(0.0f, 0.050f, std::abs(across - 0.5f));
+					const float sideVeinL = 1.0f - Util::Smoothstep(0.0f, 0.032f, std::abs(across - 0.27f));
+					const float sideVeinR = 1.0f - Util::Smoothstep(0.0f, 0.032f, std::abs(across - 0.73f));
 					float vein = std::clamp(centreVein + 0.5f * (sideVeinL + sideVeinR), 0.0f, 1.0f);
-					vein *= Smoothstep(0.0f, 0.16f, along) * Smoothstep(0.0f, 0.20f, 1.0f - along);
+					vein *= Util::Smoothstep(0.0f, 0.16f, along) * Util::Smoothstep(0.0f, 0.20f, 1.0f - along);
 					vein *= (1.0f - veinRippleDepth) + veinRippleDepth * std::sin(along * 26.0f + phase);
 
 					const float normalOffset = (across - 0.5f) * 2.0f * vein * veinStrength +

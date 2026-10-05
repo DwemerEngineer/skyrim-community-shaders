@@ -1,25 +1,6 @@
 #ifndef __PGRASS_LIGHTING_HLSLI__
 #define __PGRASS_LIGHTING_HLSLI__
 
-/** @brief Returns a stable random value for one integer grass-detail cell. */
-float GrassNoiseHash(float2 cell)
-{
-	return float(Random::iqint3(asuint(int2(cell)))) * (1.0f / 4294967296.0f);
-}
-
-/** @brief Bilinearly interpolates GrassNoiseHash for smooth blade-surface variation. */
-float GrassValueNoise(float2 p)
-{
-	float2 fl = floor(p);
-	float2 fr = frac(p);
-	fr = fr * fr * (3.0 - 2.0 * fr);
-	float a = GrassNoiseHash(fl);
-	float b = GrassNoiseHash(fl + float2(1.0, 0.0));
-	float c = GrassNoiseHash(fl + float2(0.0, 1.0));
-	float d = GrassNoiseHash(fl + float2(1.0, 1.0));
-	return lerp(lerp(a, b, fr.x), lerp(c, d, fr.x), fr.y);
-}
-
 #if defined(LOW_LOD)
 /**
  * @brief Finds the root pixel and how much nearer geometry obscures it.
@@ -129,7 +110,7 @@ float GetBladeShadowPattern(float3 viewDirection, float3 lightDirection, uint se
 	float shadowFull = 0.85f * pow(saturate(1.0f - bladeSunVisibility), 1.5f);
 	float shadowPartial = max(1.0f - shadowLit - shadowFull, 1.0e-3f);
 	static const float ShadowMaxLine = 0.8f;
-	float shadowRandom = GrassNoiseHash(float2(seed, 0.0f));
+	float shadowRandom = Random::CellNoise2D(float2(seed, 0.0f));
 	float shadowLine = (shadowRandom - shadowLit) * (ShadowMaxLine / shadowPartial);
 	shadowLine = shadowRandom >= 1.0f - shadowFull ? 2.0f : shadowLine;
 	float bladeShadow = smoothstep(shadowLine - 0.05f, shadowLine + 0.05f, along);

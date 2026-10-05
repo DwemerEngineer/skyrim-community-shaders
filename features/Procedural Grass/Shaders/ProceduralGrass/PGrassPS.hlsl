@@ -589,7 +589,7 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 #	endif
 
 	if (needsPuddleNoise) {
-		puddle = GrassValueNoise(puddleCoords.xy);
+		puddle = Random::ValueNoise2D(puddleCoords.xy);
 		puddle = puddle * ((minWetnessAngle / SharedData::wetnessEffectsSettings.PuddleMaxAngle) * SharedData::wetnessEffectsSettings.MaxPuddleWetness * 0.25) + 0.5;
 #	if defined(PGRASS_DRY_WETNESS)
 		wetness = lerp(wetness, 0.0, saturate(puddle - 0.25));

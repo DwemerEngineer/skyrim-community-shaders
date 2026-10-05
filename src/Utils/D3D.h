@@ -1,10 +1,26 @@
 #pragma once
 #include <array>
+#include <cstdint>
 #include <d3d11.h>
 #include <winrt/base.h>
 
+class Texture2D;
+
 namespace Util
 {
+	/** @brief Releases a COM interface and clears the caller's pointer. */
+	template <class T>
+	void ReleaseAndNull(T*& resource)
+	{
+		if (resource) {
+			resource->Release();
+			resource = nullptr;
+		}
+	}
+
+	/** @brief Creates an owned single-mip square texture with an SRV and optional UAV. */
+	Texture2D* CreateSquareTexture(uint32_t dim, DXGI_FORMAT format, bool unorderedAccess, const char* name);
+
 	/**
 	 * @brief Look up the matching SRV for a given render target view.
 	 * @param a_rtv The render target view to look up.

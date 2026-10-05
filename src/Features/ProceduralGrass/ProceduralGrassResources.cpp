@@ -7,39 +7,6 @@
 
 using namespace PGrassCommon;
 
-namespace
-{
-	/** @brief Creates a single-mip square texture with an SRV and, when requested, a UAV. */
-	Texture2D* CreateSquareTexture(uint32_t dim, DXGI_FORMAT format, bool unorderedAccess, const char* name)
-	{
-		D3D11_TEXTURE2D_DESC desc{};
-		desc.Width = dim;
-		desc.Height = dim;
-		desc.MipLevels = 1;
-		desc.ArraySize = 1;
-		desc.Format = format;
-		desc.SampleDesc = { 1, 0 };
-		desc.Usage = D3D11_USAGE_DEFAULT;
-		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (unorderedAccess ? D3D11_BIND_UNORDERED_ACCESS : 0u);
-		auto* texture = new Texture2D(desc, name);
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-		srvDesc.Format = format;
-		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		srvDesc.Texture2D.MipLevels = 1;
-		texture->CreateSRV(srvDesc);
-
-		if (unorderedAccess) {
-			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-			uavDesc.Format = format;
-			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-			texture->CreateUAV(uavDesc);
-		}
-		return texture;
-	}
-
-}
-
 void ProceduralGrass::CreateIndexBuffers()
 {
 	const auto makeIndexBuffer = [](const std::vector<uint16_t>& indices, const char* name) {
@@ -225,19 +192,19 @@ void ProceduralGrass::CreateGrassTextures()
 	grassMaterialDetailTexture->CreateSRV(detailSRVDesc);
 
 	if (!grassDensityTexture)
-		grassDensityTexture = CreateSquareTexture(grassDensityDim, DXGI_FORMAT_R32_UINT, true, "PGrass::GrassDensity");
+		grassDensityTexture = Util::CreateSquareTexture(grassDensityDim, DXGI_FORMAT_R32_UINT, true, "PGrass::GrassDensity");
 	if (!distantAmbientLUT)
-		distantAmbientLUT = CreateSquareTexture(distantAmbientLUTDim, DXGI_FORMAT_R16G16B16A16_FLOAT, true, "PGrass::DistantAmbientLUT");
+		distantAmbientLUT = Util::CreateSquareTexture(distantAmbientLUTDim, DXGI_FORMAT_R16G16B16A16_FLOAT, true, "PGrass::DistantAmbientLUT");
 	if (!terrainLiftTexture) {
 		// R32_FLOAT is the float format D3D11 guarantees for typed UAV reads.
-		terrainLiftMeasuredTexture = CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLiftMeasured");
-		terrainLiftTexture = CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLift");
-		terrainLiftSurfaceTexture = CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLiftSurface");
+		terrainLiftMeasuredTexture = Util::CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLiftMeasured");
+		terrainLiftTexture = Util::CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLift");
+		terrainLiftSurfaceTexture = Util::CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLiftSurface");
 		terrainLiftOriginValid = false;
 	}
 	if (!grassPresenceTexture) {
 		// Rewritten via UpdateSubresource as the window scrolls with the player.
-		grassPresenceTexture = CreateSquareTexture(grassPresenceDim, DXGI_FORMAT_R8_UINT, false, "PGrass::GrassPresence");
+		grassPresenceTexture = Util::CreateSquareTexture(grassPresenceDim, DXGI_FORMAT_R8_UINT, false, "PGrass::GrassPresence");
 		grassPresenceStaging.assign(static_cast<size_t>(grassPresenceDim) * grassPresenceDim, 0);
 	}
 }

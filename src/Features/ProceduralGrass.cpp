@@ -24,14 +24,6 @@ namespace
 {
 	// Preserve full density at the Low/Far handoff, then retain this fraction in distant Far regions.
 	constexpr float FarPerformanceKeep = 0.55f;
-	template <class T>
-	void ReleaseAndNull(T*& resource)
-	{
-		if (resource) {
-			resource->Release();
-			resource = nullptr;
-		}
-	}
 }
 
 void ProceduralGrass::PostPostLoad()
@@ -66,12 +58,12 @@ void ProceduralGrass::ClearShaderCache()
 	grassRendererLowLOD->ClearShaderCache();
 	grassRendererFarLOD->ClearShaderCache();
 
-	ReleaseAndNull(densityAOVS);
-	ReleaseAndNull(densityAOPS);
-	ReleaseAndNull(depthClipPS);
-	ReleaseAndNull(densityGatherCS);
-	ReleaseAndNull(distantAmbientLUTCS);
-	ReleaseAndNull(terrainLiftCS);
+	Util::ReleaseAndNull(densityAOVS);
+	Util::ReleaseAndNull(densityAOPS);
+	Util::ReleaseAndNull(depthClipPS);
+	Util::ReleaseAndNull(densityGatherCS);
+	Util::ReleaseAndNull(distantAmbientLUTCS);
+	Util::ReleaseAndNull(terrainLiftCS);
 	terrainLiftOriginValid = false;
 
 	CompileSupportShaders();
@@ -151,9 +143,9 @@ void ProceduralGrass::PostDepthRendering()
 	ctx->OMSetDepthStencilState(oldDSS, oldRef);
 	ctx->OMSetBlendState(oldBS, oldBlendFactor, oldSampleMask);
 
-	ReleaseAndNull(oldRS);
-	ReleaseAndNull(oldDSS);
-	ReleaseAndNull(oldBS);
+	Util::ReleaseAndNull(oldRS);
+	Util::ReleaseAndNull(oldDSS);
+	Util::ReleaseAndNull(oldBS);
 }
 
 void ProceduralGrass::CopyDepthBuffer(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer)
@@ -602,9 +594,9 @@ void ProceduralGrass::DeferredRendering() const
 	ctx->OMSetDepthStencilState(oldDSS, oldRef);
 	ctx->OMSetBlendState(oldBS, oldBlendFactor, oldSampleMask);
 
-	ReleaseAndNull(oldRS);
-	ReleaseAndNull(oldDSS);
-	ReleaseAndNull(oldBS);
+	Util::ReleaseAndNull(oldRS);
+	Util::ReleaseAndNull(oldDSS);
+	Util::ReleaseAndNull(oldBS);
 
 	ctx->OMSetRenderTargets(0, nullptr, nullptr);
 }
@@ -961,13 +953,13 @@ void ProceduralGrass::ForwardRenderFar() const
 		CopyDepthBuffer(ctx, renderer);
 	ctx->PSSetShaderResources(3, 1, &previousEffectDepthSRV);
 	ctx->PSSetShaderResources(17, 1, &previousSceneDepthSRV);
-	ReleaseAndNull(previousEffectDepthSRV);
-	ReleaseAndNull(previousSceneDepthSRV);
+	Util::ReleaseAndNull(previousEffectDepthSRV);
+	Util::ReleaseAndNull(previousSceneDepthSRV);
 	ctx->RSSetState(oldRS);
 	ctx->OMSetDepthStencilState(oldDSS, oldRef);
 	ctx->OMSetBlendState(oldBS, oldBlendFactor, oldSampleMask);
-	ReleaseAndNull(oldRS);
-	ReleaseAndNull(oldDSS);
-	ReleaseAndNull(oldBS);
+	Util::ReleaseAndNull(oldRS);
+	Util::ReleaseAndNull(oldDSS);
+	Util::ReleaseAndNull(oldBS);
 	globals::profiler->EndPass();
 }
