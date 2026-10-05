@@ -246,8 +246,7 @@ namespace PBR
 				lobeWeights.diffuse += material.FuzzColor * material.FuzzWeight;
 			}
 #endif
-			float2 specularBRDF = BRDF::EnvBRDF(material.Roughness, NdotV);
-			lobeWeights.specular = material.F0 * specularBRDF.x + specularBRDF.y;
+			lobeWeights.specular = SpecularDirectionalAlbedo(material.F0, material.Roughness, NdotV);
 
 			// Energy conservation: diffuse receives only what specular does not reflect
 			lobeWeights.diffuse *= 1 - lobeWeights.specular;
@@ -255,8 +254,7 @@ namespace PBR
 #if !defined(LANDSCAPE) && !defined(LODLANDSCAPE)
 			[branch] if ((PBRFlags & Flags::TwoLayer) != 0)
 			{
-				float2 coatSpecularBRDF = BRDF::EnvBRDF(material.CoatRoughness, NdotV);
-				float3 coatSpecularLobeSpecular = material.CoatF0 * coatSpecularBRDF.x + coatSpecularBRDF.y;
+				float3 coatSpecularLobeSpecular = SpecularDirectionalAlbedo(material.CoatF0, material.CoatRoughness, NdotV);
 
 				float3 layerAttenuation = 1 - coatSpecularLobeSpecular * material.CoatStrength;
 				lobeWeights.diffuse *= layerAttenuation;
@@ -340,8 +338,7 @@ namespace PBR
 		[branch] if (doSpecular)
 		{
 			float NdotV = saturate(dot(context.worldNormal, context.viewDir));
-			float2 specularBRDF = BRDF::EnvBRDF(material.Roughness, NdotV);
-			lobeWeights.specular = material.F0 * specularBRDF.x + specularBRDF.y;
+			lobeWeights.specular = SpecularDirectionalAlbedo(material.F0, material.Roughness, NdotV);
 			lobeWeights.diffuse *= 1 - lobeWeights.specular;
 
 			float alpha = material.Roughness * material.Roughness;
