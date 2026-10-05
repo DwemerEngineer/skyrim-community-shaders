@@ -4,6 +4,9 @@ namespace PGrassCommon
 {
 	inline constexpr uint32_t LowBladeBatchSize = 64;
 	inline constexpr uint32_t MidBladeBatchSize = 32;
+	inline constexpr uint32_t GrassMaterialDetailDim = 64;
+	inline constexpr uint32_t GrassMaterialDetailVariants = 4;
+	inline constexpr float GrassMaterialDetailNormalRange = 1.25f;
 	/** @brief Returns the game's default landscape texture used when a LAND quadrant has no base texture. */
 	RE::TESLandTexture* GetDefaultLandTexture();
 	float GetGrassTexturePctThreshold();
@@ -270,7 +273,7 @@ namespace PGrassCommon
 
 		float2 minMaxSubsurfaceOpacity;
 		float clumpGridSize;
-		float specularAnisotropy;  // OpenPBR specular_roughness_anisotropy, stretched across the blade
+		float specularAnisotropy;         // OpenPBR specular_roughness_anisotropy, stretched across the blade
 		float4 grassSurfParams;           // x: sheen (fuzz) strength, y: thin-subsurface anisotropy + 1, z: reserved, w: sheen roughness
 		float4 baseMinTipRoughnessStart;  // roughness at the base, at the smoothest point, and at the tip and t at which roughness bottoms out and starts climbing to the tip
 		float4 midRoughnessPolynomial;    // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}

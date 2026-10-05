@@ -46,7 +46,7 @@ public:
 		float curvedNormalStrength = 0.3f;                         // Edge tilt of the rolled cross-section as a fraction of 90 degrees
 		float2 subsurfaceOpacity = float2(0.5f, 0.30f);            // Opaque fraction of the base substrate, base to tip
 		float3 grassSubsurfaceTint = float3(0.50f, 0.54f, 0.38f);  // Scattering albedo at the stabilized blade colour
-		float grassTransmissionStrength = 1.5f;                 // Thin-subsurface anisotropy + 1; 0..2 splits scattering into reflection and transmission
+		float grassTransmissionStrength = 1.5f;                    // Thin-subsurface anisotropy + 1; 0..2 splits scattering into reflection and transmission
 		float3 baseMinTipRoughness = float3(0.40f, 0.30f, 0.40f);
 		float tipRoughnessStart = 0.75f;
 		float clumpAOStrength = 0.5f;
@@ -399,6 +399,7 @@ private:
 	void CreatePipelineStates();
 	/** @brief Creates the material detail, density, distant-ambient and presence textures. */
 	void CreateGrassTextures();
+	void CompileSupportShaders();
 
 	void PostDepthRendering();
 	/** @brief Player position in quadrant and cell units for one visibility update. */

@@ -15,60 +15,12 @@ StructuredBuffer<Blade> Blades : register(t0);
 ByteAddressBuffer IndirectArgs : register(t1);
 #endif
 
-struct VS_OUTPUT
-{
-	precise float4 Position: SV_POSITION;
-#if defined(DEPTH)
-#	if defined(DEPTH_CLIP)
-	float BladeHeight: TEXCOORD0;
-#	endif
-#elif defined(FAR_LOD)
-	float4 CameraPositionSide: TEXCOORD0;                // xyz: camera-relative position; w: across-blade coordinate
-	float4 BladeTColor: TEXCOORD1;                       // x: blade parameter; yzw: base-to-tip colour
-	nointerpolation uint4 PackedBladeParams: TEXCOORD2;  // facing/tilt, seed/type, root Z/width/height, f16 Far ramp/base half-width
-	nointerpolation float2 RootPixel: TEXCOORD3;         // Pixel where the blade root meets the ground
-#else
-	float4 CameraRelativePosition: TEXCOORD0;  // xyz: camera-relative position; w: across-blade coordinate
-#	if defined(HIGH_LOD)
-	float4 PreviousCameraRelativePosition: TEXCOORD1;  // xyz: previous camera-relative position; w: Bezier t
-#	elif defined(LOW_LOD)
-	float BladeT: TEXCOORD1;
-#	endif
-#	if defined(HIGH_LOD)
-	nointerpolation float4 WindLodDensity: TEXCOORD2;  // xy: tip wind offset; z: detail fade; w: canopy density and shadow
-#	elif defined(MID_LOD)
-	nointerpolation float4 WindRootPosition: TEXCOORD2;  // xy: tip wind offset; zw: root camera-relative XY
-#	elif defined(LOW_LOD)
-	nointerpolation float4 RootPosition: TEXCOORD2;  // xy: camera-relative blade root XY; zw: root pixel for the shadow mask
-#	endif
-#	if defined(MID_LOD)
-	float3 BladeTDepth: TEXCOORD3;                 // x: Bezier t; y: positive view depth; z: root camera-relative height
-	nointerpolation uint MaterialData: TEXCOORD7;  // clump seed/density and double-blade flag
-#	elif !defined(LOW_LOD)
-	float4 AOThicknessRoughness: TEXCOORD3;  // xyz: AO, thickness, roughness; w: root-relative height, or Bezier t for Mid
-#	endif
-#	if defined(LOW_LOD)
-	nointerpolation float2 BezierTipAndMid: TEXCOORD4;  // Low reconstructs the midpoint in the pixel shader.
-#	else
-	nointerpolation float4 BezierTipAndMid: TEXCOORD4;  // xy: tip; zw: midpoint in facing/up space
-#	endif
-	nointerpolation float4 BladeParams: TEXCOORD5;  // xy: facing; z: type; w: two f16 randoms
-#	if !defined(LOW_LOD) && !defined(MID_LOD)
-	float4 BaseToTipColor: TEXCOORD7;  // xyz: blade colour; w: positive view depth
-#	endif
-#	if defined(SKYLIGHTING) && !defined(LOW_LOD)
-#		if defined(MID_LOD)
-	nointerpolation float3 SkylightingRoot: TEXCOORD9;  // Full-precision probe position from the generator.
-#		else
-	nointerpolation float4 SkylightingVertexSH: TEXCOORD9;  // Per-blade SH from the generator.
-#		endif
-#	endif
-#endif
-};
+#include "ProceduralGrass/PGrassMaterial.hlsli"
+#include "ProceduralGrass/PGrassTierIO.hlsli"
 
-VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
-	VS_OUTPUT o;
+	GrassTierIO o;
 #if defined(BLADE_BATCH_SIZE)
 	// Each instance draws a fixed batch of blades; discard the final batch's unused tail.
 #	if defined(MID_VERTEX)
@@ -86,7 +38,7 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	[branch] if (instanceID >= IndirectArgs.Load(4u))
 #	endif
 	{
-		o = (VS_OUTPUT)0;
+		o = (GrassTierIO)0;
 		o.Position = float4(0.0f, 0.0f, 0.0f, 1.0f);
 		return o;
 	}
@@ -135,8 +87,7 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 
 #if defined(FAR_LOD)
 	uint grassTypeIndex = blade.seedAndType & 0xFFu;
-	uint bladeSeed = (blade.seedAndType >> 8) & 0xFFu;
-	uint clumpSeed = bladeSeed;
+	uint clumpSeed = (blade.seedAndType >> 8) & 0xFFu;
 #else
 	uint hashClumpAndGrassType = blade.hashClumpAndGrassType;
 	uint grassTypeIndex = hashClumpAndGrassType & 0xFFu;
@@ -252,12 +203,8 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	float level = abs(rung - doubleBlade * MID_LEVEL);
 	float t = level * invBladeLevels;
 #endif
-	static const float appearanceStability = 1.0f;
-	// Keep some authored height variation around a tapered blade's area-weighted mean.
-	static const float STABLE_APPEARANCE_T = 1.0f / 3.0f;
-	static const float DISTANT_APPEARANCE_DETAIL = 0.25f;
-	float stableAppearanceT = lerp(STABLE_APPEARANCE_T, t, DISTANT_APPEARANCE_DETAIL);
-	float appearanceT = lerp(t, stableAppearanceT, appearanceStability);
+	// Stabilize material sampling around the tapered blade's area-weighted mean.
+	float appearanceT = 0.25f * (t + 1.0f);
 
 	static const float COS_30 = 0.8660254f;
 	static const float SIN_30 = 0.5f;
@@ -403,7 +350,7 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #		elif !defined(LOW_LOD)
 #			if defined(HIGH_OUTER_VERTEX)
 	// Outer High and Mid share geometry and the same sampled roughness curve.
-	float roughness = mad(mad(bladeType.midRoughnessPolynomial.x, appearanceT, bladeType.midRoughnessPolynomial.y), appearanceT * appearanceT, bladeType.midRoughnessPolynomial.z);
+	float roughness = GetDistantRoughness(bladeType, appearanceT);
 #			else
 	float roughness = lerp(bladeType.baseMinTipRoughnessStart.x, bladeType.baseMinTipRoughnessStart.y, smoothstep(0.0f, bladeType.baseMinTipRoughnessStart.w, appearanceT));
 	roughness = lerp(roughness, bladeType.baseMinTipRoughnessStart.z, smoothstep(bladeType.baseMinTipRoughnessStart.x, 1.0f, appearanceT));
@@ -424,31 +371,8 @@ VS_OUTPUT main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	uint packedLowData = (hashClumpAndGrassType & 0xFF00FFFFu) | (((blade.posZWidthHeight >> 1) & 0xFu) << 16);
 	o.BladeParams = float4(facing, float(grassTypeIndex), asfloat(packedLowData));
 #	else
-#		if defined(FAR_LOD)
-	float bladeRand = (float(bladeSeed & 0xFFu) + 0.5f) * (1.0f / 256.0f);
-	float bladeRand2 = (float(bladeSeed >> 8) + 0.5f) * (1.0f / 256.0f);
-#		endif
-
-#		if defined(FAR_LOD)
-	float3 hueTint = lerp(bladeType.grassColorCool.rgb, bladeType.grassColorWarm.rgb, bladeRand);
-	float bladeValue = 1.0f + (bladeRand2 * 2.0f - 1.0f) * bladeType.grassColorVar.y;
-	float3 perBladeColor = lerp(1.0f, hueTint, bladeType.grassColorVar.x) * bladeValue;
-#		else
-	float3 perBladeColor = float3(packedBladeColor & 15u, (packedBladeColor >> 4u) & 15u, (packedBladeColor >> 8u) & 15u) * (2.0f / 15.0f);
-#		endif
-	// Retain low-frequency Voronoi colour as individual blade variation fades.
-	float clumpColorRand = (float(clumpSeed & 0xFFu) + 0.5f) * (1.0f / 256.0f);
-	float clumpValueRand = (float((clumpSeed * 73u + 41u) & 0xFFu) + 0.5f) * (1.0f / 256.0f);
-	float3 clumpTint = lerp(bladeType.grassColorCool.rgb, bladeType.grassColorWarm.rgb, clumpColorRand);
-	float clumpValue = 1.0f + (clumpValueRand * 2.0f - 1.0f) * bladeType.grassColorVar.y * 0.75f;
-	float3 stableClumpColor = lerp(1.0f, clumpTint * clumpValue, bladeType.clumpColorStrength);
-	perBladeColor = lerp(perBladeColor, stableClumpColor, appearanceStability);
-
-	// Apply base shading and tip drying at the stabilized blade sample.
-	float3 tipDryMul = lerp(1.0f, bladeType.grassColorTipDry.rgb, smoothstep(0.5f, 1.0f, appearanceT) * bladeType.grassColorVar.z);
-	float baseShade = lerp(1.0f - grassLightParams.w, 1.0f, smoothstep(0.0f, 0.5f, appearanceT));
-
-	float3 baseToTipColor = lerp(bladeType.baseColor.rgb, bladeType.tipColor.rgb, appearanceT) * perBladeColor * tipDryMul * baseShade;
+	float3 stableClumpColor = GetStableClumpColor(bladeType, clumpSeed);
+	float3 baseToTipColor = GetStabilizedBladeColor(bladeType, stableClumpColor, appearanceT);
 #		if defined(FAR_LOD)
 	o.BladeTColor = float4(t, baseToTipColor);
 #		else
