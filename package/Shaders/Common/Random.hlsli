@@ -323,6 +323,19 @@ namespace Random
 		distance = sqrt(distance);
 	}
 
+	/**
+	 * @brief Approximates FindNearestVoronoi2D with the feature of the position's own cell.
+	 * Uses the same feature hash, so it agrees with the exact search wherever that feature is the nearest.
+	 */
+	void GetVoronoiCellFeature2D(float2 gridPos, out uint seed, out float distance, out float2 offset)
+	{
+		int2 gridCell = int2(floor(gridPos));
+		uint3 hash = pcg3d(uint3(asuint(gridCell), 0u));
+		offset = float2(gridCell) + float2(hash.xy) * (1.0f / 4294967296.0f) - gridPos;
+		distance = length(offset);
+		seed = hash.z;
+	}
+
 	// https://www.shadertoy.com/view/slB3z3
 	float3 perlinGradient(uint hash)
 	{

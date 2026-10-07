@@ -181,6 +181,14 @@ namespace PBR
 		return exp(-0.5 * d * d) / (s * sqrt(Math::TAU)) + o;
 	}
 
+	/// @brief Evaluate the same fuzz fit with roughness-dependent parameters prepared once per material
+	/// @param parameters Inverse Gaussian width, centre, amplitude and baseline, in that order
+	float FuzzDirectionalAlbedoWithParameters(float NdotV, float4 parameters)
+	{
+		float d = (NdotV - parameters.y) * parameters.x;
+		return exp(-0.5 * d * d) * parameters.z + parameters.w;
+	}
+
 	/// @brief Evaluate the OpenPBR fuzz lobe (Zeltner et al. 2022 sheen) as a linearly transformed cosine
 	/// @param L Light direction
 	/// @param V View direction
@@ -204,6 +212,20 @@ namespace PBR
 		float3 wo = float3(aInv * w.x + bInv * w.z, aInv * w.y, w.z);
 		float scale = aInv / dot(wo, wo);
 		return max(wo.z, 0.0) * Math::INV_PI * scale * scale;
+	}
+
+	/// @brief Evaluate the fuzz lobe on the viewer-side face of a thin-walled surface lit from behind
+	/// @param L Light direction, behind the surface
+	/// @param V View direction
+	/// @param N Surface normal, facing the viewer
+	/// @param NdotV Dot product of normal and view direction
+	/// @param roughness Fuzz roughness [0.01,1]
+	/// @return Lobe value as FuzzLobe, zero for light in front; scale by the transmitted share of the light
+	/// @note OpenPBR thin-walled surfaces carry fuzz on both faces. Light transmitted through the surface reaches the
+	///       viewer-side fuzz continuing from the light, so that face sees it from the light's mirror image.
+	float FuzzLobeTransmitted(float3 L, float3 V, float3 N, float NdotV, float roughness)
+	{
+		return FuzzLobe(reflect(L, N), V, N, NdotV, roughness);
 	}
 
 	/// @brief Calculate index of refraction for hair using Marschner model
