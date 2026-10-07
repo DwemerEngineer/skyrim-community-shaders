@@ -4,6 +4,12 @@
 #define TRUE_PBR
 #define GRASS_LIGHTING
 
+// Outer High and Mid blades span a few pixels: they light fuzz on the specular normal, use an isotropic specular lobe,
+// and reuse the front ambient and skylighting samples, differences their pixels cannot resolve.
+#if defined(MID_LOD) || (defined(HIGH_LOD) && !defined(HIGH_INNER))
+#	define PGRASS_DISTANT_LIGHTING
+#endif
+
 #include "Common/PBRMath.hlsli"
 
 static const uint PBRFlags = PBR::Flags::Subsurface;
@@ -63,13 +69,14 @@ Texture2D<uint> GrassDensityTexture : register(t71);
 struct PS_OUTPUT
 {
 	float4 Diffuse: SV_Target0;
-#if !defined(FAR_LOD)
 	float4 MotionVectors: SV_Target1;
+#if !defined(FAR_LOD)
 	float4 NormalGlossiness: SV_Target2;
 	float4 Albedo: SV_Target3;
 	float4 Specular: SV_Target4;
 	float4 Reflectance: SV_Target5;
 	float4 Masks: SV_Target6;
+	float4 Masks2: SV_Target7;
 #endif
 };
 
@@ -89,10 +96,47 @@ Texture2D TexShadowMaskSampler : register(t14);
 #include "ProceduralGrass/PGrassMaterial.hlsli"
 #include "ProceduralGrass/PGrassLighting.hlsli"
 
+#if defined(FAR_LOD)
+#	include "ProceduralGrass/PGrassFarLighting.hlsli"
+#endif
+
+/** @brief Debug colour for the tier this permutation draws: High inner red, High outer orange, Mid yellow, Low green, Far blue. */
+float3 GetTierDebugColor()
+{
+#if defined(FAR_LOD)
+	return float3(0.1f, 0.35f, 1.0f);
+#elif defined(LOW_LOD)
+	return float3(0.1f, 0.8f, 0.15f);
+#elif defined(MID_LOD)
+	return float3(0.95f, 0.85f, 0.05f);
+#elif defined(HIGH_INNER)
+	return float3(0.95f, 0.08f, 0.05f);
+#else
+	return float3(1.0f, 0.45f, 0.0f);
+#endif
+}
+
+#if defined(HIGH_LOD) || defined(MID_LOD)
+// High and Mid colour passes only read depth, allowing rejection before blade shading.
+[earlydepthstencil]
+#endif
 PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 {
-	// Terrain Blending offsets the hardware depth. Test the visible surface before shading any tier.
-	clip(GrassSceneDepth.Load(int3(input.Position.xy, 0)) + (2.0f / 16777215.0f) - input.Position.z);
+#if defined(HIGH_LOD)
+	// Terrain Blending offsets the hardware depth; High is close enough for the offset to show, so test the visible
+	// surface before shading. High blends every target by its alpha, so zero opacity leaves them unchanged; a discard
+	// would do the same but costs these passes far more. Mid, Low and Far keep the hardware test alone.
+	float sceneHidden = GrassSceneDepth.Load(int3(input.Position.xy, 0)) + (2.0f / 16777215.0f) < input.Position.z ? 1.0f : 0.0f;
+
+	// Skip shading only when the whole 2x2 quad is hidden, so derivatives stay valid for partly hidden quads.
+	float2 quadSide = frac(input.Position.xy * 0.5f) < 0.5f ? 1.0f : -1.0f;
+	float rowHidden = 2.0f * sceneHidden + quadSide.x * ddx_fine(sceneHidden);
+	float quadHidden = 2.0f * rowHidden + quadSide.y * ddy_fine(rowHidden);
+	[branch] if (quadHidden > 3.5f)
+	{
+		return (PS_OUTPUT)0;
+	}
+#endif
 	PS_OUTPUT psout;
 
 #if defined(FAR_LOD)
@@ -100,11 +144,9 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	uint packedSeedAndType = input.PackedBladeParams.y;
 	uint packedPositionWidthHeight = input.PackedBladeParams.z;
 	uint grassTypeIndex = packedSeedAndType & 0xFFu;
-	float clumpDensity = float(packedSeedAndType >> 24) * (1.0f / 255.0f);
+	float clumpDensity = float(packedSeedAndType >> 28) * (1.0f / 15.0f);
+	float3 farTerrainNormal = UnpackFarTerrainNormal(packedSeedAndType);
 	float farWidthT = f16tof32(input.PackedBladeParams.w & 0xFFFFu);
-
-	// Start with Low's occlusion; only ease it once Far has cleared the handoff.
-	float farCanopyOcclusionScale = lerp(1.0f, 0.8f, smoothstep(0.0f, 1.0f, farWidthT));
 #else
 	uint grassTypeIndex = (uint)input.BladeParams.z;
 #endif
@@ -126,18 +168,22 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	float3 baseToTipColor = input.BladeTColor.yzw;
 	float appearanceT = 0.25f * (along + 1.0f);
 
-	float randHeight = bladeType.height * float(packedPositionWidthHeight & 0xFFu) * (1.0f / 255.0f);
+	// Match the VS: Far grows its blades as it thins, so shading measures height against the authored blade.
+	float farHeightScale = GetFarHeightScale(cameraRelativePosition.xy + FrameBuffer::CameraPosAdjust.xy - grassLodOrigin, FrameBuffer::CameraProj._m00);
+	float randHeight = bladeType.height * float(packedPositionWidthHeight & 0xFFu) * (1.0f / 255.0f) * farHeightScale;
 	float2 tip = tiltDir * randHeight;
 	float randBend = bladeType.stiffness * (0.25f + float((packedSeedAndType >> 20) & 0xFu) * (1.6f / 15.0f));
 	float2 midPoint = tip * bladeType.mid + float2(-tip.y, tip.x) * randBend;
 
 	// Shade the simplified geometry with the same authored curve as Low.
 	float2 derivative = 2.0f * (1.0f - along) * midPoint + 2.0f * along * (tip - midPoint);
-	float bladeHeight = along * tip.y;
-	float3 sideAndBladeT = float3(across, along, bladeHeight);
+	// Distant Far blades show mostly their tips behind the blades in front, which would light them brighter than nearer
+	// tiers that show whole blades. Their height-dependent occlusion uses a whole blade's mean height instead.
+	float farShadeAlong = lerp(along, 0.5f, smoothstep(0.0f, 1.0f, farWidthT));
+	float3 sideAndBladeT = float3(across, along, farShadeAlong * tip.y / farHeightScale);
 
 	// Match Low's authored roughness curve at the shared stabilized blade sample.
-	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity, along);
+	float3 aoThicknessRoughness = GetDistantAOThicknessRoughness(bladeType, appearanceT, clumpDensity, farShadeAlong);
 #else
 	float3 cameraRelativePosition = input.CameraRelativePosition.xyz;
 #	if defined(MID_LOD) || defined(LOW_LOD)
@@ -274,7 +320,10 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 #elif defined(MID_LOD)
 	tangent.xy += input.WindRootPosition.xy * (2.0f * along);
 #endif
+	// Far only needs the sheet normal, which is normalized after the cross product.
+#if !defined(FAR_LOD)
 	tangent = normalize(tangent);
+#endif
 	float3 normal = cross(-bitangent, tangent);
 	float normalLengthSquared = dot(normal, normal);
 
@@ -295,8 +344,13 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	// Use a stronger roll for indirect light and the GI normal; direct light retains the authored curve.
 	static const float IndirectCurvatureScale = 2.0f;
 	float indirectCurveAngle = clamp(curveAngle * IndirectCurvatureScale, -Math::HALF_PI, Math::HALF_PI);
+#if defined(FAR_LOD)
+	// Far has no vein or ground-normal detail; construct the stronger roll directly from its sheet basis.
+	float3 bladeIndirectNormal = normalize(transmissionNormal * cos(indirectCurveAngle) + bitangent * sin(indirectCurveAngle));
+#else
 	float3 indirectCurveOffset = bitangent * (sin(indirectCurveAngle) - sin(curveAngle)) +
 	                             transmissionNormal * (cos(indirectCurveAngle) - cos(curveAngle));
+#endif
 
 #if defined(HIGH_LOD)
 	float groundProximity = 1.0 - smoothstep(0.0, max(grassTerrainBlend.y, 0.01), sideAndBladeT.z);
@@ -305,11 +359,13 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	const float groundBlend = 0.0;
 #endif
 	float grassOpacity = 1.0f - groundBlend;
+#if defined(HIGH_LOD)
+	grassOpacity *= 1.0f - sceneHidden;
+#endif
 
 	float3 veinTint = bladeType.grassVeinParams.rgb;
 	float veinAlbedoStrength = saturate(bladeType.grassVeinParams.w * 1.20);
 	float mottleStrength = bladeType.grassColorVar.w;
-	float3 tipDryTint = bladeType.grassColorTipDry.rgb;
 
 #if defined(LOW_LOD)
 	float vein = 0.0;
@@ -351,36 +407,43 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	}
 #endif
 
+#if !defined(FAR_LOD)
 	// Turn the base normal toward the ground plane so it shades like terrain, not an edge-on blade.
 	worldSpaceNormal = normalize(lerp(worldSpaceNormal, float3(0.0, 0.0, 1.0), groundBlend * grassTerrainBlend.z));
-	float3 indirectNormal = normalize(worldSpaceNormal + indirectCurveOffset * (1.0f - groundBlend * grassTerrainBlend.z));
+	float3 bladeIndirectNormal = normalize(worldSpaceNormal + indirectCurveOffset * (1.0f - groundBlend * grassTerrainBlend.z));
+#endif
+
+	// Use the same continuous distance ramp on every tier so unresolved blades share a canopy response.
+	// Stop at the blend Low reaches where Far starts: seen at a grazing angle a distant canopy still shows blade sides, and
+	// turning Far's blades further toward the sky lit them like bare ground, so distant grass read as sparse.
+	float canopyNormalBlend = smoothstep(2048.0f, 24576.0f, min(length(cameraRelativePosition.xy), farParams.x));
+#if defined(FAR_LOD)
+	// Far's canopy lies on the terrain: on a slope it faces down the slope, not the open sky.
+	float3 canopySurfaceNormal = farTerrainNormal;
+#else
+	static const float3 canopySurfaceNormal = float3(0.0f, 0.0f, 1.0f);
+#endif
+	float3 indirectNormal = BlendGrassNormalToCanopy(bladeIndirectNormal, canopyNormalBlend, canopySurfaceNormal);
 
 	// The deferred composite's screen-space GI reads this normal.
 	float3 screenSpaceNormal = normalize(FrameBuffer::WorldToView(indirectNormal, false));
 
-#if !defined(LOW_LOD) && !defined(HIGH_LOD)
-	[branch] if (detailFade > 0.0)
-	{
-		float mottle = sin(along * 5.0 + bladeRand * Math::TAU) * 0.5 + 0.5;
-		baseColor.rgb *= 1.0 + (mottle - 0.5) * 2.0 * mottleStrength * detailFade;
-	}
+#if !defined(LOW_LOD)
+	// Mottle is low-frequency and fixed to the blade, so distant blades keep it; Mid fades it out as it takes Low's material.
+#	if defined(MID_LOD)
+	float bladeColorDetail = 1.0f - lowMaterialBlend;
+#	else
+	static const float bladeColorDetail = 1.0f;
+#	endif
+	float mottle = sin(along * 5.0 + bladeRand * Math::TAU) * 0.5 + 0.5;
+	baseColor.rgb *= 1.0 + (mottle - 0.5) * 2.0 * mottleStrength * bladeColorDetail;
 #endif
 
 #if defined(HIGH_LOD)
 	float speckle = 0.5;
 	float speckleAmount = 0.0;
 #	if defined(HIGH_INNER)
-	float mottle = sin(along * 5.0 + bladeRand * Math::TAU) * 0.5 + 0.5;
-	baseColor.rgb *= 1.0 + (mottle - 0.5) * 2.0 * mottleStrength * detailFade;
-
-	float blotch = smoothstep(0.28, 0.72, materialDetail.x);
-	float blotchAmount = bladeType.grassTextureParams.x * detailFade;
-	float3 blotchTint = lerp(bladeType.grassColorCool.rgb, bladeType.grassColorWarm.rgb, blotch);
-	float blotchTintLuma = dot(blotchTint, float3(0.2126, 0.7152, 0.0722));
-	blotchTint *= rcp(max(blotchTintLuma, 0.25));
-	baseColor.rgb *= lerp(1.0, blotchTint, blotchAmount);
-	baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * tipDryTint,
-		saturate(blotch - 0.55) * blotchAmount * 0.65);
+	baseColor.rgb = ApplyGrassBlotch(bladeType, baseColor.rgb, smoothstep(0.28, 0.72, materialDetail.x), bladeType.grassTextureParams.x * detailFade);
 
 	float2 grainCoord = float2(across, along) * float2(6.0, 26.0) * bladeType.grassTextureParams.w;
 	float grainFootprint = max(fwidth(grainCoord.x), fwidth(grainCoord.y));
@@ -396,6 +459,8 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 
 	baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * veinTint, vein * veinAlbedoStrength);
 #	endif
+	// As the texture detail fades, each blade keeps one stable blotch so distant blades do not turn a solid colour.
+	baseColor.rgb = ApplyGrassBlotch(bladeType, baseColor.rgb, smoothstep(0.28, 0.72, bladeRand), bladeType.grassTextureParams.x * (1.0f - detailFade));
 
 #elif defined(LOW_LOD)
 	float speckle = 0.5;
@@ -403,13 +468,10 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 #else
 	float speckle = 0.5;
 	float speckleAmount = 0.0;
+	// Match High's blotch with one stable value per blade.
+	baseColor.rgb = ApplyGrassBlotch(bladeType, baseColor.rgb, smoothstep(0.28, 0.72, bladeRand), bladeType.grassTextureParams.x * bladeColorDetail);
 	[branch] if (detailFade > 0.0)
 	{
-		// Broad surface variation is generated per blade; retain only pixel-dependent vein shaping here.
-		float blotch = saturate((bladeRand - 0.5) * 1.5 + 0.5);
-		baseColor.rgb *= 1.0 + (blotch - 0.5) * 2.0 * bladeType.grassTextureParams.x * detailFade;
-		baseColor.rgb = lerp(baseColor.rgb, baseColor.rgb * tipDryTint, saturate(blotch - 0.55) * bladeType.grassTextureParams.x * detailFade);
-
 		float textureFade = saturate(1.0 - viewDepth * (1.0 / 2500.0));
 		speckle = saturate((bladeRand2 - 0.5) * 2.0 + 0.5);
 		speckleAmount = bladeType.grassTextureParams.z * textureFade * detailFade;
@@ -463,7 +525,7 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 #if defined(FAR_LOD)
 	// Remove both the straight tip offset and the base-side offset to recover the actual root for shadows.
 	float baseHalfWidth = f16tof32(input.PackedBladeParams.w >> 16);
-	float2 baseSideOffset = float2(-facing.y, facing.x) * (baseHalfWidth * (1.0f - along) * (across * 2.0f - 1.0f));
+	float2 baseSideOffset = GetFarSideAxis(cameraRelativePosition.xy) * (baseHalfWidth * (1.0f - along) * (across * 2.0f - 1.0f));
 	float3 rootPosition = cameraRelativePosition - float3(facing * (along * tip.x) + baseSideOffset, along * tip.y);
 	float rootCoverWeight;
 	float rootDistantForegroundWeight;
@@ -497,8 +559,8 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	// Within the shadow distance the mask already holds the terrain's own shadow; the slope term takes over as Far
 	// leaves the range Low covers.
 	float groundSunFade = smoothstep(0.0f, 0.1f, farWidthT) * (1.0f - rootCoverWeight);
-	[branch] if (groundSunFade > 0.0f)
-		shadowColor.x *= lerp(1.0f, GetGroundSunFacing(shadowPixel, SharedData::DirLightDirection.xyz), groundSunFade);
+	float groundSunFacing = smoothstep(-0.1f, 0.1f, dot(farTerrainNormal, SharedData::DirLightDirection.xyz));
+	shadowColor.x *= lerp(1.0f, groundSunFacing, groundSunFade);
 #endif
 
 #if defined(MID_LOD) || defined(LOW_LOD)
@@ -507,11 +569,14 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 
 	// Mid's tips sit in each other's screen-space shadows, so Low's tips stay short of fully open.
 	static const float LowContactOcclusionTip = 0.9f;
+#	if defined(FAR_LOD)
+	// Keep Low's occlusion at every distance so Far does not brighten as it recedes.
+	float lowContactOcclusion = lerp(LowContactOcclusionBase, LowContactOcclusionTip, smoothstep(0.0f, 0.9f, farShadeAlong));
+#	else
 	float lowContactOcclusion = lerp(LowContactOcclusionBase, LowContactOcclusionTip, smoothstep(0.0f, 0.9f, along));
+#	endif
 #	if defined(MID_LOD)
 	lowContactOcclusion = lerp(1.0f, lowContactOcclusion, lowMaterialBlend);
-#	elif defined(FAR_LOD)
-	lowContactOcclusion = lerp(1.0f, lowContactOcclusion, farCanopyOcclusionScale);
 #	endif
 	bladeAO *= lowContactOcclusion;
 #endif
@@ -561,98 +626,41 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 #endif
 
 #if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
+	// Rain wets a thin blade on every side, so blades take the rain wetness directly. Terrain scales it by how far a
+	// surface faces up and breaks it into puddles, which would leave near-vertical blades almost dry. The water film
+	// follows the blade's own normal, and fades out before Low, which has no wet layer.
 	float nearFactor = smoothstep(4096.0 * 2.5, 0.0, viewDepth);
 	float waterHeight = SharedData::GetWaterData(cameraRelativePosition).w;
-	float waterRoughnessSpecular = 1.0;
-	float wetness = 0.0;
-	float wetnessDistToWater = abs(cameraRelativePosition.z - waterHeight);
-	float shoreFactor = saturate(1.0 - (wetnessDistToWater / (float)SharedData::wetnessEffectsSettings.ShoreRange));
-	float shoreFactorAlbedo = shoreFactor;
-
-	[flatten] if (cameraRelativePosition.z < waterHeight)
-		shoreFactorAlbedo = 1.0;
-
-	float minWetnessValue = SharedData::wetnessEffectsSettings.MinRainWetness;
-	float minWetnessAngle = 0;
-	minWetnessAngle = saturate(max(minWetnessValue, worldSpaceNormal.z));
-
+	float shoreFactor = saturate(1.0 - (abs(cameraRelativePosition.z - waterHeight) / (float)SharedData::wetnessEffectsSettings.ShoreRange));
+	bool submerged = cameraRelativePosition.z < waterHeight;
+	float shoreAlbedoWetness = (submerged ? 1.0 : shoreFactor) * SharedData::wetnessEffectsSettings.MaxShoreWetness;
+	float wetness = shoreFactor * SharedData::wetnessEffectsSettings.MaxShoreWetness;
 #	if !defined(PGRASS_DRY_WETNESS)
 #		if defined(SKYLIGHTING) && !defined(FAR_LOD)
+	// Grass under cover stays drier.
 	float wetnessOcclusion = saturate(SphericalHarmonics::Unproject(skylightingSH, float3(0, 0, 1)));
 	wetnessOcclusion *= wetnessOcclusion;
 #		else
-	float wetnessOcclusion = 1;
+	float wetnessOcclusion = 1.0;
 #		endif
-
-	float4 raindropInfo = float4(0, 0, 1, 0);
-	if (worldSpaceNormal.z > 0 && SharedData::wetnessEffectsSettings.Raining > 0.0f && SharedData::wetnessEffectsSettings.EnableRaindropFx) {
-		float4 precipOcclusionTexCoord = mul(SharedData::wetnessEffectsSettings.OcclusionViewProj, float4(cameraRelativePosition, 1));
-		precipOcclusionTexCoord.y = -precipOcclusionTexCoord.y;
-		float2 precipOcclusionUV = precipOcclusionTexCoord.xy * 0.5 + 0.5;
-
-		if (saturate(precipOcclusionUV.x) == precipOcclusionUV.x && saturate(precipOcclusionUV.y) == precipOcclusionUV.y) {
-			float precipOcclusionZ = WetnessEffects::TexPrecipOcclusion.SampleLevel(SampColorSampler, precipOcclusionUV, 0).x;
-
-			if (precipOcclusionTexCoord.z < precipOcclusionZ + 0.1)
-				raindropInfo = WetnessEffects::GetRainDrops(cameraRelativePosition + FrameBuffer::CameraPosAdjust.xyz, SharedData::wetnessEffectsSettings.Time, worldSpaceNormal);
-		}
-	}
-
-	float rainWetness = SharedData::wetnessEffectsSettings.Wetness * minWetnessAngle * SharedData::wetnessEffectsSettings.MaxRainWetness;
-	rainWetness = max(rainWetness, raindropInfo.w);
-
-	float puddleWetness = SharedData::wetnessEffectsSettings.PuddleWetness * minWetnessAngle;
-
-	rainWetness *= wetnessOcclusion;
-	puddleWetness *= wetnessOcclusion;
-
-	wetness = max(shoreFactor * SharedData::wetnessEffectsSettings.MaxShoreWetness, rainWetness);
-#	else
-	wetness = shoreFactor * SharedData::wetnessEffectsSettings.MaxShoreWetness;
+	wetness = max(wetness, SharedData::wetnessEffectsSettings.Wetness * SharedData::wetnessEffectsSettings.MaxRainWetness * wetnessOcclusion);
 #	endif
 
+	float waterRoughnessSpecular = 1.0;
 	float3 wetnessNormal = worldSpaceNormal;
-
-	float3 puddleCoords = ((cameraRelativePosition + FrameBuffer::CameraPosAdjust.xyz) * 0.5 + 0.5) * 0.01 / SharedData::wetnessEffectsSettings.PuddleRadius;
-	float puddle = wetness;
-
-#	if defined(PGRASS_DRY_WETNESS)
-	bool needsPuddleNoise = wetness > 0.0;
-#	else
-	bool needsPuddleNoise = wetness > 0.0 || puddleWetness > 0.0;
-#	endif
-
-	if (needsPuddleNoise) {
-		puddle = Random::ValueNoise2D(puddleCoords.xy);
-		puddle = puddle * ((minWetnessAngle / SharedData::wetnessEffectsSettings.PuddleMaxAngle) * SharedData::wetnessEffectsSettings.MaxPuddleWetness * 0.25) + 0.5;
-#	if defined(PGRASS_DRY_WETNESS)
-		wetness = lerp(wetness, 0.0, saturate(puddle - 0.25));
-#	else
-		wetness = lerp(wetness, puddleWetness, saturate(puddle - 0.25));
-#	endif
-		puddle *= wetness;
-	}
-
-	puddle *= nearFactor;
-
-	float wetnessGlossinessAlbedo = max(puddle, shoreFactorAlbedo * SharedData::wetnessEffectsSettings.MaxShoreWetness);
+	float filmWetness = saturate(wetness) * nearFactor;
+	// Water darkens porous ground by filling it; a waxy blade mostly turns glossy, so its film darkens it less.
+	static const float BladeWetDarkening = 0.6;
+	float wetnessGlossinessAlbedo = max(filmWetness * BladeWetDarkening, shoreAlbedoWetness);
 	wetnessGlossinessAlbedo *= wetnessGlossinessAlbedo;
 
-	float wetnessGlossinessSpecular = puddle;
-	wetnessGlossinessSpecular = lerp(wetnessGlossinessSpecular, wetnessGlossinessSpecular * shoreFactor, cameraRelativePosition.z < waterHeight);
-
-	float flatnessAmount = smoothstep(SharedData::wetnessEffectsSettings.PuddleMaxAngle, 1.0, minWetnessAngle);
-
-	flatnessAmount *= smoothstep(SharedData::wetnessEffectsSettings.PuddleMinWetness, 1.0, wetnessGlossinessSpecular);
-
-	wetnessNormal = normalize(lerp(wetnessNormal, float3(0, 0, 1), flatnessAmount));
-
-#	if !defined(PGRASS_DRY_WETNESS)
-	float3 rippleNormal = normalize(lerp(float3(0, 0, 1), raindropInfo.xyz, lerp(1.0, flatnessAmount, 0.8)));
-	wetnessNormal = ReorientNormal(rippleNormal, wetnessNormal);
-#	endif
-
-	waterRoughnessSpecular = 1.0 - wetnessGlossinessSpecular * 0.9;
+	// Without rain or shore water the wet layer is absent: its roughness stays 1, which gates every later use.
+	[branch] if (filmWetness > 0.0)
+	{
+		float wetnessGlossinessSpecular = submerged ? filmWetness * shoreFactor : filmWetness;
+		wetnessNormal = BlendGrassNormalToCanopy(wetnessNormal, canopyNormalBlend, canopySurfaceNormal);
+		waterRoughnessSpecular = 1.0 - wetnessGlossinessSpecular * 0.9;
+	}
 #endif
 
 #if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
@@ -682,6 +690,7 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	// Halve direct-light curvature while preserving the signed tilt and a nonzero sheet component.
 	static const float DirectCurvature = 0.5f;
 	float3 visibleFaceNormal = normalize(transmissionNormal * max(abs(shadingNormalSheet), 1e-4f) + shadingNormalTilt * DirectCurvature);
+	visibleFaceNormal = BlendGrassNormalToCanopy(visibleFaceNormal, canopyNormalBlend, canopySurfaceNormal);
 
 	// Use signed hemispheres for diffuse reflection and transmission.
 	float dirDiffuseNdotL = dot(visibleFaceNormal, dirLightDirection);
@@ -725,28 +734,22 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 #elif defined(SCREEN_SPACE_SHADOWS)
 	// Low and Far sample object and terrain shadows at the root, and approximate blade shadows statistically.
 	// Covered roots skip the screen-space trace so overlapping Mid blades do not shadow them twice.
-	float rootDetailShadow = lerp(ScreenSpaceShadows::ScreenSpaceShadowsTexture.Load(int3(shadowPixel + 0.5f, 0)).x, 1.0f, rootCoverWeight);
-	float detailShadowFade = saturate(3.0f - length(rootPosition.xy) * (2.0f / farParams.x));
-
-	// Suppress false trace shadows along unloaded terrain LOD seams.
-	static const float TerrainLodBlockSize = 16384.0f;
-	float2 rootWorldXY = rootPosition.xy + FrameBuffer::CameraPosAdjust.xy;
-
-	[flatten] if (any(rootWorldXY < loadedLandBounds.xy) || any(rootWorldXY > loadedLandBounds.zw))
-	{
-		float2 seamDistance = abs(frac(rootWorldXY * (1.0f / TerrainLodBlockSize) + 0.5f) - 0.5f) * TerrainLodBlockSize;
-		detailShadowFade *= smoothstep(384.0f, 512.0f, min(seamDistance.x, seamDistance.y));
+#	if defined(FAR_LOD)
+	float detailShadowFade = GetFarGrassRootShadowFade(rootPosition);
+	[branch] if (detailShadowFade > 0.0f && rootCoverWeight < 1.0f && rootDistantForegroundWeight < 1.0f) {
+		float rootContactShadow = SampleGrassRootContactShadow(
+			ScreenSpaceShadows::ScreenSpaceShadowsTexture, SampColorSampler, shadowPixel);
+		float rootDetailShadow = lerp(rootContactShadow, 1.0f, rootCoverWeight);
+		dirDetailShadow = lerp(1.0f, rootDetailShadow, detailShadowFade * (1.0f - rootDistantForegroundWeight));
 	}
-	else
-	{
-		// Take traced ground shadows only over the outer half of the Mid-to-Low handoff.
-		static const float MidHandoffEnd = 8192.0f;
-		static const float MidHandoffBand = 2048.0f;
-		float midThinning = saturate((length(rootWorldXY - grassLodOrigin) - (MidHandoffEnd - MidHandoffBand)) * (1.0f / MidHandoffBand));
-		detailShadowFade *= smoothstep(0.5f, 1.0f, midThinning);
-	}
+#	else
+	float rootContactShadow = SampleGrassRootContactShadow(
+		ScreenSpaceShadows::ScreenSpaceShadowsTexture, SampColorSampler, shadowPixel);
+	float rootDetailShadow = lerp(rootContactShadow, 1.0f, rootCoverWeight);
+	float detailShadowFade = GetGrassRootShadowFade(rootPosition);
 
 	dirDetailShadow = lerp(1.0f, rootDetailShadow, detailShadowFade * (1.0f - rootDistantForegroundWeight));
+#	endif
 
 	// The clump seed and per-blade bend are stable across frames, unlike the f16 camera-relative root.
 #	if defined(FAR_LOD)
@@ -780,29 +783,47 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	float dirSurfaceShadow = shadowColor.x;
 	float dirDetailedVisibility = dirSurfaceShadow * dirDetailShadow;
 
+#if defined(FAR_LOD)
+	FarGrassSurface farSurface;
+	farSurface.reflectionAlbedo = reflectionAlbedo;
+	farSurface.transmissionAlbedo = transmissionAlbedo;
+	farSurface.bounceColor = bladeType.grassBounceColor.rgb * bladeType.grassTypeLightParams.x;
+	farSurface.ambientDesaturation = bladeType.grassTypeLightParams.w;
+	float fuzzNdotV = clamp(dot(indirectNormal, worldSpaceViewDirection), EPSILON_DOT_CLAMP, 1.0f);
+	farSurface.fuzzAlbedo = saturate(bladeType.grassSurfParams.x) *
+	                      PBR::FuzzDirectionalAlbedoWithParameters(fuzzNdotV, bladeType.fuzzDirectionalAlbedoParams);
+	farSurface.fuzzColor = GetGrassFuzzColor(material.BaseColor, bladeType.grassSubsurfaceColor.w);
+	FarGrassLighting farLighting = GetFarGrassLighting(farSurface, material,
+		visibleFaceNormal, indirectNormal, worldSpaceViewDirection, dirLightDirection, dirLightColor * dirShadow,
+		dirSurfaceShadow, dirDetailShadow, canopyAO, canopyOverhead, canopyHeight01);
+
+	float screenAO = 1.0f - saturate(GrassScreenAO[uint2(shadowPixel)]);
+
+	psout.Diffuse = float4(Color::IrradianceToGamma(ResolveFarGrassLighting(farLighting, screenAO)), grassOpacity);
+	// Far draws after the deferred pass, so its pixels still hold the motion of the surface behind them. Against distant
+	// terrain or sky that parallax differs from the blade's, and TAA would reproject the blade from the wrong place.
+	psout.MotionVectors = float4(MotionBlur::GetSSMotionVector(float4(cameraRelativePosition, 1.0f), float4(previousCameraRelativePosition, 1.0f)), 0.0f, 1.0f);
+	[branch] if (debugFlags.y > 0.5f)
+		psout.Diffuse.xyz = GetTierDebugColor();
+	return psout;
+#else
 	float3 diffuseColor = 0;
 
 	DirectContext directContext = CreateDirectLightingContext(worldSpaceNormal, worldSpaceNormal, worldSpaceNormal, worldSpaceViewDirection, worldSpaceViewDirection, dirLightDirection, dirLightDirection, dirLightColor * dirShadow, dirDetailedVisibility, dirSurfaceShadow);
 	DirectLightingOutput dirLighting;
 
-	// Blend distant sky reflections toward the canopy normal and add the blade slope variance.
+	// Broaden unresolved highlights before the slower canopy normal transition completes.
 	static const float CanopyRoughness = 0.8f;
-#if defined(FAR_LOD)
-	// Far starts beyond the individual-blade reflection range.
-	static const float canopyBlend = 1.0f;
-#else
-	float canopyBlend = smoothstep(256.0f, 4096.0f, length(cameraRelativePosition));
-#endif
+	float canopyRoughnessBlend = smoothstep(256.0f, 4096.0f, length(cameraRelativePosition));
 
 	// Halve specular curvature and retain the sheet component to avoid cancellation at grazing views.
 	static const float SpecularCurvature = 0.5f;
-	float3 specularNormal = normalize(transmissionNormal * max(abs(shadingNormalSheet), 1e-4f) + shadingNormalTilt * (SpecularCurvature * (1.0f - canopyBlend)));
-	float3 canopyNormal = lerp(specularNormal, float3(0.0f, 0.0f, 1.0f), canopyBlend);
-	float canopyNormalLengthSquared = dot(canopyNormal, canopyNormal);
-	canopyNormal = canopyNormalLengthSquared > 1e-8f ? canopyNormal * rsqrt(canopyNormalLengthSquared) : float3(0.0f, 0.0f, 1.0f);
+	float3 specularNormal = normalize(transmissionNormal * max(abs(shadingNormalSheet), 1e-4f) + shadingNormalTilt * SpecularCurvature);
+	specularNormal = BlendGrassNormalToCanopy(specularNormal, canopyNormalBlend, canopySurfaceNormal);
+	float3 canopyNormal = specularNormal;
 	canopyNormal = dot(canopyNormal, worldSpaceViewDirection) < 0.0f ? -canopyNormal : canopyNormal;
 	float canopyNdotV = clamp(dot(canopyNormal, worldSpaceViewDirection), EPSILON_DOT_CLAMP, 1.0f);
-	float canopySlopeVariance = canopyBlend * CanopyRoughness * CanopyRoughness * CanopyRoughness * CanopyRoughness;
+	float canopySlopeVariance = canopyRoughnessBlend * CanopyRoughness * CanopyRoughness * CanopyRoughness * CanopyRoughness;
 
 	// Filter unresolved specular normal variation to prevent single-pixel highlights.
 	static const float SpecularAntiAliasingPixelVariance = 0.5f;
@@ -813,16 +834,22 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	float canopyRoughness = PBR::AddRoughnessVariance(material.Roughness, specularSlopeVariance);
 	float3 specularAlbedo = PBR::SpecularDirectionalAlbedo(material.F0, canopyRoughness, canopyNdotV);
 
-	// The white OpenPBR fuzz layer follows the indirect normal; its curvature fades toward the canopy.
-	float indirectNormalSheet = dot(indirectNormal, bladePlaneNormal);
-	float3 indirectNormalTilt = indirectNormal - bladePlaneNormal * indirectNormalSheet;
-	float3 fuzzNormal = normalize(transmissionNormal * max(abs(indirectNormalSheet), 1e-4f) + indirectNormalTilt * (1.0f - canopyBlend));
+#if defined(PGRASS_DISTANT_LIGHTING)
+	float3 fuzzNormal = canopyNormal;
+#else
+	// The OpenPBR fuzz layer follows the indirect normal; its curvature fades toward the canopy.
+	float indirectNormalSheet = dot(bladeIndirectNormal, bladePlaneNormal);
+	float3 indirectNormalTilt = bladeIndirectNormal - bladePlaneNormal * indirectNormalSheet;
+	float3 fuzzNormal = normalize(transmissionNormal * max(abs(indirectNormalSheet), 1e-4f) + indirectNormalTilt);
+	fuzzNormal = BlendGrassNormalToCanopy(fuzzNormal, canopyNormalBlend, canopySurfaceNormal);
+#endif
 	float fuzzNdotV = clamp(dot(fuzzNormal, worldSpaceViewDirection), EPSILON_DOT_CLAMP, 1.0f);
 	float fuzzRoughness = clamp(bladeType.grassSurfParams.w, 0.01f, 1.0f);
-	float fuzzAlbedo = saturate(bladeType.grassSurfParams.x) * PBR::FuzzDirectionalAlbedo(fuzzNdotV, fuzzRoughness);
+	float fuzzAlbedo = saturate(bladeType.grassSurfParams.x) * PBR::FuzzDirectionalAlbedoWithParameters(fuzzNdotV, bladeType.fuzzDirectionalAlbedoParams);
+	float3 fuzzColor = GetGrassFuzzColor(material.BaseColor, bladeType.grassSubsurfaceColor.w);
 
 	// The canopy roughening is isotropic, so the veins' anisotropy fades out where it takes over.
-	float specularAnisotropy = saturate(bladeType.specularAnisotropy) * (1.0f - canopyBlend);
+	float specularAnisotropy = saturate(bladeType.specularAnisotropy) * (1.0f - canopyRoughnessBlend);
 
 	float fuzzThroughput = 1.0f - fuzzAlbedo;
 	// Keep the anisotropic tangent perpendicular to the specular normal, with a grazing-view fallback.
@@ -831,17 +858,17 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	float3 specularTangent = normalize(dot(acrossTangent, acrossTangent) > 0.01f ? acrossTangent : cross(tangentAxis, specularNormal));
 	GetDirectLightInputProcGrass(dirLighting, directContext, material, dirDiffuseNdotL,
 		reflectionAlbedo, transmissionAlbedo,
-		specularNormal, specularTangent, material.Roughness, specularAnisotropy, specularSlopeVariance, specularAlbedo, fuzzNormal, fuzzNdotV, fuzzAlbedo, fuzzRoughness);
+		specularNormal, specularTangent, material.Roughness, specularAnisotropy, specularSlopeVariance, specularAlbedo, fuzzNormal, fuzzNdotV, fuzzAlbedo, fuzzColor, fuzzRoughness);
 
-	// Occlude direct reflections along the sun path; the canopy response takes over with distance.
+	// Retain canopy extinction along the sun path as blade normals converge.
 	float canopyLightPath = canopyOverhead / max(dirLightDirection.z, CanopyReflectionMinElevation);
-	dirLighting.specular *= lerp(exp2(-canopyLightPath * CanopyReflectionExtinction), 1.0f, canopyBlend);
+	dirLighting.specular *= exp2(-canopyLightPath * CanopyReflectionExtinction);
 
 #if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
 #	if defined(MID_LOD)
-	if (detailedSpecularWeight > 0.0 && waterRoughnessSpecular < 1.0)
+	[branch] if (detailedSpecularWeight > 0.0 && waterRoughnessSpecular < 1.0)
 #	else
-	if (waterRoughnessSpecular < 1.0)
+	[branch] if (waterRoughnessSpecular < 1.0)
 #	endif
 		EvaluateWetnessLighting(wetnessNormal, directContext, waterRoughnessSpecular, dirLighting);
 #endif
@@ -916,7 +943,7 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 			GetDiffuseLightInputProcGrass(pointLighting, pointContext, pointDiffuseNdotL,
 				reflectionAlbedo, transmissionAlbedo, (1.0f - specularAlbedo) * fuzzThroughput);
 #		if defined(WETNESS_EFFECTS)
-			if (waterRoughnessSpecular < 1.0)
+			[branch] if (waterRoughnessSpecular < 1.0)
 				EvaluateWetnessLighting(wetnessNormal, pointContext, waterRoughnessSpecular, pointLighting);
 #		endif
 			diffuseColor += pointLighting.diffuse * detailedSpecularWeight;
@@ -926,7 +953,8 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 #	endif
 #endif
 
-	float3 directionalAmbientColor = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(indirectNormal), 0).rgb;
+	float3 frontAmbientIrradiance = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(indirectNormal), 0).rgb;
+	float3 directionalAmbientColor = frontAmbientIrradiance;
 	float ambientLuma = dot(directionalAmbientColor, float3(0.2126, 0.7152, 0.0722));
 	directionalAmbientColor = lerp(directionalAmbientColor, ambientLuma, bladeType.grassTypeLightParams.w);
 
@@ -936,7 +964,17 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 
 	// Ambient light the canopy hides is scattered on like sunlight, so hidden sky still arrives as grass-coloured light.
 	float3 canopyAmbientFill = canopyScatterAlbedo;
-	directionalAmbientColor *= canopyAO * GetCanopySkyLight(indirectNormal, canopyOverhead, canopyAmbientFill);
+	float3 frontCanopySkyLight = canopyAO * GetCanopySkyLight(indirectNormal, canopyOverhead, canopyAmbientFill);
+
+	// A curved blade's concave face hides part of its sky behind its own halves, which matters most where ambient light
+	// dominates. The hidden sky arrives as grass-scattered light, as under the canopy, and the view factor fades out with
+	// the curve as the normals blend to the canopy.
+	float curveSkyView = 1.0f;
+	if (curveSign < 0.0f)
+		curveSkyView = lerp(GetCurvedBladeSkyView(saturate(bladeType.grassVeinParams2.w) * Math::HALF_PI, side), 1.0f, canopyNormalBlend);
+	float3 curveSkyLight = lerp(canopyAmbientFill, 1.0f, curveSkyView);
+	frontCanopySkyLight *= curveSkyLight;
+	directionalAmbientColor *= frontCanopySkyLight;
 
 	IndirectLobeWeights indirectLobeWeights = (IndirectLobeWeights)0;
 	// Both ambient hemispheres use the same scattering budget and surface-layer attenuation as direct light.
@@ -955,10 +993,14 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 
 	// Direct irradiance uses albedo; ambient already contains the full indirect lobe.
 	float3 ambientDiffuseColor = directionalAmbientColor * indirectLobeWeights.diffuse;
-	// The white fuzz reflects the ambient light over the hemisphere around its normal, occluded like the blade beneath.
+	// The fuzz reflects the ambient light over the hemisphere around its normal, occluded like the blade beneath.
+#if defined(PGRASS_DISTANT_LIGHTING)
+	float3 fuzzAmbient = frontAmbientIrradiance * frontCanopySkyLight * material.AO;
+#else
 	float3 fuzzAmbient = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(fuzzNormal), 0).rgb * canopyAO *
-	                     GetCanopySkyLight(fuzzNormal, canopyOverhead, canopyAmbientFill) * material.AO;
-	ambientDiffuseColor += fuzzAmbient * fuzzAlbedo;
+	                     GetCanopySkyLight(fuzzNormal, canopyOverhead, canopyAmbientFill) * curveSkyLight * material.AO;
+#endif
+	ambientDiffuseColor += fuzzAmbient * fuzzAlbedo * fuzzColor;
 
 	// The opposite hemisphere supplies diffuse transmission at every tier.
 	float3 backNormal = -indirectNormal;
@@ -987,14 +1029,17 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	float3 specularSky = DistantAmbientLUT.SampleLevel(SampColorSampler, GBuffer::EncodeNormal(specularReflectDirection), 0).rgb;
 	float specularSkyOcclusion = SpecularOcclusion(canopyNdotV, canopyRoughness * canopyRoughness, material.AO);
 #if defined(SKYLIGHTING) && !defined(FAR_LOD)
+#	if defined(PGRASS_DISTANT_LIGHTING)
+	specularSkyOcclusion *= skylightingDiffuse;
+#	else
 	specularSkyOcclusion *= Skylighting::GetSkylightingDiffuse(skylightingSH, positionMSSkylight, specularReflectDirection);
+#	endif
 #endif
 
 	// Blend occluded sky reflections toward surrounding grass; downward paths see only canopy and ground.
 	float canopyReflectionPath = canopyOverhead / max(specularReflectDirection.z, CanopyReflectionMinElevation);
 	float canopyReflectionVisibility = exp2(-canopyReflectionPath * CanopyReflectionExtinction) *
-	                                   smoothstep(-CanopyReflectionMinElevation, CanopyReflectionMinElevation, specularReflectDirection.z);
-	canopyReflectionVisibility = lerp(canopyReflectionVisibility, 1.0f, canopyBlend);
+	                                   smoothstep(-CanopyReflectionMinElevation, CanopyReflectionMinElevation, specularReflectDirection.z) * curveSkyView;
 	float3 canopyReflection = lerp(Color::IrradianceToLinear(ambientDiffuseColor),
 		Color::IrradianceToLinear(specularSky * Color::ReflectionNormalisationScale), canopyReflectionVisibility);
 	specularColorPBR += canopyReflection * specularAlbedo * fuzzThroughput * specularSkyOcclusion;
@@ -1024,38 +1069,8 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	}
 #else
 	psout.Diffuse.xyz = shadedDiffuseColor;
-
-#	if defined(FAR_LOD)
-	// Match the deferred density shadow without its four integer density reads.
-	float densityShadowOuterStart = saturate(1.0f - 4096.0f * farParams.y);
-	float densityShadowOuterFade = 1.0f - smoothstep(densityShadowOuterStart, 1.0f, farWidthT);
-	float densityShadow = densityShadowOuterFade;
-
-	// The deferred pass darkens by the drawn height above terrain.
-	float rootHeight = cameraRelativePosition.z - f16tof32(packedPositionWidthHeight >> 16);
-	float densityShadowHeight = farCanopyOcclusionScale * (1.0f - saturate(rootHeight / max(grassAOParams.w, 1.0f)));
-	float densityShadowScale = saturate(1.0f - densityShadow * saturate(grassAOParams.y) * densityShadowHeight);
-
-	// Match deferred AO at the terrain root: full AO on ambient, sqrt(AO) on direct light.
-	// An unbound AO mask leaves the grass visible.
-	float screenAO = 1.0f - farCanopyOcclusionScale * saturate(GrassScreenAO[uint2(shadowPixel)]);
-	float3 linDiffuse = Color::IrradianceToLinear(psout.Diffuse.xyz);
-	[branch] if (screenAO < 1.0f)
-	{
-		float3 linAlbedo = Color::IrradianceToLinear(indirectLobeWeights.diffuse / Color::PBRLightingScale);
-		float3 multiBounceScreenAO = MultiBounceAO(linAlbedo, screenAO);
-		float3 farAmbient = min(ambientShadedColor, psout.Diffuse.xyz);
-		float3 farDirect = Color::IrradianceToGamma(Color::IrradianceToLinear(psout.Diffuse.xyz - farAmbient) * sqrt(multiBounceScreenAO));
-		linDiffuse = Color::IrradianceToLinear(farDirect + Color::IrradianceToGamma(Color::IrradianceToLinear(farAmbient) * multiBounceScreenAO));
-	}
-
-	// Far runs after deferred composite, so resolve diffuse and specular in the same order here.
-	// The terrain-shadow pass attenuates resolved lighting, including specular, in linear space.
-	psout.Diffuse.xyz = Color::IrradianceToGamma((linDiffuse + specularColor) * densityShadowScale);
-#	endif
 #endif
 
-#if !defined(FAR_LOD)
 	psout.Specular = float4(specularColor, psout.Diffuse.w);
 
 	float3 outputAlbedo = indirectLobeWeights.diffuse;
@@ -1064,7 +1079,8 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 
 #	if defined(WETNESS_EFFECTS) && !defined(LOW_LOD)
 	indirectLobeWeights.specular += wetnessReflectance;
-	if (waterRoughnessSpecular < 1.0) {
+	[branch] if (waterRoughnessSpecular < 1.0)
+	{
 		screenSpaceNormal = normalize(FrameBuffer::WorldToView(wetnessNormal, false));
 		pbrGlossiness = saturate(1.0 - waterRoughnessSpecular);
 	}
@@ -1074,14 +1090,20 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	psout.Reflectance = float4(indirectLobeWeights.specular * specOcclusion, psout.Diffuse.w);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), pbrGlossiness, psout.Diffuse.w);
 	psout.Masks = float4(0, 0, Color::RGBToYCoCg(ambientShadedColor).x, psout.Diffuse.w);
-
-#endif
-
-#if !defined(FAR_LOD)
+	psout.Masks2 = float4(0, 0, 0, psout.Diffuse.w);
 	float2 screenMotionVector = MotionBlur::GetSSMotionVector(float4(cameraRelativePosition, 1), float4(previousCameraRelativePosition, 1));
 	psout.MotionVectors.xy = screenMotionVector.xy;
 	psout.MotionVectors.zw = float2(0, psout.Diffuse.w);
-#endif
+
+	[branch] if (debugFlags.y > 0.5f)
+	{
+		// Leave only the flat tier colour: no ambient, specular or reflections from the composite.
+		psout.Diffuse.xyz = GetTierDebugColor();
+		psout.Specular.xyz = 0.0f;
+		psout.Albedo.xyz = 0.0f;
+		psout.Reflectance.xyz = 0.0f;
+	}
 
 	return psout;
+#endif
 }

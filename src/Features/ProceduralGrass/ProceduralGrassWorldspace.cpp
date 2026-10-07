@@ -484,6 +484,21 @@ void ProceduralGrass::RebuildNearQuadrants(const RE::GridCellArray* cells, const
 	EvictGrassMapCache();
 }
 
+uint8_t ProceduralGrass::LimitGrassIdToSlope(const uint8_t id, const PGrassCommon::Quadrant& quadrant, const uint32_t column, const uint32_t row) const
+{
+	if (!id || !quadrant.heights || quadrant.minHeight <= PGrassCommon::QuadrantNoHeight)
+		return id;
+
+	// Forward differences, taken backward on the quadrant's last row and column.
+	constexpr uint32_t pitch = PGrassCommon::QuadrantGrassPitch;
+	const uint32_t sample = std::min(row, pitch - 2u) * pitch + std::min(column, pitch - 2u);
+	const float slopeX = (quadrant.heights[sample + 1] - quadrant.heights[sample]) / 128.0f;
+	const float slopeY = (quadrant.heights[sample + pitch] - quadrant.heights[sample]) / 128.0f;
+	const float normalZ = 1.0f / std::sqrt(slopeX * slopeX + slopeY * slopeY + 1.0f);
+	const auto& type = resolvedGeneratorTypes.grassType[id];
+	return normalZ < type.maxSlope || normalZ > type.minSlope ? uint8_t{ 0 } : id;
+}
+
 void ProceduralGrass::RebuildGrassPresence(const int32_t originQuadX, const int32_t originQuadY)
 {
 	uint64_t contentHash = PGrassCommon::GrassHashOffsetBasis;
@@ -510,22 +525,15 @@ void ProceduralGrass::RebuildGrassPresence(const int32_t originQuadX, const int3
 		if (sx0 < 0 || sy0 < 0 || sx0 + pitch > dim || sy0 + pitch > dim)
 			continue;
 
+		const auto filled = PGrassCommon::FillQuadrantGrassIds(quadrant.grassIds,
+			quadrant.cellX * 2 + static_cast<int32_t>(quadrant.x), quadrant.cellY * 2 + static_cast<int32_t>(quadrant.y));
+		// Match the generator's quadrant-local fill and union only the shared border samples. Filling the assembled
+		// window would reach into bare cells that the generator never fills.
 		for (int32_t row = 0; row < pitch; ++row) {
 			uint8_t* dstRow = grassPresenceStaging.data() + static_cast<size_t>(sy0 + row) * grassPresenceDim + sx0;
-			std::memcpy(dstRow, quadrant.grassIds + row * pitch, static_cast<size_t>(pitch));
-		}
-	}
-
-	// Use the generator's one-neighbour fill. Read only the original map so the fill cannot spread farther.
-	const auto sourcePresence = grassPresenceStaging;
-	const int32_t worldSampleBaseX = originQuadX * (pitch - 1);
-	const int32_t worldSampleBaseY = originQuadY * (pitch - 1);
-	for (uint32_t y = 0; y < grassPresenceDim; ++y) {
-		for (uint32_t x = 0; x < grassPresenceDim; ++x) {
-			const size_t sample = static_cast<size_t>(y) * grassPresenceDim + x;
-			if (sourcePresence[sample] == 0) {
-				grassPresenceStaging[sample] = PGrassCommon::FindAdjacentGrassId(sourcePresence.data(), grassPresenceDim, grassPresenceDim, x, y,
-					worldSampleBaseX + static_cast<int32_t>(x), worldSampleBaseY + static_cast<int32_t>(y));
+			for (int32_t column = 0; column < pitch; ++column) {
+				const uint8_t id = LimitGrassIdToSlope(filled[row * pitch + column], quadrant, column, row);
+				dstRow[column] = PGrassCommon::MergeGrassIds(dstRow[column], id);
 			}
 		}
 	}

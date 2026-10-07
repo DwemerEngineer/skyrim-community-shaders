@@ -4,6 +4,17 @@ namespace PGrassCommon
 {
 	inline constexpr uint32_t LowBladeBatchSize = 64;
 	inline constexpr uint32_t MidBladeBatchSize = 32;
+	inline constexpr uint32_t FarBladeBatchSize = 64;
+	// Far blades lay their root edge across the view, covering their full width rather than the 2/pi a random facing
+	// averages, so Far keeps this share of its candidates. Keep in sync with PGrassCommon.hlsli.
+	inline constexpr float FarViewFacingKeep = 0.63661977f;
+	// Far's largest blade height multiple as it makes up for its distance thinning; keep in sync with PGrassCommon.hlsli.
+	inline constexpr float FarMaxHeightScale = 2.0f;
+
+	// Low and Far draw blades at this multiple of High's width; keep in sync with PGrassCommon.hlsli.
+	inline constexpr float DistantWidthScale = 1.5f;
+	// Mid draws two of High's four base lanes per patch at High's width.
+	inline constexpr uint32_t MidPatchBladeCount = 2;
 	inline constexpr uint32_t GrassMaterialDetailDim = 64;
 	inline constexpr uint32_t GrassMaterialDetailVariants = 4;
 	inline constexpr float GrassMaterialDetailNormalRange = 1.25f;
@@ -144,8 +155,38 @@ namespace PGrassCommon
 		return 0;
 	}
 
+	/** @brief Fills bare samples within one LAND quadrant, without extending grass across its borders. */
+	inline std::array<uint8_t, QuadrantGrassSamples> FillQuadrantGrassIds(const uint8_t* ids, int32_t quadrantX, int32_t quadrantY)
+	{
+		std::array<uint8_t, QuadrantGrassSamples> filled{};
+		if (!ids)
+			return filled;
+
+		const int32_t worldSampleBaseX = quadrantX * static_cast<int32_t>(QuadrantCellPitch);
+		const int32_t worldSampleBaseY = quadrantY * static_cast<int32_t>(QuadrantCellPitch);
+		for (uint32_t y = 0; y < QuadrantGrassPitch; ++y) {
+			for (uint32_t x = 0; x < QuadrantGrassPitch; ++x) {
+				const uint32_t sample = y * QuadrantGrassPitch + x;
+				filled[sample] = ids[sample];
+				if (filled[sample] == 0u)
+					filled[sample] = FindAdjacentGrassId(ids, QuadrantGrassPitch, QuadrantGrassPitch, x, y,
+						worldSampleBaseX + static_cast<int32_t>(x), worldSampleBaseY + static_cast<int32_t>(y));
+			}
+		}
+		return filled;
+	}
+
+	/** @brief Unions shared LAND samples deterministically, preserving either quadrant's grass coverage. */
+	inline uint8_t MergeGrassIds(uint8_t first, uint8_t second)
+	{
+		return first == 0u ? second : (second == 0u ? first : std::min(first, second));
+	}
+
 	static constexpr int32_t HighTierQuadrantRadius = 2;
 	static constexpr int32_t MidTierQuadrantRadius = 4;  // Extend Mid this far to avoid popping when the player moves between Mid and Low tiers.
+	// Mid hands off to Low over this distance. Mid's blades are fully straightened by then and rarely cover a pixel, so
+	// the band is short. Keep in sync with PGrassCommon.hlsli.
+	static constexpr float MidLowHandoffBand = 1024.0f;
 	static constexpr int32_t LowTierQuadrantRadius = 5;  // Low overlaps Far across their radial transition band.
 	static constexpr int32_t FarCellRadiusCap = 15;      // Maximum total streamed cell radius that fits in the Far quadrant buffer.
 	static constexpr int32_t LowTierStreamGuardQuadrants = 1;
@@ -155,6 +196,8 @@ namespace PGrassCommon
 	// Terrain lift map; mirrors PGrassCommon.hlsli. The window spans the Far radius cap on every side of the camera.
 	static constexpr int32_t TerrainLiftDim = 512;
 	static constexpr float TerrainLiftCellSize = 256.0f;
+	static constexpr uint32_t TerrainCanopyDim = 1024;
+	static constexpr int32_t TerrainCanopyQuadrants = TerrainCanopyDim / QuadrantCellPitch;
 
 	// Quadrants in an md<=r square (r in each of x and y), one per tier's renderer buffer.
 	constexpr uint32_t QuadrantSquare(int32_t r) { return static_cast<uint32_t>((2 * r + 1) * (2 * r + 1)); }
@@ -198,7 +241,7 @@ namespace PGrassCommon
 	struct alignas(16) QuadrantDataArray
 	{
 		// Per-tier LOD cross-fade bands, so a quadrant dithers in/out at tier boundaries instead of popping.
-		float4 lodFadeIn;  // x: fade-in start dist, y: 1/range, z: Far seam-extra keep, w: fade-out endpoint
+		float4 lodFadeIn;  // x: fade-in start dist, y: 1/range, z: unused, w: fade-out endpoint
 		float4 lodFadeOut;
 		QuadrantData data[N];
 	};
@@ -221,19 +264,19 @@ namespace PGrassCommon
 		float grassPBRLightingScale;  // TRUE_PBR's lighting scale, resolved for the active Linear Lighting mode.
 		float4 occlusionParams;       // xy: window centre in world space, z: underside clearance, w: top-height bias (world units)
 
-		float4 grassAOParams;     // x: density map dim, y: darken strength, z: blades-per-texel for full dark, w: canopy height (world units)
-		float4 grassLightParams;  // x: density AO, y: canopy sky occlusion, z: reserved, w: base canopy shading
+		float4 grassAOParams;     // x: density map dim, y: terrain darkness (0 disables), z: full-coverage encoding, w: canopy height (world units)
+		float4 grassLightParams;  // x: density AO, y: canopy sky occlusion, z: unused, w: base canopy shading
 		float4 grassFrameLight;   // xyz: resolved TRUE_PBR directional light, w: resolved grass brightness scale
 
 		float4 farParams;          // x: thin start, y: inverse range, z: Far candidate spacing, w: Far performance keep
-		float4 miscParams;         //  x: grass map edge noise in world units, y: slope facing, z: view thicken, w: timer delta
+		float4 miscParams;         // x: grass map edge noise in world units, y: reserved, z: view thicken, w: timer delta
 		float4 grassTerrainBlend;  // x: blend strength, y: blend height (world units), z: normal blend, w: roughness blend
 
 		float2 heightMapScale;   // world space -> terrain heightmap UV, pairs with heightMapOffset
 		float2 heightMapOffset;  // -pos0.xy * heightMapScale
 		float2 heightMapZRange;  // {pos0.z, pos1.z}; texels are normalised and lerp between these
 
-		float2 debugFlags;           // x: bypass every cull in the generator
+		float2 debugFlags;           // x: bypass every cull in the generator, y: colour blades by tier
 		float4 grassPresenceParams;  // xy: world min-corner of the grass-id texture, z: 1/sample spacing, w: texture dim (density gather)
 		float4 grassHiZParams;       // xy: valid base extent, z: near-tier geometry radius, w: trustworthy mip count; zero disables
 		float2 grassLodOrigin;       // camera XY with a small dead zone, preventing stationary camera sway from moving LOD bands
@@ -244,14 +287,16 @@ namespace PGrassCommon
 		float4 loadedLandBounds;       // xy: world min, zw: world max of the cells with attached LAND; terrain LOD is rendered outside.
 		int32_t terrainLiftOrigin[4];  // xy: world cell at the terrain lift map's window origin, zw: last frame's origin
 		uint32_t terrainLiftPhase;     // The quarter of the terrain lift map refreshed this frame
-		float midCandidateSpacing;     // World spacing of Mid's candidate lattice, before its two base blades and slope fill.
-		float distantFill;             // Share of Mid's density that Low and Far extra candidates make up; 1 matches Mid.
-		uint32_t _padTerrainLift;
+		float farHandoffDensityRatio;  // Low's blades per Far patch: (Low lattice density / Far lattice density)^2.
+		float pad1;
+		float pad2;
+		int32_t terrainCanopyWindow[4];  // World quadrant bounds, maximum exclusive.
+		float4 terrainCanopyParams;      // x: transition start, y: inverse range, z: maximum blade height, w: Far density falloff.
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassGlobals);
 	static_assert(offsetof(GrassGlobals, grassPBRLightingScale) == 60);
 	static_assert(offsetof(GrassGlobals, grassFrameLight) == 112);
-	static_assert(sizeof(GrassGlobals) == 336);
+	static_assert(sizeof(GrassGlobals) == 368);
 
 	struct alignas(16) GrassType
 	{
@@ -277,10 +322,10 @@ namespace PGrassCommon
 		float2 minMaxSubsurfaceOpacity;
 		float clumpGridSize;
 		float specularAnisotropy;         // OpenPBR specular_roughness_anisotropy, stretched across the blade
-		float4 grassSurfParams;           // x: sheen (fuzz) strength, y: thin-subsurface anisotropy + 1, z: reserved, w: sheen roughness
+		float4 grassSurfParams;           // x: sheen (fuzz) strength, y: thin-subsurface anisotropy + 1, z: slope facing, w: sheen roughness
 		float4 baseMinTipRoughnessStart;  // roughness at the base, at the smoothest point, and at the tip and t at which roughness bottoms out and starts climbing to the tip
 		float4 midRoughnessPolynomial;    // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}
-		float4 grassTypeLightParams;      // x: ground bounce, yz: reserved, w: ambient desaturation
+		float4 grassTypeLightParams;      // x: ground bounce, y: mean vertical height fraction, z: mean Far triangle area, w: ambient desaturation
 
 		float4 baseColor;
 		float4 tipColor;
@@ -289,17 +334,19 @@ namespace PGrassCommon
 		float4 grassColorCool;
 		float4 grassColorWarm;
 		float4 grassBounceColor;
-		float4 grassTextureParams;    // x: blotch strength, y: blotch scale, z: speckle strength, w: speckle scale
-		float4 grassVeinParams;       // rgb: vein albedo tint, w: vein albedo strength
-		float4 grassVeinParams2;      // x: vein normal strength, y: ripple depth, z: micro-wiggle amount, w: curved normal strength
-		float4 grassSubsurfaceColor;  // rgb: linear scattering tint divided by the reference blade colour, w: reserved
+		float4 grassTextureParams;           // x: blotch strength, y: blotch scale, z: speckle strength, w: speckle scale
+		float4 grassVeinParams;              // rgb: vein albedo tint, w: vein albedo strength
+		float4 grassVeinParams2;             // x: vein normal strength, y: ripple depth, z: micro-wiggle amount, w: curved normal strength
+		float4 grassSubsurfaceColor;         // rgb: linear scattering tint divided by the reference blade colour, w: sheen (fuzz) tint toward the blade hue
+		float4 fuzzDirectionalAlbedoParams;  // inverse width, centre, amplitude and offset of the MaterialX fuzz fit
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassType);
 
 	// HLSL cbuffer packing keeps float2 inside one 16-byte register, so these offsets must match it.
 	static_assert(offsetof(GrassType, minMaxSubsurfaceOpacity) == 64);
 	static_assert(offsetof(GrassType, grassSurfParams) == 80);
-	static_assert(sizeof(GrassType) == 320);
+	static_assert(offsetof(GrassType, fuzzDirectionalAlbedoParams) == 320);
+	static_assert(sizeof(GrassType) == 336);
 
 	// Slot 0 = bare, slot 1 = the base/default type, leaving 126 total slots for loaded per-texture variants.
 	static constexpr uint32_t MaxGrassTypes = 128;
@@ -308,6 +355,7 @@ namespace PGrassCommon
 	{
 		GrassType grassType[MaxGrassTypes];
 	};
+	static_assert(sizeof(GrassTypesArray) <= 65536);
 
 	// Compact type data used by blade generation.
 	struct alignas(16) GrassGeneratorType
@@ -326,10 +374,12 @@ namespace PGrassCommon
 		float clumpLeanFactor;
 		float clumpGridSize;
 		float inverseClumpGridSize;
-		float2 _pad1;
+		float slopeFacing;
+		float _pad1;
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassGeneratorType);
 	static_assert(sizeof(GrassGeneratorType) == 64);
+	static_assert(offsetof(GrassGeneratorType, slopeFacing) == 56);
 
 	struct GrassGeneratorTypesArray
 	{
@@ -382,7 +432,7 @@ namespace PGrassCommon
 		uint posXY;            // camera-relative x/y as two f16 values
 		uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
 		uint facingTilt;
-		uint seedAndType;  // high 8: clump density; next 16: Voronoi-cell appearance seed; low 8: grass type
+		uint seedAndType;  // high 4: clump density; 24-27 and 16-19: terrain normal; 20-23: bend; 8-15: clump seed; low 8: type
 	};
 	static_assert(sizeof(BladeFar) == 16);
 }

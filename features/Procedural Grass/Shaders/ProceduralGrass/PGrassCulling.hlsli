@@ -134,17 +134,27 @@ bool IsRootUnderObject(float3 rootView, float2 terrainSlope)
 	if (any(uv < 0.0f) || any(uv >= 1.0f))
 		return false;
 	int2 depthTexel = int2(uv * grassHiZParams.xy);
-	if (GrassHiZ.Load(int3(depthTexel, 0)) >= rootClip.z / rootClip.w)
-		return false;
+	float rootDepth = rootClip.z / rootClip.w;
 
-	float4 scenePosition = GetHiZScenePosition(depthTexel);
-	if (scenePosition.w == 0.0f)
-		return false;
-	float2 sceneRootOffset = scenePosition.xy - rootView.xy;
-	float sceneGroundHeight = scenePosition.z - (rootView.z + dot(terrainSlope, sceneRootOffset));
-	if (sceneGroundHeight <= 16.0f || dot(sceneRootOffset, sceneRootOffset) >= 768.0f * 768.0f)
-		return false;
-	if (sceneGroundHeight > 64.0f)
+	// TAA jitter moves silhouettes and the base of a surface across the root's texel every frame. Treat the root as
+	// covered only when it and its four neighbours all see a raised surface in front of it, so edge blades stay put.
+	float4 scenePosition = 0.0f;
+	float minGroundHeight = 1.0e30f;
+	[unroll] for (uint sampleIndex = 0u; sampleIndex < 5u; ++sampleIndex)
+	{
+		int2 offset = int2(sampleIndex == 1u ? -1 : (sampleIndex == 2u ? 1 : 0), sampleIndex == 3u ? -1 : (sampleIndex == 4u ? 1 : 0));
+		float4 samplePosition = GetHiZScenePosition(depthTexel + offset);
+		if (samplePosition.w == 0.0f || GrassHiZ.Load(int3(depthTexel + offset, 0)) >= rootDepth)
+			return false;
+		float2 sceneRootOffset = samplePosition.xy - rootView.xy;
+		float sceneGroundHeight = samplePosition.z - (rootView.z + dot(terrainSlope, sceneRootOffset));
+		if (sceneGroundHeight <= 16.0f || dot(sceneRootOffset, sceneRootOffset) >= 768.0f * 768.0f)
+			return false;
+		minGroundHeight = min(minGroundHeight, sceneGroundHeight);
+		if (sampleIndex == 0u)
+			scenePosition = samplePosition;
+	}
+	if (minGroundHeight > 64.0f)
 		return true;
 
 	// Rock, ledge, and trunk faces are steep; low shallow surfaces are terrain.
@@ -158,6 +168,28 @@ bool IsRootUnderObject(float3 rootView, float2 terrainSlope)
 #endif
 
 #if defined(LOW_LOD)
+/** @brief Tests a projected blade rectangle with the common Hi-Z and silhouette margins. */
+bool IsProjectedBladeOccluded(float2 ndcMin, float2 ndcMax, float minClipW)
+{
+	const float2 hiZSize = grassHiZParams.xy;
+	float2 uvMin = float2(ndcMin.x, -ndcMax.y) * 0.5f + 0.5f - 1.0f / hiZSize;
+	float2 uvMax = float2(ndcMax.x, -ndcMin.y) * 0.5f + 0.5f + 1.0f / hiZSize;
+	if (any(uvMax <= 0.0f) || any(uvMin >= 1.0f))
+		return false;
+	uvMin = max(uvMin, 0.0f);
+	uvMax = min(uvMax, 1.0f);
+	const float2 spanTexels = (uvMax - uvMin) * hiZSize;
+	const int mip = (int)max(ceil(log2(max(max(spanTexels.x, spanTexels.y), 1.0f) * 0.5f)), 0.0f);
+	if (mip > (int)grassHiZParams.w - 1)
+		return false;
+	const float mipScale = exp2((float)mip);
+	const int2 mipSize = max(int2(ceil(hiZSize / mipScale)), int2(1, 1));
+	const int2 sampleMin = clamp(int2(floor(uvMin * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
+	const int2 sampleMax = clamp(int2(floor(uvMax * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
+	const float nearestDepth = FrameBuffer::CameraProj._m22 + FrameBuffer::CameraProj._m23 / minClipW;
+	return nearestDepth > LoadHiZMax3x3(sampleMin, sampleMax, mip) + 2.0e-6f;
+}
+
 // Rejects one finished blade whose projected root-to-tip rectangle is entirely behind Hi-Z.
 // Patch and tile spheres overlap nearby silhouettes, so this catches distant blades hidden behind nearer grass and terrain.
 bool IsBladeOccluded(float3 rootView, float3 tipView, float radius, bool cullsDisabled)
@@ -183,28 +215,29 @@ bool IsBladeOccluded(float3 rootView, float3 tipView, float radius, bool cullsDi
 	const float2 ndcMin = min(ndcRoot - extentRoot, ndcTip - extentTip);
 	const float2 ndcMax = max(ndcRoot + extentRoot, ndcTip + extentTip);
 
-	// One Hi-Z texel covers TAA jitter and small changes at silhouette edges.
-	const float2 hiZSize = grassHiZParams.xy;
-	float2 uvMin = float2(ndcMin.x, -ndcMax.y) * 0.5f + 0.5f - 1.0f / hiZSize;
-	float2 uvMax = float2(ndcMax.x, -ndcMin.y) * 0.5f + 0.5f + 1.0f / hiZSize;
-	if (any(uvMax <= 0.0f) || any(uvMin >= 1.0f))
-		return false;
-	uvMin = max(uvMin, 0.0f);
-	uvMax = min(uvMax, 1.0f);
-
-	// Pick the finest mip where the rectangle spans at most three texels on each axis.
-	const float2 spanTexels = (uvMax - uvMin) * hiZSize;
-	const int mip = (int)max(ceil(log2(max(max(spanTexels.x, spanTexels.y), 1.0f) * 0.5f)), 0.0f);
-	if (mip > (int)grassHiZParams.w - 1)
-		return false;
-	const float mipScale = exp2((float)mip);
-	const int2 mipSize = max(int2(ceil(hiZSize / mipScale)), int2(1, 1));
-	const int2 sampleMin = clamp(int2(floor(uvMin * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
-	const int2 sampleMax = clamp(int2(floor(uvMax * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
-
-	const float nearestDepth = FrameBuffer::CameraProj._m22 + FrameBuffer::CameraProj._m23 / minClipW;
-	return nearestDepth > LoadHiZMax3x3(sampleMin, sampleMax, mip) + 2.0e-6f;
+	return IsProjectedBladeOccluded(ndcMin, ndcMax, minClipW);
 }
+
+#	if defined(FAR_LOD)
+/** @brief Bounds Far's packed triangle directly, retaining the same depth bias and a Hi-Z texel around its silhouette. */
+bool IsFarTriangleOccluded(float3 rootView, float3 tipView, float2 facing, float halfWidth, bool cullsDisabled)
+{
+	if (cullsDisabled || grassHiZParams.w < 1.0f || !HasForwardPerspective())
+		return false;
+	float4 root = mul(FrameBuffer::CameraViewProj, float4(rootView, 1.0f));
+	float4 width = mul(FrameBuffer::CameraViewProj, float4(float2(-facing.y, facing.x) * halfWidth, 0.0f, 0.0f));
+	float4 left = root - width;
+	float4 right = root + width;
+	float4 tip = mul(FrameBuffer::CameraViewProj, float4(tipView, 1.0f));
+	float minClipW = min(min(left.w, right.w), tip.w) - 8.0f * length(FrameBuffer::CameraViewProj[3].xyz);
+	if (minClipW <= 1.0f)
+		return false;
+	float2 leftNdc = left.xy / left.w;
+	float2 rightNdc = right.xy / right.w;
+	float2 tipNdc = tip.xy / tip.w;
+	return IsProjectedBladeOccluded(min(min(leftNdc, rightNdc), tipNdc), max(max(leftNdc, rightNdc), tipNdc), minClipW);
+}
+#	endif
 #endif
 
 bool ResolveTileHeightBounds(uint quadrant, uint tile, out float2 heightBounds)
@@ -212,6 +245,19 @@ bool ResolveTileHeightBounds(uint quadrant, uint tile, out float2 heightBounds)
 	heightBounds = TileHeightBounds[quadrant * OCCUPANCY_TILES_PER_AXIS * OCCUPANCY_TILES_PER_AXIS + tile];
 	return heightBounds.x > -1.0e30f && heightBounds.y >= heightBounds.x;
 }
+
+#if defined(FAR_LOD)
+bool IsFarRootBoxReplaced(uint quadrant, float2 localMin, float2 localMax, float2 heightBounds, float geometryRadius)
+{
+	// Cover clumped roots, half-packed rounding and the existing terrain lift envelope.
+	float rootPadding = grassHiZBounds.y + 32.0f;
+	float2 worldMin = data[quadrant].quadWorldPos + localMin - rootPadding;
+	float2 worldMax = data[quadrant].quadWorldPos + localMax + rootPadding;
+	float lift = GetTerrainLiftReach((worldMin + worldMax) * 0.5f, max(worldMax.x - worldMin.x, worldMax.y - worldMin.y) * 0.5f);
+	return IsTerrainCanopyBoxCovered(float3(worldMin, heightBounds.x - geometryRadius),
+		float3(worldMax, heightBounds.y + geometryRadius + lift));
+}
+#endif
 
 bool IsPatchOccluded(float2 worldXY, float terrainZ, float2 terrainSlope, uint quadrant, bool hasLand, bool cullsDisabled)
 {
@@ -294,24 +340,14 @@ bool IsOccupiedTileOccluded(uint bladeTask)
 	float2 tileMin = float2(tile % OCCUPANCY_TILES_PER_AXIS, tile / OCCUPANCY_TILES_PER_AXIS) * QUADRANT_GRASS_SPACING - 2.0f * BLADE_TO_WORLD;
 	float2 tileMax = tileMin + QUADRANT_GRASS_SPACING + 4.0f * BLADE_TO_WORLD;
 
+#if defined(FAR_LOD)
+	if (IsFarRootBoxReplaced(quadrant, tileMin, tileMax, heightBounds, geometryRadius))
+		return true;
+#endif
 	return IsRootBoxOccluded(quadrant, tileMin, tileMax, heightBounds, geometryRadius, 768.0f, 2.0f, debugFlags.x > 0.5f);
 }
 
 #if defined(FAR_LOD)
-bool IsFarPatchBoundsOccluded(uint2 patchPos, uint quadrant, bool hasLand, bool cullsDisabled)
-{
-	if (cullsDisabled || !hasLand || grassHiZParams.w < 1.0f)
-		return false;
-
-	const float patchWidth = 2.0f * BLADE_TO_WORLD;
-	const float2 patchMin = float2(patchPos) * patchWidth;
-	const int2 tileXY = clamp(int2((patchMin + 0.5f * patchWidth) / QUADRANT_GRASS_SPACING), int2(0, 0), int2(OCCUPANCY_TILES_PER_AXIS - 1, OCCUPANCY_TILES_PER_AXIS - 1));
-	float2 heightBounds;
-	if (!ResolveTileHeightBounds(quadrant, tileXY.y * OCCUPANCY_TILES_PER_AXIS + tileXY.x, heightBounds))
-		return false;
-	return IsRootBoxOccluded(quadrant, patchMin, patchMin + patchWidth, heightBounds, max(grassHiZBounds.x, 96.0f), 512.0f, 1.5f, cullsDisabled);
-}
-
 bool IsFarGroupOccluded(uint bladeTask, uint groupX)
 {
 	if ((bladeTask & WORK_HAS_LAND) == 0u || (bladeTask & (WORK_OCCUPIED_TILE | WORK_COMPACT_FAR)) != 0u)
@@ -343,7 +379,12 @@ bool IsFarGroupOccluded(uint bladeTask, uint groupX)
 			heightBounds = float2(min(heightBounds.x, tileBounds.x), max(heightBounds.y, tileBounds.y));
 		}
 	}
-	return IsRootBoxOccluded(quadrant, float2(minPatch) * patchWidth, float2(maxPatch) * patchWidth, heightBounds, max(grassHiZBounds.x, 96.0f), 768.0f, 1.5f, false);
+	float2 localMin = float2(minPatch) * patchWidth;
+	float2 localMax = float2(maxPatch) * patchWidth;
+	float geometryRadius = max(grassHiZBounds.x, 96.0f);
+	if (IsFarRootBoxReplaced(quadrant, localMin, localMax, heightBounds, geometryRadius))
+		return true;
+	return IsRootBoxOccluded(quadrant, localMin, localMax, heightBounds, geometryRadius, 768.0f, 1.5f, false);
 }
 #endif
 

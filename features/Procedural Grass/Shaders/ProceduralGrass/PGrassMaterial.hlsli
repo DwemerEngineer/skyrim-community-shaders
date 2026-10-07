@@ -52,6 +52,18 @@ float3 GetDistantAOThicknessRoughness(GrassType bladeType, float appearanceT, fl
 		lerp(bladeType.minMaxSubsurfaceOpacity.x, bladeType.minMaxSubsurfaceOpacity.y, appearanceT), lerp(rungRoughness.x, rungRoughness.y, along));
 }
 
+/**
+ * @brief Tints a colour toward the type's cool or warm colour, and its dry tip colour, by a blotch value.
+ * High's material texture supplies the blotch per pixel; blades too distant for that detail take one value per blade.
+ */
+float3 ApplyGrassBlotch(GrassType bladeType, float3 color, float blotch, float amount)
+{
+	float3 blotchTint = lerp(bladeType.grassColorCool.rgb, bladeType.grassColorWarm.rgb, blotch);
+	blotchTint *= rcp(max(dot(blotchTint, float3(0.2126f, 0.7152f, 0.0722f)), 0.25f));
+	color *= lerp(1.0f, blotchTint, amount);
+	return lerp(color, color * bladeType.grassColorTipDry.rgb, saturate(blotch - 0.55f) * amount * 0.65f);
+}
+
 float3 GetDistantBladeColor(GrassType bladeType, float3 clumpColor, float along)
 {
 	// Fold the fixed endpoint samples so Low matches Far's vertex colours without evaluating the shade curve.

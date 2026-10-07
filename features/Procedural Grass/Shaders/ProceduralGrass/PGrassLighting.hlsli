@@ -26,6 +26,50 @@ float2 GetDistantShadowPixel(float2 rootPixel, float3 rootPosition, out float co
 }
 #endif
 
+#if defined(SCREEN_SPACE_SHADOWS) && defined(LOW_LOD)
+/** @brief Filters contact shadows at projected roots so sub-pixel movement does not switch whole blades. */
+float SampleGrassRootContactShadow(Texture2D<unorm float> shadowTexture, SamplerState linearSampler, float2 rootPixel)
+{
+	uint2 shadowExtent;
+	shadowTexture.GetDimensions(shadowExtent.x, shadowExtent.y);
+	// Pixel coordinates refer to the active viewport; UVs refer to the allocated texture.
+	float2 validExtent = min(rcp(dynamicResolutionInverted), float2(shadowExtent));
+	float2 rootUV = clamp(rootPixel, 0.5f, validExtent - 0.5f) / float2(shadowExtent);
+	return shadowTexture.SampleLevel(linearSampler, rootUV, 0.0f);
+}
+
+/** @brief Fades root contact shadows across the loaded-grid handoff and unreliable terrain LOD seams. */
+float GetGrassRootShadowFade(float3 rootPosition)
+{
+	float fade = saturate(3.0f - length(rootPosition.xy) * (2.0f / farParams.x));
+	float2 worldPosition = rootPosition.xy + FrameBuffer::CameraPosAdjust.xy;
+	[flatten] if (any(worldPosition < loadedLandBounds.xy) || any(worldPosition > loadedLandBounds.zw))
+	{
+		static const float TerrainLodBlockSize = 16384.0f;
+		float2 seamDistance = abs(frac(worldPosition * (1.0f / TerrainLodBlockSize) + 0.5f) - 0.5f) * TerrainLodBlockSize;
+		fade *= smoothstep(384.0f, 512.0f, min(seamDistance.x, seamDistance.y));
+	}
+	else
+	{
+		float midThinning = saturate((length(worldPosition - grassLodOrigin) - MidLowHandoffStart) * (1.0f / MidLowHandoffBand));
+		fade *= smoothstep(0.5f, 1.0f, midThinning);
+	}
+	return fade;
+}
+
+#	if defined(FAR_LOD)
+// Avoid the loaded-grid and LOD-seam checks once the root shadow has completely faded.
+float GetFarGrassRootShadowFade(float3 rootPosition)
+{
+	float shadowRange = 1.5f * farParams.x;
+	float fade = 0.0f;
+	[branch] if (dot(rootPosition.xy, rootPosition.xy) < shadowRange * shadowRange)
+		fade = GetGrassRootShadowFade(rootPosition);
+	return fade;
+}
+#	endif
+#endif
+
 #if defined(FAR_LOD)
 /** @brief Returns the camera-relative position of the scene surface at a pixel. */
 float3 GetScenePosition(int2 pixel)
@@ -33,30 +77,6 @@ float3 GetScenePosition(int2 pixel)
 	float2 ndc = (float2(pixel) + 0.5f) * dynamicResolutionInverted * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
 	float4 position = mul(FrameBuffer::CameraViewProjInverse, float4(ndc, GrassSceneDepth.Load(int3(pixel, 0)), 1.0f));
 	return position.xyz / position.w;
-}
-
-/**
- * @brief Estimates sun visibility from the terrain slope beyond the shadow mask's range.
- */
-float GetGroundSunFacing(float2 rootPixel, float3 lightDirection)
-{
-	static const int SlopeStep = 4;
-	int2 pixel = int2(rootPixel);
-	float3 centre = GetScenePosition(pixel);
-	float3 across = GetScenePosition(pixel + int2(SlopeStep, 0)) - centre;
-	float3 beyond = GetScenePosition(pixel - int2(0, SlopeStep)) - centre;
-
-	// A neighbour on another surface says nothing about this slope; leave such roots lit.
-	float reach = length(centre) * 0.1f;
-	if (dot(across, across) > reach * reach || dot(beyond, beyond) > reach * reach)
-		return 1.0f;
-
-	float3 groundNormal = cross(across, beyond);
-	groundNormal *= groundNormal.z < 0.0f ? -1.0f : 1.0f;
-	float facing = dot(groundNormal, lightDirection) * rsqrt(max(dot(groundNormal, groundNormal), 1.0e-8f));
-
-	// Blades stand above the ground, so they keep catching the sun until the slope turns clearly away from it.
-	return smoothstep(-0.1f, 0.1f, facing);
 }
 #endif
 
@@ -137,6 +157,14 @@ static const float CanopyReflectionExtinction = 4.0f;
 static const float CanopyReflectionMinElevation = 0.05f;
 static const float CanopyScatterEscape = 0.5f;  // Probability that scattered light escapes the canopy.
 
+/** @brief Filters distant blade normals toward the canopy surface normal: world up, or the terrain normal for Far. */
+float3 BlendGrassNormalToCanopy(float3 normal, float weight, float3 canopySurfaceNormal)
+{
+	float3 blendedNormal = lerp(normal, canopySurfaceNormal, weight);
+	float lengthSquared = dot(blendedNormal, blendedNormal);
+	return lengthSquared > 1e-8f ? blendedNormal * rsqrt(lengthSquared) : canopySurfaceNormal;
+}
+
 /** @brief Sky visibility along the surface hemisphere's mean elevation. */
 float GetCanopySkyVisibility(float3 normal, float canopyOverhead)
 {
@@ -153,6 +181,23 @@ float3 GetCanopySkyLight(float3 normal, float canopyOverhead, float3 canopyFill)
 	return lerp(canopyFill, 1.0f, GetCanopySkyVisibility(normal, canopyOverhead));
 }
 
+/** @brief Blends white fuzz toward the blade's hue normalized to unit peak brightness. */
+float3 GetGrassFuzzColor(float3 bladeColor, float tint)
+{
+	float3 hue = bladeColor / max(max(bladeColor.r, max(bladeColor.g, bladeColor.b)), 1.0e-4f);
+	return lerp(1.0f, hue, saturate(tint));
+}
+
+/**
+ * @brief Returns cosine-weighted sky visibility on the concave face of a circular blade arc.
+ * At side in [-1, 1], the two edges rise by curveHalfAngle * (1 -/+ side) / 2.
+ * Averaging the cosines of those elevations gives the product below.
+ */
+float GetCurvedBladeSkyView(float curveHalfAngle, float side)
+{
+	return cos(0.5f * curveHalfAngle) * cos(0.5f * curveHalfAngle * side);
+}
+
 void GetDiffuseLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, float normalDotLight,
 	float3 reflectionAlbedo, float3 transmissionAlbedo, float3 surfaceThroughput)
 {
@@ -166,9 +211,10 @@ void GetDiffuseLightInputProcGrass(out DirectLightingOutput lightingOutput, Dire
 	lightingOutput.diffuse = (reflectionAlbedo * diffuseCosines.x + transmissionAlbedo * diffuseCosines.y) * irradiance;
 }
 
+#if !defined(FAR_LOD)
 void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, float diffuseNdotL,
 	float3 reflectionAlbedo, float3 transmissionAlbedo,
-	float3 specularNormal, float3 specularTangent, float specularRoughness, float specularAnisotropy, float specularSlopeVariance, float3 specularAlbedo, float3 fuzzNormal, float fuzzNdotV, float fuzzAlbedo, float fuzzRoughness)
+	float3 specularNormal, float3 specularTangent, float specularRoughness, float specularAnisotropy, float specularSlopeVariance, float3 specularAlbedo, float3 fuzzNormal, float fuzzNdotV, float fuzzAlbedo, float3 fuzzColor, float fuzzRoughness)
 {
 	const float3 detailedLightColor = context.lightColor * context.detailedShadow;
 	const float3 V = context.viewDir;
@@ -178,36 +224,29 @@ void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, Direc
 	float specularNdotL = saturate(dot(specularNormal, L));
 	float3 specularF;
 
-#if defined(FAR_LOD)
-	// The canopy has no anisotropy; evaluate the isotropic limit without the tangent frame.
-	float3 halfVector = V + L;
-	float halfLengthSquared = dot(halfVector, halfVector);
-	float specularNdotV = dot(specularNormal, V);
-	float3 directSpecular = 0.0f;
-
-	[branch] if (specularNdotL > 0.0f && specularNdotV > 0.0f && halfLengthSquared > 1e-8f)
-	{
-		float3 H = halfVector * rsqrt(halfLengthSquared);
-		float alpha = max(specularRoughness * specularRoughness, 1e-3f);
-		float roughness = sqrt(sqrt(alpha * alpha + specularSlopeVariance));
-
-		float distribution = BRDF::D_GGX(roughness, saturate(dot(specularNormal, H)));
-		float visibility = BRDF::Vis_SmithJoint(roughness, saturate(specularNdotV) + EPSILON_DOT_CLAMP, specularNdotL);
-		specularF = BRDF::F_Schlick(material.F0, saturate(dot(V, H)));
-		directSpecular = distribution * visibility * specularF * specularNdotL;
-	}
-#else
+#	if defined(PGRASS_DISTANT_LIGHTING)
+	// Fold the filter variance into an isotropic lobe; distant blades cannot resolve the veins' anisotropy.
+	float3 halfVector = normalize(V + L);
+	float filteredRoughness = PBR::AddRoughnessVariance(specularRoughness, specularSlopeVariance);
+	float3 directSpecular = PBR::SpecularMicrofacet(filteredRoughness, material.F0, specularNdotL, saturate(dot(specularNormal, V)) + EPSILON_DOT_CLAMP,
+								saturate(dot(specularNormal, halfVector)), saturate(dot(V, halfVector)), specularF) *
+	                        specularNdotL;
+#	else
 	float3 directSpecular = PBR::SpecularMicrofacetAnisotropic(specularRoughness, specularAnisotropy, material.F0, specularNormal, specularTangent, V, L, specularF, specularSlopeVariance) * specularNdotL;
-#endif
+#	endif
 
-	// OpenPBR fuzz sits over the whole blade: it reflects fuzzAlbedo of the light and passes the rest untinted.
+	// OpenPBR fuzz sits over both faces of the blade: it reflects fuzzAlbedo of the light in its colour and passes the
+	// rest untinted. Light from behind reaches the viewer-side fuzz through the blade, tinted by its transmission.
 	float fuzzThroughput = 1.0f - fuzzAlbedo;
-	float fuzzReflection = fuzzAlbedo * PBR::FuzzLobe(L, V, fuzzNormal, fuzzNdotV, fuzzRoughness);
+	float3 fuzzReflection = fuzzAlbedo * fuzzColor *
+	                        (PBR::FuzzLobe(L, V, fuzzNormal, fuzzNdotV, fuzzRoughness) +
+								transmissionAlbedo * PBR::FuzzLobeTransmitted(L, V, fuzzNormal, fuzzNdotV, fuzzRoughness));
 
 	GetDiffuseLightInputProcGrass(lightingOutput, context, diffuseNdotL, reflectionAlbedo, transmissionAlbedo,
 		(1.0f - specularAlbedo) * fuzzThroughput);
 
 	lightingOutput.specular = (directSpecular * fuzzThroughput + fuzzReflection) * detailedLightColor;
 }
+#endif
 
 #endif

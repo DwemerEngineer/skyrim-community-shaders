@@ -55,6 +55,7 @@ namespace
 		v("SpecularAnisotropy", s.specularAnisotropy);
 		v("SheenStrength", s.sheenStrength);
 		v("SheenRoughness", s.sheenRoughness);
+		v("SheenTint", s.sheenTint);
 		v("CurvedNormalStrength", s.curvedNormalStrength);
 
 		v("SubsurfaceOpacity", s.subsurfaceOpacity);
@@ -104,7 +105,6 @@ namespace
 		v("TerrainBlendNormal", s.grassTerrainBlendNormal);
 		v("TerrainBlendRough", s.grassTerrainBlendRough);
 		v("TerrainShadowStrength", s.grassAOStrength);
-		v("TerrainShadowDensity", s.grassAODensity);
 
 		// Clump
 		v("ClumpGridSize", s.clumpGridSize);
@@ -136,12 +136,12 @@ namespace
 		v("FarDensity", s.farGrassDensity);
 		v("FarRadius", s.grassCellRadius);
 		v("FarEdgeDensity", s.farDensityFalloff);
-		v("DistantFill", s.distantFill);
 
 		// Debug
 		v("DebugIgnoreGrassMap", s.debugIgnoreGrassMap);
 		v("DebugIgnoreObjectOcclusion", s.debugIgnoreObjectOcclusion);
 		v("DebugDisableAllCulls", s.debugDisableAllCulls);
+		v("DebugTierView", s.debugTierView);
 		v("DebugIgnorePreProcessedFlag", s.debugIgnorePreProcessedFlag);
 	}
 
@@ -152,7 +152,6 @@ namespace
 	template <class SettingsT, class Visitor>
 	void ForEachTypeOverride(SettingsT& s, Visitor&& v)
 	{
-
 		v.Section(T("feature.procedural_grass.shape_section", "Shape"));
 		v("Height", s.grassHeight, T("feature.procedural_grass.height", "Height"), 0.0f, 150.0f, "%.1f");
 		v("Width", s.grassWidth, T("feature.procedural_grass.width", "Width"), 0.0f, 10.0f, "%.1f");
@@ -164,6 +163,7 @@ namespace
 		v.Section(T("feature.procedural_grass.slope_section", "Slope"));
 		v("MinSlope", s.grassMinSlope, T("feature.procedural_grass.min_slope", "Min Slope (deg)"), 0.0f, 90.0f, "%.0f");
 		v("MaxSlope", s.grassMaxSlope, T("feature.procedural_grass.max_slope", "Max Slope (deg)"), 0.0f, 90.0f, "%.0f");
+		v("SlopeFacing", s.grassSlopeFacing, T("feature.procedural_grass.slope_facing", "Slope Facing"), 0.0f, 1.0f);
 
 		v.Section(T("feature.procedural_grass.clump_section", "Clump"));
 		v("ClumpGridSize", s.clumpGridSize, T("feature.procedural_grass.clump_grid_size", "Clump Grid Size"), ProceduralGrass::MinClumpGridSize, ProceduralGrass::MaxClumpGridSize, "%.0f");
@@ -191,6 +191,7 @@ namespace
 		v("SpecularAnisotropy", s.specularAnisotropy, T("feature.procedural_grass.specular_anisotropy", "Specular Anisotropy"), 0.0f, 1.0f);
 		v("SheenStrength", s.sheenStrength, T("feature.procedural_grass.sheen_strength", "Sheen Strength"), 0.0f, 1.0f);
 		v("SheenRoughness", s.sheenRoughness, T("feature.procedural_grass.sheen_roughness", "Sheen Roughness"), 0.0f, 1.0f);
+		v("SheenTint", s.sheenTint, T("feature.procedural_grass.sheen_tint", "Sheen Tint"), 0.0f, 1.0f);
 		v("CurvedNormalStrength", s.curvedNormalStrength, T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), 0.0f, 1.0f);
 		v("SubsurfaceOpacity", s.subsurfaceOpacity, T("feature.procedural_grass.subsurface_base_tip", "Subsurface Opacity (Base>Tip)"), 0.0f, 1.0f);
 		v("SubsurfaceTint", s.grassSubsurfaceTint, T("feature.procedural_grass.subsurface_color", "Subsurface Tint"), 0.0f, 1.0f);
@@ -423,7 +424,6 @@ void ProceduralGrass::DrawSettings()
 			SettingSlider3(T("feature.procedural_grass.cool_tint", "Cool/Green Tint"), settings.grassColorCool, 0.0f, 2.0f, T("feature.procedural_grass.cool_tint_tooltip", "Sets the tint used by cooler blade color variation."));
 			SettingSlider3(T("feature.procedural_grass.warm_tint", "Warm/Straw Tint"), settings.grassColorWarm, 0.0f, 2.0f, T("feature.procedural_grass.warm_tint_tooltip", "Sets the tint used by warmer blade color variation."));
 			SettingSlider3(T("feature.procedural_grass.dried_tip_tint", "Dried Tip Tint"), settings.grassColorTipDry, 0.0f, 2.0f, T("feature.procedural_grass.dried_tip_tint_tooltip", "Sets the color applied to dried blade tips."));
-			SettingSlider(T("feature.procedural_grass.clump_colour_patches", "Clump Colour Patches"), settings.grassClumpColorStrength, 0.0f, 1.0f, T("feature.procedural_grass.clump_color_tooltip", "Varies color between neighboring grass clumps."));
 		}
 
 		if (ImGui::CollapsingHeader(T("feature.procedural_grass.blade_detail_section", "Blade Detail"))) {
@@ -452,12 +452,12 @@ void ProceduralGrass::DrawSettings()
 			SettingSlider(T("feature.procedural_grass.specular_anisotropy", "Specular Anisotropy"), settings.specularAnisotropy, 0.0f, 1.0f, T("feature.procedural_grass.specular_anisotropy_tooltip", "Stretches highlights across each blade, as its parallel veins do, so blade fronts catch the sun over a wider range of angles. 0 is a smooth, isotropic surface."));
 			SettingSlider(T("feature.procedural_grass.sheen_strength", "Sheen Strength"), settings.sheenStrength, 0.0f, 1.0f, T("feature.procedural_grass.sheen_strength_tooltip", "Covers blades with fine hairs and wax bloom (the OpenPBR fuzz layer). They catch light at grazing angles and give grass a soft silvery sheen."));
 			SettingSlider(T("feature.procedural_grass.sheen_roughness", "Sheen Roughness"), settings.sheenRoughness, 0.0f, 1.0f, T("feature.procedural_grass.sheen_roughness_tooltip", "Low values give a fibre-like sheen concentrated at grazing angles; high values give a broader, dusty sheen."));
-			SettingSlider(T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), settings.curvedNormalStrength, 0.0f, 1.0f, T("feature.procedural_grass.curved_normal_strength_tooltip", "How far the blade rolls across its width, as the angle its edges turn away from the middle (1 = 90 degrees). Sky light and screen-space GI see twice this roll, so the curvature still shows without direct light."));
+			SettingSlider(T("feature.procedural_grass.sheen_tint", "Sheen Tint"), settings.sheenTint, 0.0f, 1.0f, T("feature.procedural_grass.sheen_tint_tooltip", "Colours the sheen toward the blade's own hue (the OpenPBR fuzz colour). 0 is a white sheen; higher values keep backlit glow and blade colour from greying under sky light."));
+			SettingSlider(T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), settings.curvedNormalStrength, 0.0f, 1.0f, T("feature.procedural_grass.curved_normal_strength_tooltip", "How far the blade rolls across its width, as the angle its edges turn away from the middle (1 = 90 degrees). Sky light and screen-space GI see twice this roll, and the concave face loses sky behind its own halves, so the curvature still shows without direct light."));
 			SettingSlider3(T("feature.procedural_grass.roughness", "Roughness (Base>Min>Tip)"), settings.baseMinTipRoughness, 0.0f, 1.0f, T("feature.procedural_grass.roughness_tooltip", "Sets roughness at the blade base, minimum point, and tip."));
 
 			// Kept off 0 and 1 so neither smoothstep in the vertex shader collapses to a zero-width range.
 			SettingSlider(T("feature.procedural_grass.roughness_tip_start", "Roughness Tip Start"), settings.tipRoughnessStart, 0.05f, 0.95f, T("feature.procedural_grass.roughness_tip_start_tooltip", "Sets where roughness begins transitioning toward the tip value."));
-			SettingSlider(T("feature.procedural_grass.clump_ao_strength", "Clump AO Strength"), settings.clumpAOStrength, 0.0f, 1.0f, T("feature.procedural_grass.clump_ao_tooltip", "Darkens blade bases toward each clump's center, where blades crowd together. Blade tips stay lit."));
 
 			ImGui::SeparatorText(T("feature.procedural_grass.canopy_lighting_section", "Canopy and Ambient"));
 			SettingSlider(T("feature.procedural_grass.canopy_base_shading", "Canopy Base Shading"), settings.grassBaseAO, 0.0f, 1.0f, T("feature.procedural_grass.canopy_base_shading_tooltip", "Darkens blade bases beneath the grass canopy."));
@@ -486,26 +486,24 @@ void ProceduralGrass::DrawSettings()
 		SettingSlider(T("feature.procedural_grass.k2", "K2"), settings.tipWeight, -10.0f, 10.0f, T("feature.procedural_grass.k2_tooltip", "Controls the random tilt applied to blade tips."));
 		SettingSlider(T("feature.procedural_grass.mid", "Mid"), settings.mid, 0.0f, 1.0f, T("feature.procedural_grass.mid_tooltip", "Positions the middle control point along the blade to shape its curve."));
 		SettingSlider(T("feature.procedural_grass.rotational_stiffness", "Rotational Stiffness"), settings.rotationalStiffness, 0.0f, 10.0f, T("feature.procedural_grass.rotational_stiffness_tooltip", "Controls how strongly blades resist rotating to face the wind."));
-	}
 
-	if (ImGui::CollapsingHeader(T("feature.procedural_grass.global_settings_section", "Global Grass Settings"), ImGuiTreeNodeFlags_DefaultOpen)) {
-		SettingSlider(T("feature.procedural_grass.terrain_shadow_strength", "Terrain Shadow Strength"), settings.grassAOStrength, 0.0f, 2.0f, T("feature.procedural_grass.terrain_shadow_strength_tooltip", "Controls how strongly grass darkens the terrain beneath it."));
-		SettingSlider(T("feature.procedural_grass.terrain_shadow_density", "Terrain Shadow Density"), settings.grassAODensity, 1.0f, 64.0f, T("feature.procedural_grass.terrain_shadow_density_tooltip", "Controls how quickly terrain darkening builds with grass density."), "%.0f");
-
-		ImGui::Separator();
-
+		ImGui::SeparatorText(T("feature.procedural_grass.clump_section", "Clump"));
 		SettingSlider(T("feature.procedural_grass.clump_grid_size", "Clump Grid Size"), settings.clumpGridSize, MinClumpGridSize, MaxClumpGridSize, T("feature.procedural_grass.clump_grid_size_tooltip", "Sets the average spacing between generated grass clumps, in world units."), "%.0f");
 		SettingSlider(T("feature.procedural_grass.clump_distance_factor", "Clump Distance Factor"), settings.clumpDistanceFactor, 0.0f, 1.0f, T("feature.procedural_grass.clump_distance_tooltip", "Pulls blades toward their clump center."));
 		SettingSlider(T("feature.procedural_grass.clump_facing_factor", "Clump Facing Factor"), settings.clumpFacingFactor, -1.0f, 1.0f, T("feature.procedural_grass.clump_facing_tooltip", "Positive values turn blades away from their clump center so clumps splay outward. Negative values turn them inward."));
 		SettingSlider(T("feature.procedural_grass.clump_lean_factor", "Clump Lean Factor"), settings.clumpLeanFactor, 0.0f, 1.0f, T("feature.procedural_grass.clump_lean_tooltip", "Turns the blades of each clump toward one shared direction, so neighboring clumps lean different ways."));
 		SettingSlider(T("feature.procedural_grass.clump_height_factor", "Clump Height Factor"), settings.clumpHeightFactor, 0.0f, 1.0f, T("feature.procedural_grass.clump_height_tooltip", "Sets how much blades share their clump's height instead of their own, so neighboring clumps stand at different heights."));
+		SettingSlider(T("feature.procedural_grass.clump_ao_strength", "Clump AO Strength"), settings.clumpAOStrength, 0.0f, 1.0f, T("feature.procedural_grass.clump_ao_tooltip", "Darkens blade bases toward each clump's center, where blades crowd together. Blade tips stay lit."));
+		SettingSlider(T("feature.procedural_grass.clump_colour_patches", "Clump Colour Patches"), settings.grassClumpColorStrength, 0.0f, 1.0f, T("feature.procedural_grass.clump_color_tooltip", "Varies color between neighboring grass clumps."));
 
-		ImGui::Separator();
-
-		// Cull is disabled at 90 degrees, lower trims grass off cliffs first.
+		ImGui::SeparatorText(T("feature.procedural_grass.slope_section", "Slope"));
 		SettingSlider(T("feature.procedural_grass.max_slope", "Max Slope (deg)"), settings.grassMaxSlope, 0.0f, 90.0f, T("feature.procedural_grass.max_slope_tooltip", "Stops normal grass from growing on slopes above this angle. 90 disables the limit."), "%.0f");
 		SettingSlider(T("feature.procedural_grass.min_slope", "Min Slope (deg)"), settings.grassMinSlope, 0.0f, 90.0f, T("feature.procedural_grass.min_slope_tooltip", "Stops grass from growing on slopes below this angle."), "%.0f");
 		SettingSlider(T("feature.procedural_grass.slope_facing", "Slope Facing"), settings.grassSlopeFacing, 0.0f, 1.0f, T("feature.procedural_grass.slope_facing_tooltip", "Leans blades downhill based on terrain steepness."));
+	}
+
+	if (ImGui::CollapsingHeader(T("feature.procedural_grass.global_settings_section", "Global Grass Settings"), ImGuiTreeNodeFlags_DefaultOpen)) {
+		SettingSlider(T("feature.procedural_grass.terrain_shadow_strength", "Terrain Shadow Darkness"), settings.grassAOStrength, 0.0f, 1.0f, T("feature.procedural_grass.terrain_shadow_strength_tooltip", "Darkens terrain beneath grass by this share of its brightness, scaled by how much grass covers it. 0 disables darkening and 1 is black."));
 
 		ImGui::SeparatorText(T("feature.procedural_grass.wind_section", "Wind"));
 		if (ImGui::SliderAngle(T("feature.procedural_grass.wind_direction", "Wind Direction"), &settings.windAngle)) {
@@ -524,13 +522,13 @@ void ProceduralGrass::DrawSettings()
 		ImGui::Separator();
 
 		ImGui::SeparatorText(T("feature.procedural_grass.lod_density_section", "LOD Density"));
-		if (ImGui::SliderInt(T("feature.procedural_grass.high_density", "Density (High LOD)"), &settings.Quality, 0, static_cast<uint8_t>(Quality::Count) - 1, QualityNames[settings.Quality], ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput))
-			grassRendererHighLOD->SetDensity(QualityDensities[settings.Quality]);
-		DrawSettingDescription(T("feature.procedural_grass.high_density_tooltip", "Sets blade density in the closest, highest-detail grass tier."));
+		if (ImGui::SliderInt(T("feature.procedural_grass.high_density", "Density Preset"), &settings.Quality, 0, static_cast<uint8_t>(Quality::Count) - 1, QualityNames[settings.Quality], ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput))
+			ApplyDensityPreset(settings.Quality);
+		DrawSettingDescription(T("feature.procedural_grass.high_density_tooltip", "Sets blade density in the closest tier and matching densities for the middle, low and far tiers."));
 		if (ImGui::SliderInt(T("feature.procedural_grass.mid_density", "Density (Mid LOD)"), &settings.midGrassDensity, 8, 320, "%d", ImGuiSliderFlags_AlwaysClamp))
 			grassRendererMidLOD->SetDensity(static_cast<uint32_t>(settings.midGrassDensity));
 		DrawSettingDescription(T("feature.procedural_grass.mid_density_tooltip", "Sets blade density in the middle-distance grass tier."));
-		if (ImGui::SliderInt(T("feature.procedural_grass.low_density", "Density (Low LOD)"), &settings.lowGrassDensity, 8, 320, "%d", ImGuiSliderFlags_AlwaysClamp)) {
+		if (ImGui::SliderInt(T("feature.procedural_grass.low_density", "Density (Low LOD)"), &settings.lowGrassDensity, 8, 640, "%d", ImGuiSliderFlags_AlwaysClamp)) {
 			grassRendererLowLOD->SetDensity(static_cast<uint32_t>(settings.lowGrassDensity));
 			grassRendererFarLOD->SetDensity(FarPatchDensity());
 		}
@@ -546,7 +544,6 @@ void ProceduralGrass::DrawSettings()
 			grassRendererFarLOD->SetDensity(FarPatchDensity());
 		DrawSettingDescription(T("feature.procedural_grass.far_density_tooltip", "Sets blade density in the far grass tier."));
 		SettingSlider(T("feature.procedural_grass.far_edge_density", "Far Edge Density"), settings.farDensityFalloff, 0.0f, 1.0f, T("feature.procedural_grass.far_edge_density_tooltip", "Sets the remaining grass density at the outer edge of the far tier."));
-		SettingSlider(T("feature.procedural_grass.distant_fill", "Distant Fill"), settings.distantFill, 0.0f, 1.0f, T("feature.procedural_grass.distant_fill_tooltip", "Sets how fully the low and far tiers fill in to match middle-distance density. Lower values thin distant grass and reduce GPU cost."));
 	}
 
 	ImGui::Separator();
@@ -579,6 +576,7 @@ void ProceduralGrass::DrawDebugSettings()
 		ImGui::Text(T("feature.procedural_grass.debug_occluders_drawn", "Occluders drawn: %u"), td->GetDrawCount());
 	}
 	SettingCheckbox(T("feature.procedural_grass.debug_disable_culls", "Disable ALL generator culls"), settings.debugDisableAllCulls, T("feature.procedural_grass.debug_disable_culls_tooltip", "Disables generator rejection tests for debugging."));
+	SettingCheckbox(T("feature.procedural_grass.debug_tier_view", "Visualize tiers"), settings.debugTierView, T("feature.procedural_grass.debug_tier_view_tooltip", "Colours blades by tier: High inner red, High outer orange, Mid yellow, Low green, Far blue."));
 	SettingCheckbox(T("feature.procedural_grass.debug_ignore_preprocessed", "Ignore preprocessed-node check"), settings.debugIgnorePreProcessedFlag, T("feature.procedural_grass.debug_ignore_preprocessed_tooltip", "Includes LAND meshes that are not marked as preprocessed."));
 	if (invalidate) {
 		ClearGrassMapCache();
@@ -788,7 +786,6 @@ void ProceduralGrass::LoadSettings(json& o_json)
 	settings.Quality = std::clamp(settings.Quality, 0, static_cast<int32_t>(Quality::Count) - 1);
 
 	ForEachSettingKey(settings, [&](const char* key, auto& value) { value = o_json.value(key, value); });
-	settings.distantFill = std::clamp(settings.distantFill, 0.0f, 1.0f);
 	settings.clumpGridSize = std::clamp(settings.clumpGridSize, MinClumpGridSize, MaxClumpGridSize);
 	settings.clumpHeightFactor = std::clamp(settings.clumpHeightFactor, 0.0f, 1.0f);
 	windDirection = float2(std::cos(settings.windAngle), std::sin(settings.windAngle));
@@ -796,17 +793,40 @@ void ProceduralGrass::LoadSettings(json& o_json)
 	LoadTextureTypes();
 	RebuildTypeAllocation();
 
+	settings.midGrassDensity = std::clamp(settings.midGrassDensity, 8, 320);
+	settings.lowGrassDensity = std::clamp(settings.lowGrassDensity, 8, 640);
+	settings.farGrassDensity = std::clamp(settings.farGrassDensity, 8, 160);
+	ApplyTierDensities();
+
+	globals::topDownOcclusion->SetHalfExtent(settings.occlusionHalfExtent);
+}
+
+void ProceduralGrass::ApplyDensityPreset(const int32_t quality)
+{
+	settings.Quality = std::clamp(quality, 0, static_cast<int32_t>(Quality::Count) - 1);
+	const float highDensity = static_cast<float>(QualityDensities[settings.Quality]);
+
+	// Mid draws two of High's four blades per patch and Low one, all on High's lattice.
+	settings.midGrassDensity = static_cast<int>(highDensity);
+	settings.lowGrassDensity = static_cast<int>(highDensity);
+	// Far keeps the share of High's density it had at the default preset; FarPatchDensity is sqrt(Low * Far).
+	static constexpr float FarShareOfHigh = 157.0f / 256.0f;
+	const float farPatchDensity = highDensity * FarShareOfHigh;
+	settings.farGrassDensity = std::clamp(static_cast<int>(std::lround(farPatchDensity * farPatchDensity / static_cast<float>(settings.lowGrassDensity))), 8, 160);
+
+	ApplyTierDensities();
+}
+
+void ProceduralGrass::ApplyTierDensities()
+{
 	if (grassRendererHighLOD)
 		grassRendererHighLOD->SetDensity(QualityDensities[settings.Quality]);
 	if (grassRendererMidLOD)
 		grassRendererMidLOD->SetDensity(static_cast<uint32_t>(settings.midGrassDensity));
 	if (grassRendererLowLOD)
 		grassRendererLowLOD->SetDensity(static_cast<uint32_t>(settings.lowGrassDensity));
-	if (grassRendererFarLOD) {
+	if (grassRendererFarLOD)
 		grassRendererFarLOD->SetDensity(FarPatchDensity());
-	}
-
-	globals::topDownOcclusion->SetHalfExtent(settings.occlusionHalfExtent);
 }
 
 void ProceduralGrass::SaveSettings(json& o_json)
@@ -823,14 +843,6 @@ void ProceduralGrass::RestoreDefaultSettings()
 	ClearGrassMapCache();
 
 	windDirection = float2(std::cos(settings.windAngle), std::sin(settings.windAngle));
-	if (grassRendererMidLOD)
-		grassRendererMidLOD->SetDensity(static_cast<uint32_t>(settings.midGrassDensity));
-	if (grassRendererLowLOD)
-		grassRendererLowLOD->SetDensity(static_cast<uint32_t>(settings.lowGrassDensity));
-	if (grassRendererFarLOD) {
-		grassRendererFarLOD->SetDensity(FarPatchDensity());
-	}
-	if (grassRendererHighLOD)
-		grassRendererHighLOD->SetDensity(QualityDensities[settings.Quality]);
+	ApplyTierDensities();
 	globals::topDownOcclusion->SetHalfExtent(settings.occlusionHalfExtent);
 }

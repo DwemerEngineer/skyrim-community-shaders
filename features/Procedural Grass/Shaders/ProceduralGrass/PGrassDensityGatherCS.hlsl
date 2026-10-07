@@ -6,8 +6,6 @@
 Texture2D<uint> GrassPresenceTexture : register(t0);  // Worldspace grass id per sample, zero is bare
 RWTexture2D<uint> GrassDensityTexture : register(u0);
 
-// Full coverage matches the maximum density count used by the terrain darkening shader.
-static const float DENSITY_COUNT_AT_FULL_COVERAGE = 64.0f;
 static const float PRESENCE_FILTER_RADIUS = 4.0f;
 
 float LoadPresenceCoverage(int2 sample, int dimension)
@@ -69,8 +67,9 @@ float QuinticSmoothstep(float value)
 	float centreCoverage = hasCentreCoverage ? SamplePresenceCoverage(presenceCoordinate, presenceDimension) : 0.0f;
 	float filteredCoverage = FilterPresenceCoverage(presenceCoordinate, presenceDimension, centreCoverage);
 
-	float edgeFade = QuinticSmoothstep(saturate((filteredCoverage - 0.5f) * 2.0f));
+	// Inset the filtered boundary so the fade finishes inside the grass-covered area.
+	float edgeFade = QuinticSmoothstep(saturate((filteredCoverage - 0.75f) * 4.0f));
 	float densityCoverage = centreCoverage * edgeFade;
 
-	GrassDensityTexture[threadID.xy] = (uint)(densityCoverage * DENSITY_COUNT_AT_FULL_COVERAGE + 0.5f);
+	GrassDensityTexture[threadID.xy] = (uint)(densityCoverage * grassAOParams.z + 0.5f);
 }

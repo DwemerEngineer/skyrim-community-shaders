@@ -1,198 +1,108 @@
 #ifndef __PGRASS_GENERATION_HLSLI__
 #define __PGRASS_GENERATION_HLSLI__
 
-#if defined(LOW_LOD) && !defined(FAR_LOD) && SLOPE_EXTRA_BLADES > 0
+#if defined(FAR_LOD)
+// Far's handoff fill and its full view-facing keep fade out over this distance past Low's band. Keep in sync with
+// PGrassRenderer.h.
+static const float FarHandoffFillFade = 4096.0f;
+
+/** @brief Returns the smoothstep from Low's handoff end to FarHandoffFillFade beyond it. */
+float GetFarHandoffFade(float squareDistance)
+{
+	float handoffEnd = lodFadeIn.x + rcp(max(lodFadeIn.y, 1.0e-6f));
+	return smoothstep(handoffEnd, handoffEnd + FarHandoffFillFade, squareDistance);
+}
+
 /**
- * @brief Returns how many extra blades a patch needs to match Mid's two base blades and slope fill.
- * Slots below the count are always kept and the next one in proportion to the remainder, so the slot count only has
- * to cover the largest count rather than dilute it.
+ * @brief Returns the share of candidates Far keeps for its view-facing blades. Where Far meets Low it keeps them all,
+ * since Low's edge-on blades are view-thickened and cover more than their random facing alone; it eases to
+ * FarViewFacingKeep as the handoff fill fades.
  */
-float GetLowExtraCount(float terrainNormalZ)
+float GetFarViewFacingKeep(float2 lodOffset)
 {
-	float slopeKeep = saturate(rcp(max(terrainNormalZ, 0.05f)) - 1.0f);
-	float densityRatio = BLADE_TO_WORLD / max(midCandidateSpacing, 1.0f);
-	densityRatio *= densityRatio;
-	return clamp(distantFill * (densityRatio * (2.0f + slopeKeep) - 1.0f), 0.0f, SLOPE_EXTRA_BLADES);
-}
-
-void AppendLowBlade(Blade blade, bool outerGeometry)
-{
-	uint slot;
-#	if defined(LOW_OUTER_GEOMETRY)
-	if (outerGeometry) {
-		InterlockedAdd(LowOuterCount, 1u, slot);
-		GroupBlades[THREADGROUP_SIZE * (1 + SLOPE_EXTRA_BLADES) - 1u - slot] = blade;
-		return;
-	}
-#	endif
-	InterlockedAdd(LowInnerCount, 1u, slot);
-	GroupBlades[slot] = blade;
-}
-
-void GenerateLowExtra(uint3 dispatch, uint extraTask)
-{
-	uint activePatch = extraTask / SLOPE_EXTRA_BLADES;
-	uint extraIndex = extraTask % SLOPE_EXTRA_BLADES;
-	LowPatchSetup setup = LowPatchSetups[activePatch];
-
-	uint bladeTask = VisibleBladeTasks[dispatch.z];
-	uint quadrant = bladeTask & WORK_QUADRANT_MASK;
-	bool hasLand = (bladeTask & WORK_HAS_LAND) != 0u;
-	bool insideFrustum = (bladeTask & WORK_INSIDE_FRUSTUM) != 0u;
-	bool cullsDisabled = debugFlags.x > 0.5f;
-	QuadrantData quadrantData = data[quadrant];
-
-	uint2 patchPos = uint2(setup.patch % PATCHES_PER_ROW, setup.patch / PATCHES_PER_ROW);
-	uint3 candidateHash = ExtraCandidateHash(patchPos, extraIndex, quadrantData.quadrantHash);
-	float2 candidateQuadPos = ExtraCandidateQuadPos(patchPos, candidateHash);
-	float2 candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
-
-	float terrainNormalZ = rsqrt(dot(setup.terrainSlope, setup.terrainSlope) + 1.0f);
-	if (!cullsDisabled && float(candidateHash.z) * UINT_TO_FLOAT > GetLowExtraCount(terrainNormalZ) - float(extraIndex))
-		return;
-
-	float2 candidateMapSamplePos = GrassMapSamplePos(candidateQuadPos, candidateHash);
-	uint packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
-	if (!cullsDisabled && packedGrassCell == 0u)
-		return;
-
-	float candidateWorldZ = setup.baseWorldZ + dot(setup.terrainSlope, candidateWorldPos - setup.baseWorldPos2D);
-	Blade blade;
-	bool outerGeometry;
-
-	if (BuildBlade(candidateHash, candidateMapSamplePos, candidateWorldPos, candidateWorldZ,
-			setup.terrainSlope, terrainNormalZ, quadrantData.quadWorldPos, quadrant, hasLand, packedGrassCell, cullsDisabled, insideFrustum, false, blade, outerGeometry))
-		AppendLowBlade(blade, outerGeometry);
+	return lerp(1.0f, FarViewFacingKeep, GetFarHandoffFade(max(abs(lodOffset.x), abs(lodOffset.y))));
 }
 #endif
 
-#if defined(FAR_LOD) && SLOPE_EXTRA_BLADES > 0
-/** @brief Retains matching candidate counts until Low is gone, then gradually returns to sparse Far fill. */
-float GetFarExtraCount(float2 world2D, float terrainNormalZ)
+#if defined(FAR_LOD) && defined(PGRASS_FAR_HANDOFF)
+/**
+ * @brief Returns the fill candidates a Far patch adds beyond its slope slot to match Low's density where they meet.
+ * The fill is full through Low's fade-out band and fades over the next FarHandoffFillFade units, never covering more
+ * ground than the seam as Far's blades widen. Beyond it Far keeps the density its own setting gives.
+ */
+float GetFarHandoffFill(float2 lodOffset, float slopeKeep)
 {
-	float slopeKeep = saturate(rcp(max(terrainNormalZ, 0.05f)) - 1.0f);
-	float densityRatio = BLADE_TO_WORLD / max(midCandidateSpacing, 1.0f);
-	densityRatio *= densityRatio;
-	float seamExtras = clamp(distantFill * (densityRatio * (2.0f + slopeKeep) - 1.0f), 0.0f, SLOPE_EXTRA_BLADES);
-	float distantExtras = min(2.0f * distantFill * max(saturate(lodFadeIn.z + 2.0f * slopeKeep), farParams.w), SLOPE_EXTRA_BLADES);
-	float2 offset = abs(world2D - grassLodOrigin);
-	float squareDistance = max(offset.x, offset.y);
-	float handoffEnd = lodFadeOut.x;
-	float distantBlend = smoothstep(handoffEnd, handoffEnd + 4096.0f, squareDistance);
-	float extraFade = 1.0f - smoothstep(handoffEnd + 4096.0f, handoffEnd + 6144.0f, squareDistance);
-	return lerp(seamExtras, distantExtras, distantBlend) * extraFade;
+	float seamBlades = (1.0f + slopeKeep) * farHandoffDensityRatio;
+	float fade = 1.0f - GetFarHandoffFade(max(abs(lodOffset.x), abs(lodOffset.y)));
+	float coverageBlades = seamBlades * (DistantWidthScale / GetFarWidthScale(lodOffset));
+	return max(min(seamBlades * fade, coverageBlades) - 1.0f - slopeKeep, 0.0f);
 }
 #endif
 
-void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBladeCounts)
+// One thread's patch after its LOD, grass-map, terrain, and occlusion tests, ready to emit its candidates.
+struct PatchCandidates
 {
-	emittedBladeCounts = 0u;
+	uint2 patchPos;
+	uint quadrant;
+	uint quadrantHash;
+	float2 quadWorldPos;
+	uint bladeIndex;
+	// Flags are 0 or 1: bool members here compiled wrongly at /O3 on AMD, adding blades to Far's compact quadrants.
+	uint hasLand;
+	uint insideFrustum;
+	uint cullsDisabled;
+	uint useBasePath;
+	uint3 baseHash;
+	float2 baseWorldPos2D;
+	float2 baseMapSamplePos;
+	uint baseGrassCell;
+	float2 terrainSlope;
+	float baseWorldZ;
+	float terrainNormalZ;
+	float extraKeep;  // Near tiers: the slope fill's keep share. Far: the extra candidates before its LOD keep.
+	uint candidateCount;
+#if defined(FAR_LOD)
+	float farLODKeep;
+	float2 farPatchRank;  // x: the patch's rank in its work item's permutation, y: 1 / the item's patch count
+#endif
+};
 
-#if defined(LOW_LOD) && !defined(FAR_LOD) && SLOPE_EXTRA_BLADES > 0
-	uint bladeTask = VisibleBladeTasks[dispatch.z];
-	uint patchSlot = groupIndex;
-	bool laneHasPatch = patchSlot < LOW_PATCHES_PER_GROUP;
-
-	if (laneHasPatch) {
-		uint dispatchGroup = dispatch.x / THREADGROUP_SIZE;
-		uint patch = dispatchGroup * LOW_PATCHES_PER_GROUP + patchSlot;
-		bool validPatch = ResolveTilePatch(bladeTask, patch);
-		if (validPatch && debugFlags.x <= 0.5f && (bladeTask & WORK_FULL_GRASS) == 0u && !PatchHasGrass(uint2(patch % PATCHES_PER_ROW, patch / PATCHES_PER_ROW), bladeTask & WORK_QUADRANT_MASK))
-			validPatch = false;
-
-		if (validPatch) {
-			uint quadrant = bladeTask & WORK_QUADRANT_MASK;
-			bool hasLand = (bladeTask & WORK_HAS_LAND) != 0u;
-			bool nearCovered = (bladeTask & WORK_NEAR_COVERED) != 0u;
-			bool compactFar = (bladeTask & WORK_COMPACT_FAR) != 0u;
-			bool cullsDisabled = debugFlags.x > 0.5f;
-			QuadrantData quadrantData = data[quadrant];
-			uint2 patchPos = uint2(patch % PATCHES_PER_ROW, patch / PATCHES_PER_ROW);
-			uint quadrantHash = quadrantData.quadrantHash;
-			uint bladeIndex = (bladeTask >> WORK_LANE_SHIFT) & 0xFu;
-
-			uint3 baseHash;
-			uint2 gridPos = BaseGridPosition(patchPos, bladeIndex);
-			baseHash = Random::pcg3d(uint3(gridPos, quadrantHash));
-			float2 baseQuadPos2D = BaseQuadrantPosition(gridPos, baseHash);
-
-			float2 baseWorldPos2D = baseQuadPos2D + quadrantData.quadWorldPos;
-			float2 baseMapSamplePos = GrassMapSamplePos(baseQuadPos2D, baseHash);
-			bool useBasePath = PassesEarlyFarLOD(baseWorldPos2D, nearCovered, compactFar, cullsDisabled);
-			uint baseGrassCell = 0u;
-
-			if (useBasePath) {
-				baseGrassCell = LoadGrassCell(baseMapSamplePos, quadrant);
-				if (!cullsDisabled && baseGrassCell == 0u)
-					useBasePath = false;
-			}
-
-			float2 terrainSlope;
-			float baseWorldZ;
-			baseWorldZ = TerrainHeightSlopeAt(terrainSlope, baseWorldPos2D, quadrantData.quadWorldPos, quadrant, hasLand);
-
-			if (!(useBasePath && IsPatchOccluded(baseWorldPos2D, baseWorldZ, terrainSlope, quadrant, hasLand, cullsDisabled))) {
-				// Share only the terrain plane needed by extra candidates. Base inputs stay in this lane.
-				LowPatchSetup setup;
-				setup.baseWorldPos2D = baseWorldPos2D;
-				setup.terrainSlope = terrainSlope;
-				setup.baseWorldZ = baseWorldZ;
-				setup.patch = patch;
-
-				// Only accepted patches contribute extra candidates to the group queue.
-				uint activeSlot;
-				InterlockedAdd(LowActiveCount, 1u, activeSlot);
-				LowPatchSetups[activeSlot] = setup;
-
-				if (useBasePath) {
-					float terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
-					Blade blade;
-					bool outerGeometry;
-					bool insideFrustum = (bladeTask & WORK_INSIDE_FRUSTUM) != 0u;
-					if (BuildBlade(baseHash, baseMapSamplePos, baseWorldPos2D, baseWorldZ,
-							terrainSlope, terrainNormalZ, quadrantData.quadWorldPos, quadrant, hasLand, baseGrassCell, cullsDisabled, insideFrustum, true, blade, outerGeometry))
-						AppendLowBlade(blade, outerGeometry);
-				}
-			}
-		}
-	}
-	return;
-#else
-	uint emittedBladeCount = 0u;
+/** @brief Resolves a thread's patch and its shared terrain plane. Returns false when the patch emits nothing. */
+bool PreparePatchCandidates(uint3 dispatch, out PatchCandidates candidates)
+{
+	candidates = (PatchCandidates)0;
 
 	uint patch = dispatch.x;
-	uint bladeTask = VisibleBladeTasks[dispatch.z];
+	uint bladeTask = LoadBladeTask(dispatch.z);
 	uint bladeIndex = (bladeTask >> WORK_LANE_SHIFT) & 0xFu;
 	uint quadrant = bladeTask & WORK_QUADRANT_MASK;
 
 	bool hasLand = (bladeTask & WORK_HAS_LAND) != 0u;
 	bool insideFrustum = (bladeTask & WORK_INSIDE_FRUSTUM) != 0u;
-	bool allowSlopeExtras = (bladeTask & WORK_ALLOW_SLOPE_EXTRAS) != 0u;
 	bool nearCovered = (bladeTask & WORK_NEAR_COVERED) != 0u;
 	bool compactFar = (bladeTask & WORK_COMPACT_FAR) != 0u;
 
-	// Full-quadrant dispatches round up to whole groups, so also reject the tail past the last patch.
-	if (!ResolveTilePatch(bladeTask, patch))
-		return;
-
-#	if defined(FAR_LOD)
-	if (compactFar) {
-		uint activePatchCount = max(1u, (uint)ceil(PATCHES_PER_QUADRANT * saturate(farParams.w)));
-
-		if (dispatch.x >= activePatchCount)
-			return;
-
-		// An odd permutation spreads the retained candidates over the entire quadrant.
-		patch = (patch * 40501u + data[quadrant].quadrantHash) % PATCHES_PER_QUADRANT;
-	}
-#	endif
+	// Full-quadrant dispatches round up to whole groups, so also reject the tail past the last patch. Far's compact work
+	// generates only its share of the tile's or quadrant's patches, spread over them.
+#if defined(FAR_LOD)
+	SharedPatchDomain patchDomain = GetSharedPatchDomain(bladeTask, data[quadrant].quadrantHash);
+	uint patchRank = patch;
+	bool patchResolved = compactFar ? ResolveSharedPatch(patchDomain, patch) : ResolveTilePatch(bladeTask, patch);
+	// Full items keep their contiguous groups for group culling and recover the rank a compact item would give the patch.
+	if (patchResolved && !compactFar)
+		patchRank = GetSharedPatchRank(patchDomain, patch);
+#else
+	bool patchResolved = ResolveTilePatch(bladeTask, patch);
+#endif
+	if (!patchResolved)
+		return false;
 
 	bool cullsDisabled = debugFlags.x > 0.5f;
 	QuadrantData quadrantData = data[quadrant];
 	uint2 patchPos = uint2(patch % PATCHES_PER_ROW, patch / PATCHES_PER_ROW);
 	uint quadrantHash = quadrantData.quadrantHash;
 	if (!cullsDisabled && (bladeTask & WORK_FULL_GRASS) == 0u && !PatchHasGrass(patchPos, quadrant))
-		return;
+		return false;
 
 	// Preserve the base blade slot's position and seed.
 	uint3 baseHash;
@@ -200,10 +110,21 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 	baseHash = Random::pcg3d(uint3(gridPos, quadrantHash));
 	float2 baseQuadPos2D = BaseQuadrantPosition(gridPos, baseHash);
 	float2 baseWorldPos2D = baseQuadPos2D + quadrantData.quadWorldPos;
-	float2 baseMapSamplePos = GrassMapSamplePos(baseQuadPos2D, baseHash);
+	float2 baseMapSamplePos = GrassMapSamplePos(baseQuadPos2D, baseWorldPos2D, baseHash);
 	uint baseGrassCell = 0u;
-	bool useBasePath = PassesEarlyFarLOD(baseWorldPos2D, nearCovered, compactFar, cullsDisabled);
-#	if !defined(LOW_LOD) && !defined(FAR_LOD)
+#if defined(FAR_LOD)
+	// Every candidate dithers against Far's LOD fades and view-facing share by its patch's rank in the item's permutation.
+	// A compact item generates the first ranks, and the CPU bounds its share above every keep in it, so a share change
+	// never changes which candidates survive; moving the camera only dissolves them one at a time as their keep changes.
+	float farLODKeep = cullsDisabled ? 1.0f : GetFarLODKeep(baseWorldPos2D, nearCovered) * GetFarViewFacingKeep(baseWorldPos2D - grassLodOrigin);
+	float inversePatchCount = rcp(float(max(patchDomain.patchCount, 1u)));
+	if (farLODKeep <= float(patchRank) * inversePatchCount)
+		return false;
+	bool useBasePath = farLODKeep >= 1.0f || (float(patchRank) + LodDither(baseWorldPos2D)) * inversePatchCount <= farLODKeep;
+#else
+	bool useBasePath = true;
+#endif
+#if !defined(LOW_LOD) && !defined(FAR_LOD)
 	if (!cullsDisabled) {
 		float2 baseLodXY = baseWorldPos2D - grassLodOrigin;
 		float baseDistSq = dot(baseLodXY, baseLodXY);
@@ -211,7 +132,7 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 		if (baseDistSq >= baseCullDist * baseCullDist)
 			useBasePath = false;
 	}
-#	endif
+#endif
 
 	if (useBasePath) {
 		baseGrassCell = LoadGrassCell(baseMapSamplePos, quadrant);
@@ -220,158 +141,163 @@ void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBlad
 			useBasePath = false;
 	}
 
-#	if defined(FAR_LOD)
-	// Extra candidates perform their own grass checks; skip a redundant pre-scan.
-#		if SLOPE_EXTRA_BLADES > 0
-	if (!useBasePath && !allowSlopeExtras)
-		return;
-#		else
-	if (!useBasePath)
-		return;
-#		endif
-
-	if (IsFarPatchBoundsOccluded(patchPos, quadrant, hasLand, cullsDisabled))
-		return;
-#	elif defined(LOW_LOD) && SLOPE_EXTRA_BLADES > 0
-	if (!useBasePath && !cullsDisabled) {
-		bool anyExtraGrass = false;
-
-		[unroll] for (uint extraIndex = 0u; extraIndex < SLOPE_EXTRA_BLADES; ++extraIndex)
-		{
-			uint3 extraHash = ExtraCandidateHash(patchPos, extraIndex, quadrantHash);
-			float2 extraQuadPos = ExtraCandidateQuadPos(patchPos, extraHash);
-
-			if (LoadGrassCell(GrassMapSamplePos(extraQuadPos, extraHash), quadrant) != 0u) {
-				anyExtraGrass = true;
-				break;
-			}
-		}
-
-		if (!anyExtraGrass)
-			return;
-	}
-#	else
-#		if SLOPE_EXTRA_BLADES > 0
+#if SLOPE_EXTRA_BLADES > 0
 	if (!useBasePath && bladeIndex >= SLOPE_EXTRA_BLADES)
-		return;
-#		else
+		return false;
+#else
 	if (!useBasePath)
-		return;
-#		endif
-#	endif
+		return false;
+#endif
 
 	// One bilinear terrain sample establishes the plane for this path and its extras.
 	float2 terrainSlope;
 	float baseWorldZ;
 	baseWorldZ = TerrainHeightSlopeAt(terrainSlope, baseWorldPos2D, quadrantData.quadWorldPos, quadrant, hasLand);
 	if (useBasePath && IsPatchOccluded(baseWorldPos2D, baseWorldZ, terrainSlope, quadrant, hasLand, cullsDisabled))
-		return;
-	float terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
+		return false;
 
-#	if SLOPE_EXTRA_BLADES > 0
+	candidates.patchPos = patchPos;
+	candidates.quadrant = quadrant;
+	candidates.quadrantHash = quadrantHash;
+	candidates.quadWorldPos = quadrantData.quadWorldPos;
+	candidates.bladeIndex = bladeIndex;
+	candidates.hasLand = hasLand ? 1u : 0u;
+	candidates.insideFrustum = insideFrustum ? 1u : 0u;
+	candidates.cullsDisabled = cullsDisabled ? 1u : 0u;
+	candidates.useBasePath = useBasePath ? 1u : 0u;
+	candidates.baseHash = baseHash;
+	candidates.baseWorldPos2D = baseWorldPos2D;
+	candidates.baseMapSamplePos = baseMapSamplePos;
+	candidates.baseGrassCell = baseGrassCell;
+	candidates.terrainSlope = terrainSlope;
+	candidates.baseWorldZ = baseWorldZ;
+	candidates.terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
+	candidates.candidateCount = 1u + SLOPE_EXTRA_BLADES;
+
+#if SLOPE_EXTRA_BLADES > 0
 	// Reject slope extras before grass typing, clumping, LOD, occlusion, wind, and packing.
-#		if defined(FAR_LOD)
-	float farExtraCount = allowSlopeExtras ? GetFarExtraCount(baseWorldPos2D, terrainNormalZ) : 0.0f;
-#		else
-	float baseSlopeKeep = saturate(1.0f / max(terrainNormalZ, 0.05f) - 1.0f);
-#		endif
-	// Keep one emit path and let FXC choose the legal loop form for each permutation.
-	uint candidateCount = 1u + SLOPE_EXTRA_BLADES;
-#		if defined(FAR_LOD)
-	if (!cullsDisabled)
-		candidateCount = 1u + uint(ceil(farExtraCount));
-#		endif
-	for (uint candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
-		bool isBase = candidateIndex == 0;
-		uint3 candidateHash = baseHash;
-		float2 candidateWorldPos = baseWorldPos2D;
-		float2 candidateMapSamplePos = baseMapSamplePos;
-		uint packedGrassCell = baseGrassCell;
-		float candidateWorldZ = baseWorldZ;
-		bool candidateValid = useBasePath;
-
-		if (!isBase) {
-			uint emitExtraIndex = candidateIndex - 1;
-#		if defined(FAR_LOD)
-			if (!allowSlopeExtras)
-				continue;
-
-			candidateHash = ExtraCandidateHash(patchPos, emitExtraIndex, quadrantHash);
-			float2 extraQuadPos = ExtraCandidateQuadPos(patchPos, candidateHash);
-			candidateWorldPos = extraQuadPos + quadrantData.quadWorldPos;
-			candidateMapSamplePos = GrassMapSamplePos(extraQuadPos, candidateHash);
-			candidateValid = PassesEarlyFarLOD(candidateWorldPos, nearCovered, compactFar, cullsDisabled);
-			if (!candidateValid)
-				continue;
-
-			float extraKeep = saturate(farExtraCount - float(emitExtraIndex));
-			float keepRand = float(Random::pcg3d(uint3(asuint(candidateWorldPos), SLOPE_EXTRA_SEED_BASE + emitExtraIndex)).x) * UINT_TO_FLOAT;
-
-			if (!cullsDisabled && keepRand > extraKeep)
-				continue;
-			packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
-			if (!cullsDisabled && packedGrassCell == 0u)
-				continue;
-#		else
-			if ((emitExtraIndex % PATCH_BLADE_COUNT) != bladeIndex)
-				continue;
-
-			candidateHash = ExtraCandidateHash(patchPos, emitExtraIndex, quadrantHash);
-#			if !defined(LOW_LOD)
-			float slopeRoll = float(candidateHash.z) * UINT_TO_FLOAT;
-			if (!cullsDisabled && slopeRoll > baseSlopeKeep)
-				continue;
+	float baseSlopeKeep = GetSlopeFillKeep(candidates.terrainNormalZ);
+	candidates.extraKeep = baseSlopeKeep;
+#	if defined(FAR_LOD)
+	// Far's slope slot and, near Low, its handoff fill share one count: slot k is kept for its share of what remains.
+#		if defined(PGRASS_FAR_HANDOFF)
+	candidates.extraKeep += GetFarHandoffFill(baseWorldPos2D - grassLodOrigin, baseSlopeKeep);
+#			if defined(FAR_DOUBLE_GEOMETRY)
+	// Each handoff extra draws a double blade, so half as many records give the same blades.
+	candidates.extraKeep *= 0.5f;
 #			endif
-
-			float2 candidateQuadPos = ExtraCandidateQuadPos(patchPos, candidateHash);
-			candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
-			candidateMapSamplePos = GrassMapSamplePos(candidateQuadPos, candidateHash);
-			packedGrassCell = LoadGrassCell(candidateMapSamplePos, quadrant);
-			if (!cullsDisabled && packedGrassCell == 0u)
-				continue;
-			candidateValid = true;
 #		endif
-			candidateWorldZ = baseWorldZ + dot(terrainSlope, candidateWorldPos - baseWorldPos2D);
-		}
+	if (!cullsDisabled)
+		candidates.candidateCount = min(candidates.candidateCount, 1u + uint(ceil(candidates.extraKeep)));
+	candidates.farLODKeep = farLODKeep;
+	candidates.farPatchRank = float2(patchRank, inversePatchCount);
+#	endif
+#endif
+	return true;
+}
 
-		if (!candidateValid)
-			continue;
+/** @brief Builds one candidate: the patch's base blade at index 0, or one of its extras. Returns false when it is rejected. */
+bool BuildPatchCandidate(PatchCandidates candidates, uint candidateIndex, out Blade blade, out bool outerGeometry)
+{
+	blade = (Blade)0;
+	outerGeometry = false;
 
-		Blade blade;
-		bool outerGeometry;
-		if (BuildBlade(candidateHash, candidateMapSamplePos, candidateWorldPos, candidateWorldZ,
-				terrainSlope, terrainNormalZ, quadrantData.quadWorldPos, quadrant, hasLand, packedGrassCell, cullsDisabled, insideFrustum, isBase, blade, outerGeometry)) {
-			GroupBlades[emittedBladeCount * THREADGROUP_SIZE + groupIndex] = blade;
-#		if defined(HIGH_GEOMETRY_LOD)
-			GroupBladeOuter[emittedBladeCount * THREADGROUP_SIZE + groupIndex] = outerGeometry ? 1u : 0u;
-#		endif
+	bool isBase = candidateIndex == 0;
+	uint3 candidateHash = candidates.baseHash;
+	float2 candidateWorldPos = candidates.baseWorldPos2D;
+	float2 candidateMapSamplePos = candidates.baseMapSamplePos;
+	uint packedGrassCell = candidates.baseGrassCell;
+	float candidateWorldZ = candidates.baseWorldZ;
+	bool cullsDisabled = candidates.cullsDisabled != 0u;
 
-			if (outerGeometry)
-				emittedBladeCounts.y++;
-			else
-				emittedBladeCounts.x++;
-			emittedBladeCount++;
-		}
-	}
+	if (isBase) {
+		if (candidates.useBasePath == 0u)
+			return false;
+	} else {
+#if SLOPE_EXTRA_BLADES > 0
+		uint emitExtraIndex = candidateIndex - 1;
+		if ((emitExtraIndex % PATCH_BLADE_COUNT) != candidates.bladeIndex)
+			return false;
+
+		candidateHash = ExtraCandidateHash(candidates.patchPos, emitExtraIndex, candidates.quadrantHash);
+#	if defined(FAR_LOD)
+		// Separate hashes keep the retained slots' grass types and placement unbiased.
+		uint3 keepHash = Random::pcg3d(candidateHash ^ uint3(0x9E3779B9u, 0x7F4A7C15u, 0x94D049BBu));
+		float keepRoll = float(keepHash.x) * UINT_TO_FLOAT;
+		float rankRoll = (candidates.farPatchRank.x + float(keepHash.y) * UINT_TO_FLOAT) * candidates.farPatchRank.y;
+		if (!cullsDisabled && (keepRoll >= candidates.extraKeep - float(emitExtraIndex) || rankRoll > candidates.farLODKeep))
+			return false;
 #	else
-	if (useBasePath) {
-		Blade blade;
-		bool outerGeometry;
-		if (BuildBlade(baseHash, baseMapSamplePos, baseWorldPos2D, baseWorldZ, terrainSlope, terrainNormalZ, quadrantData.quadWorldPos, quadrant, hasLand, baseGrassCell, cullsDisabled, insideFrustum, true, blade, outerGeometry)) {
-			GroupBlades[groupIndex] = blade;
-#		if defined(HIGH_GEOMETRY_LOD)
-			GroupBladeOuter[groupIndex] = outerGeometry ? 1u : 0u;
-#		endif
-
-			if (outerGeometry)
-				emittedBladeCounts.y = 1u;
-			else
-				emittedBladeCounts.x = 1u;
-		}
-	}
+		float slopeRoll = float(candidateHash.z) * UINT_TO_FLOAT;
+		if (!cullsDisabled && slopeRoll > candidates.extraKeep)
+			return false;
 #	endif
 
+		float2 candidateQuadPos = ExtraCandidateQuadPos(candidates.patchPos, candidateHash);
+		candidateWorldPos = candidateQuadPos + candidates.quadWorldPos;
+		candidateMapSamplePos = GrassMapSamplePos(candidateQuadPos, candidateWorldPos, candidateHash);
+		packedGrassCell = LoadGrassCell(candidateMapSamplePos, candidates.quadrant);
+		if (!cullsDisabled && packedGrassCell == 0u)
+			return false;
+		candidateWorldZ = candidates.baseWorldZ + dot(candidates.terrainSlope, candidateWorldPos - candidates.baseWorldPos2D);
+#else
+		return false;
 #endif
+	}
+
+	return BuildBlade(candidateHash, candidateMapSamplePos, candidateWorldPos, candidateWorldZ, candidates.terrainSlope, candidates.terrainNormalZ,
+		candidates.quadWorldPos, candidates.quadrant, candidates.hasLand != 0u, packedGrassCell, cullsDisabled, candidates.insideFrustum != 0u, isBase, blade, outerGeometry);
+}
+
+// Stages a built blade in this thread's next group slot.
+void StageBlade(Blade blade, bool outerGeometry, uint groupIndex, inout uint2 emittedBladeCounts)
+{
+	uint slot = (emittedBladeCounts.x + emittedBladeCounts.y) * THREADGROUP_SIZE + groupIndex;
+	GroupBlades[slot] = blade;
+#if defined(PGRASS_OUTER_LIST)
+	GroupBladeOuter[slot] = outerGeometry ? 1u : 0u;
+#endif
+
+	if (outerGeometry)
+		emittedBladeCounts.y++;
+	else
+		emittedBladeCounts.x++;
+}
+
+#if defined(PGRASS_STAGED_ROUNDS)
+/** @brief Stages candidates [candidateBegin, candidateEnd), at most MAX_BLADES_PER_THREAD of them. */
+void EmitPatchCandidates(PatchCandidates candidates, uint candidateBegin, uint candidateEnd, uint groupIndex, inout uint2 emittedBladeCounts)
+{
+	for (uint candidateIndex = candidateBegin; candidateIndex < candidateEnd; ++candidateIndex) {
+		Blade blade;
+		bool outerGeometry;
+		if (BuildPatchCandidate(candidates, candidateIndex, blade, outerGeometry))
+			StageBlade(blade, outerGeometry, groupIndex, emittedBladeCounts);
+	}
+}
+#endif
+
+void GenerateThreadBlades(uint3 dispatch, uint groupIndex, out uint2 emittedBladeCounts)
+{
+	emittedBladeCounts = 0u;
+
+	PatchCandidates candidates;
+	if (!PreparePatchCandidates(dispatch, candidates))
+		return;
+
+#if defined(FAR_LOD)
+	for (uint candidateIndex = 0; candidateIndex < candidates.candidateCount; ++candidateIndex) {
+#else
+	// Keep one emit path, unrolled: AMD's driver has miscompiled the loop form of the Mid generator, passing the extra
+	// candidate a wrong position so that it emitted no blades.
+	[unroll] for (uint candidateIndex = 0; candidateIndex < 1u + SLOPE_EXTRA_BLADES; ++candidateIndex)
+	{
+#endif
+		Blade blade;
+		bool outerGeometry;
+		if (BuildPatchCandidate(candidates, candidateIndex, blade, outerGeometry))
+			StageBlade(blade, outerGeometry, groupIndex, emittedBladeCounts);
+	}
 }
 
 #endif

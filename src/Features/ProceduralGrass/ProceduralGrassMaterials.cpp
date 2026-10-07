@@ -10,6 +10,40 @@ using namespace PGrassCommon;
 
 namespace
 {
+	/** @brief Roughness-dependent coefficients of PBR::FuzzDirectionalAlbedo's MaterialX fit. */
+	float4 GetFuzzDirectionalAlbedoParameters(float roughness)
+	{
+		const float r = std::clamp(roughness, 0.01f, 1.0f);
+		const float s = r * (0.0206607f + 1.58491f * r) / (0.0379424f + r * (1.32227f + r));
+		const float m = r * (-0.193854f + r * (-1.14885f + r * (1.7932f - 0.95943f * r * r))) / (0.046391f + r);
+		const float o = r * (0.000654023f + (-0.0207818f + 0.119681f * r) * r) / (1.26264f + r * (-1.92021f + r));
+		return float4(1.0f / s, m, 1.0f / (s * std::sqrt(2.0f * std::numbers::pi_v<float>)), o);
+	}
+
+	/** @brief Mean packed vertical height and triangle area, evaluated only on material updates. */
+	float2 GetDistantCanopyGeometry(const GrassType& type)
+	{
+		constexpr uint32_t samples = 32;
+		float meanTilt = 0.0f;
+		float meanArea = 0.0f;
+		float meanAbsoluteTilt = 0.0f;
+		for (uint32_t i = 0; i < samples; ++i) {
+			const float random = (static_cast<float>(i) + 0.5f) / samples;
+			const float tilt = std::cos(type.tipWeight * (random * 1.4f + 0.3f));
+			const float packedTilt = std::round((tilt * 0.5f + 0.5f) * 255.0f) * (2.0f / 255.0f) - 1.0f;
+			meanTilt += packedTilt / samples;
+			meanAbsoluteTilt += std::abs(packedTilt) / samples;
+			const float height = 0.45f + std::lerp(random, 0.5f, type.clumpHeightFactor) * 0.55f - 0.5f / 255.0f;
+			for (uint32_t j = 0; j < samples; ++j) {
+				const float angle = (static_cast<float>(j) + 0.5f) / samples;
+				const float widthRandom = random * 1.618f + angle * 0.5f;
+				const float width = std::lerp(0.6f, 1.0f, widthRandom - std::floor(widthRandom)) - 0.5f / 255.0f;
+				meanArea += height * std::lerp(0.45f, 1.3f, width) / (samples * samples);
+			}
+		}
+		return float2((0.725f - 0.5f / 255.0f) * meanTilt, type.width * 2.5f * type.height * meanArea * meanAbsoluteTilt);
+	}
+
 	float GrassMaterialDetailTexel(int32_t x, int32_t y, bool grain)
 	{
 		const uint32_t wrappedX = static_cast<uint32_t>(x) & (GrassMaterialDetailDim - 1u);
@@ -127,10 +161,11 @@ PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& 
 	t.specularAnisotropy = std::clamp(ov.value("SpecularAnisotropy", s.specularAnisotropy), 0.0f, 1.0f);
 	t.minMaxSubsurfaceOpacity = ov.value("SubsurfaceOpacity", s.subsurfaceOpacity);
 	t.grassSubsurfaceColor = packColor(ov.value("SubsurfaceTint", s.grassSubsurfaceTint));
+	t.grassSubsurfaceColor.w = std::clamp(ov.value("SheenTint", s.sheenTint), 0.0f, 1.0f);
 	t.grassSurfParams = float4(
 		ov.value("SheenStrength", s.sheenStrength),
 		std::clamp(ov.value("TransmissionStrength", s.grassTransmissionStrength), 0.0f, 2.0f),
-		0.0f,
+		std::clamp(ov.value("SlopeFacing", s.grassSlopeFacing), 0.0f, 1.0f),
 		ov.value("SheenRoughness", s.sheenRoughness));
 
 	const float3 rough = ov.value("BaseMinTipRoughness", s.baseMinTipRoughness);
@@ -262,6 +297,10 @@ void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors, const
 	const uint32_t activeTypeCount = std::min<uint32_t>(static_cast<uint32_t>(typeAllocation.size()) + 2u, MaxGrassTypes);
 	for (uint32_t i = 1; i < activeTypeCount; ++i) {
 		auto& type = resolvedGrassTypes.grassType[i];
+		type.fuzzDirectionalAlbedoParams = GetFuzzDirectionalAlbedoParameters(type.grassSurfParams.w);
+		const auto canopyGeometry = GetDistantCanopyGeometry(type);
+		type.grassTypeLightParams.y = canopyGeometry.x;
+		type.grassTypeLightParams.z = canopyGeometry.y;
 
 		// Anchor the scattering tint at the same area-weighted colour used to stabilize blade appearance.
 		float4 referenceColor(
@@ -295,7 +334,7 @@ void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors, const
 			source.height, source.width, source.minSlope, source.maxSlope,
 			source.stiffness, source.rotationalStiffness, source.tipWeight, source.mid,
 			source.clumpDistanceFactor, source.clumpHeightFactor, source.clumpFacingFactor, source.clumpLeanFactor,
-			clumpGridSize, 1.0f / clumpGridSize, float2(0.0f, 0.0f)
+			clumpGridSize, 1.0f / clumpGridSize, source.grassSurfParams.z, 0.0f
 		};
 
 		maxHeight = std::max(maxHeight, source.height);
@@ -307,6 +346,21 @@ void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors, const
 		maxNearWidth = std::max(maxNearWidth, baseWidth * 2.0f);        // Low is the widest near tier.
 		maxFarWidth = std::max(maxFarWidth, baseWidth * 32.0f * 2.0f);  // Include Far's maximum coverage compensation.
 	}
+	// Far grows its blades up to this multiple as it thins with distance.
+	terrainCanopyMaxHeight = maxHeight * PGrassCommon::FarMaxHeightScale;
+
+	// Both terrain-darkening maps apply the types' slope limits. The settings panel re-resolves the types every frame,
+	// and a cleared canopy map refills over many frames, so rebuild the maps only when a limit changes.
+	uint64_t slopeLimitsHash = GrassHashOffsetBasis;
+	for (const auto& type : resolvedGeneratorTypes.grassType) {
+		GrassHashValue(slopeLimitsHash, type.minSlope);
+		GrassHashValue(slopeLimitsHash, type.maxSlope);
+	}
+	if (slopeLimitsHash != resolvedSlopeLimitsHash) {
+		resolvedSlopeLimitsHash = slopeLimitsHash;
+		terrainCanopyNeedsClear = true;
+		grassPresenceContentHash = (std::numeric_limits<uint64_t>::max)();
+	}
 
 	grassTypesArrayCB->Update(resolvedGrassTypes);
 	grassGeneratorTypesCB->Update(resolvedGeneratorTypes);
@@ -314,7 +368,7 @@ void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors, const
 
 	// View thickening scales with blade width.
 	nearQuadrantFrustumPadding = maxClumpPull + maxCurveReach + maxNearWidth * (1.0f + settings.grassViewThicken);
-	farQuadrantFrustumPadding = maxHeight + maxFarWidth;
+	farQuadrantFrustumPadding = maxHeight * PGrassCommon::FarMaxHeightScale + maxFarWidth;
 	lowFadeInPositionPadding = maxClumpPull * 0.1125f + 1.0f;
 	hiZClumpReach = maxClumpPull * 0.16f;
 	nearHiZRadius = maxCurveReach + maxNearWidth * (1.0f + settings.grassViewThicken) + hiZClumpReach + 1.0f;

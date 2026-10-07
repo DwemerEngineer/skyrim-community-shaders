@@ -1,6 +1,8 @@
 #ifndef __PGRASS_PLACEMENT_HLSLI__
 #define __PGRASS_PLACEMENT_HLSLI__
 
+#include "ProceduralGrass/PGrassCoverage.hlsli"
+
 float SampleTerrainHeightMap(float2 world2D)
 {
 	return lerp(heightMapZRange.x, heightMapZRange.y, TerrainHeightTexture.SampleLevel(LinearSampler, world2D * heightMapScale + heightMapOffset, 0));
@@ -38,31 +40,6 @@ float GetTerrainLift(float2 world2D, float landHeight)
 }
 #endif
 
-Texture2D<float> OcclusionMaskHigh : register(t2);
-Texture2D<float> OcclusionMaskLow : register(t4);
-
-float GetObjectClearance(float3 worldPos, bool cullsDisabled)
-{
-	if (cullsDisabled)
-		return 1.0e30f;
-
-	float2 uv = (worldPos.xy - occlusionParams.xy) * occlusionInvExtent + 0.5f;
-	float2 mapUV = saturate(uv);
-
-	if (any(mapUV != uv))
-		return 1.0e30f;
-
-	uint2 texel = min(uint2(mapUV * occlusionMapDim), uint2(occlusionMapDim - 1u, occlusionMapDim - 1u));
-	float highest = OcclusionMaskHigh.Load(int3(texel, 0));
-
-	if (highest <= worldPos.z + occlusionParams.w)
-		return 1.0e30f;
-
-	float lowest = OcclusionMaskLow.Load(int3(texel, 0));
-	float clearance = lowest - worldPos.z;
-	return clearance < occlusionParams.z ? clearance : 1.0e30f;
-}
-
 uint LoadGrassCell(float2 quadLocalPos, uint quadrant)
 {
 	float2 grassSample = clamp(quadLocalPos / QUADRANT_GRASS_SPACING, 0.0f, QUADRANT_GRASS_PITCH - 1.001f);
@@ -85,12 +62,13 @@ bool PatchHasGrass(uint2 patchPos, uint quadrant)
 	return false;
 }
 
-float2 GrassMapSamplePos(float2 bladeQuadPos2D, uint3 hash)
+float2 GrassMapSamplePos(float2 bladeQuadPos2D, float2 bladeWorldPos2D, uint3 hash)
 {
-	return bladeQuadPos2D + (float2(hash.xy) * UINT_TO_FLOAT * 2.0f - 1.0f) * miscParams.x;
+	float2 jitter = float2(hash.xy) * (2.0f * UINT_TO_FLOAT) - 1.0f;
+	return bladeQuadPos2D + lerp(jitter, GetGrassMapWarp(bladeWorldPos2D), GrassMapWarpShare) * miscParams.x;
 }
 
-void ComputeGrassType(out uint type, uint packedGrassCell, float2 quadLocalPos, float typeRandom)
+void ComputeGrassType(out uint type, uint packedGrassCell, float2 quadLocalPos, float typeRandom, float2 bladeWorldPos2D, float edgeRandom)
 {
 	uint firstType = packedGrassCell & 0xFFu;
 	if (packedGrassCell == firstType * 0x01010101u) {
@@ -100,29 +78,42 @@ void ComputeGrassType(out uint type, uint packedGrassCell, float2 quadLocalPos, 
 
 	float2 grassSample = clamp(quadLocalPos / QUADRANT_GRASS_SPACING, 0.0f, QUADRANT_GRASS_PITCH - 1.001f);
 	float2 sampleFraction = frac(grassSample);
-
 	float2 inverseFraction = 1.0f - sampleFraction;
-	float firstThreshold = inverseFraction.x * inverseFraction.y;
-	float secondThreshold = firstThreshold + sampleFraction.x * inverseFraction.y;
-	float thirdThreshold = secondThreshold + inverseFraction.x * sampleFraction.y;
+	float4 weights = float4(inverseFraction.x * inverseFraction.y, sampleFraction.x * inverseFraction.y, inverseFraction.x * sampleFraction.y,
+		sampleFraction.x * sampleFraction.y);
 
-	if (typeRandom < firstThreshold)
-		type = packedGrassCell & 0xFFu;
-	else if (typeRandom < secondThreshold)
-		type = (packedGrassCell >> 8u) & 0xFFu;
-	else if (typeRandom < thirdThreshold)
-		type = (packedGrassCell >> 16u) & 0xFFu;
+	// Cells without a bare corner stay fully covered; only cells reaching bare LAND get the edge fade.
+	uint4 ids = (packedGrassCell.xxxx >> uint4(0u, 8u, 16u, 24u)) & 0xFFu;
+	float4 grassWeights = ids != 0u ? weights : 0.0f;
+	float presence = dot(grassWeights, 1.0f);
+	[branch] if (any(ids == 0u))
+	{
+		if (edgeRandom >= GetGrassMapEdgeCoverage(bladeWorldPos2D, presence)) {
+			type = 0u;
+			return;
+		}
+	}
+
+	// Pick among the grass corners by their bilinear weight.
+	float pick = typeRandom * presence;
+	float firstThreshold = grassWeights.x;
+	float secondThreshold = firstThreshold + grassWeights.y;
+	float thirdThreshold = secondThreshold + grassWeights.z;
+
+	if (pick < firstThreshold && ids.x != 0u)
+		type = ids.x;
+	else if (pick < secondThreshold && ids.y != 0u)
+		type = ids.y;
+	else if (pick < thirdThreshold && ids.z != 0u)
+		type = ids.z;
 	else
-		type = packedGrassCell >> 24u;
+		type = ids.w != 0u ? ids.w : (ids.z != 0u ? ids.z : (ids.y != 0u ? ids.y : ids.x));
 }
 
-// Far can complete its LOD test before terrain and grass-map access.
-bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar, bool cullsDisabled)
-{
 #if defined(FAR_LOD)
-	if (cullsDisabled)
-		return true;
-
+/** @brief Returns the share of Far candidates its handoff, distance and unload fades keep at a position. */
+float GetFarLODKeep(float2 bladeWorldPos2D, bool nearCovered)
+{
 	float2 lodOffset = abs(bladeWorldPos2D - grassLodOrigin);
 	float lodDistanceSq = dot(lodOffset, lodOffset);
 	float handoffDistance = max(lodOffset.x, lodOffset.y);
@@ -134,18 +125,12 @@ bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar
 
 	float fullKeepRadius = min(lodFadeOut.x, farParams.x);
 	// Low fades on square distance, so retain Far through the same handoff band.
-	if (handoffDistance <= fullKeepRadius) {
-		if (!compactFar && inRamp >= 1.0f)
-			return true;
-
-		float keep = compactFar ? saturate(inRamp / max(farParams.w, 1.0e-3f)) : inRamp;
-		float dither = LodDither(bladeWorldPos2D);
-		return dither <= keep;
-	}
+	if (handoffDistance <= fullKeepRadius)
+		return inRamp;
 
 	float unloadFadeEnd = lodFadeIn.w + rcp(max(lodFadeOut.w, 1.0e-6f));
 	if (lodFadeOut.w > 0.0f && lodDistanceSq >= unloadFadeEnd * unloadFadeEnd)
-		return false;
+		return 0.0f;
 
 	float lodDistance = sqrt(lodDistanceSq);
 	float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodDistance - lodFadeOut.x) * lodFadeOut.y));
@@ -157,15 +142,8 @@ bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool nearCovered, bool compactFar
 	// Ease back to radial thinning after Low is gone, including at diagonal corners.
 	float handoffEnd = lodFadeIn.x + rcp(max(lodFadeIn.y, 1.0e-6f));
 	float seamKeep = inRamp * (1.0f - saturate((handoffDistance - handoffEnd) * lodFadeIn.y)) * unloadRamp;
-	keep = max(keep, seamKeep);
-	if (compactFar)
-		keep = saturate(keep / max(farParams.w, 1.0e-3f));
-	float dither = LodDither(bladeWorldPos2D);
-
-	return dither <= keep;
-#else
-	return true;
-#endif
+	return max(keep, seamKeep);
 }
+#endif
 
 #endif

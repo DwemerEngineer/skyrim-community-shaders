@@ -24,10 +24,12 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 
 #if defined(BLADE_BATCH_SIZE)
 	// Each instance draws a fixed batch of blades; discard the final batch's unused tail.
-#	if defined(MID_VERTEX)
-	const uint verticesPerBlade = 5u;
-#	elif defined(LOW_OUTER_VERTEX)
+#	if defined(FAR_DOUBLE_VERTEX)
+	const uint verticesPerBlade = 6u;
+#	elif defined(MID_OUTER_VERTEX) || defined(LOW_OUTER_VERTEX) || defined(FAR_VERTEX)
 	const uint verticesPerBlade = 3u;
+#	elif defined(MID_VERTEX)
+	const uint verticesPerBlade = 5u;
 #	else
 	const uint verticesPerBlade = 4u;
 #	endif
@@ -35,7 +37,7 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	instanceID = instanceID * BLADE_BATCH_SIZE + vertexID / verticesPerBlade;
 	vertexID %= verticesPerBlade;
 
-#	if defined(LOW_OUTER_VERTEX)
+#	if defined(LOW_OUTER_VERTEX) || defined(MID_OUTER_VERTEX) || defined(FAR_DOUBLE_VERTEX)
 	[branch] if (instanceID >= IndirectArgs.Load(24u))
 #	else
 	[branch] if (instanceID >= IndirectArgs.Load(4u))
@@ -46,7 +48,7 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 		return o;
 	}
 
-#	if defined(LOW_OUTER_VERTEX)
+#	if defined(LOW_OUTER_VERTEX) || defined(MID_OUTER_VERTEX) || defined(FAR_DOUBLE_VERTEX)
 	instanceID += IndirectArgs.Load(36u);
 #	endif
 #endif
@@ -71,12 +73,18 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	static const float MID_LEVEL = 3.0f;
 	bool isBlade1 = vertexID >> 3;
 
-#elif defined(FAR_VERTEX)
-	// Far uses one tapered triangle.
+#elif defined(FAR_VERTEX) || defined(MID_OUTER_VERTEX)
+	// Far, and Mid's straight single blades, use one tapered triangle.
 	static const float LEVELS = 1.0f;
 	static const float DOUBLE_LEVELS = 1.0f;
 	static const float MID_LEVEL = 1.0f;
+#	if defined(FAR_DOUBLE_VERTEX)
+	// Far's handoff doubles draw two blades per record: the second on a nearby root, turned 30 degrees.
+	bool isBlade1 = vertexID >= 3u;
+	vertexID -= isBlade1 ? 3u : 0u;
+#	else
 	bool isBlade1 = false;
+#	endif
 
 #elif defined(MID_VERTEX)
 	// Mid uses base, midpoint, and tip. Double blades use one triangle per half.
@@ -115,6 +123,11 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 		f16tof32(blade.posXY >> 16),
 		f16tof32(blade.posXY),
 		f16tof32(blade.posZWidthHeight >> 16));
+#if defined(FAR_DOUBLE_VERTEX)
+	// The rotated twin would mostly overlap the first blade across the view, so it stands on its own root.
+	if (isBlade1)
+		rootViewPosition.xy += GetFarDoubleRootOffset(blade.seedAndType, blade.posZWidthHeight);
+#endif
 #if defined(MID_LOD)
 	float rootDistance = float(blade.tipDir >> 16) * (6144.0f / 65535.0f);
 #elif defined(FAR_LOD)
@@ -180,15 +193,19 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #if defined(FAR_LOD)
 	float2 farCoverage = GetFarCoverage(rootLodOffset, FrameBuffer::CameraProj._m00);
 	float farWidthT = farCoverage.x;
-	randWidth *= lerp(2.0f, 32.0f, farWidthT) * farCoverage.y;
+	randWidth *= GetFarWidthScale(rootLodOffset) * farCoverage.y;
+	randHeight *= GetFarHeightScale(rootLodOffset, FrameBuffer::CameraProj._m00);
 #elif defined(MID_LOD)
-	// Mid keeps half of High's candidate lattice, so double width to preserve projected coverage.
-	randWidth *= 2.0f;
+#	if defined(MID_OUTER_VERTEX)
+	// The generator only sends fully morphed blades here.
+	static const float lowGeometryBlend = 1.0f;
+#	else
 	float lowGeometryBlend = GetMidLowBlend(rootDistance);
+#	endif
 #endif
 
-#if defined(FAR_VERTEX)
-	bool doubleBlade = false;  // Far renders a single tapered blade.
+#if defined(FAR_VERTEX) || defined(MID_OUTER_VERTEX)
+	bool doubleBlade = false;  // Far and Mid's outer list render a single tapered blade.
 #elif defined(LOW_LOD)
 	bool doubleBlade = (blade.posZWidthHeight & 1u) != 0u;
 #else
@@ -206,7 +223,11 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	float t = doubleBlade ? ((vertexID == 0u || vertexID == 3u) ? 1.0f : 0.0f) : (vertexID >= 2u ? 1.0f : 0.0f);
 #	endif
 #else
+#	if defined(FAR_DOUBLE_VERTEX)
+	bool rotateFirstBlade = !isBlade1;
+#	else
 	bool rotateFirstBlade = doubleBlade && !isBlade1;
+#	endif
 
 	// Double blades run tip-to-base-to-tip, with each half reaching t = 1.
 	float rung = vertexID >> 1;
@@ -274,9 +295,14 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 
 	// Build the blade in camera-relative space, then apply the animated tip displacement.
 #if defined(LOW_VERTEX)
+	float2 sideAxis = bladeAxis;
 	float2 bladeOffsetXY = mad(bladeAxis, sideSign * lowTaperScale, facing * bladePosition.x);
+#elif defined(FAR_VERTEX)
+	// Far's root edge lies across the view to cover its full width; the blade still leans along its facing.
+	float2 bladeOffsetXY = mad(GetFarSideAxis(rootViewPosition.xy), taper * sideSign, facing * bladePosition.x);
 #else
-	float2 bladeOffsetXY = mad(float2(-facing.y, facing.x), taper * sideSign, facing * bladePosition.x);
+	float2 sideAxis = float2(-facing.y, facing.x);
+	float2 bladeOffsetXY = mad(sideAxis, taper * sideSign, facing * bladePosition.x);
 #endif
 	float3 positionOffset = float3(bladeOffsetXY, bladePosition.y);
 	float windWeight = t * t;
@@ -318,15 +344,21 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 	float4 clipPosition = mul(FrameBuffer::CameraViewProj, viewPos);
 
 // Widen edge-on blades to keep their silhouette visible.
+#if defined(MID_VERTEX) || defined(LOW_VERTEX) || defined(HIGH_VERTEX) || defined(HIGH_OUTER_VERTEX)
+	// Push each edge toward the side of the screen its side axis projects to. A fixed screen direction would move the
+	// edges together whenever the blade's positive side lies on the left of the screen.
+	float2 sideAxisClip = float2(dot(FrameBuffer::CameraViewProj[0].xy, sideAxis), dot(FrameBuffer::CameraViewProj[3].xy, sideAxis));
+	float screenSide = sideAxisClip.x * clipPosition.w - clipPosition.x * sideAxisClip.y < 0.0f ? -1.0f : 1.0f;
+#endif
 #if defined(MID_VERTEX) || defined(LOW_VERTEX)
 	// Mid/Low pack one 4-bit factor for each double-blade facing.
 	uint packedViewThicken = (hashClumpAndGrassType >> 16) & 0xFFu;
 	uint viewThickenNibble = rotateFirstBlade ? packedViewThicken >> 4 : packedViewThicken & 0xFu;
 	float viewThicken = float(viewThickenNibble) * (1.0f / 15.0f);
-	clipPosition.x = mad(FrameBuffer::CameraProj._m00 * viewThicken * sideSign * taper, miscParams.z, clipPosition.x);
+	clipPosition.x = mad(FrameBuffer::CameraProj._m00 * viewThicken * sideSign * screenSide * taper, miscParams.z, clipPosition.x);
 #elif defined(HIGH_VERTEX) || defined(HIGH_OUTER_VERTEX)
 	float viewThicken = float((hashClumpAndGrassType >> 20) & 0xFu) * (1.0f / 15.0f);
-	clipPosition.x = mad(FrameBuffer::CameraProj._m00 * viewThicken * sideSign * taper, miscParams.z, clipPosition.x);
+	clipPosition.x = mad(FrameBuffer::CameraProj._m00 * viewThicken * sideSign * screenSide * taper, miscParams.z, clipPosition.x);
 #endif
 
 	o.Position = clipPosition;
@@ -339,7 +371,13 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 
 #	if defined(FAR_LOD)
 	o.CameraPositionSide = float4(viewPos.xyz, mad(sideSign, 0.5f, 0.5f));
-	o.PackedBladeParams = uint4(blade.facingTilt, blade.seedAndType, blade.posZWidthHeight, f32tof16(farWidthT) | (f32tof16(randWidth) << 16));
+	uint farFacingTilt = blade.facingTilt;
+#		if defined(FAR_DOUBLE_VERTEX)
+	// The pixel shader lights each half of the pair from its own facing.
+	uint2 packedFacing = (uint2)round(saturate(facing * 0.5f + 0.5f) * 255.0f);
+	farFacingTilt = (farFacingTilt & 0xFFFF0000u) | packedFacing.x | packedFacing.y << 8;
+#		endif
+	o.PackedBladeParams = uint4(farFacingTilt, blade.seedAndType, blade.posZWidthHeight, f32tof16(farWidthT) | (f32tof16(randWidth) << 16));
 	float4 rootClip = mul(FrameBuffer::CameraViewProj, float4(rootViewPosition, 1.0f));
 	o.RootPixel = (rootClip.xy / max(rootClip.w, 1.0f) * float2(0.5f, -0.5f) + 0.5f) / dynamicResolutionInverted;
 

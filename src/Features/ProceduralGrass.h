@@ -43,6 +43,7 @@ public:
 		float specularAnisotropy = 0.6f;                           // OpenPBR specular anisotropy, stretched across the blade by its veins
 		float sheenStrength = 0.08f;                               // OpenPBR fuzz weight: coverage of the blade hairs and wax bloom
 		float sheenRoughness = 0.5f;                               // OpenPBR fuzz roughness: low is fibre-like, high is dusty
+		float sheenTint = 0.5f;                                    // OpenPBR fuzz colour: 0 is white, 1 is the blade's hue
 		float curvedNormalStrength = 0.3f;                         // Edge tilt of the rolled cross-section as a fraction of 90 degrees
 		float2 subsurfaceOpacity = float2(0.5f, 0.30f);            // Opaque fraction of the base substrate, base to tip
 		float3 grassSubsurfaceTint = float3(0.50f, 0.54f, 0.38f);  // Scattering albedo at the stabilized blade colour
@@ -91,8 +92,7 @@ public:
 		float grassTerrainBlendHeight = 2.0f;
 		float grassTerrainBlendNormal = 0.8f;
 		float grassTerrainBlendRough = 0.7f;
-		float grassAOStrength = 0.8f;  // Terrain darkening. 0 disables it.
-		float grassAODensity = 12.0f;  // Blades per full-coverage density texel
+		float grassAOStrength = 0.5f;  // Perceptual darkening of terrain under full grass. 0 disables it; 1 is black.
 
 		// Clump
 		float clumpGridSize = 64.0f;        // Average spacing between Voronoi clump centres, in world units; about one tuft
@@ -116,15 +116,15 @@ public:
 		float occlusionPadding = 12.0f;
 		float occlusionBias = 4.0f;  // Minimum occluder height above a blade
 		float grassMapEdgeNoise = 64.0f;
-		float grassViewThicken = 1.0f;  // Edge-on blade widening. 0 disables it.
+		float grassViewThicken = 0.5f;  // Edge-on blade widening. 0 disables it.
 
 		// Per-LOD densities and far tier
+		// Defaults match the High preset (see ApplyDensityPreset): Mid and Low use High's lattice.
 		int midGrassDensity = 256;
 		int lowGrassDensity = 256;
 		int farGrassDensity = 96;
 		int grassCellRadius = 6;
 		float farDensityFalloff = 0.15f;
-		float distantFill = 1.0f;  // Share of Mid's density that Low and Far extra blades make up. 1 matches Mid.
 
 		struct GrassTypeDef
 		{
@@ -140,6 +140,7 @@ public:
 		bool debugIgnoreGrassMap = false;
 		bool debugIgnoreObjectOcclusion = false;
 		bool debugDisableAllCulls = false;
+		bool debugTierView = false;
 		bool debugIgnorePreProcessedFlag = true;
 	};
 
@@ -190,7 +191,7 @@ private:
 	uint32_t QualityDensities[static_cast<uint8_t>(Quality::Count)] = { 160, 192, 256, 320 };
 
 	PGrassRenderer<PGrassCommon::HighTierQuadrantCap, 4>* grassRendererHighLOD = nullptr;
-	PGrassRenderer<PGrassCommon::MidTierQuadrantCap, 2>* grassRendererMidLOD = nullptr;
+	PGrassRenderer<PGrassCommon::MidTierQuadrantCap, PGrassCommon::MidPatchBladeCount>* grassRendererMidLOD = nullptr;
 	PGrassRenderer<PGrassCommon::LowTierQuadrantCap, 1>* grassRendererLowLOD = nullptr;
 	PGrassRenderer<PGrassCommon::FarQuadrantCount, 1>* grassRendererFarLOD = nullptr;
 
@@ -225,7 +226,6 @@ private:
 	ID3D11BlendState* depthOnlyBlend = nullptr;
 	ID3D11BlendState* defaultBlend = nullptr;
 	ID3D11BlendState* terrainFadeBlend = nullptr;
-	ID3D11BlendState* multiplyBlend = nullptr;
 	ID3D11DepthStencilState* noDepthDSS = nullptr;
 
 	// Top-down grass density and the terrain-darkening pass.
@@ -233,6 +233,30 @@ private:
 	Texture2D* grassMaterialDetailTexture = nullptr;
 	Texture2D* distantAmbientLUT = nullptr;
 	mutable ID3D11ComputeShader* distantAmbientLUTCS = nullptr;
+
+	Texture2D* terrainCanopyTexture = nullptr;
+	ID3D11ComputeShader* terrainCanopyCS = nullptr;
+	bool terrainCanopyTypedLoadSupported = false;
+	bool terrainCanopyNeedsClear = true;
+	float terrainCanopyMaxHeight = 0.0f;
+	RE::TESWorldSpace* terrainCanopyWorldSpace = nullptr;
+	uint64_t terrainCanopyPolicyVersion = 0;
+	uint64_t terrainCanopyQuadrantsVersion = 0;
+	int32_t terrainCanopyOrigin[2]{};
+	struct CanopyTile
+	{
+		int32_t x = (std::numeric_limits<int32_t>::min)();
+		int32_t y = (std::numeric_limits<int32_t>::min)();
+		uint64_t version = 0;
+	};
+	std::array<CanopyTile, PGrassCommon::TerrainCanopyQuadrants * PGrassCommon::TerrainCanopyQuadrants> terrainCanopyTiles{};
+	struct CanopyUpload
+	{
+		CanopyTile tile;
+		std::array<uint32_t, PGrassCommon::QuadrantCellPitch * PGrassCommon::QuadrantCellPitch> samples;
+	};
+	std::vector<CanopyUpload> terrainCanopyPending;
+	size_t terrainCanopyUploadCursor = 0;
 
 	// Rendered terrain LOD on a wrapping world-aligned grid: measurements, lift, and the surface height bounding it.
 	Texture2D* terrainLiftMeasuredTexture = nullptr;
@@ -247,6 +271,7 @@ private:
 
 	ID3D11VertexShader* densityAOVS = nullptr;
 	ID3D11PixelShader* densityAOPS = nullptr;
+	mutable std::unique_ptr<Texture2D> terrainDarkeningSceneCopy;
 	ID3D11PixelShader* depthClipPS = nullptr;
 
 	float depthBlendStrength = -1.0f;
@@ -277,14 +302,17 @@ private:
 	PGrassCommon::GrassTypesArray resolvedGrassTypes{};
 	PGrassCommon::GrassGeneratorTypesArray resolvedGeneratorTypes{};
 	bool grassTypesDirty = true;
+	uint64_t resolvedSlopeLimitsHash = 0;  // Slope limits the terrain-darkening maps were built with.
 	bool resolvedTypeColorsLinear = false;
 	float resolvedTypeColorGamma = 1.0f;
 	Buffer* vertexIndicesHighBuffer = nullptr;
 	Buffer* vertexIndicesHighOuterBuffer = nullptr;
-	Buffer* vertexIndicesMidBuffer = nullptr;  // 9-index, five-vertex Mid blade
+	Buffer* vertexIndicesMidBuffer = nullptr;       // 9-index, five-vertex Mid blade
+	Buffer* vertexIndicesMidOuterBuffer = nullptr;  // One triangle per straight single Mid blade
 	Buffer* vertexIndicesLowBuffer = nullptr;
 	Buffer* vertexIndicesLowOuterBuffer = nullptr;
-	Buffer* vertexIndicesFarBuffer = nullptr;  // 3-index single-triangle far blade
+	Buffer* vertexIndicesFarBuffer = nullptr;        // 3-index single-triangle far blade
+	Buffer* vertexIndicesFarDoubleBuffer = nullptr;  // Two crossed triangles per Far handoff record
 
 	/** @brief Cached grass ids and heights for one LAND quadrant. */
 	struct QuadrantGrass
@@ -364,6 +392,15 @@ private:
 	/** @brief Returns terrain Z from cached LAND data, or nullopt outside loaded cells. */
 	std::optional<float> GetLandHeightAt(float worldX, float worldY) const;
 
+	/**
+	 * @brief Sets every tier's density from a quality preset so neighbouring tiers match.
+	 * Mid draws two of High's four blades per patch and Low draws one, both on High's lattice. Far keeps the same
+	 * share of High's density at every preset.
+	 */
+	void ApplyDensityPreset(int32_t quality);
+	/** @brief Pushes the current density settings to every tier renderer. */
+	void ApplyTierDensities();
+
 	/** @brief Returns geometric-mean Far patch density so Low and Far meet at the seam. */
 	uint32_t FarPatchDensity() const
 	{
@@ -410,6 +447,11 @@ private:
 	/** @brief Creates the material detail, density, distant-ambient and presence textures. */
 	void CreateGrassTextures();
 	void CompileSupportShaders();
+	void CreateTerrainCanopyResources();
+	/** @brief Updates changed LAND tiles with a bounded number of uploads; unchanged frames skip the scan. */
+	void UpdateTerrainCanopy(ID3D11DeviceContext* ctx);
+	/** @brief Replaces distant terrain interiors with resolved grass-canopy lighting. */
+	void RenderTerrainCanopy(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const;
 
 	void PostDepthRendering();
 	/** @brief Player position in quadrant and cell units for one visibility update. */
@@ -437,6 +479,8 @@ private:
 
 	/** @brief Refreshes the terrain-darkening grass-id window when its origin or content changes. */
 	void RebuildGrassPresence(int32_t originQuadX, int32_t originQuadY);
+	/** @brief Clears a grass id whose type's slope limits reject the LAND slope at a quadrant sample, as the generator culls its blades. */
+	uint8_t LimitGrassIdToSlope(uint8_t id, const PGrassCommon::Quadrant& quadrant, uint32_t column, uint32_t row) const;
 
 	/** @brief Streams Far LAND cells and rebuilds the Far quadrant list when the cache changes. */
 	void UpdateFarQuadrants(RE::TESWorldSpace* landWorldSpace, const RE::GridCellArray* cells, const VisibilityOrigin& origin);

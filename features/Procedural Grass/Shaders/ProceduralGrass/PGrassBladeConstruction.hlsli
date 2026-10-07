@@ -138,18 +138,12 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 	// Fetch the grass type after culling to avoid the four-sample lookup for rejected blades.
 	uint type;
-	ComputeGrassType(type, packedGrassCell, mapSamplePos, typeRandom);
+	ComputeGrassType(type, packedGrassCell, mapSamplePos, typeRandom, bladeWorldPos2D, float(hash.z & 0xFFFFu) * (1.0f / 65536.0f));
 	if (type == 0u && !cullsDisabled)
 		return false;
 	type = max(type, 1u);
 
 	GrassGeneratorType generatorType = generatorGrassType[type];
-#if defined(FAR_LOD)
-	if (!baseCandidate) {
-		bladeWorldZ = TerrainHeightSlopeAt(terrainSlope, bladeWorldPos2D, quadWorldPos, quadrant, hasLand);
-		terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
-	}
-#endif
 #if !defined(LOW_LOD) || defined(FAR_LOD)
 	if (!cullsDisabled && (terrainNormalZ < generatorType.maxSlope || terrainNormalZ > generatorType.minSlope))
 		return false;
@@ -180,13 +174,38 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 	if (!cullsDisabled && objectClearance <= occlusionParams.w)
 		return false;
+
+	float canopyBlend = GetTerrainCanopyDistanceBlend(bladeWorldPos2D);
+	float canopyDither = float(initialHash.x) * UINT_TO_FLOAT;
+	if (!cullsDisabled)
+		viewPos.z += GetTerrainLift(bladeWorldPos2D, bladeWorldZ);
+	[branch] if (!cullsDisabled && canopyDither < canopyBlend)
+	{
+		canopyBlend *= GetTerrainCanopyInterior(viewPos);
+		[branch] if (canopyDither < canopyBlend)
+		{
+			uint4 canopyTypes;
+			float4 canopyWeights;
+			if (LoadTerrainCanopyTypes(bladeWorldPos2D, canopyTypes, canopyWeights) && any(canopyTypes != 0u))
+				return false;
+		}
+	}
+
+	// Test the lifted root before the clump search; Far does not displace roots toward clumps.
+	if (!cullsDisabled && IsRootUnderObject(viewPos, terrainSlope))
+		return false;
 #endif
 
 	// Delay the nine-cell clump search until after the inexpensive rejection tests.
 	uint clumpRand;
 	float clumpDist;
 	float2 clumpDir;
+#if defined(FAR_LOD)
+	// Far only needs rough clump traits: each blade takes its own cell's clump rather than searching nine cells.
+	Random::GetVoronoiCellFeature2D(bladeWorldPos2D * generatorType.inverseClumpGridSize, clumpRand, clumpDist, clumpDir);
+#else
 	Random::FindNearestVoronoi2D(bladeWorldPos2D * generatorType.inverseClumpGridSize, clumpRand, clumpDist, clumpDir);
+#endif
 
 	// Height, facing, lean, and colour belong to the whole Voronoi cell. Only the pull and base AO fall off with distance.
 	float clumpDensity = 1.0f - smoothstep(0.15f, 0.50f, clumpDist);
@@ -227,9 +246,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 		// A root outside the frustum can still produce visible blade geometry near the edge.
 		float widthExtent = generatorType.width * 2.5f * 1.3f;
 #	if defined(LOW_LOD)
-		widthExtent *= 2.0f * (1.0f + miscParams.z);
-#	elif defined(MID_LOD)
-		widthExtent *= 1.41421356f * (1.0f + miscParams.z);
+		widthExtent *= DistantWidthScale * (1.0f + miscParams.z);
 #	else
 		widthExtent *= 1.0f + miscParams.z;
 #	endif
@@ -251,14 +268,9 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 		return false;
 #endif
 
-#if defined(LOW_LOD)
+#if defined(LOW_LOD) && !defined(FAR_LOD)
 	if (!cullsDisabled) {
 		viewPos.z += GetTerrainLift(bladeWorldPos2D, bladeWorldZ);
-#	if defined(FAR_LOD)
-		// Test the raised root: terrain LOD that the lift accounts for must not count as an object above it.
-		if (IsRootUnderObject(viewPos, terrainSlope))
-			return false;
-#	endif
 	}
 #endif
 
@@ -293,10 +305,10 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 		float clumpLeanAngle = float(Random::pcg(leanState)) * UINT_TO_FLOAT * Math::TAU;
 		clumpedAngle = Math::LerpAngle(clumpedAngle, clumpLeanAngle, generatorType.clumpLeanFactor);
 	}
-	if (miscParams.y > 0.0f) {
+	if (generatorType.slopeFacing > 0.0f) {
 		float steepness = sqrt(saturate(1.0f - terrainNormalZ * terrainNormalZ));
 		if (steepness > 1e-4f)
-			clumpedAngle = Math::LerpAngle(clumpedAngle, atan2(-terrainSlope.y, -terrainSlope.x), miscParams.y * steepness);
+			clumpedAngle = Math::LerpAngle(clumpedAngle, atan2(-terrainSlope.y, -terrainSlope.x), generatorType.slopeFacing * steepness);
 	}
 
 	// Turn toward the wind without rotating beyond it.
@@ -343,7 +355,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	// Switch single blades after the Mid handoff, only when their tip is narrower than half a pixel.
 	float outerStart = lodFadeIn.x + rcp(max(lodFadeIn.y, 1.0e-6f));
 	float outerKeep = saturate((length(bladeWorldPos2D - grassLodOrigin) - outerStart) * (1.0f / 1024.0f));
-	float lowTipWidth = generatorType.width * 5.0f * lerp(0.45f, 1.3f, float(packedWidth) * (1.0f / 255.0f)) * 0.06f;
+	float lowTipWidth = generatorType.width * 2.5f * DistantWidthScale * lerp(0.45f, 1.3f, float(packedWidth) * (1.0f / 255.0f)) * 0.06f;
 	float tipViewDepth = mul(FrameBuffer::CameraViewProjUnjittered, float4(viewPos, 1.0f)).w - generatorType.height;
 	float projectedTipWidth = lowTipWidth * max(cameraViewRow0Sum + abs(FrameBuffer::CameraProj._m00) * miscParams.z, cameraViewRow1Sum) /
 	                          (max(tipViewDepth, 1.0f) * min(dynamicResolutionInverted.x, dynamicResolutionInverted.y));
@@ -359,35 +371,24 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	// Keep the geometry hash independent of the camera-dependent view-thickening byte.
 	uint stableBladeHash = (hash.z << 12) | ((clumpRand & 15u) << 8) | type;
 
-#if defined(MID_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
+#if defined(MID_LOD) || defined(HIGH_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
+	// Every near tier widens a blade toward the view as it turns edge-on, from either side, for each double-blade facing.
 	float2 viewOffset = grassLodOrigin - bladeWorldPos2D;
 	float2 viewDirection = viewOffset * rsqrt(max(dot(viewOffset, viewOffset), 1.0e-4f));
-	float viewDotNormal = abs(dot(randFacing, viewDirection));
-	float viewDotNormal2 = viewDotNormal * viewDotNormal;
-	float viewThicken = 1.0f - viewDotNormal2 * viewDotNormal2;
-
 	float2 rotatedFacing = float2(randFacing.x * 0.8660254f - randFacing.y * 0.5f, randFacing.x * 0.5f + randFacing.y * 0.8660254f);
-	float rotatedViewDotNormal = abs(dot(rotatedFacing, viewDirection));
-	float rotatedViewDotNormal2 = rotatedViewDotNormal * rotatedViewDotNormal;
-	float rotatedViewThicken = 1.0f - rotatedViewDotNormal2 * rotatedViewDotNormal2;
-
-	uint packedViewThicken = (uint)round(saturate(viewThicken) * 15.0f) | (uint)round(saturate(rotatedViewThicken) * 15.0f) << 4;
+	float2 viewDotNormal2 = float2(dot(randFacing, viewDirection), dot(rotatedFacing, viewDirection));
+	viewDotNormal2 *= viewDotNormal2;
+	float2 viewThicken = saturate(1.0f - viewDotNormal2 * viewDotNormal2);
+	uint2 packedViewThickens = (uint2)round(viewThicken * 15.0f);
+#endif
+#if defined(MID_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
+	uint packedViewThicken = packedViewThickens.x | packedViewThickens.y << 4;
 	uint packedClumpDensity = (uint)round(clumpDensity * 255.0f);
 	uint hashClumpAndGrassType = type | (clumpRand & 0xFFu) << 8 | packedViewThicken << 16 | packedClumpDensity << 24;
 #elif defined(HIGH_LOD)
-	float2 viewOffset = grassLodOrigin - bladeWorldPos2D;
-	float2 viewDirection = viewOffset * rsqrt(max(dot(viewOffset, viewOffset), 1.0e-4f));
-	float viewDotNormal = saturate(dot(randFacing, viewDirection));
-	float viewDotNormal2 = viewDotNormal * viewDotNormal;
-	float viewThicken = (1.0f - viewDotNormal2 * viewDotNormal2) * smoothstep(0.0f, 0.2f, viewDotNormal);
-
-	float2 rotatedFacing = float2(randFacing.x * 0.8660254f - randFacing.y * 0.5f, randFacing.x * 0.5f + randFacing.y * 0.8660254f);
-	float rotatedViewDotNormal = saturate(dot(rotatedFacing, viewDirection));
-	float rotatedViewDotNormal2 = rotatedViewDotNormal * rotatedViewDotNormal;
-	float rotatedViewThicken = (1.0f - rotatedViewDotNormal2 * rotatedViewDotNormal2) * smoothstep(0.0f, 0.2f, rotatedViewDotNormal);
-
+	// High has one nibble for both facings; the canopy takes the top byte.
 	uint packedClumpDensity = (uint)round(clumpDensity * 15.0f);
-	uint packedViewThicken = (uint)round(saturate(max(viewThicken, rotatedViewThicken)) * 15.0f);
+	uint packedViewThicken = max(packedViewThickens.x, packedViewThickens.y);
 	uint hashClumpAndGrassType = type | (clumpRand & 0xFFu) << 8 | packedClumpDensity << 16 | packedViewThicken << 20;
 #else
 	uint hashClumpAndGrassType = stableBladeHash;
@@ -408,28 +409,46 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	uint4 packedDirections = (uint4)round(saturate(float4(facingCos, facingSin, tiltSin, tiltCos) * 0.5f + 0.5f) * 255.0f);
 	b.facingTilt = packedDirections.x | packedDirections.y << 8 | packedDirections.z << 16 | packedDirections.w << 24;
 
-	uint packedClumpDensity = (uint)round(clumpDensity * 255.0f);
+	uint packedClumpDensity = (uint)round(clumpDensity * 15.0f);
 	uint packedRandBend = (uint)round(saturate(float(tiltHash.y) * UINT_TO_FLOAT) * 15.0f);
-	b.seedAndType = packedClumpDensity << 24 | packedRandBend << 20 | (clumpRand & 0xFFu) << 8 | (type & 0xFFu);
+	// The terrain normal orients the distant canopy and its ground-facing sunlight.
+	uint packedTerrainNormal = PackFarTerrainNormal(-terrainSlope * terrainNormalZ);
+	b.seedAndType = packedClumpDensity << 28 | packedTerrainNormal | packedRandBend << 20 | (clumpRand & 0xFFu) << 8 | (type & 0xFFu);
 
 	// Mirror the Far VS: packed root and directions, distance widening, and coverage compensation.
 	float3 packedRoot = float3(f16tof32(b.posXY >> 16), f16tof32(b.posXY), f16tof32(b.posZWidthHeight >> 16));
 	float4 packedDirectionValues = float4(packedDirections) * (2.0f / 255.0f) - 1.0f;
-	float2 farTip = packedDirectionValues.zw * (generatorType.height * float(packedHeight) * (1.0f / 255.0f));
-	float3 packedTip = packedRoot + float3(packedDirectionValues.xy * farTip.x, farTip.y);
 	float2 farRootOffset = packedRoot.xy + FrameBuffer::CameraPosAdjust.xy - grassLodOrigin;
+	float farHeight = generatorType.height * float(packedHeight) * (1.0f / 255.0f) * GetFarHeightScale(farRootOffset, FrameBuffer::CameraProj._m00);
+	float2 farTip = packedDirectionValues.zw * farHeight;
+	float3 packedTip = packedRoot + float3(packedDirectionValues.xy * farTip.x, farTip.y);
 	float2 farCoverage = GetFarCoverage(farRootOffset, FrameBuffer::CameraProj._m00);
 	float farWidth = generatorType.width * 2.5f * lerp(0.45f, 1.3f, float(packedWidth) * (1.0f / 255.0f)) *
-	                 lerp(2.0f, 32.0f, farCoverage.x) * farCoverage.y;
-	if (IsBladeOccluded(packedRoot, packedTip, farWidth + 1.0f, cullsDisabled))
+	                 GetFarWidthScale(farRootOffset) * farCoverage.y;
+	// The test widens perpendicular to the direction it is given; Far's width lies across the view.
+	float2 farViewDirection = packedRoot.xy * rsqrt(max(dot(packedRoot.xy, packedRoot.xy), 1.0f));
+	bool farOccluded = IsFarTriangleOccluded(packedRoot, packedTip, farViewDirection, farWidth, cullsDisabled);
+#	if defined(FAR_DOUBLE_GEOMETRY)
+	// Handoff extras draw a second blade on a nearby root, turned 30 degrees; keep the pair while either blade shows.
+	outerGeometry = !baseCandidate;
+	if (farOccluded && outerGeometry) {
+		float2 turnedFacing = float2(dot(packedDirectionValues.xy, float2(0.8660254f, -0.5f)), dot(packedDirectionValues.xy, float2(0.5f, 0.8660254f)));
+		float3 secondRoot = packedRoot + float3(GetFarDoubleRootOffset(b.seedAndType, b.posZWidthHeight), 0.0f);
+		float3 turnedTip = secondRoot + float3(turnedFacing * farTip.x, farTip.y);
+		farOccluded = IsFarTriangleOccluded(secondRoot, turnedTip, farViewDirection, farWidth, cullsDisabled);
+	}
+#	endif
+	if (farOccluded)
 		return false;
 #else
 	uint packedRandBend = (uint)round(saturate(float(tiltHash.y) * UINT_TO_FLOAT) * 15.0f);
 
 #	if !defined(LOW_LOD)
-	// Only detailed materials consume the packed per-blade colour seed.
+	// Only detailed materials consume the packed per-blade colour. Outer High blades skip it, but their statistical
+	// blade shadows still seed from these bits, so give them a stable random value instead of one shared by every blade.
 	uint packedBladeColor = 0u;
 #		if defined(HIGH_GEOMETRY_LOD)
+	packedBladeColor = tiltHash.y & 0xFFFu;
 	[branch] if (!outerGeometry)
 #		endif
 	{
@@ -462,7 +481,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	uint lowTiltY = f32tof16(tiltCos);
 	float2 lowTip = float2(f16tof32(lowTiltX), f16tof32(lowTiltY)) * lowDrawHeight;
 	float lowWidthScale = float(packedWidth) * (1.0f / 255.0f);
-	float lowRandWidth = generatorType.width * 5.0f * lerp(0.45f, 1.3f, lowWidthScale);
+	float lowRandWidth = generatorType.width * 2.5f * DistantWidthScale * lerp(0.45f, 1.3f, lowWidthScale);
 	float2 packedFacingValue = float2(packedFacing) * (1.0f / 127.0f);
 	float packedWidthValue = f16tof32(f32tof16(lowRandWidth));
 	float2 lowBaseAxis = float2(-packedFacingValue.y, packedFacingValue.x) * packedWidthValue;
@@ -510,6 +529,12 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float appearanceDistance = ApproximateGrassDistance(bladeWorldPos2D - grassLodOrigin);
 	uint packedLodDistance = (uint)round(saturate(appearanceDistance * (1.0f / 6144.0f)) * 65535.0f);
 	b.tipDir = packedTilt.x | packedTilt.y << 8 | packedLodDistance << 16;
+#		if defined(MID_OUTER_GEOMETRY)
+	// Once fully morphed to Low's straight profile, a single blade's middle rung lies on the edges between base and
+	// tip, so one triangle draws it. Double blades keep the inner geometry for their two halves.
+	bool midDoubleBlade = generatorType.height * float(packedHeight) * (1.0f / 255.0f) <= 45.0f;
+	outerGeometry = packedLodDistance == 65535u && !midDoubleBlade;
+#		endif
 #	else
 	b.tipDir = f32tof16(lowTip.x) << 16 | f32tof16(lowTip.y);
 #	endif
