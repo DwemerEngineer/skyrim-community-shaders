@@ -22,6 +22,27 @@ float SampleLandHeight(float2 world2D)
 	return lerp(heightMapZRange.x, heightMapZRange.y, TerrainHeightTexture.SampleLevel(LinearSampler, world2D * heightMapScale + heightMapOffset, 0));
 }
 
+// LOD terrain vertices are LAND samples, so its surface cannot rise above the highest LAND around it.
+static const float LodTerrainLiftMargin = 8.0f;
+static const float2 LodTerrainVertexReach = float2(256.0f, 512.0f);
+
+/**
+ * @brief Returns the highest a LOD terrain surface can be at a position: the highest LAND within a LOD triangle's reach.
+ * Flat-topped rocks and ledges pass the steep-face test, but their tops stand above all nearby LAND.
+ */
+float GetLodTerrainHeightBound(float2 world2D, float landHeight)
+{
+	static const float2 Directions[8] = { float2(1.0f, 0.0f), float2(0.70710678f, 0.70710678f), float2(0.0f, 1.0f), float2(-0.70710678f, 0.70710678f),
+		float2(-1.0f, 0.0f), float2(-0.70710678f, -0.70710678f), float2(0.0f, -1.0f), float2(0.70710678f, -0.70710678f) };
+	float highest = landHeight;
+	[unroll] for (uint ring = 0u; ring < 2u; ++ring)
+	{
+		[unroll] for (uint direction = 0u; direction < 8u; ++direction)
+			highest = max(highest, SampleLandHeight(world2D + Directions[direction] * LodTerrainVertexReach[ring]));
+	}
+	return highest + LodTerrainLiftMargin;
+}
+
 /** @brief Projects a camera-relative position; xy is its scene-depth pixel, z its depth, and w is positive when it is on screen. */
 float4 ProjectToSceneDepth(float3 position)
 {
@@ -37,57 +58,92 @@ float DistanceOutsideLoadedLand(float2 world2D)
 	return max(outside.x, outside.y);
 }
 
+/** @brief Reconstructs the world position at a scene-depth sample. */
+float3 GetSurfacePosition(float2 pixel, float depth)
+{
+	float2 ndc = pixel * dynamicResolutionInverted * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
+	float4 position = mul(FrameBuffer::CameraViewProjInverse, float4(ndc, depth, 1.0f));
+	return position.xyz / position.w + FrameBuffer::CameraPosAdjust.xyz;
+}
+
+/** @brief Samples depth at the projected point without snapping the probe to a screen pixel. */
+bool SampleSurfaceDepth(float3 position, out float4 probe, out float depth)
+{
+	probe = ProjectToSceneDepth(position);
+	depth = 1.0f;
+	if (probe.w < 0.0f || any(probe.xy < 2.0f) || any(probe.xy + 2.0f >= rcp(dynamicResolutionInverted)))
+		return false;
+
+	depth = SceneDepth.SampleLevel(LinearSampler, probe.xy * dynamicResolutionInverted, 0);
+	return depth < 1.0f;
+}
+
 /**
- * @brief Measures the rendered terrain's absolute height at a cell centre near or outside the loaded LAND boundary.
- * Returns `previous` when the cell cannot be measured this frame, so cells keep what was seen when last visible.
+ * @brief Finds the visible terrain height on the world-space vertical through a cache sample.
+ * Returns the cached reference when foreground geometry or a silhouette prevents a measurement.
  */
 float MeasureHeight(float2 world2D, float previous)
 {
 	const bool forwardPerspective = FrameBuffer::CameraProj._m32 == 1.0f && FrameBuffer::CameraProj._m33 == 0.0f && FrameBuffer::CameraProj._m23 < 0.0f;
 	const float landHeight = SampleLandHeight(world2D);
 	const float3 root = float3(world2D, landHeight) - FrameBuffer::CameraPosAdjust.xyz;
-	const float4 rootPixel = ProjectToSceneDepth(root);
-	if (!forwardPerspective || rootPixel.w < 0.0f)
+	float4 probe;
+	float depth;
+	if (!forwardPerspective || !SampleSurfaceDepth(root, probe, depth))
 		return previous;
 
-	// When the LAND height itself is visible, the rendered terrain is not above it.
-	const float sceneDepth = SceneDepth.Load(int3(rootPixel.xy, 0));
-	if (sceneDepth >= rootPixel.z)
-		return landHeight + 4.0f;
+	float lower = 0.0f;
+	float upper = 0.0f;
 
-	// Include the overlap of simplified LOD triangles with loaded LAND.
-	const float2 sceneNDC = (floor(rootPixel.xy) + 0.5f) * dynamicResolutionInverted * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
-	float4 scenePosition = mul(FrameBuffer::CameraViewProjInverse, float4(sceneNDC, sceneDepth, 1.0f));
-	scenePosition.xyz = scenePosition.xyz / scenePosition.w + FrameBuffer::CameraPosAdjust.xyz;
+	// A root already in front of the scene needs no lift, but must still belong to the sampled terrain surface.
+	// Otherwise bracket the surface within the existing lift bound.
+	[branch] if (probe.z > depth)
+	{
+		upper = TerrainLiftMax;
+		if (!SampleSurfaceDepth(root + float3(0.0f, 0.0f, upper), probe, depth) || probe.z > depth)
+			return previous;
+
+		[unroll] for (uint iteration = 0u; iteration < 8u; ++iteration)
+		{
+			float middle = (lower + upper) * 0.5f;
+			if (!SampleSurfaceDepth(root + float3(0.0f, 0.0f, middle), probe, depth))
+				return previous;
+			if (probe.z > depth)
+				lower = middle;
+			else
+				upper = middle;
+		}
+	}
+
+	// Validate the surface at the intersection and retain the reference at silhouettes or object faces.
+	if (!SampleSurfaceDepth(root + float3(0.0f, 0.0f, upper), probe, depth))
+		return previous;
+	float3 scenePosition = GetSurfacePosition(probe.xy, depth);
 	const float sceneLift = scenePosition.z - SampleLandHeight(scenePosition.xy);
 	if (DistanceOutsideLoadedLand(scenePosition.xy) <= -TerrainLodOverlapMargin || sceneLift < -8.0f || sceneLift > TerrainLiftMax)
 		return previous;
-
-	// Terrain seen at a grazing angle recedes quickly up the screen, while rock, ledge, and trunk faces keep nearly
-	// the same depth. Require at least the recession of a 45 degree slope across two rows.
-	const float sceneViewDepth = FrameBuffer::CameraProj._m23 / (sceneDepth - FrameBuffer::CameraProj._m22);
-	const float upperViewDepth = FrameBuffer::CameraProj._m23 / (SceneDepth.Load(int3(rootPixel.xy, 0), int2(0, -2)) - FrameBuffer::CameraProj._m22);
-	if (upperViewDepth - sceneViewDepth < sceneViewDepth * 4.0f * dynamicResolutionInverted.y / abs(FrameBuffer::CameraProj._m11))
+	if (dot(scenePosition.xy - world2D, scenePosition.xy - world2D) > 128.0f * 128.0f)
 		return previous;
 
-	// The vertical line above the root leaves the visible surface at the rendered terrain height.
-	// A root still covered at the limit is behind a real hill instead.
-	float lowLift = 0.0f;
-	float highLift = min(sceneLift * 2.0f + 32.0f, TerrainLiftMax);
-	const float4 limitPixel = ProjectToSceneDepth(root + float3(0.0f, 0.0f, highLift));
-	if (limitPixel.w < 0.0f || SceneDepth.Load(int3(limitPixel.xy, 0)) < limitPixel.z)
+	float4 depths = float4(
+		SceneDepth.SampleLevel(LinearSampler, (probe.xy + float2(-1.0f, -1.0f)) * dynamicResolutionInverted, 0),
+		SceneDepth.SampleLevel(LinearSampler, (probe.xy + float2(1.0f, -1.0f)) * dynamicResolutionInverted, 0),
+		SceneDepth.SampleLevel(LinearSampler, (probe.xy + float2(-1.0f, 1.0f)) * dynamicResolutionInverted, 0),
+		SceneDepth.SampleLevel(LinearSampler, (probe.xy + float2(1.0f, 1.0f)) * dynamicResolutionInverted, 0));
+	if (any(depths >= 1.0f))
 		return previous;
-	for (uint i = 0u; i < 5u; ++i) {
-		const float probeLift = (lowLift + highLift) * 0.5f;
-		const float4 probePixel = ProjectToSceneDepth(root + float3(0.0f, 0.0f, probeLift));
-		if (SceneDepth.Load(int3(probePixel.xy, 0)) < probePixel.z)
-			lowLift = probeLift;
-		else
-			highLift = probeLift;
-	}
 
-	// Use the first uncovered height; a lower estimate can bury short Far blades.
-	return landHeight + highLift + 1.0f;
+	float3 corner = GetSurfacePosition(probe.xy + float2(-1.0f, -1.0f), depths.x);
+	float3 right = GetSurfacePosition(probe.xy + float2(1.0f, -1.0f), depths.y);
+	float3 down = GetSurfacePosition(probe.xy + float2(-1.0f, 1.0f), depths.z);
+	float3 diagonal = GetSurfacePosition(probe.xy + float2(1.0f, 1.0f), depths.w);
+	float3 normal = cross(right - corner, down - corner);
+	float normalLengthSquared = dot(normal, normal);
+	if (normalLengthSquared < 1.0e-8f || normal.z * normal.z < 0.5f * normalLengthSquared ||
+		abs(dot(normal, diagonal - corner)) > LodTerrainLiftMargin * abs(normal.z))
+		return previous;
+
+	return landHeight + upper + 4.0f;
 }
 
 [numthreads(8, 8, 1)] void main(uint3 dispatchID : SV_DispatchThreadID) {
@@ -112,6 +168,11 @@ float MeasureHeight(float2 world2D, float previous)
 	// Unknown cells stay on LAND. The generator caps interpolated lift at the cached surface height.
 	const bool valid = measured < InvalidSurfaceHeight;
 	const float landHeight = SampleLandHeight(world2D);
-	AppliedLift[texel] = valid ? max(measured - landHeight, 0.0f) : 0.0f;
-	AppliedHeight[texel] = valid ? measured : landHeight;
+	float appliedHeight = valid ? measured : landHeight;
+	[branch] if (appliedHeight > landHeight + LodTerrainLiftMargin)
+	{
+		appliedHeight = min(appliedHeight, GetLodTerrainHeightBound(world2D, landHeight));
+	}
+	AppliedLift[texel] = max(appliedHeight - landHeight, 0.0f);
+	AppliedHeight[texel] = appliedHeight;
 }
