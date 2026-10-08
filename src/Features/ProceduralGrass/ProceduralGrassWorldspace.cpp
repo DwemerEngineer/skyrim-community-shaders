@@ -1,5 +1,8 @@
 #include "Features/ProceduralGrass.h"
 
+#include "Globals.h"
+#include "TopDownOcclusion.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -11,6 +14,19 @@ namespace
 	constexpr int32_t FloorDiv2(int32_t a)
 	{
 		return a >= 0 ? a / 2 : -((-a + 1) / 2);
+	}
+
+	PGrassCommon::Quadrant MakeObjectQuadrant(const TopDownOcclusion::GrassSurfaceQuadrant& surface, bool nearCovered)
+	{
+		PGrassCommon::Quadrant quadrant{};
+		quadrant.cellX = FloorDiv2(surface.x);
+		quadrant.cellY = FloorDiv2(surface.y);
+		quadrant.x = surface.x - quadrant.cellX * 2;
+		quadrant.y = surface.y - quadrant.cellY * 2;
+		quadrant.nearCovered = nearCovered;
+		quadrant.worldPos = { surface.x * 2048.0f, surface.y * 2048.0f };
+		quadrant.minHeight = quadrant.maxHeight = PGrassCommon::QuadrantNoHeight;
+		return quadrant;
 	}
 
 	/** @brief Builds a quadrant from streamed LAND data for one of a cell's four quadrants. */
@@ -324,6 +340,8 @@ uint64_t ProceduralGrass::ComputeNearVisibilityStamp(RE::TESWorldSpace* landWorl
 	PGrassCommon::GrassHashValue(stamp, grassMapCacheVersion);
 	PGrassCommon::GrassHashValue(stamp, settings.debugIgnorePreProcessedFlag);
 	PGrassCommon::GrassHashValue(stamp, cellCount);
+	const auto* topDown = globals::topDownOcclusion;
+	PGrassCommon::GrassHashValue(stamp, topDown->GetGrassSurfaceSRV() ? topDown->GetGrassSurfaceRevision() : 0u);
 
 	for (uint32_t i = 0; i < cellCount; ++i) {
 		const auto cell = cells->cells[i];
@@ -473,6 +491,25 @@ void ProceduralGrass::RebuildNearQuadrants(const RE::GridCellArray* cells, const
 				if (md <= PGrassCommon::LowTierQuadrantRadius)
 					quadrantsPresence.push_back(quadrant);
 			}
+		}
+	}
+
+	if (const auto* topDown = globals::topDownOcclusion; topDown->GetGrassSurfaceSRV()) {
+		const auto appendMissing = [](auto& quadrants, const auto& quadrant, size_t capacity) {
+			if (quadrants.size() < capacity && std::ranges::none_of(quadrants, [&](const auto& existing) {
+					return existing.cellX == quadrant.cellX && existing.cellY == quadrant.cellY && existing.x == quadrant.x && existing.y == quadrant.y;
+				}))
+				quadrants.push_back(quadrant);
+		};
+		for (const auto& [key, surface] : topDown->GetGrassSurfaceQuadrants()) {
+			const int32_t md = std::max(std::abs(origin.quadrantX - surface.x), std::abs(origin.quadrantY - surface.y));
+			const auto quadrant = MakeObjectQuadrant(surface, true);
+			if (md <= PGrassCommon::HighTierQuadrantRadius)
+				appendMissing(quadrantsHighLOD, quadrant, PGrassCommon::HighTierQuadrantCap);
+			if (md >= PGrassCommon::HighTierQuadrantRadius - 1 && md <= PGrassCommon::MidTierQuadrantRadius)
+				appendMissing(quadrantsMidLOD, quadrant, PGrassCommon::MidTierQuadrantCap);
+			if (md >= PGrassCommon::MidTierQuadrantRadius - 2 && md <= NearCoverageRadius)
+				appendMissing(quadrantsLowLOD, quadrant, PGrassCommon::LowTierQuadrantCap);
 		}
 	}
 
@@ -649,6 +686,28 @@ void ProceduralGrass::UpdateFarQuadrants(RE::TESWorldSpace* landWorldSpace, cons
 				}
 				++quadrantCount;
 			}
+		}
+	}
+
+	if (const auto* topDown = globals::topDownOcclusion; topDown->GetGrassSurfaceSRV()) {
+		std::unordered_set<uint64_t> present;
+		for (size_t i = 0; i < quadrantCount; ++i) {
+			const auto& quadrant = quadrantsFarLOD[i];
+			present.insert(PGrassCommon::GrassQuadrantKey(quadrant.cellX * 2 + quadrant.x, quadrant.cellY * 2 + quadrant.y));
+		}
+		for (const auto& [key, surface] : topDown->GetGrassSurfaceQuadrants()) {
+			if (present.contains(key) || quadrantCount >= PGrassCommon::FarQuadrantCount)
+				continue;
+			const int32_t index = NearCoverageIndex(surface.x, surface.y, origin);
+			const auto quadrant = MakeObjectQuadrant(surface, index >= 0 && nearCoveredQuadrants[index]);
+			if (quadrantCount < quadrantsFarLOD.size()) {
+				contentChanged |= quadrantsFarLOD[quadrantCount] != quadrant;
+				quadrantsFarLOD[quadrantCount] = quadrant;
+			} else {
+				quadrantsFarLOD.push_back(quadrant);
+				contentChanged = true;
+			}
+			++quadrantCount;
 		}
 	}
 

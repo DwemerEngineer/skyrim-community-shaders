@@ -59,29 +59,32 @@ bool LoadGrassPresenceIds(float2 worldPosition, out uint4 ids, out float4 weight
 	return true;
 }
 
-/**
- * @brief Returns the share of blades the generator's object test keeps, tent-filtered over 4x4 occlusion map texels so
- * the darkening fades over about two texels at object edges instead of stepping texel by texel.
- */
-float GetObjectCoverage(float3 rootPosition)
+/** @brief Builds a normalized tent filter over 4x4 occlusion texels. */
+bool GetDarkeningFilter(float2 worldPosition, out float2 base, out float4 weightsX, out float4 weightsY)
 {
 	float dim = float(occlusionMapDim);
-	float2 texel = ((rootPosition.xy - occlusionParams.xy) * occlusionInvExtent + 0.5f) * dim - 0.5f;
-	float2 base = floor(texel) - 1.0f;
-	// The generator culls nothing outside the map.
-	if (any(base < 0.0f) || any(base + 3.0f >= dim))
-		return 1.0f;
+	float2 texel = ((worldPosition - occlusionParams.xy) * occlusionInvExtent + 0.5f) * dim - 0.5f;
+	base = floor(texel) - 1.0f;
+	float2 f = frac(texel);
+	weightsX = float4(1.0f - f.x, 2.0f - f.x, 1.0f + f.x, f.x) * 0.25f;
+	weightsY = float4(1.0f - f.y, 2.0f - f.y, 1.0f + f.y, f.y) * 0.25f;
+	return all(base >= 0.0f) && all(base + 3.0f < dim);
+}
 
-	// Tent weights of radius two texels for the four texels along each axis; each set sums to one.
-	float2 f = texel - floor(texel);
-	float4 weightsX = float4(1.0f - f.x, 2.0f - f.x, 1.0f + f.x, f.x) * 0.25f;
-	float4 weightsY = float4(1.0f - f.y, 2.0f - f.y, 1.0f + f.y, f.y) * 0.25f;
+/** @brief Filters the generator's object clearance test across nearby LAND roots. */
+float GetObjectCoverage(float3 rootPosition)
+{
+	float2 base;
+	float4 weightsX, weightsY;
+	// The generator culls nothing outside the map.
+	if (!GetDarkeningFilter(rootPosition.xy, base, weightsX, weightsY))
+		return 1.0f;
 
 	float keep = 0.0f;
 	[unroll] for (uint block = 0u; block < 4u; ++block)
 	{
 		uint2 blockIndex = uint2(block & 1u, block >> 1u);
-		float2 gatherUV = (base + float2(blockIndex) * 2.0f + 1.0f) / dim;
+		float2 gatherUV = (base + float2(blockIndex) * 2.0f + 1.0f) / float(occlusionMapDim);
 		// Gather returns (0,1), (1,1), (1,0), (0,0) of the 2x2 texels around the shared corner.
 		float4 texelKeep = GetObjectTexelKeep(OcclusionMaskHigh.Gather(LinearSampler, gatherUV),
 			OcclusionMaskLow.Gather(LinearSampler, gatherUV), rootPosition.z);
@@ -124,6 +127,37 @@ float GetGrassDarkeningCoverage(float3 rootPosition)
 	return coverage * GetObjectCoverage(rootPosition);
 }
 
+/** @brief Filters the cliff footprint inward, including blockers and discontinuities in the captured surface. */
+float GetGrassObjectDarkeningCoverage(float2 worldPosition, float height, float2 slope, uint type)
+{
+	float dim = float(occlusionMapDim);
+	float texelWidth = GetGrassObjectTexelWidth();
+	float2 base;
+	float4 weightsX, weightsY;
+	if (!GetDarkeningFilter(worldPosition, base, weightsX, weightsY))
+		return 0.0f;
+
+	float2 heightStep = slope * texelWidth;
+	float coverage = 0.0f;
+	[unroll] for (uint block = 0u; block < 4u; ++block)
+	{
+		uint2 blockIndex = uint2(block & 1u, block >> 1u);
+		float2 corner = base + float2(blockIndex) * 2.0f;
+		float2 gatherUV = (corner + 1.0f) / dim;
+		uint4 types = uint4(GrassObjectSurfaces.GatherAlpha(LinearSampler, gatherUV)) & 0xFFu;
+		float4 heights = GrassObjectSurfaces.GatherRed(LinearSampler, gatherUV);
+		float2 cornerWorld = GetGrassObjectTexelCentre(corner);
+		float cornerHeight = height + dot(slope, cornerWorld - worldPosition);
+		float4 planeHeights = cornerHeight + float4(heightStep.y, heightStep.x + heightStep.y, heightStep.x, 0.0f);
+		float4 keep = float4(types == type) * float4(abs(heights - planeHeights) <= GetGrassObjectHeightTolerance());
+		float2 wx = blockIndex.x == 0u ? weightsX.xy : weightsX.zw;
+		float2 wy = blockIndex.y == 0u ? weightsY.xy : weightsY.zw;
+		coverage += dot(keep, float4(wx.x * wy.y, wx.y * wy.y, wx.y * wy.x, wx.x * wy.x));
+	}
+	// Fade darkening ahead of the root inset at ledges and objects.
+	return smoothstep(0.75f, 1.0f, coverage);
+}
+
 float GetTerrainDarkeningWeight(float2 position)
 {
 	// Low writes depth after the blended copy was made. Shade its drawn height, not the terrain behind it.
@@ -144,6 +178,24 @@ float GetTerrainDarkeningWeight(float2 position)
 		return 0.0f;
 
 	float terrainZ = lerp(heightMapZRange.x, heightMapZRange.y, TerrainHeightTexture.SampleLevel(LinearSampler, world.xy * heightMapScale + heightMapOffset, 0));
+	[branch] if (miscParams.y > 0.0f) {
+		float objectHeight, objectDensity;
+		float2 objectSlope;
+		uint objectType;
+		float heightTolerance = GetGrassObjectHeightTolerance();
+		if (LoadGrassObjectSurface(world.xy, objectHeight, objectSlope, objectType, objectDensity) && objectHeight >= terrainZ - 2.0f && world.z >= objectHeight - 2.0f * heightTolerance) {
+			float normalZ = rsqrt(dot(objectSlope, objectSlope) + 1.0f);
+			GrassType type = grassType[objectType];
+			if (normalZ < type.maxSlope || normalZ > type.minSlope)
+				return 0.0f;
+			float heightWeight = smoothstep(-2.0f * heightTolerance, -heightTolerance, world.z - objectHeight);
+			heightWeight *= 1.0f - saturate((world.z - objectHeight) / max(grassAOParams.w, 1.0f));
+			if (heightWeight <= 0.0f || objectDensity <= 0.0f)
+				return 0.0f;
+			return weight * objectDensity * heightWeight * GetGrassObjectDarkeningCoverage(world.xy, objectHeight, objectSlope, objectType);
+		}
+	}
+
 	weight *= 1.0f - saturate((world.z - terrainZ) / max(grassAOParams.w, 1.0f));
 	[branch] if (weight > 0.0f)
 		weight *= GetGrassDarkeningCoverage(float3(world.xy, terrainZ));

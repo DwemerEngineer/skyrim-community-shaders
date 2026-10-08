@@ -117,7 +117,7 @@ bool PassesBladeLOD(float2 bladeWorldPos2D, bool cullsDisabled)
 
 // Finish one base or slope-fill candidate after establishing its terrain plane.
 bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D, float bladeWorldZ, float2 terrainSlope, float terrainNormalZ,
-	float2 quadWorldPos, uint quadrant, bool hasLand, uint packedGrassCell, bool cullsDisabled, bool insideFrustum, bool baseCandidate, out Blade b, out bool outerGeometry)
+	float2 quadWorldPos, uint quadrant, bool hasLand, uint packedGrassCell, bool cullsDisabled, bool insideFrustum, bool baseCandidate, bool objectSurface, out Blade b, out bool outerGeometry)
 {
 	b = (Blade)0;
 	outerGeometry = false;
@@ -138,7 +138,23 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 	// Fetch the grass type after culling to avoid the four-sample lookup for rejected blades.
 	uint type;
-	ComputeGrassType(type, packedGrassCell, mapSamplePos, typeRandom, bladeWorldPos2D, float(hash.z & 0xFFFFu) * (1.0f / 65536.0f));
+	float objectDensity = 0.0f;
+	float objectDensityRandom = 0.0f;
+	if (objectSurface) {
+		if (!LoadGrassObjectSurface(bladeWorldPos2D, bladeWorldZ, terrainSlope, type, objectDensity))
+			return false;
+		uint densityHash = initialHash.x ^ 0xB5297A4Du;
+		objectDensityRandom = float(Random::pcg(densityHash)) * UINT_TO_FLOAT;
+		if (objectDensityRandom >= objectDensity)
+			return false;
+		terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
+#if defined(FAR_LOD)
+		if (!IsGrassObjectInterior(bladeWorldPos2D, bladeWorldZ, terrainSlope, type))
+			return false;
+#endif
+	} else {
+		ComputeGrassType(type, packedGrassCell, mapSamplePos, typeRandom, bladeWorldPos2D, float(hash.z & 0xFFFFu) * (1.0f / 65536.0f));
+	}
 	if (type == 0u && !cullsDisabled)
 		return false;
 	type = max(type, 1u);
@@ -162,7 +178,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float objectClearance = 1.0e30f;
 #if defined(FAR_LOD)
 	worldPos = float3(bladeWorldPos2D, bladeWorldZ);
-	objectClearance = GetObjectClearance(worldPos, cullsDisabled);
+	objectClearance = objectSurface ? 1.0e30f : GetObjectClearance(worldPos, cullsDisabled);
 	viewPos = worldPos - FrameBuffer::CameraPosAdjust.xyz;
 
 	if (!insideFrustum) {
@@ -177,9 +193,9 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 	float canopyBlend = GetTerrainCanopyDistanceBlend(bladeWorldPos2D);
 	float canopyDither = float(initialHash.x) * UINT_TO_FLOAT;
-	if (!cullsDisabled)
+	if (!cullsDisabled && !objectSurface)
 		viewPos.z += GetTerrainLift(bladeWorldPos2D, bladeWorldZ);
-	[branch] if (!cullsDisabled && canopyDither < canopyBlend)
+	[branch] if (!cullsDisabled && !objectSurface && canopyDither < canopyBlend)
 	{
 		canopyBlend *= GetTerrainCanopyInterior(viewPos);
 		[branch] if (canopyDither < canopyBlend)
@@ -192,7 +208,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	}
 
 	// Test the lifted root before the clump search; Far does not displace roots toward clumps.
-	if (!cullsDisabled && IsRootUnderObject(viewPos, terrainSlope))
+	if (!cullsDisabled && !objectSurface && IsRootUnderObject(viewPos, terrainSlope))
 		return false;
 #endif
 
@@ -224,22 +240,39 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 #	if defined(LOW_LOD)
 	if (!PassesBladeLOD(bladeWorldPos2D, cullsDisabled))
 		return false;
-	float2 displacedQuadPos = bladeWorldPos2D - quadWorldPos;
-	if (hasLand && all(displacedQuadPos >= 0.0f) && all(displacedQuadPos < 2048.0f)) {
-		bladeWorldZ = TerrainHeightSlopeAt(terrainSlope, bladeWorldPos2D, quadWorldPos, quadrant, true);
-		terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
-	} else {
-		bladeWorldZ += dot(terrainSlope, clumpDisplace);
+	if (!objectSurface) {
+		float2 displacedQuadPos = bladeWorldPos2D - quadWorldPos;
+		if (hasLand && all(displacedQuadPos >= 0.0f) && all(displacedQuadPos < 2048.0f)) {
+			bladeWorldZ = TerrainHeightSlopeAt(terrainSlope, bladeWorldPos2D, quadWorldPos, quadrant, true);
+			terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
+		} else {
+			bladeWorldZ += dot(terrainSlope, clumpDisplace);
+		}
+		if (!cullsDisabled && (terrainNormalZ < generatorType.maxSlope || terrainNormalZ > generatorType.minSlope))
+			return false;
 	}
-	if (!cullsDisabled && (terrainNormalZ < generatorType.maxSlope || terrainNormalZ > generatorType.minSlope))
-		return false;
 #	else
 	bladeWorldZ += dot(terrainSlope, clumpDisplace);
 #	endif
 #endif
 #if !defined(FAR_LOD)
+	if (objectSurface) {
+		uint displacedType;
+		float displacedDensity;
+		if (!LoadGrassObjectSurface(bladeWorldPos2D, bladeWorldZ, terrainSlope, displacedType, displacedDensity) || displacedType != type)
+			return false;
+		terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
+		if (terrainNormalZ < generatorType.maxSlope || terrainNormalZ > generatorType.minSlope)
+			return false;
+		objectDensity = min(objectDensity, displacedDensity);
+		if (objectDensityRandom >= objectDensity)
+			return false;
+		if (!IsGrassObjectInterior(bladeWorldPos2D, bladeWorldZ, terrainSlope, type))
+			return false;
+	}
+
 	worldPos = float3(bladeWorldPos2D, bladeWorldZ);
-	objectClearance = GetObjectClearance(worldPos, cullsDisabled);
+	objectClearance = objectSurface ? 1.0e30f : GetObjectClearance(worldPos, cullsDisabled);
 	viewPos = worldPos - FrameBuffer::CameraPosAdjust.xyz;
 
 	if (!insideFrustum) {
@@ -269,7 +302,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 #endif
 
 #if defined(LOW_LOD) && !defined(FAR_LOD)
-	if (!cullsDisabled) {
+	if (!cullsDisabled && !objectSurface) {
 		viewPos.z += GetTerrainLift(bladeWorldPos2D, bladeWorldZ);
 	}
 #endif
@@ -413,7 +446,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	uint packedRandBend = (uint)round(saturate(float(tiltHash.y) * UINT_TO_FLOAT) * 15.0f);
 	// The terrain normal orients the distant canopy and its ground-facing sunlight.
 	uint packedTerrainNormal = PackFarTerrainNormal(-terrainSlope * terrainNormalZ);
-	b.seedAndType = packedClumpDensity << 28 | packedTerrainNormal | packedRandBend << 20 | (clumpRand & 0xFFu) << 8 | (type & 0xFFu);
+	b.seedAndType = packedClumpDensity << 28 | packedTerrainNormal | packedRandBend << 20 | (clumpRand & 0xFFu) << 8 | (objectSurface ? FAR_OBJECT_SURFACE : 0u) | (type & 0x7Fu);
 
 	// Mirror the Far VS: packed root and directions, distance widening, and coverage compensation.
 	float3 packedRoot = float3(f16tof32(b.posXY >> 16), f16tof32(b.posXY), f16tof32(b.posZWidthHeight >> 16));
@@ -431,11 +464,24 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 #	if defined(FAR_DOUBLE_GEOMETRY)
 	// Handoff extras draw a second blade on a nearby root, turned 30 degrees; keep the pair while either blade shows.
 	outerGeometry = !baseCandidate;
-	if (farOccluded && outerGeometry) {
-		float2 turnedFacing = float2(dot(packedDirectionValues.xy, float2(0.8660254f, -0.5f)), dot(packedDirectionValues.xy, float2(0.5f, 0.8660254f)));
+	if (outerGeometry && (farOccluded || objectSurface)) {
 		float3 secondRoot = packedRoot + float3(GetFarDoubleRootOffset(b.seedAndType, b.posZWidthHeight), 0.0f);
-		float3 turnedTip = secondRoot + float3(turnedFacing * farTip.x, farTip.y);
-		farOccluded = IsFarTriangleOccluded(secondRoot, turnedTip, farViewDirection, farWidth, cullsDisabled);
+		if (objectSurface) {
+			float secondHeight, secondDensity;
+			float2 secondSlope;
+			uint secondType;
+			float2 secondWorld = secondRoot.xy + FrameBuffer::CameraPosAdjust.xy;
+			outerGeometry = LoadGrassObjectSurface(secondWorld, secondHeight, secondSlope, secondType, secondDensity) && secondType == type &&
+				IsGrassObjectInterior(secondWorld, secondHeight, secondSlope, secondType);
+			float secondNormalZ = rsqrt(dot(secondSlope, secondSlope) + 1.0f);
+			outerGeometry = outerGeometry && objectDensityRandom < secondDensity && secondNormalZ >= generatorType.maxSlope && secondNormalZ <= generatorType.minSlope;
+			secondRoot.z = secondHeight - FrameBuffer::CameraPosAdjust.z;
+		}
+		if (farOccluded && outerGeometry) {
+			float2 turnedFacing = float2(dot(packedDirectionValues.xy, float2(0.8660254f, -0.5f)), dot(packedDirectionValues.xy, float2(0.5f, 0.8660254f)));
+			float3 turnedTip = secondRoot + float3(turnedFacing * farTip.x, farTip.y);
+			farOccluded = IsFarTriangleOccluded(secondRoot, turnedTip, farViewDirection, farWidth, cullsDisabled);
+		}
 	}
 #	endif
 	if (farOccluded)
@@ -509,6 +555,10 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 
 	float canopyDensity = lerp(1.0f, onMapDensity, densityEdgeFade);
 	float canopyAODensity = onMapDensity * densityEdgeFade;
+	if (objectSurface) {
+		canopyDensity = objectDensity;
+		canopyAODensity = objectDensity;
+	}
 	uint packedCanopy = (uint)round(canopyDensity * 15.0f) | (uint)round(canopyAODensity * 15.0f) << 4;
 	hashClumpAndGrassType |= packedCanopy << 24;
 

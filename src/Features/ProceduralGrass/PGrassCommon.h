@@ -269,7 +269,7 @@ namespace PGrassCommon
 		float4 grassFrameLight;   // xyz: resolved TRUE_PBR directional light, w: resolved grass brightness scale
 
 		float4 farParams;          // x: thin start, y: inverse range, z: Far candidate spacing, w: Far performance keep
-		float4 miscParams;         // x: grass map edge noise in world units, y: reserved, z: view thicken, w: timer delta
+		float4 miscParams;         // x: grass map edge noise in world units, y: object surface map enabled, z: view thicken, w: timer delta
 		float4 grassTerrainBlend;  // x: blend strength, y: blend height (world units), z: normal blend, w: roughness blend
 
 		float2 heightMapScale;   // world space -> terrain heightmap UV, pairs with heightMapOffset
@@ -432,7 +432,7 @@ namespace PGrassCommon
 		uint posXY;            // camera-relative x/y as two f16 values
 		uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
 		uint facingTilt;
-		uint seedAndType;  // high 4: clump density; 24-27 and 16-19: terrain normal; 20-23: bend; 8-15: clump seed; low 8: type
+		uint seedAndType;  // high 4: clump density; 24-27 and 16-19: terrain normal; 20-23: bend; 8-15: clump seed; 7: object surface; low 7: type
 	};
 	static_assert(sizeof(BladeFar) == 16);
 }

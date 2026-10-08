@@ -98,8 +98,6 @@ void ProceduralGrass::PostDepthRendering()
 		return;
 	}
 
-	GetVisibleQuadrants();
-
 	ID3D11RasterizerState* oldRS = nullptr;
 	ID3D11DepthStencilState* oldDSS = nullptr;
 	UINT oldRef = 0;
@@ -113,6 +111,7 @@ void ProceduralGrass::PostDepthRendering()
 	ctx->OMGetBlendState(&oldBS, oldBlendFactor, &oldSampleMask);
 
 	globals::topDownOcclusion->Render();
+	GetVisibleQuadrants();
 	// Grass Optimizations reuses this shared pyramid later in the frame.
 	auto* grassHiZ = globals::hiZPyramid;
 	grassHiZ->Build(globals::d3d::device, ctx, true);
@@ -374,7 +373,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	previousShaderTimer = shaderTimer;
 	previousWindDirection = windDirection;
 	previousWindSpeed = settings.windSpeed;
-	grassGlobals.miscParams = float4(settings.grassMapEdgeNoise, 0.0f, settings.grassViewThicken, timerDelta);
+	grassGlobals.miscParams = float4(settings.grassMapEdgeNoise, topDown->GetGrassSurfaceSRV() ? 1.0f : 0.0f, settings.grassViewThicken, timerDelta);
 	grassGlobals.grassTerrainBlend = float4(settings.grassTerrainBlendStrength, settings.grassTerrainBlendHeight, settings.grassTerrainBlendNormal, settings.grassTerrainBlendRough);
 	UpdateDepthBaseCutoff();
 
@@ -816,12 +815,14 @@ void ProceduralGrass::DarkenTerrainUnderGrass() const
 	ctx->PSSetShaderResources(0, 6, srvs);
 	ID3D11ShaderResourceView* canopySRV = terrainCanopyTexture ? terrainCanopyTexture->srv.get() : nullptr;
 	ctx->PSSetShaderResources(64, 1, &canopySRV);
+	ID3D11ShaderResourceView* objectSurfaceSRV = topDown->GetGrassSurfaceSRV();
+	ctx->PSSetShaderResources(66, 1, &objectSurfaceSRV);
 	ctx->PSSetSamplers(0, 1, &linearClampSampler);
 
 	ID3D11Buffer* lightingCBs[2] = { globals::state->sharedDataCB->CB(), globals::state->featureDataCB->CB() };
 	ctx->PSSetConstantBuffers(5, 2, lightingCBs);
-	ID3D11Buffer* grassCB = grassGlobalsCB->CB();
-	ctx->PSSetConstantBuffers(8, 1, &grassCB);
+	ID3D11Buffer* grassCBs[2] = { grassGlobalsCB->CB(), grassTypesArrayCB->CB() };
+	ctx->PSSetConstantBuffers(8, 2, grassCBs);
 	ID3D11Buffer* perFrame = *globals::game::perFrame;
 	ctx->PSSetConstantBuffers(12, 1, &perFrame);
 
@@ -840,6 +841,7 @@ void ProceduralGrass::DarkenTerrainUnderGrass() const
 	ID3D11ShaderResourceView* nullSRVs[7] = {};
 	ctx->PSSetShaderResources(0, 7, nullSRVs);
 	ctx->PSSetShaderResources(64, 1, nullSRVs);
+	ctx->PSSetShaderResources(66, 1, nullSRVs);
 
 	globals::profiler->EndPass();
 }

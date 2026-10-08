@@ -104,7 +104,7 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 #endif
 
 #if defined(FAR_LOD)
-	uint grassTypeIndex = blade.seedAndType & 0xFFu;
+	uint grassTypeIndex = blade.seedAndType & 0x7Fu;
 	uint clumpSeed = (blade.seedAndType >> 8) & 0xFFu;
 #else
 	uint hashClumpAndGrassType = blade.hashClumpAndGrassType;
@@ -125,8 +125,16 @@ GrassTierIO main(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 		f16tof32(blade.posZWidthHeight >> 16));
 #if defined(FAR_DOUBLE_VERTEX)
 	// The rotated twin would mostly overlap the first blade across the view, so it stands on its own root.
-	if (isBlade1)
+	if (isBlade1) {
 		rootViewPosition.xy += GetFarDoubleRootOffset(blade.seedAndType, blade.posZWidthHeight);
+		[branch] if ((blade.seedAndType & FAR_OBJECT_SURFACE) != 0u) {
+			float height, density;
+			float2 slope;
+			uint type;
+			if (LoadGrassObjectSurface(rootViewPosition.xy + FrameBuffer::CameraPosAdjust.xy, height, slope, type, density))
+				rootViewPosition.z = height - FrameBuffer::CameraPosAdjust.z;
+		}
+	}
 #endif
 #if defined(MID_LOD)
 	float rootDistance = float(blade.tipDir >> 16) * (6144.0f / 65535.0f);

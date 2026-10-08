@@ -83,6 +83,7 @@ std::string ProceduralGrass::LandTextureKey(const RE::TESLandTexture* tex)
 
 void ProceduralGrass::RebuildTypeAllocation()
 {
+	RebuildObjectGrassRules();
 	typeAllocation.clear();
 	textureSelection.clear();
 	textureSelectionByTexture.clear();

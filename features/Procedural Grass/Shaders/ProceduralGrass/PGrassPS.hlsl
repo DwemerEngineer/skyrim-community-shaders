@@ -143,7 +143,7 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	uint packedFacingTilt = input.PackedBladeParams.x;
 	uint packedSeedAndType = input.PackedBladeParams.y;
 	uint packedPositionWidthHeight = input.PackedBladeParams.z;
-	uint grassTypeIndex = packedSeedAndType & 0xFFu;
+	uint grassTypeIndex = packedSeedAndType & 0x7Fu;
 	float clumpDensity = float(packedSeedAndType >> 28) * (1.0f / 15.0f);
 	float3 farTerrainNormal = UnpackFarTerrainNormal(packedSeedAndType);
 	float farWidthT = f16tof32(input.PackedBladeParams.w & 0xFFFFu);
@@ -339,17 +339,18 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	// Roll the normal across the blade width; folded halves reverse winding.
 	float curveSign = frontFace ? 1.0f : -1.0f;
 	float curveAngle = side * bladeType.grassVeinParams2.w * Math::HALF_PI * curveSign;
-	float3 worldSpaceNormal = transmissionNormal * cos(curveAngle) + bitangent * sin(curveAngle);
 
 	// Use a stronger roll for indirect light and the GI normal; direct light retains the authored curve.
-	static const float IndirectCurvatureScale = 2.0f;
+	static const float IndirectCurvatureScale = 3.0f;
 	float indirectCurveAngle = clamp(curveAngle * IndirectCurvatureScale, -Math::HALF_PI, Math::HALF_PI);
+	float2 curveSines, curveCosines;
+	sincos(float2(curveAngle, indirectCurveAngle), curveSines, curveCosines);
+	float3 worldSpaceNormal = transmissionNormal * curveCosines.x + bitangent * curveSines.x;
 #if defined(FAR_LOD)
 	// Far has no vein or ground-normal detail; construct the stronger roll directly from its sheet basis.
-	float3 bladeIndirectNormal = normalize(transmissionNormal * cos(indirectCurveAngle) + bitangent * sin(indirectCurveAngle));
+	float3 bladeIndirectNormal = normalize(transmissionNormal * curveCosines.y + bitangent * curveSines.y);
 #else
-	float3 indirectCurveOffset = bitangent * (sin(indirectCurveAngle) - sin(curveAngle)) +
-	                             transmissionNormal * (cos(indirectCurveAngle) - cos(curveAngle));
+	float3 indirectCurveOffset = bitangent * (curveSines.y - curveSines.x) + transmissionNormal * (curveCosines.y - curveCosines.x);
 #endif
 
 #if defined(HIGH_LOD)
@@ -511,6 +512,21 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 		float edgeFade = saturate(min(min(densityUV.x, 1.0f - densityUV.x), min(densityUV.y, 1.0f - densityUV.y)) * 10.0f);
 		canopyDensity = lerp(1.0f, onMapDensity, edgeFade);
 		canopyAODensity = onMapDensity * edgeFade;
+	}
+
+	[branch] if (miscParams.y > 0.0f) {
+#	if defined(MID_LOD)
+		float3 objectRoot = float3(input.WindRootPosition.zw, input.BladeTDepth.z) + FrameBuffer::CameraPosAdjust.xyz;
+#	else
+		float3 objectRoot = float3(input.RootPosition.xy, cameraRelativePosition.z - along * lowTip.y) + FrameBuffer::CameraPosAdjust.xyz;
+#	endif
+		float objectHeight, objectDensity;
+		float2 objectSlope;
+		uint objectType;
+		if (LoadGrassObjectSurface(objectRoot.xy, objectHeight, objectSlope, objectType, objectDensity) && abs(objectRoot.z - objectHeight) < 4.0f) {
+			canopyDensity = objectDensity;
+			canopyAODensity = objectDensity;
+		}
 	}
 
 	canopyAO *= 1.0 - grassLightParams.x * canopyAODensity * (1.0 - canopyHeight01);

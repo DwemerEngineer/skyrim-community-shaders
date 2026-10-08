@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Buffer.h"
+#include "PGrassCommon.h"
 
 /**
  * @brief Top-down world-height map of nearby geometry, for coverage/occlusion queries.
@@ -42,6 +43,19 @@ public:
 	uint32_t GetMapDim() const { return mapDim; }
 	uint32_t GetDrawCount() const { return lastDrawCount; }
 
+	struct GrassSurfaceQuadrant
+	{
+		int32_t x = 0, y = 0;
+		PGrassCommon::QuadrantOccupancy rows{};
+		float minHeight = FLT_MAX;
+		float maxHeight = -FLT_MAX;
+	};
+
+	ID3D11ShaderResourceView* GetGrassSurfaceSRV() const;
+	uint64_t GetGrassSurfaceRevision() const { return capturedGeometryRevision; }
+	const GrassSurfaceQuadrant* GetGrassSurfaceQuadrant(int32_t x, int32_t y) const;
+	const auto& GetGrassSurfaceQuadrants() const { return grassSurfaceQuadrants; }
+
 	/** @brief Grid the window snaps to. Set to the coarsest consumer (density map) so both stay world-stable. */
 	void SetSnapDim(uint32_t a_snapDim)
 	{
@@ -60,6 +74,18 @@ public:
 	}
 
 private:
+	struct alignas(16) HeightCB
+	{
+		float4 worldRow0, worldRow1, worldRow2;
+		float2 windowCentre;
+		float halfExtent;
+		float padding;
+		float4 grassSurfaceParams;  // Type, density, lower height bound, inverse height range.
+		float4 grassAlphaParams;    // Alpha threshold, material alpha, use vertex alpha, unused.
+		float4 grassUVTransform;    // UV scale XY and offset XY.
+	};
+	static_assert(sizeof(HeightCB) == 112);
+
 	struct CapturedGeometry
 	{
 		RE::NiPointer<RE::BSGeometry> geometry;
@@ -69,7 +95,37 @@ private:
 		ID3D11InputLayout* inputLayout = nullptr;
 		uint32_t indexCount = 0;
 		uint32_t stride = 0;
+		RE::BSGraphics::VertexDesc vertexDesc{};
+		bool grassSurfaceCaptured = false;
+		uint8_t grassType = 0;
+		float grassDensity = 0.0f;
+		winrt::com_ptr<ID3D11ShaderResourceView> grassAlphaTexture;
+		float4 grassAlphaParams{};
+		float4 grassUVTransform{};
+		uint8_t grassAlphaSampler = 0;
 	};
+
+	Texture2D* grassSurfaceMap = nullptr;
+	Texture2D* grassSurfaceDepth = nullptr;
+	ID3D11PixelShader* grassSurfacePS = nullptr;
+	winrt::com_ptr<ID3D11VertexShader> grassSurfaceAlphaVS;
+	winrt::com_ptr<ID3D11PixelShader> grassSurfaceAlphaPS;
+	winrt::com_ptr<ID3DBlob> grassSurfaceAlphaVSBlob;
+	std::unordered_map<uint64_t, winrt::com_ptr<ID3D11InputLayout>> grassAlphaInputLayouts;
+	std::array<winrt::com_ptr<ID3D11SamplerState>, 4> grassAlphaSamplers;
+	winrt::com_ptr<ID3D11DepthStencilState> grassSurfaceDSS;
+	std::unordered_map<uint64_t, GrassSurfaceQuadrant> grassSurfaceQuadrants;
+	bool grassSurfaceValid = false;
+	uint64_t loadedCellStamp = 0;
+
+	HeightCB MakeHeightConstants(const CapturedGeometry& entry) const;
+	void ResolveGrassSurface(CapturedGeometry& entry, bool allowGrass) const;
+	ID3D11InputLayout* GetGrassAlphaInputLayout(const RE::BSGraphics::VertexDesc& desc);
+	ID3D11SamplerState* GetGrassAlphaSampler(uint8_t mode);
+	void AddGrassSurfaceBounds(const CapturedGeometry& entry);
+	void FilterGrassSurfaceBlockers();
+	void CreateGrassSurfaceResources();
+	void RenderGrassSurfaces(ID3D11DeviceContext* context);
 
 	Texture2D* heightMapHigh = nullptr;
 	Texture2D* heightMapLow = nullptr;
@@ -120,7 +176,7 @@ private:
 
 	void CompileShaders();
 	void GatherGeometry();
-	void CollectFrom(RE::NiAVObject* a_object);
+	void CollectFrom(RE::NiAVObject* a_object, bool allowGrass);
 	RenderCacheState GetRenderCacheState() const;
 	bool CanReuseRenderedMaps() const;
 	void CommitRenderedMaps();

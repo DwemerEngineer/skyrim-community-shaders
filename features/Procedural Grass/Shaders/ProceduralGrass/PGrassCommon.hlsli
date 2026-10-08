@@ -21,7 +21,7 @@ cbuffer GrassGlobals : register(b8)
 	float4 grassFrameLight;   // xyz: resolved TRUE_PBR directional light, w: resolved grass brightness scale
 
 	float4 farParams;          // x: thin start, y: inverse range, z: Far candidate spacing, w: Far performance keep
-	float4 miscParams;         // x: grass map edge noise in world units, y: reserved, z: view thicken, w: timer delta
+	float4 miscParams;         // x: grass map edge noise in world units, y: object surface map enabled, z: view thicken, w: timer delta
 	float4 grassTerrainBlend;  // x: blend strength, y: blend height (world units), z: normal blend, w: roughness blend
 
 	float2 heightMapScale;   // world space -> terrain heightmap UV, pairs with heightMapOffset
@@ -179,6 +179,9 @@ float3 UnpackFarTerrainNormal(uint seedAndType)
 	return float3(normalXY, sqrt(saturate(1.0f - dot(normalXY, normalXY))));
 }
 
+// Far type IDs use seven bits (GRASS_TYPE_COUNT = 128); bit 7 marks an object root in this internal blade record.
+static const uint FAR_OBJECT_SURFACE = 1u << 7u;
+
 #	if defined(FAR_DOUBLE_GEOMETRY) || defined(FAR_DOUBLE_VERTEX)
 /** @brief Places a Far double blade's second root within one lattice cell, from record bits that stay fixed for the blade. */
 float2 GetFarDoubleRootOffset(uint seedAndType, uint posZWidthHeight)
@@ -271,7 +274,7 @@ struct Blade
 	uint posXY;            // camera-relative x/y as two f16 values
 	uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
 	uint facingTilt;       // 4x UNORM8 mapped to [-1,1]: facing.xy, tilt sin/cos
-	uint seedAndType;      // high 4: clump density; 24-27 and 16-19: terrain normal; 20-23: bend; 8-15: clump seed; low 8: type
+	uint seedAndType;      // high 4: clump density; 24-27 and 16-19: terrain normal; 20-23: bend; 8-15: clump seed; 7: object surface; low 7: type
 };
 
 #else
@@ -300,3 +303,79 @@ struct Blade
 #	endif
 };
 #endif
+
+// Object surfaces shared by generation, lighting and terrain darkening.
+// Unpadded topmost object height, geometric normal XY, and packed grass type/density.
+Texture2D<float4> GrassObjectSurfaces : register(t66);
+
+float GetGrassObjectTexelWidth()
+{
+	return 2.0f * occlusionHalfExtent / float(occlusionMapDim);
+}
+
+float2 GetGrassObjectTexelCentre(float2 texel)
+{
+	return (texel + 0.5f) * GetGrassObjectTexelWidth() + occlusionParams.xy - occlusionHalfExtent;
+}
+
+float GetGrassObjectHeightTolerance()
+{
+	return max(2.0f, GetGrassObjectTexelWidth() * 0.25f);
+}
+
+bool GetGrassObjectTexel(float2 worldPosition, out int2 texel)
+{
+	float2 uv = (worldPosition - occlusionParams.xy) * occlusionInvExtent + 0.5f;
+	texel = int2(floor(uv * occlusionMapDim));
+	return miscParams.y > 0.0f && all(texel > 0) && all(texel + 1 < int(occlusionMapDim));
+}
+
+/** @brief Reads one surface plane; zero-type records are blockers, not grass surfaces. */
+bool LoadGrassObjectSurface(float2 worldPosition, out float height, out float2 slope, out uint type, out float density)
+{
+	height = 0.0f;
+	slope = 0.0f;
+	type = 0u;
+	density = 0.0f;
+	int2 texel;
+	if (!GetGrassObjectTexel(worldPosition, texel))
+		return false;
+
+	float4 surface = GrassObjectSurfaces.Load(int3(texel, 0));
+	uint packed = (uint)surface.w;
+	type = packed & 0xFFu;
+	if (type == 0u)
+		return false;
+
+	float normalZ = sqrt(saturate(1.0f - dot(surface.yz, surface.yz)));
+	if (normalZ < 0.01f)
+		return false;
+
+	slope = -surface.yz / normalZ;
+	float2 centre = GetGrassObjectTexelCentre(float2(texel));
+	height = surface.x + dot(slope, worldPosition - centre);
+	density = float(packed >> 8) * (1.0f / 255.0f);
+	float2 toEdge = occlusionHalfExtent - abs(worldPosition - occlusionParams.xy);
+	density *= smoothstep(0.0f, 256.0f, min(toEdge.x, toEdge.y));
+	return true;
+}
+
+/** @brief Insets roots from ledges and discontinuities without dilating the object footprint. */
+bool IsGrassObjectInterior(float2 worldPosition, float height, float2 slope, uint type)
+{
+	int2 texel;
+	if (!GetGrassObjectTexel(worldPosition, texel))
+		return false;
+
+	float texelWidth = GetGrassObjectTexelWidth();
+	float2 centre = GetGrassObjectTexelCentre(float2(texel));
+	float centreHeight = height + dot(slope, centre - worldPosition);
+	[unroll] for (uint i = 0u; i < 4u; ++i)
+	{
+		int2 offset = int2(i == 0u ? -1 : (i == 1u ? 1 : 0), i == 2u ? -1 : (i == 3u ? 1 : 0));
+		float4 neighbour = GrassObjectSurfaces.Load(int3(texel + offset, 0));
+		if (((uint)neighbour.w & 0xFFu) != type || abs(neighbour.x - centreHeight - dot(slope, float2(offset) * texelWidth)) > GetGrassObjectHeightTolerance())
+			return false;
+	}
+	return true;
+}

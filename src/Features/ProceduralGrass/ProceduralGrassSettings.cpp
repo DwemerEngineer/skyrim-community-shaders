@@ -9,6 +9,10 @@
 #include <fstream>
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	ProceduralGrass::Settings::ObjectGrassRule,
+	LandTexture, Variant, Density)
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ProceduralGrass::Settings,
 	Enabled,
 	Quality)
@@ -128,6 +132,8 @@ namespace
 		v("OcclusionPadding", s.occlusionPadding);
 		v("OcclusionBias", s.occlusionBias);
 		v("GrassMapEdgeNoise", s.grassMapEdgeNoise);
+		v("ObjectGrassEnabled", s.objectGrassEnabled);
+		v("ObjectGrassTextures", s.objectGrassTextures);
 		v("ViewThicken", s.grassViewThicken);
 
 		// Per-LOD densities and far-tier controls
@@ -406,6 +412,10 @@ void ProceduralGrass::DrawSettings()
 
 	SettingCheckbox(T("feature.procedural_grass.enabled", "Enabled"), settings.Enabled, T("feature.procedural_grass.enabled_tooltip", "Enables procedural grass rendering."));
 
+	if (SettingCheckbox(T("feature.procedural_grass.object_grass", "Grass on static objects"), settings.objectGrassEnabled,
+			T("feature.procedural_grass.object_grass_tooltip", "Enables grass on supported static objects, such as dirt cliffs.")))
+		globals::topDownOcclusion->Invalidate();
+
 	if (ImGui::Button(T("feature.procedural_grass.toggle_vanilla_grass", "Toggle Vanilla Grass Rendering")))
 		ConsoleFunc_ToggleGrass();
 
@@ -453,7 +463,7 @@ void ProceduralGrass::DrawSettings()
 			SettingSlider(T("feature.procedural_grass.sheen_strength", "Sheen Strength"), settings.sheenStrength, 0.0f, 1.0f, T("feature.procedural_grass.sheen_strength_tooltip", "Covers blades with fine hairs and wax bloom (the OpenPBR fuzz layer). They catch light at grazing angles and give grass a soft silvery sheen."));
 			SettingSlider(T("feature.procedural_grass.sheen_roughness", "Sheen Roughness"), settings.sheenRoughness, 0.0f, 1.0f, T("feature.procedural_grass.sheen_roughness_tooltip", "Low values give a fibre-like sheen concentrated at grazing angles; high values give a broader, dusty sheen."));
 			SettingSlider(T("feature.procedural_grass.sheen_tint", "Sheen Tint"), settings.sheenTint, 0.0f, 1.0f, T("feature.procedural_grass.sheen_tint_tooltip", "Colours the sheen toward the blade's own hue (the OpenPBR fuzz colour). 0 is a white sheen; higher values keep backlit glow and blade colour from greying under sky light."));
-			SettingSlider(T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), settings.curvedNormalStrength, 0.0f, 1.0f, T("feature.procedural_grass.curved_normal_strength_tooltip", "How far the blade rolls across its width, as the angle its edges turn away from the middle (1 = 90 degrees). Sky light and screen-space GI see twice this roll, and the concave face loses sky behind its own halves, so the curvature still shows without direct light."));
+			SettingSlider(T("feature.procedural_grass.curved_normal_strength", "Curved Normal Strength"), settings.curvedNormalStrength, 0.0f, 1.0f, T("feature.procedural_grass.curved_normal_strength_tooltip", "How far the blade rolls across its width, as the angle its edges turn away from the middle (1 = 90 degrees). Sky light and screen-space GI see three times this roll, and the concave face loses sky behind its own halves, so the curvature still shows without direct light."));
 			SettingSlider3(T("feature.procedural_grass.roughness", "Roughness (Base>Min>Tip)"), settings.baseMinTipRoughness, 0.0f, 1.0f, T("feature.procedural_grass.roughness_tooltip", "Sets roughness at the blade base, minimum point, and tip."));
 
 			// Kept off 0 and 1 so neither smoothstep in the vertex shader collapses to a zero-width range.

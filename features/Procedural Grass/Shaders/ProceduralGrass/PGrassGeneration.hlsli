@@ -49,6 +49,7 @@ struct PatchCandidates
 	uint bladeIndex;
 	// Flags are 0 or 1: bool members here compiled wrongly at /O3 on AMD, adding blades to Far's compact quadrants.
 	uint hasLand;
+	uint objectSurface;
 	uint insideFrustum;
 	uint cullsDisabled;
 	uint useBasePath;
@@ -78,6 +79,7 @@ bool PreparePatchCandidates(uint3 dispatch, out PatchCandidates candidates)
 	uint quadrant = bladeTask & WORK_QUADRANT_MASK;
 
 	bool hasLand = (bladeTask & WORK_HAS_LAND) != 0u;
+	bool objectSurface = (bladeTask & WORK_OBJECT_SURFACE) != 0u;
 	bool insideFrustum = (bladeTask & WORK_INSIDE_FRUSTUM) != 0u;
 	bool nearCovered = (bladeTask & WORK_NEAR_COVERED) != 0u;
 	bool compactFar = (bladeTask & WORK_COMPACT_FAR) != 0u;
@@ -134,7 +136,7 @@ bool PreparePatchCandidates(uint3 dispatch, out PatchCandidates candidates)
 	}
 #endif
 
-	if (useBasePath) {
+	if (useBasePath && !objectSurface) {
 		baseGrassCell = LoadGrassCell(baseMapSamplePos, quadrant);
 
 		if (!cullsDisabled && baseGrassCell == 0u)
@@ -149,11 +151,17 @@ bool PreparePatchCandidates(uint3 dispatch, out PatchCandidates candidates)
 		return false;
 #endif
 
-	// One bilinear terrain sample establishes the plane for this path and its extras.
+	// Share the sampled surface plane when deciding how many slope extras to generate.
 	float2 terrainSlope;
 	float baseWorldZ;
-	baseWorldZ = TerrainHeightSlopeAt(terrainSlope, baseWorldPos2D, quadrantData.quadWorldPos, quadrant, hasLand);
-	if (useBasePath && IsPatchOccluded(baseWorldPos2D, baseWorldZ, terrainSlope, quadrant, hasLand, cullsDisabled))
+	if (objectSurface) {
+		uint surfaceType;
+		float surfaceDensity;
+		LoadGrassObjectSurface(baseWorldPos2D, baseWorldZ, terrainSlope, surfaceType, surfaceDensity);
+	} else {
+		baseWorldZ = TerrainHeightSlopeAt(terrainSlope, baseWorldPos2D, quadrantData.quadWorldPos, quadrant, hasLand);
+	}
+	if (!objectSurface && useBasePath && IsPatchOccluded(baseWorldPos2D, baseWorldZ, terrainSlope, quadrant, hasLand, cullsDisabled))
 		return false;
 
 	candidates.patchPos = patchPos;
@@ -162,6 +170,7 @@ bool PreparePatchCandidates(uint3 dispatch, out PatchCandidates candidates)
 	candidates.quadWorldPos = quadrantData.quadWorldPos;
 	candidates.bladeIndex = bladeIndex;
 	candidates.hasLand = hasLand ? 1u : 0u;
+	candidates.objectSurface = objectSurface ? 1u : 0u;
 	candidates.insideFrustum = insideFrustum ? 1u : 0u;
 	candidates.cullsDisabled = cullsDisabled ? 1u : 0u;
 	candidates.useBasePath = useBasePath ? 1u : 0u;
@@ -236,9 +245,11 @@ bool BuildPatchCandidate(PatchCandidates candidates, uint candidateIndex, out Bl
 		float2 candidateQuadPos = ExtraCandidateQuadPos(candidates.patchPos, candidateHash);
 		candidateWorldPos = candidateQuadPos + candidates.quadWorldPos;
 		candidateMapSamplePos = GrassMapSamplePos(candidateQuadPos, candidateWorldPos, candidateHash);
-		packedGrassCell = LoadGrassCell(candidateMapSamplePos, candidates.quadrant);
-		if (!cullsDisabled && packedGrassCell == 0u)
-			return false;
+		if (candidates.objectSurface == 0u) {
+			packedGrassCell = LoadGrassCell(candidateMapSamplePos, candidates.quadrant);
+			if (!cullsDisabled && packedGrassCell == 0u)
+				return false;
+		}
 		candidateWorldZ = candidates.baseWorldZ + dot(candidates.terrainSlope, candidateWorldPos - candidates.baseWorldPos2D);
 #else
 		return false;
@@ -246,7 +257,7 @@ bool BuildPatchCandidate(PatchCandidates candidates, uint candidateIndex, out Bl
 	}
 
 	return BuildBlade(candidateHash, candidateMapSamplePos, candidateWorldPos, candidateWorldZ, candidates.terrainSlope, candidates.terrainNormalZ,
-		candidates.quadWorldPos, candidates.quadrant, candidates.hasLand != 0u, packedGrassCell, cullsDisabled, candidates.insideFrustum != 0u, isBase, blade, outerGeometry);
+		candidates.quadWorldPos, candidates.quadrant, candidates.hasLand != 0u, packedGrassCell, cullsDisabled, candidates.insideFrustum != 0u, isBase, candidates.objectSurface != 0u, blade, outerGeometry);
 }
 
 // Stages a built blade in this thread's next group slot.

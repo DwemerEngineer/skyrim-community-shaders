@@ -9,6 +9,7 @@ namespace PGrassRendererQuads
 	inline constexpr uint32_t WorkLaneShift = 12;
 	inline constexpr uint32_t WorkHasLand = 1u << 16;
 	inline constexpr uint32_t WorkInsideFrustum = 1u << 17;
+	inline constexpr uint32_t WorkObjectSurface = 1u << 18;  // Internal work-list bit, unrelated to NIF and material flags.
 	inline constexpr uint32_t WorkNearCovered = 1u << 19;
 	inline constexpr uint32_t WorkCompactFar = 1u << 20;  // Generates only its dispatch's share of the item's patches.
 	inline constexpr uint32_t WorkShareSteps = 8;         // Compact Far work generates a multiple of 1/8 of its patches.
@@ -121,9 +122,14 @@ private:
 
 	StructuredBuffer* tileHeightBoundsSB = nullptr;
 	std::vector<float2> tileHeightBoundsStaging;
+	std::vector<PGrassCommon::QuadrantOccupancy> objectOccupancyRows;
+	std::vector<float2> objectHeightBounds;
 
 	StructuredBuffer* visibleWorkSB = nullptr;
 	std::vector<uint32_t> visibleWorkStaging;
+	uint32_t visibleTerrainWorkCount = 0;
+	uint32_t visibleObjectHandoffCount = 0;
+	uint32_t cachedObjectGX = 0;
 	uint32_t visibleHandoffWorkCount = 0;  // Far work items at the front of the list that take the handoff fill.
 	// Far's base work items, after the handoff items, ordered by the eighths of their patches they generate.
 	std::array<uint32_t, PGrassRendererQuads::WorkShareSteps> baseWorkShareCounts{};
@@ -136,6 +142,7 @@ private:
 	};
 
 	std::array<float4, PGrassRendererQuads::OccupancyTileCount> tileLocalBounds{};
+	std::array<uint32_t, PGrassRendererQuads::OccupancyTileCount> tilePatchCounts{};
 	std::vector<OccupiedTile> visibleTilesStaging;
 
 	struct OccupancyCacheEntry

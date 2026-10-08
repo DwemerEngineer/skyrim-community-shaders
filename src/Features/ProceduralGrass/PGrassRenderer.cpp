@@ -171,12 +171,13 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::CreateArgsBuffer()
 	tileHeightBoundsSB = new StructuredBuffer(StructuredBufferDesc<float2>(tileCount, true), tileCount, "PGrass::TileHeightBounds");
 	tileHeightBoundsSB->CreateSRV();
 	tileHeightBoundsStaging.resize(tileCount);
+	objectOccupancyRows.resize(QuadrantCount);
+	objectHeightBounds.resize(QuadrantCount);
 
-	constexpr uint32_t workItemCapacity = QuadrantCount * PatchBladeCount * OccupancyTileCount;
+	constexpr uint32_t workItemCapacity = 2u * QuadrantCount * PatchBladeCount * OccupancyTileCount;
 	visibleWorkSB = new StructuredBuffer(StructuredBufferDesc<uint32_t>(workItemCapacity, true), workItemCapacity, "PGrass::VisibleWork");
 	visibleWorkSB->CreateSRV();
-	if (extraDefine)
-		workRangeCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<std::array<uint32_t, 4>>(), "PGrass::WorkRange");
+	workRangeCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<std::array<uint32_t, 4>>(), "PGrass::WorkRange");
 	visibleWorkStaging.reserve(workItemCapacity);
 	visibleWorkCandidates.reserve(QuadrantCount);
 	visibleTilesStaging.reserve(QuadrantCount * OccupancyTileCount);
@@ -261,11 +262,17 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetDensity(uint32_t grassDe
 
 	for (uint32_t tileY = 0; tileY < OccupancyTilesPerAxis; ++tileY) {
 		for (uint32_t tileX = 0; tileX < OccupancyTilesPerAxis; ++tileX) {
-			tileLocalBounds[tileY * OccupancyTilesPerAxis + tileX] = {
-				static_cast<float>(tileX * patchesPerRow / OccupancyTilesPerAxis) * patchWorldSize,
-				static_cast<float>(tileY * patchRows / OccupancyTilesPerAxis) * patchWorldSize,
-				static_cast<float>((tileX + 1u) * patchesPerRow / OccupancyTilesPerAxis) * patchWorldSize,
-				static_cast<float>((tileY + 1u) * patchRows / OccupancyTilesPerAxis) * patchWorldSize
+			const uint32_t tile = tileY * OccupancyTilesPerAxis + tileX;
+			const uint32_t startX = tileX * patchesPerRow / OccupancyTilesPerAxis;
+			const uint32_t startY = tileY * patchRows / OccupancyTilesPerAxis;
+			const uint32_t endX = (tileX + 1u) * patchesPerRow / OccupancyTilesPerAxis;
+			const uint32_t endY = (tileY + 1u) * patchRows / OccupancyTilesPerAxis;
+			tilePatchCounts[tile] = (endX - startX) * (endY - startY);
+			tileLocalBounds[tile] = {
+				static_cast<float>(startX) * patchWorldSize,
+				static_cast<float>(startY) * patchWorldSize,
+				static_cast<float>(endX) * patchWorldSize,
+				static_cast<float>(endY) * patchWorldSize
 			};
 		}
 	}
@@ -292,7 +299,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::EnsureBladeCapacity(const u
 		return;
 
 	const uint64_t allocationQuantum = std::max<uint64_t>(patchesPerQuadrant, 1u);
-	const uint64_t maximumCandidateCount = allocationQuantum * QuadrantCount * (PatchBladeCount + std::max(slopeExtraBlades, handoffExtraBlades));
+	const uint64_t maximumCandidateCount = 2u * allocationQuantum * QuadrantCount * (PatchBladeCount + std::max(slopeExtraBlades, handoffExtraBlades));
 	const uint64_t maximumBufferElements = std::numeric_limits<UINT>::max() / bladeStrideBytes;
 	const uint64_t maximumCapacity = std::min(maximumCandidateCount, maximumBufferElements);
 
@@ -385,12 +392,15 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::GenerateBlades(ID3D11Device
 	}
 
 	const float tileReach = (extraDefine ? 0.0f : frustumPadding) + 4096.0f / density;
-	UploadQuadrantInputs(quadrants, contentVersion, cellXOffset, cellYOffset, lodFadeIn, lodFadeOut, tileReach);
+	uint64_t surfaceVersion = contentVersion;
+	const auto* topDown = globals::topDownOcclusion;
+	GrassHashValue(surfaceVersion, topDown->GetGrassSurfaceSRV() ? topDown->GetGrassSurfaceRevision() : 0u);
+	UploadQuadrantInputs(quadrants, surfaceVersion, cellXOffset, cellYOffset, lodFadeIn, lodFadeOut, tileReach);
 
 	const auto quadrantsBuffer = quadrantsCB->CB();
 	ctx->CSSetConstantBuffers(7, 1, &quadrantsBuffer);
 
-	const WorkListState workListState{ contentVersion, density, threadGroupSize, static_cast<uint32_t>(quadrants.size()),
+	const WorkListState workListState{ surfaceVersion, density, threadGroupSize, static_cast<uint32_t>(quadrants.size()),
 		globals::game::frameBufferCached.GetCameraViewProjUnjittered().Transpose(), globals::game::frameBufferCached.GetCameraPosAdjust(),
 		lodOrigin, lodFadeIn, lodFadeOut, frustumPadding, fadeInPositionPadding, farKeepParams,
 		globals::features::proceduralGrass.settings.grassMapEdgeNoise, disableGeneratorCulls };
@@ -432,6 +442,13 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::UploadQuadrantInputs(const 
 			const uint32_t hashY = static_cast<uint32_t>((quadrant.cellY + cellYOffset) * 32 + quadrant.y * 16);
 			quadrantData.quadrantHash = QuadrantHash(hashX, hashY);
 			quadrantData.flags = quadrant.maxHeight > QuadrantNoHeight ? WorkHasLand : 0u;
+
+			objectOccupancyRows[i].fill(0u);
+			objectHeightBounds[i] = { QuadrantNoHeight, QuadrantNoHeight };
+			if (const auto* surface = globals::topDownOcclusion->GetGrassSurfaceQuadrant(quadrant.cellX * 2 + quadrant.x, quadrant.cellY * 2 + quadrant.y)) {
+				objectOccupancyRows[i] = surface->rows;
+				objectHeightBounds[i] = { surface->minHeight, surface->maxHeight };
+			}
 
 			StageQuadrantGrassIds(i, quadrant);
 
@@ -483,10 +500,12 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::PackQuadrantGrassCells(cons
 	for (uint32_t axis = 0; axis < 2; ++axis) {
 		for (uint32_t i = 0; i < quadrants.size(); ++i) {
 			const auto& q = quadrants[i];
+			if (!q.grassIds)
+				continue;
 			const uint32_t x = q.cellX * 2 + q.x;
 			const uint32_t y = q.cellY * 2 + q.y;
 			const auto neighbour = indices.find(GrassQuadrantKey(x + (axis == 0), y + (axis == 1)));
-			if (neighbour == indices.end())
+			if (neighbour == indices.end() || !quadrants[neighbour->second].grassIds)
 				continue;
 
 			auto& a = quadrantGrassIdsStaging[i];
@@ -563,6 +582,10 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::StageTileHeightBounds(const
 					bounds.y += extension;
 				}
 			}
+
+			const auto objectBounds = objectHeightBounds[index];
+			if (objectBounds.x > QuadrantNoHeight)
+				bounds = bounds.x > QuadrantNoHeight ? float2(std::min(bounds.x, objectBounds.x), std::max(bounds.y, objectBounds.y)) : objectBounds;
 
 			tileHeightBoundsStaging[index * OccupancyTileCount + tileY * OccupancyTilesPerAxis + tileX] = bounds;
 		}
@@ -656,7 +679,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::BuildVisibleWorkList(const 
 		const float maxX = quadrant.worldPos.x + bounds.z;
 		const float maxY = quadrant.worldPos.y + bounds.w;
 
-		if ((workFlags & WorkInsideFrustum) == 0u && (workFlags & WorkHasLand) != 0u) {
+		if ((workFlags & WorkInsideFrustum) == 0u && (workFlags & (WorkHasLand | WorkObjectSurface)) != 0u) {
 			const auto& heightBounds = tileHeightBoundsStaging[quadrantIndex * OccupancyTileCount + tile];
 			const bool hasTileBounds = heightBounds.x > QuadrantNoHeight && heightBounds.y >= heightBounds.x;
 			const float minZ = (hasTileBounds ? heightBounds.x : quadrant.minHeight) - 256.0f;
@@ -737,10 +760,18 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::BuildVisibleWorkList(const 
 
 	for (uint32_t i = 0; i < quadrants.size(); ++i) {
 		const auto& quadrant = quadrants[i];
+		if (!quadrant.grassIds)
+			continue;
 		bool hasLand = quadrant.maxHeight > QuadrantNoHeight && quadrant.minHeight <= quadrant.maxHeight;
 		auto frustumState = QuadrantFrustumState::Inside;
 		if (!disableGeneratorCulls) {
-			frustumState = ClassifyQuadrantFrustum(quadrant, frustum, cameraPosAdjust, frustumPadding, hasLand);
+			auto cullBounds = quadrant;
+			if (objectHeightBounds[i].x > QuadrantNoHeight) {
+				cullBounds.minHeight = hasLand ? std::min(cullBounds.minHeight, objectHeightBounds[i].x) : objectHeightBounds[i].x;
+				cullBounds.maxHeight = hasLand ? std::max(cullBounds.maxHeight, objectHeightBounds[i].y) : objectHeightBounds[i].y;
+			}
+			bool hasCullBounds;
+			frustumState = ClassifyQuadrantFrustum(cullBounds, frustum, cameraPosAdjust, frustumPadding, hasCullBounds);
 			if (frustumState == QuadrantFrustumState::Outside)
 				continue;
 		}
@@ -858,6 +889,49 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::BuildVisibleWorkList(const 
 		visibleHandoffWorkCount = static_cast<uint32_t>(handoffEnd - visibleWorkStaging.begin());
 	}
 
+	visibleTerrainWorkCount = static_cast<uint32_t>(visibleWorkStaging.size());
+
+	// Object work follows LAND work and always uses occupied tiles.
+	const auto* player = RE::PlayerCharacter::GetSingleton();
+	const float2 objectOrigin = player ? float2(player->GetPosition().x, player->GetPosition().y) : lodOrigin;
+	const int32_t objectOriginX = static_cast<int32_t>(std::floor(objectOrigin.x / 2048.0f));
+	const int32_t objectOriginY = static_cast<int32_t>(std::floor(objectOrigin.y / 2048.0f));
+	constexpr int32_t objectNearRadius = LowTierQuadrantRadius + LowTierStreamGuardQuadrants;
+	for (uint32_t i = 0; i < quadrants.size(); ++i) {
+		const auto& quadrant = quadrants[i];
+		if (objectHeightBounds[i].x <= QuadrantNoHeight)
+			continue;
+		// Object coverage is independent of accepted LAND, including the grass beneath overhangs.
+		const bool objectNearCovered = std::max(std::abs(quadrant.cellX * 2 + static_cast<int32_t>(quadrant.x) - objectOriginX),
+										   std::abs(quadrant.cellY * 2 + static_cast<int32_t>(quadrant.y) - objectOriginY)) <= objectNearRadius;
+		const auto& rows = objectOccupancyRows[i];
+		for (uint32_t y = 0; y < OccupancyTilesPerAxis; ++y) {
+			for (uint32_t x = 0; x < OccupancyTilesPerAxis; ++x) {
+				if ((rows[y] & (1u << x)) == 0u)
+					continue;
+				const uint32_t tile = y * OccupancyTilesPerAxis + x;
+				const auto& bounds = tileLocalBounds[tile];
+				uint32_t flags = WorkObjectSurface | WorkOccupiedTile | WorkFullGrass | (tile << WorkTileShift) |
+				                 (objectNearCovered ? WorkNearCovered : 0u) | (quadrant.heights ? WorkHasLand : 0u);
+				flags = withFarHandoff(quadrant.worldPos.x + bounds.x, quadrant.worldPos.y + bounds.y,
+					quadrant.worldPos.x + bounds.z, quadrant.worldPos.y + bounds.w, flags);
+				if (!disableGeneratorCulls && tileRejected(i, tile, flags))
+					continue;
+				const uint32_t patchCount = tilePatchCounts[tile];
+				if (patchCount)
+					appendWork(visibleWorkStaging, requiredBladeCount, patchCount, i, flags);
+			}
+		}
+	}
+
+	visibleObjectHandoffCount = 0;
+	if (isFarTier) {
+		const auto firstObject = visibleWorkStaging.begin() + visibleTerrainWorkCount;
+		const auto handoffEnd = std::stable_partition(firstObject, visibleWorkStaging.end(), [](uint32_t task) { return (task & WorkFarHandoff) != 0u; });
+		visibleObjectHandoffCount = static_cast<uint32_t>(handoffEnd - firstObject);
+	}
+	cachedObjectGX = tileGX;
+
 	if (!visibleWorkStaging.empty())
 		visibleWorkSB->UpdatePartial(visibleWorkStaging.data(), visibleWorkStaging.size() * sizeof(uint32_t));
 	cachedWorkGX = useOccupiedTiles ? tileGX : fullGX;
@@ -893,20 +967,21 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::DispatchGeneration(ID3D11De
 		ctx->CSSetShaderResources(50, 1, &skylightingSRV);
 	}
 
-	ctx->CSSetShader(bladeGenerator, nullptr, 0);
+	ID3D11ShaderResourceView* objectSurfaces = topDown->GetGrassSurfaceSRV();
+	ctx->CSSetShaderResources(66, 1, &objectSurfaces);
+	const auto rangeBuffer = workRangeCB->CB();
+	ctx->CSSetConstantBuffers(0, 1, &rangeBuffer);
+	const auto dispatchRange = [&](ID3D11ComputeShader* generator, const uint32_t offset, const uint32_t count, const uint32_t groupsX, const float workShare) {
+		if (!count)
+			return;
+		workRangeCB->Update(std::array<uint32_t, 4>{ offset, std::bit_cast<uint32_t>(workShare), 0u, 0u });
+		ctx->CSSetShader(generator, nullptr, 0);
+		ctx->Dispatch(groupsX, 1, count);
+	};
 	if (UsesGrassCollision(globals::features::grassCollision.loaded))
 		globals::features::grassCollision.BindProceduralGrassGenerationResources(ctx);
 
 	if (extraDefine) {
-		const auto rangeBuffer = workRangeCB->CB();
-		ctx->CSSetConstantBuffers(0, 1, &rangeBuffer);
-		const auto dispatchRange = [&](ID3D11ComputeShader* generator, const uint32_t offset, const uint32_t count, const uint32_t groupsX, const float workShare) {
-			if (!count)
-				return;
-			workRangeCB->Update(std::array<uint32_t, 4>{ offset, std::bit_cast<uint32_t>(workShare), 0u, 0u });
-			ctx->CSSetShader(generator, nullptr, 0);
-			ctx->Dispatch(groupsX, 1, count);
-		};
 		auto* handoffGenerator = GetBladeGeneratorCS(true);
 		dispatchRange(handoffGenerator ? handoffGenerator : bladeGenerator, 0u, visibleHandoffWorkCount, cachedWorkGX, 1.0f);
 
@@ -919,11 +994,17 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::DispatchGeneration(ID3D11De
 			workOffset += count;
 		}
 
-		ID3D11Buffer* nullRangeBuffer = nullptr;
-		ctx->CSSetConstantBuffers(0, 1, &nullRangeBuffer);
-	} else if (!visibleWorkStaging.empty()) {
-		ctx->Dispatch(cachedWorkGX, 1, static_cast<uint32_t>(visibleWorkStaging.size()));
+		dispatchRange(handoffGenerator ? handoffGenerator : bladeGenerator, visibleTerrainWorkCount, visibleObjectHandoffCount, cachedObjectGX, 1.0f);
+		dispatchRange(bladeGenerator, visibleTerrainWorkCount + visibleObjectHandoffCount,
+			static_cast<uint32_t>(visibleWorkStaging.size()) - visibleTerrainWorkCount - visibleObjectHandoffCount, cachedObjectGX, 1.0f);
+	} else {
+		dispatchRange(bladeGenerator, 0u, visibleTerrainWorkCount, cachedWorkGX, 1.0f);
+		dispatchRange(bladeGenerator, visibleTerrainWorkCount, static_cast<uint32_t>(visibleWorkStaging.size()) - visibleTerrainWorkCount, cachedObjectGX, 1.0f);
 	}
+	ID3D11Buffer* nullRangeBuffer = nullptr;
+	ctx->CSSetConstantBuffers(0, 1, &nullRangeBuffer);
+	ID3D11ShaderResourceView* nullObjectSurfaces = nullptr;
+	ctx->CSSetShaderResources(66, 1, &nullObjectSurfaces);
 
 	ID3D11UnorderedAccessView* nullOutputUAVs[2] = {};
 	ctx->CSSetUnorderedAccessViews(0, 2, nullOutputUAVs, nullptr);
@@ -1023,6 +1104,10 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::RenderGrass(ID3D11DeviceCon
 		hasRainWetness = wetnessData.Wetness > 0.0f || wetnessData.Raining > 0.0f;
 	}
 
+	ID3D11ShaderResourceView* objectSurfaces = globals::topDownOcclusion->GetGrassSurfaceSRV();
+	ctx->PSSetShaderResources(66, 1, &objectSurfaces);
+	if (extraDefine)
+		ctx->VSSetShaderResources(66, 1, &objectSurfaces);
 	const bool simpleLighting = UsesSimpleLighting();
 
 	const bool noWetness = !simpleLighting && !extraDefine && wetnessEffects.loaded && !hasRainWetness;
@@ -1041,6 +1126,10 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::RenderGrass(ID3D11DeviceCon
 		ctx->VSSetShader(GetVertexShader(false, true), nullptr, 0);
 		ctx->DrawIndexedInstancedIndirect(drawArgs, 5 * sizeof(uint32_t));
 	}
+	ID3D11ShaderResourceView* nullObjectSurface = nullptr;
+	ctx->PSSetShaderResources(66, 1, &nullObjectSurface);
+	if (extraDefine)
+		ctx->VSSetShaderResources(66, 1, &nullObjectSurface);
 	if (outerVertexIndicesBuffer || batchArgsBuffer) {
 		ID3D11ShaderResourceView* nullArgsSRV = nullptr;
 		ctx->VSSetShaderResources(1, 1, &nullArgsSRV);

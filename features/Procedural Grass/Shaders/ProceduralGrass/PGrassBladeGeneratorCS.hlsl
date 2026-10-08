@@ -174,20 +174,16 @@ bool SampleLandHeightSlope(out float height, out float2 slope, float2 quadLocalP
 
 // The low 12 bits select QuadrantData. The remaining bits store the blade slot and flags.
 StructuredBuffer<uint> VisibleBladeTasks : register(t5);
-#if defined(FAR_LOD)
-// Far's handoff and base variants each dispatch their own range of one work list.
+// Terrain and object surfaces dispatch separate ranges of the same work list.
 cbuffer GrassWorkRange : register(b0)
 {
 	uint workItemOffset;
 	float workShare;  // Share of each compact work item's patches that this dispatch generates.
 }
-#endif
 
 uint LoadBladeTask(uint taskIndex)
 {
-#if defined(FAR_LOD)
 	taskIndex += workItemOffset;
-#endif
 	return VisibleBladeTasks[taskIndex];
 }
 
@@ -218,6 +214,7 @@ float GetTerrainLiftReach(float2 world2D, float reach)
 static const uint WORK_QUADRANT_MASK = 0xFFFu;
 static const uint WORK_LANE_SHIFT = 12u;
 static const uint WORK_INSIDE_FRUSTUM = 1u << 17u;
+static const uint WORK_OBJECT_SURFACE = 1u << 18u;
 static const uint WORK_NEAR_COVERED = 1u << 19u;
 static const uint WORK_COMPACT_FAR = 1u << 20u;
 static const uint WORK_OCCUPIED_TILE = 1u << 21u;
@@ -420,7 +417,7 @@ void FlushGroupBlades(uint groupIndex, uint2 emittedBladeCounts)
 
 	if (groupIndex == 0u) {
 		GroupTileOccluded = 0u;
-		if (grassHiZParams.w >= 1.0f && debugFlags.x <= 0.5f) {
+		if (grassHiZParams.w >= 1.0f && debugFlags.x <= 0.5f && (tileTask & WORK_OBJECT_SURFACE) == 0u) {
 			if ((tileTask & (WORK_OCCUPIED_TILE | WORK_HAS_LAND)) == (WORK_OCCUPIED_TILE | WORK_HAS_LAND))
 				GroupTileOccluded = IsOccupiedTileOccluded(tileTask) ? 1u : 0u;
 #if defined(FAR_LOD)

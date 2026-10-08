@@ -136,6 +136,15 @@ public:
 		// Keyed by "plugin|0xLOCALID" (LandTextureKey).
 		std::unordered_map<std::string, std::vector<GrassTypeDef>> textureTypes;
 
+		struct ObjectGrassRule
+		{
+			std::string LandTexture;  // Empty selects the base grass type.
+			uint32_t Variant = 0;
+			float Density = 1.0f;
+		};
+		bool objectGrassEnabled = true;
+		std::unordered_map<std::string, ObjectGrassRule> objectGrassTextures;
+
 		// Debug
 		bool debugIgnoreGrassMap = false;
 		bool debugIgnoreObjectOcclusion = false;
@@ -145,6 +154,10 @@ public:
 	};
 
 	Settings settings;
+
+	/** @brief Resolves an object surface rule to an allocated grass type; invalid rules stay bare. */
+	uint8_t GetObjectGrassType(const Settings::ObjectGrassRule& rule) const;
+	const Settings::ObjectGrassRule* GetObjectGrassRule(std::string_view texturePath) const;
 
 	virtual void DrawSettings() override;
 
@@ -426,6 +439,8 @@ private:
 	std::vector<std::pair<std::string, uint32_t>> typeAllocation;
 	std::unordered_map<std::string, TextureSelection> textureSelection;
 	std::unordered_map<const RE::TESLandTexture*, const TextureSelection*> textureSelectionByTexture;
+	std::unordered_map<std::string, Settings::ObjectGrassRule> objectGrassTextureRules;
+	void RebuildObjectGrassRules();
 
 	/** @brief Rebuilds type ids and weighted selections from settings.textureTypes. */
 	void RebuildTypeAllocation();
