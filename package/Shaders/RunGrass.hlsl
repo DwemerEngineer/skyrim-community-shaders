@@ -564,6 +564,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	Skylighting::ApplySkylighting(directColor, directionalAmbientColor, outputAlbedo, skylightingDiffuse);
 #				endif
 
+	// Match the PBR brightness and deferred albedo convention used by ordinary PBR objects.
+	directColor *= Color::PBRLightingScale;
+	directionalAmbientColor *= Color::PBRLightingScale;
+	outputAlbedo *= Color::PBRLightingScale;
+	totalLighting.specular *= Color::PBRLightingScale;
+
 	float3 outputColor = FogNearColor.w * directColor;
 #				if defined(LIGHT_LIMIT_FIX) && defined(LLFDEBUG)
 	if (SharedData::lightLimitFixSettings.EnableLightsVisualisation) {
