@@ -92,6 +92,51 @@ namespace PBR
 		return D * G * F;
 	}
 
+	/// @brief Directional albedo of a GGX specular lobe from the split-sum environment BRDF
+	/// @param F0 Reflectance at normal incidence
+	/// @param roughness Perceptual roughness [0,1]
+	/// @param NdotV Dot product of normal and view direction
+	/// @return Fraction of light the lobe reflects toward the viewer, used for OpenPBR albedo scaling of the layers below
+	float3 SpecularDirectionalAlbedo(float3 F0, float roughness, float NdotV)
+	{
+		float2 specularBRDF = BRDF::EnvBRDF(roughness, NdotV);
+		return F0 * specularBRDF.x + specularBRDF.y;
+	}
+
+
+	/** @brief Splits a thin foliage sheet so its underside is never darker than its lit face; lower opacity favors the underside.
+	 *  @param baseColor Color of the lit face
+	 *  @param scatteringColor Color of light transmitted to the underside
+	 */
+	void GetFoliageSubsurfaceAlbedos(float3 baseColor, float3 scatteringColor, float opacity,
+		out float3 reflectionAlbedo, out float3 transmissionAlbedo)
+	{
+		// OpenPBR thin sheet at full subsurface weight: R = (1-g)/2, T = (1+g)/2, with forward anisotropy
+		// g = 0.5 * (1 - opacity) in [0, 0.5]. Opacity 1 is OpenPBR's balanced default, opacity 0 transmits 75%.
+		float transmittedShare = 0.5f + 0.25f * (1.0f - saturate(opacity));
+		reflectionAlbedo = baseColor * (1.0f - transmittedShare);
+		transmissionAlbedo = scatteringColor * transmittedShare;
+	}
+
+	/** @brief Normalized foliage reflection with optional wrap, and transmission confined to backlighting. */
+	float2 GetFoliageDiffuseCosines(float NdotL, float wrap)
+	{
+		// Wrap only reflection; transmission must not illuminate the light-facing side.
+		// The squared denominator normalizes the wrapped reflection lobe over the sphere.
+		float reflectionCosine = saturate((NdotL + wrap) / ((1.0f + wrap) * (1.0f + wrap)));
+		return float2(reflectionCosine, saturate(-NdotL));
+	}
+
+	/** @brief Evaluates thin-foliage diffuse lobes with separate reflection and transmission shadows. */
+	void GetFoliageDirectScattering(float3 reflectionAlbedo, float3 transmissionAlbedo, float3 irradiance,
+		float NdotL, float wrap, float reflectionShadow, float transmissionShadow,
+		out float3 reflection, out float3 transmission)
+	{
+		float2 diffuseCosines = GetFoliageDiffuseCosines(NdotL, wrap);
+		reflection = reflectionAlbedo * diffuseCosines.x * irradiance * reflectionShadow;
+		transmission = transmissionAlbedo * diffuseCosines.y * irradiance * transmissionShadow;
+	}
+
 	/// @brief Calculate index of refraction for hair using Marschner model
 	/// @return Effective IOR for hair (approximately 1.55)
 	float HairIOR()

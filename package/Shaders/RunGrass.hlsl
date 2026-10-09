@@ -332,6 +332,7 @@ Texture2D<float4> TexShadowMaskSampler : register(t1);
 #	if defined(GRASS_LIGHTING) && defined(TRUE_PBR)
 Texture2D<float4> TexNormalSampler : register(t2);
 Texture2D<float4> TexRMAOSSampler : register(t3);
+// Texture-set slot 8 (featuresTexture0): sRGB subsurface color in RGB, linear opacity in alpha.
 Texture2D<float4> TexSubsurfaceSampler : register(t4);
 #	endif
 
@@ -455,6 +456,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		rawRMAOS = TexRMAOSSampler.SampleBias(SampRMAOSSampler, input.TexCoord.xy, SharedData::MipBias) *
 		           float4(PBRParams1.x, 1, 1, PBRParams1.y);
 	}
+	// Thin reflection/transmission is evaluated on the face visible to the camera.
+	normal = dot(normal, viewDirection) < 0.0f ? -normal : normal;
 	MaterialProperties material = (MaterialProperties)0;
 	material.Roughness = clamp(rawRMAOS.x, PBR::Constants::MinRoughness, PBR::Constants::MaxRoughness);
 	material.Metallic = saturate(rawRMAOS.y);
@@ -466,14 +469,24 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	material.BaseColor = baseColor.xyz * vertexColor;
 	material.F0 = lerp(saturate(rawRMAOS.w), material.BaseColor, material.Metallic);
 	material.BaseColor *= 1 - material.Metallic;
-	material.SubsurfaceColor = PBRParams2.xyz;
-	material.Thickness = PBRParams2.w;
-	[branch] if (pbrDetail && (PBRFlags & PBR::Flags::HasFeatureTexture0) != 0)
+	material.Thickness = 1.0f;
+	[branch] if ((PBRFlags & PBR::Flags::Subsurface) != 0)
 	{
-		float4 subsurface = TexSubsurfaceSampler.Sample(SampSubsurfaceSampler, input.TexCoord.xy);
-		material.SubsurfaceColor *= Color::Diffuse(subsurface.xyz);
-		material.Thickness *= subsurface.w;
+		material.SubsurfaceColor = PBRParams2.xyz;
+		material.Thickness = PBRParams2.w;
+		[branch] if (pbrDetail && (PBRFlags & PBR::Flags::HasFeatureTexture0) != 0)
+		{
+			float4 subsurface = TexSubsurfaceSampler.Sample(SampSubsurfaceSampler, input.TexCoord.xy);
+			material.SubsurfaceColor *= Color::Diffuse(subsurface.xyz);
+			material.Thickness *= subsurface.w;
+		}
+		else
+		{
+			// Without a subsurface texture, the base color supplies the transmitted blade detail.
+			material.SubsurfaceColor *= material.BaseColor;
+		}
 	}
+	PBR::GrassSurface grassSurface = PBR::CreateGrassSurface(material, clamp(dot(normal, viewDirection), EPSILON_DOT_CLAMP, 1.0f), pbrDetail);
 
 	float3 viewPosition = mul(FrameBuffer::CameraView, float4(input.WorldPosition.xyz, 1)).xyz;
 	float2 screenUV = FrameBuffer::ViewToUV(viewPosition);
@@ -511,7 +524,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	DirectContext dirContext = CreateDirectLightingContext(normal, normal, vertexNormal, viewDirection, viewDirection,
 		SharedData::DirLightDirection.xyz, SharedData::DirLightDirection.xyz, dirLightColor, dirDetailedShadow, dirSoftShadow);
 	DirectLightingOutput dirOutput;
-	PBR::GetDirectLightInputGrass(dirOutput, dirContext, material, pbrDetail);
+	PBR::GetDirectLightInputGrass(dirOutput, dirContext, material, grassSurface, pbrDetail);
 	totalLighting.diffuse += dirOutput.diffuse;
 	totalLighting.specular += dirOutput.specular;
 	totalLighting.transmission += dirOutput.transmission;
@@ -537,7 +550,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				DirectContext pointContext = CreateDirectLightingContext(normal, normal, vertexNormal, viewDirection, viewDirection,
 					lightDirection, lightDirection, lightColor, lightShadow, lightShadow);
 				DirectLightingOutput pointOutput;
-				PBR::GetDirectLightInputGrass(pointOutput, pointContext, material, pbrDetail);
+				PBR::GetDirectLightInputGrass(pointOutput, pointContext, material, grassSurface, pbrDetail);
 				totalLighting.diffuse += pointOutput.diffuse;
 				totalLighting.specular += pointOutput.specular;
 				totalLighting.transmission += pointOutput.transmission;
@@ -547,10 +560,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #				endif
 
 	IndirectLobeWeights indirectLobes;
+	float3 indirectTransmission;
 	IndirectContext indirectContext = CreateIndirectLightingContext(normal, vertexNormal, viewDirection);
-	PBR::GetIndirectLobeWeightsGrass(indirectLobes, indirectContext, material, pbrDetail);
+	PBR::GetIndirectLobeWeightsGrass(indirectLobes, indirectTransmission, indirectContext, material, grassSurface);
 
-	float3 directColor = totalLighting.diffuse * material.BaseColor + totalLighting.transmission;
+	float3 directColor = totalLighting.diffuse + totalLighting.transmission;
 	float3 directionalAmbientColor = Color::Ambient(max(0, SharedData::GetAmbient(normal)));
 #				if defined(IBL)
 	if (SharedData::iblSettings.EnableIBL)
@@ -563,6 +577,21 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float skylightingDiffuse = Skylighting::GetSkylightingDiffuse(skylightingSH, input.WorldPosition.xyz, normal, vertexAO);
 	Skylighting::ApplySkylighting(directColor, directionalAmbientColor, outputAlbedo, skylightingDiffuse);
 #				endif
+
+	// The back hemisphere illuminates transmitted light, using the same budget as direct lighting.
+	[branch] if (any(indirectTransmission > 0.0f))
+	{
+		float3 backAmbientColor = Color::Ambient(max(0, SharedData::GetAmbient(-normal)));
+		float3 transmittedAmbientColor;
+		directColor += GetFoliageTransmissionLighting(backAmbientColor, indirectTransmission, -normal,
+			input.WorldPosition.xyz, vertexAO, transmittedAmbientColor
+#				if defined(SKYLIGHTING)
+			, skylightingSH
+#				endif
+		);
+		directionalAmbientColor += transmittedAmbientColor;
+	}
+	// Deferred diffuse/GI uses the visible normal, so its albedo contains reflection only.
 
 	// Match the PBR brightness and deferred albedo convention used by ordinary PBR objects.
 	directColor *= Color::PBRLightingScale;

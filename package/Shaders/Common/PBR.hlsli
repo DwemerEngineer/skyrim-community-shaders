@@ -182,8 +182,15 @@ namespace PBR
 			}
 #	else
 			{
-				float subsurfaceFoliage = saturate(-NdotL) * (1.0 - material.Thickness);
-				lightingOutput.transmission += material.SubsurfaceColor * subsurfaceFoliage * detailedLightColor * BRDF::Diffuse_Lambert() * kD;
+				// Diffuse output receives BaseColor at the call site, so split the color multipliers here.
+				float3 reflectionTint, transmissionTint;
+				GetFoliageSubsurfaceAlbedos(1.0f, saturate(material.SubsurfaceColor), material.Thickness,
+					reflectionTint, transmissionTint);
+				float3 scatteringThroughput = 1.0f - saturate(SpecularDirectionalAlbedo(material.F0, material.Roughness, satNdotV));
+				float3 irradiance = detailedLightColor * BRDF::Diffuse_Lambert() * scatteringThroughput;
+				// The sheet replaces ordinary diffuse: reflection lights the lit face, transmission the underside.
+				GetFoliageDirectScattering(reflectionTint, transmissionTint, irradiance,
+					NdotL, 0.0f, 1.0f, 1.0f, lightingOutput.diffuse, lightingOutput.transmission);
 			}
 #	endif
 			else if ((PBRFlags & Flags::TwoLayer) != 0)
@@ -247,7 +254,12 @@ namespace PBR
 #if !defined(LANDSCAPE) && !defined(LODLANDSCAPE)
 			[branch] if ((PBRFlags & Flags::Subsurface) != 0)
 			{
+#	if defined(TREE_ANIM)
+				GetFoliageSubsurfaceAlbedos(material.BaseColor, saturate(material.SubsurfaceColor), material.Thickness,
+					lobeWeights.diffuse, lobeWeights.transmission);
+#	else
 				lobeWeights.diffuse += material.SubsurfaceColor * (1 - material.Thickness) / Math::PI;
+#	endif
 			}
 			[branch] if ((PBRFlags & Flags::Fuzz) != 0)
 			{
@@ -259,6 +271,9 @@ namespace PBR
 
 			// Energy conservation: diffuse receives only what specular does not reflect
 			lobeWeights.diffuse *= 1 - lobeWeights.specular;
+#if defined(TREE_ANIM)
+			lobeWeights.transmission *= 1 - lobeWeights.specular;
+#endif
 
 #if !defined(LANDSCAPE) && !defined(LODLANDSCAPE)
 			[branch] if ((PBRFlags & Flags::TwoLayer) != 0)
@@ -281,77 +296,86 @@ namespace PBR
 		}
 
 		// Apply ambient occlusion with multi-bounce approximation
+#if defined(TREE_ANIM)
+		float3 diffuseAO = MultiBounceAO(material.BaseColor, material.AO);
+		// The AO fit can slightly exceed one; keep the thin-surface scattering budget bounded.
+		[branch] if ((PBRFlags & Flags::Subsurface) != 0)
+			diffuseAO = saturate(diffuseAO);
+		lobeWeights.diffuse *= diffuseAO;
+		lobeWeights.transmission *= diffuseAO;
+#else
 		lobeWeights.diffuse *= MultiBounceAO(material.BaseColor, material.AO);
+#endif
 		float alpha = material.Roughness * material.Roughness;
 		lobeWeights.specular *= SpecularOcclusion(NdotV, alpha, material.AO);
 	}
 
 #if defined(GRASS_LIGHTING)
-	void GetDirectLightInputGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, bool doSpecular)
+	struct GrassSurface
+	{
+		float3 reflectionAlbedo;
+		float3 transmissionAlbedo;
+		float3 specularAlbedo;
+	};
+
+	/** @brief Prepares the scattering budget once for all lights. */
+	GrassSurface CreateGrassSurface(MaterialProperties material, float NdotV, bool doSpecular)
+	{
+		GrassSurface surface = (GrassSurface)0;
+		surface.reflectionAlbedo = saturate(material.BaseColor);
+		[branch] if ((PBRFlags & Flags::Subsurface) != 0)
+		{
+			GetFoliageSubsurfaceAlbedos(surface.reflectionAlbedo, saturate(material.SubsurfaceColor), material.Thickness,
+				surface.reflectionAlbedo, surface.transmissionAlbedo);
+		}
+
+		[branch] if (doSpecular)
+		{
+			surface.specularAlbedo = saturate(SpecularDirectionalAlbedo(material.F0, material.Roughness, NdotV));
+		}
+		return surface;
+	}
+
+	void GetDirectLightInputGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, GrassSurface surface, bool doSpecular)
 	{
 		lightingOutput = (DirectLightingOutput)0;
 		const float3 detailedLightColor = context.lightColor * context.detailedShadow;
-		const float3 softLightColor = context.lightColor * context.softShadow;
 
 		const float3 N = context.worldNormal;
 		const float3 V = context.viewDir;
 		const float3 L = context.lightDir;
 
 		float NdotL = dot(N, L);
-		float VdotL = dot(V, L);
+		float satNdotL = saturate(NdotL);
+		float NdotV = clamp(dot(N, V), EPSILON_DOT_CLAMP, 1.0f);
+		float3 scatteringThroughput = 1.0f - surface.specularAlbedo;
 
-		float satNdotL = clamp(NdotL, EPSILON_DOT_CLAMP, 1);
+		float wrap = saturate(SharedData::grassLightingSettings.PBRWrappedLightingAmount);
+		float3 irradiance = context.lightColor * BRDF::Diffuse_Lambert() * scatteringThroughput;
+		GetFoliageDirectScattering(surface.reflectionAlbedo, surface.transmissionAlbedo, irradiance,
+			NdotL, wrap, context.detailedShadow, context.softShadow, lightingOutput.diffuse, lightingOutput.transmission);
 
 		float3 F = 0;
-		float3 Fr = 0;
 		[branch] if (doSpecular)
 		{
 			const float3 H = context.halfVector;
-			float satNdotV = saturate(abs(dot(N, V)) + EPSILON_DOT_CLAMP);
 			float satNdotH = saturate(dot(N, H));
 			float satVdotH = saturate(dot(V, H));
-			Fr = SpecularMicrofacet(material.Roughness, material.F0, satNdotL, satNdotV, satNdotH, satVdotH, F);
-		}
-		float3 kD = 1 - F;
-
-		const float diffuseWrap = 0.5;
-		float wrappedNdotL = saturate((abs(NdotL) + diffuseWrap) / (1.0 + diffuseWrap));
-		lightingOutput.diffuse += detailedLightColor * wrappedNdotL * BRDF::Diffuse_Lambert() * kD;
-		lightingOutput.specular += Fr * detailedLightColor * satNdotL;
-
-		[branch] if ((PBRFlags & Flags::Subsurface) != 0)
-		{
-			const float subsurfacePower = 12.234;
-			float forwardScatter = exp2(saturate(-VdotL) * subsurfacePower - subsurfacePower);
-			float backScatter = saturate(satNdotL * material.Thickness + (1.0 - material.Thickness)) * 0.5;
-			float subsurface = lerp(backScatter, 1, forwardScatter) * (1.0 - material.Thickness);
-			lightingOutput.transmission += material.SubsurfaceColor * subsurface * softLightColor * BRDF::Diffuse_Lambert() * kD;
+			float3 Fr = SpecularMicrofacet(material.Roughness, material.F0, max(satNdotL, EPSILON_DOT_CLAMP), NdotV, satNdotH, satVdotH, F);
+			lightingOutput.specular = Fr * detailedLightColor * satNdotL;
 		}
 	}
 
-	void GetIndirectLobeWeightsGrass(out IndirectLobeWeights lobeWeights, IndirectContext context, MaterialProperties material, bool doSpecular)
+	void GetIndirectLobeWeightsGrass(out IndirectLobeWeights lobeWeights, out float3 transmissionWeight, IndirectContext context, MaterialProperties material, GrassSurface surface)
 	{
 		lobeWeights = (IndirectLobeWeights)0;
-
-		lobeWeights.diffuse = material.BaseColor;
-
-		[branch] if ((PBRFlags & Flags::Subsurface) != 0)
-		{
-			lobeWeights.diffuse += material.SubsurfaceColor * (1 - material.Thickness) / Math::PI;
-		}
-
-		[branch] if (doSpecular)
-		{
-			float NdotV = saturate(dot(context.worldNormal, context.viewDir));
-			float2 specularBRDF = BRDF::EnvBRDF(material.Roughness, NdotV);
-			lobeWeights.specular = material.F0 * specularBRDF.x + specularBRDF.y;
-			lobeWeights.diffuse *= 1 - lobeWeights.specular;
-
-			float alpha = material.Roughness * material.Roughness;
-			lobeWeights.specular *= SpecularOcclusion(NdotV, alpha, material.AO);
-		}
-
-		lobeWeights.diffuse *= MultiBounceAO(material.BaseColor, material.AO);
+		float3 scatteringThroughput = MultiBounceAO(material.BaseColor, material.AO) *
+		                              (1.0f - surface.specularAlbedo);
+		lobeWeights.diffuse = surface.reflectionAlbedo * scatteringThroughput;
+		transmissionWeight = surface.transmissionAlbedo * scatteringThroughput;
+		float NdotV = clamp(dot(context.worldNormal, context.viewDir), EPSILON_DOT_CLAMP, 1.0f);
+		lobeWeights.specular = surface.specularAlbedo *
+		                       SpecularOcclusion(NdotV, material.Roughness * material.Roughness, material.AO);
 	}
 #endif
 }
