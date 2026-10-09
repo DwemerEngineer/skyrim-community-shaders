@@ -9,7 +9,6 @@
 #endif
 
 #if defined(TRUE_PBR) && (defined(TREE_ANIM) || defined(GRASS_LIGHTING))
-// Ambient sampling stays at the call site because each shader uses different ambient data.
 float3 GetFoliageTransmissionLighting(float3 ambientColor, float3 transmissionWeight, float3 backNormal,
 	float3 worldPosition, float vertexAO, out float3 transmittedAmbientColor
 #	if defined(IBL) && defined(LIGHTING)

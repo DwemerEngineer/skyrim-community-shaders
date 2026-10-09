@@ -1898,7 +1898,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			material.Thickness *= sampledSubsurfaceProperties.w;
 		}
 #			if defined(TREE_ANIM)
-		// Foliage transmits the subsurface texture color; without one, the base color supplies the leaf detail.
 		else
 		{
 			material.SubsurfaceColor *= material.BaseColor;

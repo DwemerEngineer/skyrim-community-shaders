@@ -326,6 +326,7 @@ SamplerState SampNormalSampler : register(s2);
 SamplerState SampRMAOSSampler : register(s3);
 SamplerState SampSubsurfaceSampler : register(s4);
 SamplerState SampFuzzSampler : register(s5);
+SamplerState SampEmissiveSampler : register(s6);
 #	endif
 
 Texture2D<float4> TexBaseSampler : register(t0);
@@ -337,6 +338,8 @@ Texture2D<float4> TexRMAOSSampler : register(t3);
 Texture2D<float4> TexSubsurfaceSampler : register(t4);
 // Texture-set slot 7 (featuresTexture1): sRGB fuzz color in RGB, linear weight in alpha.
 Texture2D<float4> TexFuzzSampler : register(t5);
+// Texture-set slot 3: linear emissive color in RGB.
+Texture2D<float4> TexEmissiveSampler : register(t6);
 #	endif
 
 cbuffer PerFrame : register(b0)
@@ -460,7 +463,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		rawRMAOS = TexRMAOSSampler.SampleBias(SampRMAOSSampler, input.TexCoord.xy, SharedData::MipBias) *
 		           float4(PBRParams1.x, 1, 1, PBRParams1.y);
 	}
-	// Thin reflection/transmission and sheen are evaluated on the face visible to the camera.
 	normal = dot(normal, viewDirection) < 0.0f ? -normal : normal;
 	MaterialProperties material = (MaterialProperties)0;
 	material.Roughness = clamp(rawRMAOS.x, PBR::Constants::MinRoughness, PBR::Constants::MaxRoughness);
@@ -486,7 +488,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		else
 		{
-			// Without a subsurface texture, the base color supplies the transmitted blade detail.
 			material.SubsurfaceColor *= material.BaseColor;
 		}
 	}
@@ -593,7 +594,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	Skylighting::ApplySkylighting(directColor, directionalAmbientColor, outputAlbedo, skylightingDiffuse);
 #				endif
 
-	// The back hemisphere illuminates transmitted light, using the same budget as direct lighting.
 	[branch] if (any(indirectTransmission > 0.0f))
 	{
 		float3 backAmbientColor = Color::Ambient(max(0, SharedData::GetAmbient(-normal)));
@@ -608,7 +608,19 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 	// Deferred diffuse/GI uses the visible normal, so its albedo contains reflection only.
 
-	// Match the PBR brightness and deferred albedo convention used by ordinary PBR objects.
+	[branch] if ((PBRFlags & PBR::Flags::HasEmissive) != 0)
+	{
+		float3 glowColor = Color::Glowmap(TexEmissiveSampler.SampleBias(SampEmissiveSampler, input.TexCoord.xy, SharedData::MipBias).xyz);
+		float3 emitVertexColor = Color::SrgbToLinear(input.Color.xyz);
+		float emitVertexAO = max(max(emitVertexColor.r, emitVertexColor.g), emitVertexColor.b);
+		emitVertexColor = emitVertexAO == 0.0f ? 1.0f : emitVertexColor * lerp(1 / max(emitVertexAO, 1e-4), 1, SharedData::truePBRSettings.VertexAOStrength);
+		if (SharedData::linearLightingSettings.enableLinearLighting)
+			glowColor *= emitVertexColor * SharedData::linearLightingSettings.emitColorMult;
+		else
+			glowColor = Color::LinearToSrgb(Color::SrgbToLinear(glowColor) * emitVertexColor);
+		directColor += glowColor;
+	}
+
 	directColor *= Color::PBRLightingScale;
 	directionalAmbientColor *= Color::PBRLightingScale;
 	outputAlbedo *= Color::PBRLightingScale;

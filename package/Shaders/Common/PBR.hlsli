@@ -188,7 +188,6 @@ namespace PBR
 					reflectionTint, transmissionTint);
 				float3 scatteringThroughput = 1.0f - saturate(SpecularDirectionalAlbedo(material.F0, material.Roughness, satNdotV));
 				float3 irradiance = detailedLightColor * BRDF::Diffuse_Lambert() * scatteringThroughput;
-				// The sheet replaces ordinary diffuse: reflection lights the lit face, transmission the underside.
 				GetFoliageDirectScattering(reflectionTint, transmissionTint, irradiance,
 					NdotL, 0.0f, 1.0f, 1.0f, lightingOutput.diffuse, lightingOutput.transmission);
 			}

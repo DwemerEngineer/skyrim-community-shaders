@@ -1527,6 +1527,14 @@ struct BSGrassShader_SetupMaterial
 		shadowState->SetPSTextureFilterMode(3, RE::BSGraphics::TextureFilterMode::kAnisotropic);
 
 		stl::enumeration<PBRShaderFlags> shaderFlags;
+		const bool hasEmissive = pbrMaterial->emissiveTexture != nullptr &&
+		                         pbrMaterial->emissiveTexture != globals::game::graphicsState->GetRuntimeData().defaultTextureBlack;
+		if (hasEmissive) {
+			shadowState->SetPSTexture(6, pbrMaterial->emissiveTexture->rendererTexture);
+			shadowState->SetPSTextureAddressMode(6, clampMode);
+			shadowState->SetPSTextureFilterMode(6, RE::BSGraphics::TextureFilterMode::kAnisotropic);
+			shaderFlags.set(PBRShaderFlags::HasEmissive);
+		}
 		const bool hasSubsurface = pbrMaterial->pbrFlags.any(PBRFlags::Subsurface) &&
 		                           !pbrMaterial->pbrFlags.any(PBRFlags::TwoLayer) &&
 		                           !pbrMaterial->pbrFlags.any(PBRFlags::HairMarschner);

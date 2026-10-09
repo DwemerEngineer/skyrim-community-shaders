@@ -162,7 +162,6 @@ namespace PBR
 	/// @note Rational fits from the MaterialX reference implementation (mx_microfacet_sheen.glsl).
 	float FuzzLobe(float3 L, float3 V, float3 N, float NdotV, float roughness)
 	{
-		// Orient the lobe in the plane of the view and the normal.
 		float3 X = V - N * NdotV;
 		float lengthSquared = dot(X, X);
 		X = lengthSquared > 1e-8 ? X * rsqrt(lengthSquared) : normalize(abs(N.z) < 0.999 ? cross(float3(0, 0, 1), N) : float3(1, 0, 0));
