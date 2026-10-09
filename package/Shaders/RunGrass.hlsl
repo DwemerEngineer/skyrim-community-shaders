@@ -325,6 +325,7 @@ SamplerState SampShadowMaskSampler : register(s1);
 SamplerState SampNormalSampler : register(s2);
 SamplerState SampRMAOSSampler : register(s3);
 SamplerState SampSubsurfaceSampler : register(s4);
+SamplerState SampFuzzSampler : register(s5);
 #	endif
 
 Texture2D<float4> TexBaseSampler : register(t0);
@@ -334,6 +335,8 @@ Texture2D<float4> TexNormalSampler : register(t2);
 Texture2D<float4> TexRMAOSSampler : register(t3);
 // Texture-set slot 8 (featuresTexture0): sRGB subsurface color in RGB, linear opacity in alpha.
 Texture2D<float4> TexSubsurfaceSampler : register(t4);
+// Texture-set slot 7 (featuresTexture1): sRGB fuzz color in RGB, linear weight in alpha.
+Texture2D<float4> TexFuzzSampler : register(t5);
 #	endif
 
 cbuffer PerFrame : register(b0)
@@ -388,6 +391,7 @@ cbuffer PerMaterial : register(b1)
 	uint PBRFlags : packoffset(c0.x);
 	float3 PBRParams1 : packoffset(c0.y);  // roughness scale, specular level
 	float4 PBRParams2 : packoffset(c1);    // subsurface color, subsurface opacity
+	float4 PBRParams3 : packoffset(c2);    // fuzz color, fuzz weight
 };
 
 #			include "Common/LightingEval.hlsli"
@@ -456,7 +460,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		rawRMAOS = TexRMAOSSampler.SampleBias(SampRMAOSSampler, input.TexCoord.xy, SharedData::MipBias) *
 		           float4(PBRParams1.x, 1, 1, PBRParams1.y);
 	}
-	// Thin reflection/transmission is evaluated on the face visible to the camera.
+	// Thin reflection/transmission and sheen are evaluated on the face visible to the camera.
 	normal = dot(normal, viewDirection) < 0.0f ? -normal : normal;
 	MaterialProperties material = (MaterialProperties)0;
 	material.Roughness = clamp(rawRMAOS.x, PBR::Constants::MinRoughness, PBR::Constants::MaxRoughness);
@@ -484,6 +488,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		{
 			// Without a subsurface texture, the base color supplies the transmitted blade detail.
 			material.SubsurfaceColor *= material.BaseColor;
+		}
+	}
+	[branch] if (pbrDetail && (PBRFlags & PBR::Flags::Fuzz) != 0)
+	{
+		material.FuzzColor = PBRParams3.xyz;
+		material.FuzzWeight = PBRParams3.w;
+		[branch] if ((PBRFlags & PBR::Flags::HasFeatureTexture1) != 0)
+		{
+			float4 fuzz = TexFuzzSampler.Sample(SampFuzzSampler, input.TexCoord.xy);
+			material.FuzzColor *= Color::Diffuse(fuzz.xyz);
+			material.FuzzWeight *= fuzz.w;
 		}
 	}
 	PBR::GrassSurface grassSurface = PBR::CreateGrassSurface(material, clamp(dot(normal, viewDirection), EPSILON_DOT_CLAMP, 1.0f), pbrDetail);

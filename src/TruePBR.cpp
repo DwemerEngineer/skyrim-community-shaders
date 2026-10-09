@@ -1544,11 +1544,29 @@ struct BSGrassShader_SetupMaterial
 				shaderFlags.set(PBRShaderFlags::HasFeaturesTexture0);
 			}
 		}
+		const bool hasFuzz = pbrMaterial->pbrFlags.any(PBRFlags::Fuzz) &&
+		                     !pbrMaterial->pbrFlags.any(PBRFlags::TwoLayer) &&
+		                     !pbrMaterial->pbrFlags.any(PBRFlags::HairMarschner);
+		std::array<float, 4> pbrParams3{};
+		if (hasFuzz) {
+			shaderFlags.set(PBRShaderFlags::Fuzz);
+			pbrParams3 = { pbrMaterial->GetFuzzColor().red, pbrMaterial->GetFuzzColor().green,
+				pbrMaterial->GetFuzzColor().blue, pbrMaterial->GetFuzzWeight() };
+			const bool hasFeaturesTexture1 = pbrMaterial->featuresTexture1 != nullptr &&
+			                                 pbrMaterial->featuresTexture1 != globals::game::graphicsState->GetRuntimeData().defaultTextureWhite;
+			if (hasFeaturesTexture1) {
+				shadowState->SetPSTexture(5, pbrMaterial->featuresTexture1->rendererTexture);
+				shadowState->SetPSTextureAddressMode(5, clampMode);
+				shadowState->SetPSTextureFilterMode(5, RE::BSGraphics::TextureFilterMode::kAnisotropic);
+				shaderFlags.set(PBRShaderFlags::HasFeaturesTexture1);
+			}
+		}
 
 		shadowState->SetPSConstant(shaderFlags, RE::BSGraphics::ConstantGroupLevel::PerMaterial, grassPSConstants.PBRFlags);
 		std::array<float, 3> pbrParams1{ pbrMaterial->GetRoughnessScale(), pbrMaterial->GetSpecularLevel(), 0.0f };
 		shadowState->SetPSConstant(pbrParams1, RE::BSGraphics::ConstantGroupLevel::PerMaterial, grassPSConstants.PBRParams1);
 		shadowState->SetPSConstant(pbrParams2, RE::BSGraphics::ConstantGroupLevel::PerMaterial, grassPSConstants.PBRParams2);
+		shadowState->SetPSConstant(pbrParams3, RE::BSGraphics::ConstantGroupLevel::PerMaterial, grassPSConstants.PBRParams3);
 
 		RE::BSGraphics::Renderer::FlushPSConstantGroup(RE::BSGraphics::ConstantGroupLevel::PerMaterial);
 		RE::BSGraphics::Renderer::ApplyPSConstantGroup(RE::BSGraphics::ConstantGroupLevel::PerMaterial);

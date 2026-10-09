@@ -316,9 +316,12 @@ namespace PBR
 		float3 reflectionAlbedo;
 		float3 transmissionAlbedo;
 		float3 specularAlbedo;
+		float3 fuzzColor;
+		float fuzzAlbedo;
+		float fuzzRoughness;
 	};
 
-	/** @brief Prepares the scattering budget once for all lights. */
+	/** @brief Prepares the scattering budget and OpenPBR sheen once for all lights. */
 	GrassSurface CreateGrassSurface(MaterialProperties material, float NdotV, bool doSpecular)
 	{
 		GrassSurface surface = (GrassSurface)0;
@@ -332,6 +335,12 @@ namespace PBR
 		[branch] if (doSpecular)
 		{
 			surface.specularAlbedo = saturate(SpecularDirectionalAlbedo(material.F0, material.Roughness, NdotV));
+			[branch] if ((PBRFlags & Flags::Fuzz) != 0)
+			{
+				surface.fuzzRoughness = clamp(material.Roughness, 0.01f, 1.0f);
+				surface.fuzzAlbedo = saturate(saturate(material.FuzzWeight) * FuzzDirectionalAlbedo(NdotV, surface.fuzzRoughness));
+				surface.fuzzColor = saturate(material.FuzzColor);
+			}
 		}
 		return surface;
 	}
@@ -348,7 +357,8 @@ namespace PBR
 		float NdotL = dot(N, L);
 		float satNdotL = saturate(NdotL);
 		float NdotV = clamp(dot(N, V), EPSILON_DOT_CLAMP, 1.0f);
-		float3 scatteringThroughput = 1.0f - surface.specularAlbedo;
+		float fuzzThroughput = 1.0f - surface.fuzzAlbedo;
+		float3 scatteringThroughput = (1.0f - surface.specularAlbedo) * fuzzThroughput;
 
 		float wrap = saturate(SharedData::grassLightingSettings.PBRWrappedLightingAmount);
 		float3 irradiance = context.lightColor * BRDF::Diffuse_Lambert() * scatteringThroughput;
@@ -362,7 +372,15 @@ namespace PBR
 			float satNdotH = saturate(dot(N, H));
 			float satVdotH = saturate(dot(V, H));
 			float3 Fr = SpecularMicrofacet(material.Roughness, material.F0, max(satNdotL, EPSILON_DOT_CLAMP), NdotV, satNdotH, satVdotH, F);
-			lightingOutput.specular = Fr * detailedLightColor * satNdotL;
+			lightingOutput.specular = Fr * detailedLightColor * satNdotL * fuzzThroughput;
+			[branch] if (surface.fuzzAlbedo > 0.0f)
+			{
+				// Back light reaches the viewer-side fuzz through the blade, using the same transmission budget.
+				float3 fuzzReflection = surface.fuzzAlbedo * surface.fuzzColor *
+				                        (FuzzLobe(L, V, N, NdotV, surface.fuzzRoughness) +
+											surface.transmissionAlbedo * FuzzLobeTransmitted(L, V, N, NdotV, surface.fuzzRoughness));
+				lightingOutput.specular += fuzzReflection * detailedLightColor;
+			}
 		}
 	}
 
@@ -370,11 +388,11 @@ namespace PBR
 	{
 		lobeWeights = (IndirectLobeWeights)0;
 		float3 scatteringThroughput = MultiBounceAO(material.BaseColor, material.AO) *
-		                              (1.0f - surface.specularAlbedo);
-		lobeWeights.diffuse = surface.reflectionAlbedo * scatteringThroughput;
+		                              (1.0f - surface.specularAlbedo) * (1.0f - surface.fuzzAlbedo);
+		lobeWeights.diffuse = surface.reflectionAlbedo * scatteringThroughput + surface.fuzzAlbedo * surface.fuzzColor * material.AO;
 		transmissionWeight = surface.transmissionAlbedo * scatteringThroughput;
 		float NdotV = clamp(dot(context.worldNormal, context.viewDir), EPSILON_DOT_CLAMP, 1.0f);
-		lobeWeights.specular = surface.specularAlbedo *
+		lobeWeights.specular = surface.specularAlbedo * (1.0f - surface.fuzzAlbedo) *
 		                       SpecularOcclusion(NdotV, material.Roughness * material.Roughness, material.AO);
 	}
 #endif
