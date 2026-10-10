@@ -912,6 +912,8 @@ void GrassBucketStore::MergeSlicesIntoRuns(GrassBucket& b)
 	if (!b.clustersValid) {
 		b.sliceRunBatches.clear();
 		b.sliceRunCount = 0;
+		b.sliceBlockBatches.clear();
+		b.sliceBlocksUseful = false;
 		b.cullGroups.clear();
 		b.clusteredSlices = 0;
 		b.residentGroups = 0;
@@ -936,6 +938,28 @@ void GrassBucketStore::MergeSlicesIntoRuns(GrassBucket& b)
 		const auto& bounds = b.sliceBounds[i];
 		const float loX = bounds.lo[0] - pad, loY = bounds.lo[1] - pad, loZ = bounds.lo[2] - pad;
 		const float hiX = bounds.hi[0] + pad, hiY = bounds.hi[1] + pad, hiZ = bounds.hi[2] + pad;
+		const uint32_t blockIndex = (b.sliceRunCount - 1) / GrassBucket::kRunsPerCullBlock;
+		const uint32_t blockLane = blockIndex % 4;
+		const bool startsBlock = !continues && (b.sliceRunCount - 1) % GrassBucket::kRunsPerCullBlock == 0;
+		if (startsBlock && blockLane == 0)
+			b.sliceBlockBatches.emplace_back();
+		auto& block = b.sliceBlockBatches.back();
+		if (startsBlock) {
+			block.loX[blockLane] = loX;
+			block.loY[blockLane] = loY;
+			block.loZ[blockLane] = loZ;
+			block.hiX[blockLane] = hiX;
+			block.hiY[blockLane] = hiY;
+			block.hiZ[blockLane] = hiZ;
+			block.firstGroup[blockLane] = (uint32_t)b.cullGroups.size();
+		} else {
+			block.loX[blockLane] = std::min(block.loX[blockLane], loX);
+			block.loY[blockLane] = std::min(block.loY[blockLane], loY);
+			block.loZ[blockLane] = std::min(block.loZ[blockLane], loZ);
+			block.hiX[blockLane] = std::max(block.hiX[blockLane], hiX);
+			block.hiY[blockLane] = std::max(block.hiY[blockLane], hiY);
+			block.hiZ[blockLane] = std::max(block.hiZ[blockLane], hiZ);
+		}
 		if (continues) {
 			batch.loX[lane] = std::min(batch.loX[lane], loX);
 			batch.loY[lane] = std::min(batch.loY[lane], loY);
@@ -958,7 +982,26 @@ void GrassBucketStore::MergeSlicesIntoRuns(GrassBucket& b)
 			b.cullGroups.push_back({ { slice.origin.x, slice.origin.y, slice.origin.z }, slice.fadeStart,
 				slice.bufferOffset + first, std::min(kCullGroupSize, slice.count - first) });
 			++batch.groupCount[lane];
+			++block.groupCount[blockLane];
 		}
+	}
+	// Only traverse parents when run order has spatial locality. Wide, scattered parents add
+	// tests without avoiding leaf work; keep those buckets on the flat SSE path instead.
+	b.sliceBlocksUseful = false;
+	if (b.sliceRunCount >= GrassBucket::kRunsPerCullBlock * 2) {
+		float loX = FLT_MAX, loY = FLT_MAX, hiX = -FLT_MAX, hiY = -FLT_MAX;
+		float blockArea = 0.0f;
+		const uint32_t blockCount = (b.sliceRunCount + GrassBucket::kRunsPerCullBlock - 1) / GrassBucket::kRunsPerCullBlock;
+		for (uint32_t i = 0; i < blockCount; ++i) {
+			const auto& block = b.sliceBlockBatches[i / 4];
+			const uint32_t lane = i % 4;
+			loX = std::min(loX, block.loX[lane]);
+			loY = std::min(loY, block.loY[lane]);
+			hiX = std::max(hiX, block.hiX[lane]);
+			hiY = std::max(hiY, block.hiY[lane]);
+			blockArea += (block.hiX[lane] - block.loX[lane]) * (block.hiY[lane] - block.loY[lane]);
+		}
+		b.sliceBlocksUseful = blockArea < (hiX - loX) * (hiY - loY) * (0.5f * blockCount);
 	}
 	b.clusteredSlices = (uint32_t)b.slices.size();
 	b.clustersValid = true;

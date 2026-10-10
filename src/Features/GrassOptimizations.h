@@ -163,6 +163,9 @@ public:
 	/** @brief Appends this bucket's visible slice runs to sliceTableCPU and records the window in the bucket. */
 	void CullBucketSlices(GrassBucket& b, const FrustumSoA& frustumSoA, __m128 camPosV);
 
+	/** @brief Traverses cached bounds over cell-run blocks, appending whole visible blocks and testing partial blocks with SSE. */
+	void CullBucketSliceBlocks(GrassBucket& b, const FrustumSoA& frustumSoA, __m128 camPosV, uint32_t planeMask, bool allWithinDistance);
+
 	/** @brief Fills the per-bucket cull constant buffer, uploads the slice table and issues the cull dispatches. */
 	void UploadCullState(ID3D11Device* device, ID3D11DeviceContext* ctx);
 

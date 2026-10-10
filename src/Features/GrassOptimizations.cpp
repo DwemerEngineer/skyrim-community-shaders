@@ -420,19 +420,22 @@ void GrassOptimizations::CullBucketSlices(GrassBucket& b, const FrustumSoA& frus
 	for (GrassBucket::LODBin& bin : b.lodBins)
 		bin.active = false;
 
-	if (b.sliceBounds.size() != b.slices.size())
+	if (b.sliceBounds.size() != b.slices.size()) {
 		return;
+	}
 
 	const __m128 bucketLo = _mm_setr_ps(b.coarseMin.x, b.coarseMin.y, b.coarseMin.z, 0.0f);
 	const __m128 bucketHi = _mm_setr_ps(b.coarseMax.x, b.coarseMax.y, b.coarseMax.z, 0.0f);
 	const __m128 zero = _mm_setzero_ps();
 	const __m128 nearest = _mm_max_ps(_mm_max_ps(_mm_sub_ps(bucketLo, camPosV), _mm_sub_ps(camPosV, bucketHi)), zero);
-	if (_mm_cvtss_f32(_mm_dp_ps(nearest, nearest, 0x71)) > maxDistSq)
+	if (_mm_cvtss_f32(_mm_dp_ps(nearest, nearest, 0x71)) > maxDistSq) {
 		return;
+	}
 
 	uint32_t planeMask;
-	if (!ClassifyAabb(frustumSoA, bucketLo, bucketHi, planeMask))
+	if (!ClassifyAabb(frustumSoA, bucketLo, bucketHi, planeMask)) {
 		return;
+	}
 
 	if (!b.clustersValid || b.clusteredSlices != b.slices.size())
 		bucketStore.MergeSlicesIntoRuns(b);
@@ -451,23 +454,138 @@ void GrassOptimizations::CullBucketSlices(GrassBucket& b, const FrustumSoA& frus
 		return;
 	}
 
+	if (planeMask && b.sliceBlocksUseful) {
+		CullBucketSliceBlocks(b, frustumSoA, camPosV, planeMask, allWithinDistance);
+	} else {
+		const __m128 camX = _mm_shuffle_ps(camPosV, camPosV, _MM_SHUFFLE(0, 0, 0, 0));
+		const __m128 camY = _mm_shuffle_ps(camPosV, camPosV, _MM_SHUFFLE(1, 1, 1, 1));
+		const __m128 camZ = _mm_shuffle_ps(camPosV, camPosV, _MM_SHUFFLE(2, 2, 2, 2));
+		const __m128 maxDistance = _mm_set1_ps(maxDistSq);
+		for (uint32_t firstRun = 0; firstRun < b.sliceRunCount; firstRun += 4) {
+			const auto& batch = b.sliceRunBatches[firstRun / 4];
+			const __m128 lx = _mm_load_ps(batch.loX), ly = _mm_load_ps(batch.loY), lz = _mm_load_ps(batch.loZ);
+			const __m128 hx = _mm_load_ps(batch.hiX), hy = _mm_load_ps(batch.hiY), hz = _mm_load_ps(batch.hiZ);
+			uint32_t visibleMask = (1u << std::min(4u, b.sliceRunCount - firstRun)) - 1u;
+			if (!allWithinDistance) {
+				const __m128 dx = _mm_max_ps(_mm_max_ps(_mm_sub_ps(lx, camX), _mm_sub_ps(camX, hx)), zero);
+				const __m128 dy = _mm_max_ps(_mm_max_ps(_mm_sub_ps(ly, camY), _mm_sub_ps(camY, hy)), zero);
+				const __m128 dz = _mm_max_ps(_mm_max_ps(_mm_sub_ps(lz, camZ), _mm_sub_ps(camZ, hz)), zero);
+				const __m128 distanceSq = _mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy)), _mm_mul_ps(dz, dz));
+				visibleMask &= _mm_movemask_ps(_mm_cmple_ps(distanceSq, maxDistance));
+			}
+
+			uint32_t remainingPlanes = planeMask;
+			while (visibleMask && remainingPlanes) {
+				unsigned long planeIndex;
+				_BitScanForward(&planeIndex, remainingPlanes);
+				remainingPlanes &= remainingPlanes - 1;
+				const auto& plane = frustumSoA.planes[planeIndex];
+				const __m128 px = _mm_blendv_ps(hx, lx, plane.nx);
+				const __m128 py = _mm_blendv_ps(hy, ly, plane.ny);
+				const __m128 pz = _mm_blendv_ps(hz, lz, plane.nz);
+				const __m128 dot = _mm_add_ps(_mm_add_ps(_mm_mul_ps(plane.nx, px), _mm_mul_ps(plane.ny, py)), _mm_mul_ps(plane.nz, pz));
+				visibleMask &= ~_mm_movemask_ps(_mm_cmplt_ps(_mm_sub_ps(dot, plane.d), zero));
+			}
+
+			while (visibleMask) {
+				unsigned long lane;
+				_BitScanForward(&lane, visibleMask);
+				visibleMask &= visibleMask - 1;
+				// Consume lanes in order so adjacent visible groups still coalesce.
+				const bool extendsLast = b.sliceTableCount &&
+				                         sliceTableCPU.back().first + (b.groupCount - sliceTableCPU.back().second) == batch.firstGroup[lane];
+				if (!extendsLast) {
+					sliceTableCPU.emplace_back(batch.firstGroup[lane], b.groupCount);
+					++b.sliceTableCount;
+				}
+				b.groupCount += batch.groupCount[lane];
+			}
+		}
+	}
+
+	b.cullVisible = b.sliceTableCount != 0;
+	if (!b.cullVisible)
+		sliceTableCPU.resize(b.sliceTableOffset);
+}
+
+void GrassOptimizations::CullBucketSliceBlocks(GrassBucket& b, const FrustumSoA& frustumSoA, __m128 camPosV, uint32_t planeMask, bool allWithinDistance)
+{
+	const __m128 zero = _mm_setzero_ps();
+	const __m128 sign = _mm_set1_ps(-0.0f);
 	const __m128 camX = _mm_shuffle_ps(camPosV, camPosV, _MM_SHUFFLE(0, 0, 0, 0));
 	const __m128 camY = _mm_shuffle_ps(camPosV, camPosV, _MM_SHUFFLE(1, 1, 1, 1));
 	const __m128 camZ = _mm_shuffle_ps(camPosV, camPosV, _MM_SHUFFLE(2, 2, 2, 2));
 	const __m128 maxDistance = _mm_set1_ps(maxDistSq);
-	for (uint32_t firstRun = 0; firstRun < b.sliceRunCount; firstRun += 4) {
-		const auto& batch = b.sliceRunBatches[firstRun / 4];
+	const auto appendGroups = [&](uint32_t firstGroup, uint32_t groupCount) {
+		const bool extendsLast = b.sliceTableCount &&
+		                         sliceTableCPU.back().first + (b.groupCount - sliceTableCPU.back().second) == firstGroup;
+		if (!extendsLast) {
+			sliceTableCPU.emplace_back(firstGroup, b.groupCount);
+			++b.sliceTableCount;
+		}
+		b.groupCount += groupCount;
+	};
+
+	const auto cullRuns = [&](uint32_t firstRun, uint32_t endRun, uint32_t testPlanes, bool withinDistance) {
+		for (; firstRun < endRun; firstRun += 4) {
+			const auto& batch = b.sliceRunBatches[firstRun / 4];
+			const __m128 lx = _mm_load_ps(batch.loX), ly = _mm_load_ps(batch.loY), lz = _mm_load_ps(batch.loZ);
+			const __m128 hx = _mm_load_ps(batch.hiX), hy = _mm_load_ps(batch.hiY), hz = _mm_load_ps(batch.hiZ);
+			uint32_t visibleMask = (1u << std::min(4u, endRun - firstRun)) - 1u;
+			if (!withinDistance) {
+				const __m128 dx = _mm_max_ps(_mm_max_ps(_mm_sub_ps(lx, camX), _mm_sub_ps(camX, hx)), zero);
+				const __m128 dy = _mm_max_ps(_mm_max_ps(_mm_sub_ps(ly, camY), _mm_sub_ps(camY, hy)), zero);
+				const __m128 dz = _mm_max_ps(_mm_max_ps(_mm_sub_ps(lz, camZ), _mm_sub_ps(camZ, hz)), zero);
+				const __m128 distanceSq = _mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy)), _mm_mul_ps(dz, dz));
+				visibleMask &= _mm_movemask_ps(_mm_cmple_ps(distanceSq, maxDistance));
+			}
+
+			uint32_t remainingPlanes = testPlanes;
+			while (visibleMask && remainingPlanes) {
+				unsigned long planeIndex;
+				_BitScanForward(&planeIndex, remainingPlanes);
+				remainingPlanes &= remainingPlanes - 1;
+				const auto& plane = frustumSoA.planes[planeIndex];
+				const __m128 px = _mm_blendv_ps(hx, lx, plane.nx);
+				const __m128 py = _mm_blendv_ps(hy, ly, plane.ny);
+				const __m128 pz = _mm_blendv_ps(hz, lz, plane.nz);
+				const __m128 dot = _mm_add_ps(_mm_add_ps(_mm_mul_ps(plane.nx, px), _mm_mul_ps(plane.ny, py)), _mm_mul_ps(plane.nz, pz));
+				visibleMask &= ~_mm_movemask_ps(_mm_cmplt_ps(_mm_sub_ps(dot, plane.d), zero));
+			}
+
+			while (visibleMask) {
+				unsigned long lane;
+				_BitScanForward(&lane, visibleMask);
+				visibleMask &= visibleMask - 1;
+				appendGroups(batch.firstGroup[lane], batch.groupCount[lane]);
+			}
+		}
+	};
+
+	const uint32_t blockCount = (b.sliceRunCount + GrassBucket::kRunsPerCullBlock - 1) / GrassBucket::kRunsPerCullBlock;
+	for (uint32_t firstBlock = 0; firstBlock < blockCount; firstBlock += 4) {
+		const auto& batch = b.sliceBlockBatches[firstBlock / 4];
 		const __m128 lx = _mm_load_ps(batch.loX), ly = _mm_load_ps(batch.loY), lz = _mm_load_ps(batch.loZ);
 		const __m128 hx = _mm_load_ps(batch.hiX), hy = _mm_load_ps(batch.hiY), hz = _mm_load_ps(batch.hiZ);
-		uint32_t visibleMask = (1u << std::min(4u, b.sliceRunCount - firstRun)) - 1u;
+		uint32_t visibleMask = (1u << std::min(4u, blockCount - firstBlock)) - 1u;
+		uint32_t withinDistanceMask = visibleMask;
 		if (!allWithinDistance) {
 			const __m128 dx = _mm_max_ps(_mm_max_ps(_mm_sub_ps(lx, camX), _mm_sub_ps(camX, hx)), zero);
 			const __m128 dy = _mm_max_ps(_mm_max_ps(_mm_sub_ps(ly, camY), _mm_sub_ps(camY, hy)), zero);
 			const __m128 dz = _mm_max_ps(_mm_max_ps(_mm_sub_ps(lz, camZ), _mm_sub_ps(camZ, hz)), zero);
 			const __m128 distanceSq = _mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy)), _mm_mul_ps(dz, dz));
 			visibleMask &= _mm_movemask_ps(_mm_cmple_ps(distanceSq, maxDistance));
+			if (!visibleMask)
+				continue;
+
+			const __m128 fx = _mm_max_ps(_mm_andnot_ps(sign, _mm_sub_ps(lx, camX)), _mm_andnot_ps(sign, _mm_sub_ps(hx, camX)));
+			const __m128 fy = _mm_max_ps(_mm_andnot_ps(sign, _mm_sub_ps(ly, camY)), _mm_andnot_ps(sign, _mm_sub_ps(hy, camY)));
+			const __m128 fz = _mm_max_ps(_mm_andnot_ps(sign, _mm_sub_ps(lz, camZ)), _mm_andnot_ps(sign, _mm_sub_ps(hz, camZ)));
+			const __m128 farthestSq = _mm_add_ps(_mm_add_ps(_mm_mul_ps(fx, fx), _mm_mul_ps(fy, fy)), _mm_mul_ps(fz, fz));
+			withinDistanceMask = _mm_movemask_ps(_mm_cmple_ps(farthestSq, maxDistance));
 		}
 
+		__m128i childPlanes = _mm_set1_epi32(planeMask);
 		uint32_t remainingPlanes = planeMask;
 		while (visibleMask && remainingPlanes) {
 			unsigned long planeIndex;
@@ -477,28 +595,32 @@ void GrassOptimizations::CullBucketSlices(GrassBucket& b, const FrustumSoA& frus
 			const __m128 px = _mm_blendv_ps(hx, lx, plane.nx);
 			const __m128 py = _mm_blendv_ps(hy, ly, plane.ny);
 			const __m128 pz = _mm_blendv_ps(hz, lz, plane.nz);
-			const __m128 dot = _mm_add_ps(_mm_add_ps(_mm_mul_ps(plane.nx, px), _mm_mul_ps(plane.ny, py)), _mm_mul_ps(plane.nz, pz));
-			visibleMask &= ~_mm_movemask_ps(_mm_cmplt_ps(_mm_sub_ps(dot, plane.d), zero));
+			const __m128 positiveDot = _mm_add_ps(_mm_add_ps(_mm_mul_ps(plane.nx, px), _mm_mul_ps(plane.ny, py)), _mm_mul_ps(plane.nz, pz));
+			visibleMask &= ~_mm_movemask_ps(_mm_cmplt_ps(_mm_sub_ps(positiveDot, plane.d), zero));
+
+			const __m128 nx = _mm_blendv_ps(lx, hx, plane.nx);
+			const __m128 ny = _mm_blendv_ps(ly, hy, plane.ny);
+			const __m128 nz = _mm_blendv_ps(lz, hz, plane.nz);
+			const __m128 negativeDot = _mm_add_ps(_mm_add_ps(_mm_mul_ps(plane.nx, nx), _mm_mul_ps(plane.ny, ny)), _mm_mul_ps(plane.nz, nz));
+			const __m128i inside = _mm_castps_si128(_mm_cmpge_ps(_mm_sub_ps(negativeDot, plane.d), zero));
+			childPlanes = _mm_andnot_si128(_mm_and_si128(inside, _mm_set1_epi32(1u << planeIndex)), childPlanes);
 		}
 
+		alignas(16) uint32_t childPlaneMasks[4];
+		_mm_store_si128((__m128i*)childPlaneMasks, childPlanes);
 		while (visibleMask) {
 			unsigned long lane;
 			_BitScanForward(&lane, visibleMask);
 			visibleMask &= visibleMask - 1;
-			// Consume lanes in order so adjacent visible groups still coalesce.
-			const bool extendsLast = b.sliceTableCount &&
-			                         sliceTableCPU.back().first + (b.groupCount - sliceTableCPU.back().second) == batch.firstGroup[lane];
-			if (!extendsLast) {
-				sliceTableCPU.emplace_back(batch.firstGroup[lane], b.groupCount);
-				++b.sliceTableCount;
+			const bool withinDistance = (withinDistanceMask & (1u << lane)) != 0;
+			if (!childPlaneMasks[lane] && withinDistance) {
+				appendGroups(batch.firstGroup[lane], batch.groupCount[lane]);
+			} else {
+				const uint32_t firstRun = (firstBlock + lane) * GrassBucket::kRunsPerCullBlock;
+				cullRuns(firstRun, std::min(firstRun + GrassBucket::kRunsPerCullBlock, b.sliceRunCount), childPlaneMasks[lane], withinDistance);
 			}
-			b.groupCount += batch.groupCount[lane];
 		}
 	}
-
-	b.cullVisible = b.sliceTableCount != 0;
-	if (!b.cullVisible)
-		sliceTableCPU.resize(b.sliceTableOffset);
 }
 
 void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceContext* ctx)

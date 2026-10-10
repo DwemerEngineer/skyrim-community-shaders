@@ -181,6 +181,11 @@ struct GrassBucket
 
 	std::vector<SliceRunBatch> sliceRunBatches;
 	uint32_t sliceRunCount = 0;  // excludes unused lanes in the final batch
+	// One parent bounds a contiguous block of cell runs; four parents share an SSE batch.
+	static constexpr uint32_t kRunsPerCullBlock = 16;
+	static_assert(kRunsPerCullBlock % 4 == 0);
+	std::vector<SliceRunBatch> sliceBlockBatches;
+	bool sliceBlocksUseful = false;  // scattered run order may make parent bounds too broad
 	// Cull thread groups for every run, in run order.
 	std::vector<CullGroup> cullGroups;
 	uint32_t groupCapacity = 0;
@@ -257,6 +262,8 @@ struct GrassBucket
 		sliceBounds.clear();
 		sliceRunBatches.clear();
 		sliceRunCount = 0;
+		sliceBlockBatches.clear();
+		sliceBlocksUseful = false;
 		cullGroups.clear();
 		clusteredSlices = 0;
 		clustersValid = false;
