@@ -37,6 +37,11 @@ ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
 
 ID3D11ShaderResourceView* HiZPyramid::GetLiveDepthSRV()
 {
+	// Use the live UNORM view because Terrain Blending's replacement is not ready during depth rendering.
+	auto& tb = globals::features::terrainBlending;
+	if (tb.loaded && tb.depthSRVBackup)
+		return tb.depthSRVBackup;
+
 	auto* renderer = globals::game::renderer;
 	if (!renderer)
 		return nullptr;
