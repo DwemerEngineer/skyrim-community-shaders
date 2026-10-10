@@ -2,6 +2,8 @@
 
 #include "Feature.h"
 
+class BSLightingShaderMaterialPBR;
+
 struct GlintParameters
 {
 	bool enabled = false;
@@ -119,6 +121,20 @@ public:
 	 * @param grassProperty Generated grass property to update.
 	 */
 	void SetupGrassMaterial(RE::BSLightingShaderProperty* sourceProperty, RE::BSLightingShaderProperty* grassProperty);
+
+	/** @brief PBR grass PerMaterial constants, laid out as RunGrass.hlsl's PerMaterial (b1). */
+	struct alignas(16) GrassPBRConstants
+	{
+		uint32_t flags;
+		float params1[3];
+		float params2[4];
+	};
+
+	/** @brief Points the renderer shadow state at a PBR grass material's textures and samplers. */
+	static void SetGrassPBRTextures(const BSLightingShaderMaterialPBR* material);
+
+	/** @brief Returns a PBR grass material's PerMaterial constants. */
+	static GrassPBRConstants GetGrassPBRConstants(const BSLightingShaderMaterialPBR* material);
 
 	/**
 	 * @brief Binds extended PBR shader resources (displacement, RMAOS textures) to the device context.
