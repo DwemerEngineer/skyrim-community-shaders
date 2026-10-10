@@ -1,6 +1,9 @@
 #include "GrassOptimizations.h"
 #include "GrassLighting.h"
-#include "TerrainBlending.h"  // loaded state selects the scene depth SRV's format
+#include "ShaderCache.h"
+#include "State.h"
+#include "TruePBR.h"
+#include "TruePBR/BSLightingShaderMaterialPBR.h"
 
 #define I18N_KEY_PREFIX "feature.grass_optimizations."
 
@@ -247,15 +250,8 @@ void GrassOptimizations::UpdateGrass()
 	auto* device = globals::d3d::device;
 	auto* ctx = globals::d3d::context;
 
-	if (!GetCullCS() || !ctx1 || !cullParamsCB) {
-		// Without a cull dispatch, the args buffers are never written. Skip drawing grass this frame to avoid drawing stale data. 
-		for (auto& [key, b] : bucketStore.buckets)
-			b.ResetCullState();
-		bucketStore.DiscardPending();
-		return;
-	}
+	const bool canCull = GetCullCS() && ctx1 && cullParamsCB;
 
-	// Get vanilla wind timer values
 	timeAccum += globals::game::smState->timerValues[1];
 	prevTimeBase = timeBase;
 	timeBase = globals::game::smState->timerValues[4] * 0.0016666667f * 6.2831802f;
@@ -279,15 +275,23 @@ void GrassOptimizations::UpdateGrass()
 	bucketStore.BeginFrame({ settings.EnableMeshLOD, settings.EnableMidLOD, settings.EnableFarLOD, timeAccum });
 
 	globals::profiler->BeginPass("GrassOptimizations::ApplyPending");
-	bucketStore.RefreshComplexGrass(globals::features::grassLighting.settings.ComplexGrassThreshold, ctx);
 	bucketStore.ApplyPending(device, ctx);
 	globals::profiler->EndPass();
+	if (!canCull) {
+		for (auto& [key, b] : bucketStore.buckets) {
+			b.ResetCullState();
+			b.optimizedReady.store(false, std::memory_order_relaxed);
+		}
+		return;
+	}
 
 	RE::NiCamera* cam = RE::Main::WorldRootCamera();
 	if (!cam) {
 		// Leaving last frame's flags up would let the draw path re-issue its indirect draws.
-		for (auto& [key, b] : bucketStore.buckets)
+		for (auto& [key, b] : bucketStore.buckets) {
 			b.cullVisible = false;
+			b.optimizedReady.store(false, std::memory_order_relaxed);
+		}
 		return;
 	}
 
@@ -298,10 +302,24 @@ void GrassOptimizations::UpdateGrass()
 	FrustumSoA frustumSoA;
 	BuildFrustumSoA(frustumSoA, frustum);
 
-	if (settings.EnableOcclusionCulling)
+	// PerFrame holds the light's camera during shadow passes, so only snapshot it when it matches the
+	// main camera. Shadow cameras sit far from the eye, so the tolerance only absorbs eye offsets.
+	const auto& frameBuffer = globals::game::frameBufferCached;
+	const auto& posAdjust = frameBuffer.GetCameraPosAdjust();
+	const RE::NiPoint3 eyeOffset{ posAdjust.x - camPos.x, posAdjust.y - camPos.y, posAdjust.z - camPos.z };
+	const bool mainCameraCurrent = eyeOffset.SqrLength() < 64.0f * 64.0f;
+	if (mainCameraCurrent || !mainCameraValid) {
+		mainCameraViewProj = frameBuffer.GetCameraViewProjUnjittered();
+		mainCameraPos = posAdjust;
+		mainCameraValid = true;
+	}
+
+	// A previous frame's camera is close enough for fading, but not for occlusion.
+	if (settings.EnableOcclusionCulling && mainCameraCurrent) {
 		hiZ.Build(device, ctx);
-	else
+	} else {
 		hiZ.Invalidate();
+	}
 
 	{
 		CullParamsCB cp{};
@@ -311,6 +329,10 @@ void GrassOptimizations::UpdateGrass()
 			cp.frustumPlanes[i][2] = frustum.cullingPlanes[i].normal.z;
 			cp.frustumPlanes[i][3] = frustum.cullingPlanes[i].constant;
 		}
+		std::memcpy(cp.cameraViewProj, &mainCameraViewProj, sizeof(cp.cameraViewProj));
+		cp.cameraPos[0] = mainCameraPos.x;
+		cp.cameraPos[1] = mainCameraPos.y;
+		cp.cameraPos[2] = mainCameraPos.z;
 
 		cp.minPixelSize = settings.MinPixelSize;
 		cp.fullDetailPixelSize = settings.FullDetailPixelSize;
@@ -349,89 +371,51 @@ void GrassOptimizations::UpdateGrass()
 		cullParamsCB->Update(cp);
 	}
 
-	uint32_t visibleBuckets = 0;
+	visibleBuckets.clear();
 	sliceTableCPU.clear();
 
-	// Measures the CPU time spent frustum culling bucket slices
 	globals::profiler->BeginPass("GrassOptimizations::SliceCull");
 	for (auto& [key, b] : bucketStore.buckets) {
 		b.ResetCullState();
-		if (!b.totalInstances || !b.instanceSRV)
+		b.optimizedReady.store(false, std::memory_order_relaxed);
+		if (!b.totalInstances || !b.instanceSRV || b.dirty || b.firstNewSlice != UINT32_MAX)
 			continue;
 
 		if (!b.coarseValid)
 			bucketStore.UpdateCoarseBounds(b);
 
 		CullBucketSlices(b, frustumSoA, camPosV);
+		b.optimizedReady.store(true, std::memory_order_relaxed);
 
 		if (!b.cullVisible)
 			continue;
 
-		for (uint32_t tier = 0; tier < (uint32_t)GrassMeshLibrary::LODTier::kCount; ++tier)
-			b.lodBins[tier].active = bucketStore.EnsureLODBin(b, (GrassMeshLibrary::LODTier)tier, device);
-		++visibleBuckets;
-	}
-	globals::profiler->EndPass();
+		bucketStore.RefreshComplexGrass(b, ctx);
 
-	// Measures the slice table upload, the per-bucket constants, and the cull dispatch per visible bucket.
-	globals::profiler->BeginPass("GrassOptimizations::InstanceCull");
-	UploadCullState(device, ctx, visibleBuckets);
-	globals::profiler->EndPass();
-}
-
-void GrassOptimizations::MergeSlicesIntoRuns(GrassBucket& b)
-{
-	const auto cellOf = [](const RE::NiPoint3& origin) {
-		constexpr float kCellSize = 4096.0f;
-		const auto cellX = (int32_t)std::floor(origin.x / kCellSize);
-		const auto cellY = (int32_t)std::floor(origin.y / kCellSize);
-		return ((uint64_t)(uint32_t)cellX << 32) | (uint32_t)cellY;
-	};
-
-	const auto continuesRun = [&cellOf](const BucketSlice& slice, const GrassBucket::SliceRun& run, uint64_t cell) {
-		return slice.bufferOffset != UINT32_MAX && slice.count != 0 &&
-		       slice.bufferOffset == run.firstSliceOffset + run.instanceCount &&
-		       cellOf(slice.origin) == cell;
-	};
-
-	b.sliceRuns.clear();
-	const uint32_t sliceCount = (uint32_t)b.slices.size();
-
-	for (uint32_t first = 0; first < sliceCount;) {
-		if (b.slices[first].bufferOffset == UINT32_MAX || b.slices[first].count == 0)
-		{
-			++first;
+		if (!bucketStore.UploadCullGroups(b, device, ctx)) {
+			// Without its groups the bucket cannot be culled, so draw it the vanilla way.
+			sliceTableCPU.resize(b.sliceTableOffset);
+			b.ResetCullState();
+			b.optimizedReady.store(false, std::memory_order_relaxed);
 			continue;
 		}
 
-		GrassBucket::SliceRun run;
-		run.firstSliceOffset = b.slices[first].bufferOffset;
-		run.instanceCount = b.slices[first].count;
-		__m128 lo = _mm_load_ps(b.sliceBounds[first].lo);
-		__m128 hi = _mm_load_ps(b.sliceBounds[first].hi);
-		const uint64_t cell = cellOf(b.slices[first].origin);
-
-		uint32_t next = first + 1;
-		for (; next < sliceCount && continuesRun(b.slices[next], run, cell); ++next) {
-			lo = _mm_min_ps(lo, _mm_load_ps(b.sliceBounds[next].lo));
-			hi = _mm_max_ps(hi, _mm_load_ps(b.sliceBounds[next].hi));
-			run.instanceCount += b.slices[next].count;
-		}
-
-		_mm_store_ps(run.bounds.lo, lo);
-		_mm_store_ps(run.bounds.hi, hi);
-		b.sliceRuns.push_back(run);
-		first = next;
+		for (uint32_t tier = 0; tier < (uint32_t)GrassMeshLibrary::LODTier::kCount; ++tier)
+			b.lodBins[tier].active = bucketStore.EnsureLODBin(b, (GrassMeshLibrary::LODTier)tier, device);
+		visibleBuckets.push_back(&b);
 	}
+	globals::profiler->EndPass();
 
-	b.clustersValid = true;
+	globals::profiler->BeginPass("GrassOptimizations::InstanceCull");
+	UploadCullState(device, ctx);
+	globals::profiler->EndPass();
 }
 
 void GrassOptimizations::CullBucketSlices(GrassBucket& b, const FrustumSoA& frustumSoA, __m128 camPosV)
 {
 	b.sliceTableOffset = (uint32_t)sliceTableCPU.size();
 	b.sliceTableCount = 0;
-	b.visibleInstances = 0;
+	b.groupCount = 0;
 	b.cullVisible = false;
 	for (GrassBucket::LODBin& bin : b.lodBins)
 		bin.active = false;
@@ -441,27 +425,75 @@ void GrassOptimizations::CullBucketSlices(GrassBucket& b, const FrustumSoA& frus
 
 	const __m128 bucketLo = _mm_setr_ps(b.coarseMin.x, b.coarseMin.y, b.coarseMin.z, 0.0f);
 	const __m128 bucketHi = _mm_setr_ps(b.coarseMax.x, b.coarseMax.y, b.coarseMax.z, 0.0f);
-	if (!AabbVisible(frustumSoA, bucketLo, bucketHi))
+	const __m128 zero = _mm_setzero_ps();
+	const __m128 nearest = _mm_max_ps(_mm_max_ps(_mm_sub_ps(bucketLo, camPosV), _mm_sub_ps(camPosV, bucketHi)), zero);
+	if (_mm_cvtss_f32(_mm_dp_ps(nearest, nearest, 0x71)) > maxDistSq)
 		return;
 
-	if (!b.clustersValid)
-		MergeSlicesIntoRuns(b);
+	uint32_t planeMask;
+	if (!ClassifyAabb(frustumSoA, bucketLo, bucketHi, planeMask))
+		return;
 
-	const __m128 pad = _mm_set1_ps(b.modelRadius + 64.0f);
-	for (const GrassBucket::SliceRun& run : b.sliceRuns) {
-		const __m128 lo = _mm_sub_ps(_mm_load_ps(run.bounds.lo), pad);
-		const __m128 hi = _mm_add_ps(_mm_load_ps(run.bounds.hi), pad);
+	if (!b.clustersValid || b.clusteredSlices != b.slices.size())
+		bucketStore.MergeSlicesIntoRuns(b);
 
-		const __m128 beyond = _mm_max_ps(_mm_max_ps(_mm_sub_ps(lo, camPosV), _mm_sub_ps(camPosV, hi)), _mm_setzero_ps());
-		auto distanceSq = _mm_cvtss_f32(_mm_dp_ps(beyond, beyond, 0x71));
+	const __m128 sign = _mm_set1_ps(-0.0f);
+	const __m128 farthest = _mm_max_ps(_mm_andnot_ps(sign, _mm_sub_ps(bucketLo, camPosV)), _mm_andnot_ps(sign, _mm_sub_ps(bucketHi, camPosV)));
+	const bool allWithinDistance = _mm_cvtss_f32(_mm_dp_ps(farthest, farthest, 0x71)) <= maxDistSq;
+	if (!planeMask && allWithinDistance) {
+		b.groupCount = (uint32_t)b.cullGroups.size();
+		if (b.groupCount) {
+			// Every run is visible, and its groups are contiguous in their original order.
+			sliceTableCPU.emplace_back(0, 0);
+			b.sliceTableCount = 1;
+			b.cullVisible = true;
+		}
+		return;
+	}
 
-		const bool withinRenderDistance = distanceSq <= maxDistSq;
-		if (!withinRenderDistance || !AabbVisible(frustumSoA, lo, hi))
-			continue;
+	const __m128 camX = _mm_shuffle_ps(camPosV, camPosV, _MM_SHUFFLE(0, 0, 0, 0));
+	const __m128 camY = _mm_shuffle_ps(camPosV, camPosV, _MM_SHUFFLE(1, 1, 1, 1));
+	const __m128 camZ = _mm_shuffle_ps(camPosV, camPosV, _MM_SHUFFLE(2, 2, 2, 2));
+	const __m128 maxDistance = _mm_set1_ps(maxDistSq);
+	for (uint32_t firstRun = 0; firstRun < b.sliceRunCount; firstRun += 4) {
+		const auto& batch = b.sliceRunBatches[firstRun / 4];
+		const __m128 lx = _mm_load_ps(batch.loX), ly = _mm_load_ps(batch.loY), lz = _mm_load_ps(batch.loZ);
+		const __m128 hx = _mm_load_ps(batch.hiX), hy = _mm_load_ps(batch.hiY), hz = _mm_load_ps(batch.hiZ);
+		uint32_t visibleMask = (1u << std::min(4u, b.sliceRunCount - firstRun)) - 1u;
+		if (!allWithinDistance) {
+			const __m128 dx = _mm_max_ps(_mm_max_ps(_mm_sub_ps(lx, camX), _mm_sub_ps(camX, hx)), zero);
+			const __m128 dy = _mm_max_ps(_mm_max_ps(_mm_sub_ps(ly, camY), _mm_sub_ps(camY, hy)), zero);
+			const __m128 dz = _mm_max_ps(_mm_max_ps(_mm_sub_ps(lz, camZ), _mm_sub_ps(camZ, hz)), zero);
+			const __m128 distanceSq = _mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy)), _mm_mul_ps(dz, dz));
+			visibleMask &= _mm_movemask_ps(_mm_cmple_ps(distanceSq, maxDistance));
+		}
 
-		sliceTableCPU.emplace_back(run.firstSliceOffset, b.visibleInstances);
-		++b.sliceTableCount;
-		b.visibleInstances += run.instanceCount;
+		uint32_t remainingPlanes = planeMask;
+		while (visibleMask && remainingPlanes) {
+			unsigned long planeIndex;
+			_BitScanForward(&planeIndex, remainingPlanes);
+			remainingPlanes &= remainingPlanes - 1;
+			const auto& plane = frustumSoA.planes[planeIndex];
+			const __m128 px = _mm_blendv_ps(hx, lx, plane.nx);
+			const __m128 py = _mm_blendv_ps(hy, ly, plane.ny);
+			const __m128 pz = _mm_blendv_ps(hz, lz, plane.nz);
+			const __m128 dot = _mm_add_ps(_mm_add_ps(_mm_mul_ps(plane.nx, px), _mm_mul_ps(plane.ny, py)), _mm_mul_ps(plane.nz, pz));
+			visibleMask &= ~_mm_movemask_ps(_mm_cmplt_ps(_mm_sub_ps(dot, plane.d), zero));
+		}
+
+		while (visibleMask) {
+			unsigned long lane;
+			_BitScanForward(&lane, visibleMask);
+			visibleMask &= visibleMask - 1;
+			// Consume lanes in order so adjacent visible groups still coalesce.
+			const bool extendsLast = b.sliceTableCount &&
+			                         sliceTableCPU.back().first + (b.groupCount - sliceTableCPU.back().second) == batch.firstGroup[lane];
+			if (!extendsLast) {
+				sliceTableCPU.emplace_back(batch.firstGroup[lane], b.groupCount);
+				++b.sliceTableCount;
+			}
+			b.groupCount += batch.groupCount[lane];
+		}
 	}
 
 	b.cullVisible = b.sliceTableCount != 0;
@@ -469,35 +501,40 @@ void GrassOptimizations::CullBucketSlices(GrassBucket& b, const FrustumSoA& frus
 		sliceTableCPU.resize(b.sliceTableOffset);
 }
 
-void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceContext* ctx, uint32_t visibleBuckets)
+void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
 	// One map fills every visible bucket's slot — replaces a Map/Unmap per bucket.
 	bool cullStateUploaded = false;
-	if (visibleBuckets && EnsureCullBucketCapacity(visibleBuckets, device)) {
+	if (!visibleBuckets.empty() &&
+		EnsureCullBucketCapacity((uint32_t)visibleBuckets.size()) &&
+		EnsureDrawArgsCapacity((uint32_t)visibleBuckets.size(), device)) {
 		D3D11_MAPPED_SUBRESOURCE m{};
 		if (SUCCEEDED(ctx->Map(cullBucketCB->CB(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
 			auto* bytes = static_cast<uint8_t*>(m.pData);
 			uint32_t slot = 0;
-			for (auto& [key, b] : bucketStore.buckets) {
-				if (!b.cullVisible)
-					continue;
-				b.cullSlot = slot;
+			for (GrassBucket* b : visibleBuckets) {
+				b->cullSlot = slot;
 				auto* cb = reinterpret_cast<CullBucketCB*>(bytes + (size_t)slot * kSlotBytes);
-				cb->instanceCount = b.visibleInstances;
-				cb->sliceTableOffset = b.sliceTableOffset;
-				cb->sliceCount = b.sliceTableCount;
-				cb->wavePeriod = b.wavePeriod;
+				cb->groupCount = b->groupCount;
+				cb->sliceTableOffset = b->sliceTableOffset;
+				cb->sliceCount = b->sliceTableCount;
+				cb->dispatchWidth = std::min(b->groupCount, (uint32_t)D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION);
+				cb->wavePeriod = b->wavePeriod;
 				cb->timeBase = timeBase;
 				cb->prevTimeBase = prevTimeBase;
-				cb->boundCenter[0] = b.boundCenter.x;
-				cb->boundCenter[1] = b.boundCenter.y;
-				cb->boundCenter[2] = b.boundCenter.z;
-				cb->modelRadius = b.modelRadius;
-				cb->distScale = b.distScale;
-				cb->minPixelScale = b.minPixelScale;
-				cb->isComplex = b.isComplex ? 1.0f : 0.0f;
-				cb->midLODEnabled = b.lodBins[(size_t)GrassMeshLibrary::LODTier::kMiddle].active ? 1.0f : 0.0f;
-				cb->farLODEnabled = b.lodBins[(size_t)GrassMeshLibrary::LODTier::kFar].active ? 1.0f : 0.0f;
+				cb->boundCenter[0] = b->boundCenter.x;
+				cb->boundCenter[1] = b->boundCenter.y;
+				cb->boundCenter[2] = b->boundCenter.z;
+				cb->modelRadius = b->modelRadius;
+				cb->distScale = b->distScale;
+				cb->minPixelScale = b->minPixelScale;
+				cb->complexThreshold = globals::features::grassLighting.settings.ComplexGrassThreshold;
+				cb->midLODEnabled = b->lodBins[(size_t)GrassMeshLibrary::LODTier::kMiddle].active ? 1.0f : 0.0f;
+				cb->farLODEnabled = b->lodBins[(size_t)GrassMeshLibrary::LODTier::kFar].active ? 1.0f : 0.0f;
+				if (b->pbrMaterial) {
+					auto* material = reinterpret_cast<TruePBR::GrassPBRConstants*>(bytes + (size_t)slot * kSlotBytes + kSlotMaterialOffset);
+					*material = TruePBR::GetGrassPBRConstants(static_cast<const BSLightingShaderMaterialPBR*>(b->material.get()));
+				}
 				++slot;
 			}
 			ctx->Unmap(cullBucketCB->CB(), 0);
@@ -506,15 +543,16 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 	}
 
 	// If the cull state failed to upload, skip all buckets to prevent the CS from running using garbage or out-of-date data.
-	if (visibleBuckets && !cullStateUploaded) {
-		for (auto& [key, b] : bucketStore.buckets)
+	if (!visibleBuckets.empty() && !cullStateUploaded) {
+		for (auto& [key, b] : bucketStore.buckets) {
 			b.cullVisible = false;
+			b.optimizedReady.store(false, std::memory_order_relaxed);
+		}
+		visibleBuckets.clear();
 	}
 
 	ID3D11Buffer* paramsCB = cullParamsCB->CB();
 	ctx->CSSetConstantBuffers(0, 1, &paramsCB);
-	ID3D11Buffer* frameBuffers[1]{ *globals::game::perFrame.get() };
-	ctx->CSSetConstantBuffers(12, 1, frameBuffers);
 
 	bool sliceTableUploaded = sliceTableCPU.empty();
 	if (!sliceTableCPU.empty()) {
@@ -558,21 +596,52 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 	}
 
 	if (!sliceTableUploaded) {
-		for (auto& [key, b] : bucketStore.buckets)
+		for (auto& [key, b] : bucketStore.buckets) {
 			b.cullVisible = false;
+			b.optimizedReady.store(false, std::memory_order_relaxed);
+		}
+		visibleBuckets.clear();
 	}
 
 	ctx->CSSetShader(cullCS, nullptr, 0);
 
-	for (auto& [key, b] : bucketStore.buckets)
-		if (b.cullVisible)
-			CullBucket(b, ctx);
+	// Upload complete args records in one command instead of clearing a count UAV per bucket.
+	// The count windows preserve the cull shader's byte-zero addressing within each record.
+	if (!visibleBuckets.empty()) {
+		UploadDrawArgs(ctx);
+	}
+
+	// Only active LOD bins read these separate counters.
+	const UINT zeros[4] = { 0, 0, 0, 0 };
+	for (GrassBucket* b : visibleBuckets) {
+		if (std::ranges::any_of(b->lodBins, [](const GrassBucket::LODBin& bin) { return bin.active; }))
+			ctx->ClearUnorderedAccessViewUint(b->lodCounterUAV, zeros);
+	}
+
+	for (GrassBucket* b : visibleBuckets)
+		CullBucket(*b, ctx);
 
 	ID3D11UnorderedAccessView* nullUAVs[4 + 2 * (size_t)GrassMeshLibrary::LODTier::kCount] = {};
 	ctx->CSSetUnorderedAccessViews(0, (UINT)std::size(nullUAVs), nullUAVs, nullptr);
-	ID3D11ShaderResourceView* nullSRVs[4] = {};
-	ctx->CSSetShaderResources(0, 4, nullSRVs);
+
+	// Copy the LOD counts once every dispatch is queued; copying after each one stalls the next.
+	for (GrassBucket* b : visibleBuckets) {
+		for (size_t tier = 0; tier < (size_t)GrassMeshLibrary::LODTier::kCount; ++tier) {
+			const GrassBucket::LODBin& bin = b->lodBins[tier];
+			if (!bin.active || !bin.argsBuf)
+				continue;
+			const UINT countOffset = (UINT)(tier * sizeof(uint32_t));
+			const D3D11_BOX countBox{ countOffset, 0, 0, static_cast<UINT>(countOffset + sizeof(uint32_t)), 1, 1 };
+			ctx->CopySubresourceRegion(bin.argsBuf, 0, instanceCountOffset, 0, 0, b->lodCounterBuf, 0, &countBox);
+		}
+	}
+
+	ID3D11ShaderResourceView* nullSRVs[5] = {};
+	ctx->CSSetShaderResources(0, 5, nullSRVs);
 	ctx->CSSetShader(nullptr, nullptr, 0);
+
+	// Removals at Present may destroy these buckets before the next frame.
+	visibleBuckets.clear();
 }
 
 void GrassOptimizations::BuildFrustumSoA(FrustumSoA& out, const RE::NiFrustumPlanes& f)
@@ -606,10 +675,14 @@ void GrassOptimizations::BuildFrustumSoA(FrustumSoA& out, const RE::NiFrustumPla
 		out.nz[g] = _mm_load_ps(nz + g * 4);
 		out.d[g] = _mm_load_ps(d + g * 4);
 	}
+	for (uint32_t i = 0; i < 6; ++i) {
+		out.planes[i] = { _mm_set1_ps(nx[i]), _mm_set1_ps(ny[i]), _mm_set1_ps(nz[i]), _mm_set1_ps(d[i]) };
+	}
 }
 
-bool GrassOptimizations::AabbVisible(const FrustumSoA& f, __m128 lo, __m128 hi)
+bool GrassOptimizations::ClassifyAabb(const FrustumSoA& f, __m128 lo, __m128 hi, uint32_t& intersectingPlanes)
 {
+	intersectingPlanes = 0;
 	const __m128 lx = _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(0, 0, 0, 0));
 	const __m128 ly = _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(1, 1, 1, 1));
 	const __m128 lz = _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(2, 2, 2, 2));
@@ -631,13 +704,23 @@ bool GrassOptimizations::AabbVisible(const FrustumSoA& f, __m128 lo, __m128 hi)
 		// dot(n, p) - constant < 0 → outside
 		if (_mm_movemask_ps(_mm_cmplt_ps(_mm_sub_ps(dot, f.d[g]), _mm_setzero_ps())))
 			return false;
+
+		// A plane containing the negative vertex contains the whole coarse box.
+		const __m128 qx = _mm_blendv_ps(lx, hx, f.nx[g]);
+		const __m128 qy = _mm_blendv_ps(ly, hy, f.ny[g]);
+		const __m128 qz = _mm_blendv_ps(lz, hz, f.nz[g]);
+		const __m128 minimum = _mm_add_ps(_mm_add_ps(_mm_mul_ps(f.nx[g], qx), _mm_mul_ps(f.ny[g], qy)), _mm_mul_ps(f.nz[g], qz));
+		const uint32_t inside = _mm_movemask_ps(_mm_cmpge_ps(_mm_sub_ps(minimum, f.d[g]), _mm_setzero_ps()));
+		intersectingPlanes |= ((~inside) & 0xFu) << (g * 4);
 	}
+	intersectingPlanes &= 0x3Fu;
 	return true;
 }
 
 void GrassOptimizations::SetupResources()
 {
 	cullParamsCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<CullParamsCB>(), "GrassOptimizations::CullParamsCB");
+	perGeometryCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc((kMaxPerGeometryVariants + 1) * kPerGeometrySlotBytes), "GrassOptimizations::PerGeometryCB");
 	hiZ.SetupResources();
 	bucketStore.SetupResources();
 
@@ -645,6 +728,13 @@ void GrassOptimizations::SetupResources()
 		logger::error("[GRASS OPTIMIZATIONS] ID3D11DeviceContext1 unavailable — feature disabled");
 		ctx1 = nullptr;
 	}
+}
+
+void GrassOptimizations::Reset()
+{
+	std::scoped_lock lk(bucketStore.bucketMutex);
+	bucketStore.ProcessRemovals();
+	bucketStore.meshLibrary.CommitLoadedLODMeshes();
 }
 
 void GrassOptimizations::ClearShaderCache()
@@ -676,20 +766,15 @@ void GrassOptimizations::CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
 {
 	static_assert(
 		(size_t)GrassMeshLibrary::LODTier::kMiddle == 0 &&
-		(size_t)GrassMeshLibrary::LODTier::kFar == 1 &&
-		(size_t)GrassMeshLibrary::LODTier::kCount == 2,
+			(size_t)GrassMeshLibrary::LODTier::kFar == 1 &&
+			(size_t)GrassMeshLibrary::LODTier::kCount == 2,
 		"GrassCullingCS LOD counter offsets must match LODTier");
 
 	if (b.cullSlot == UINT32_MAX)
 		return;
 
-	// Clearing the args view allows the instance count to be directly reset to zero for the draw.
-	const UINT zeros[4] = { 0, 0, 0, 0 };
-	ctx->ClearUnorderedAccessViewUint(b.argsUAV, zeros);
-	ctx->ClearUnorderedAccessViewUint(b.lodCounterUAV, zeros);
-
 	// Main outputs, two outputs per LOD tier, then the shared LOD counter, matching u0-u7 in GrassCullingCS.
-	ID3D11UnorderedAccessView* uavs[4 + 2 * (size_t)GrassMeshLibrary::LODTier::kCount] = { b.compactedUAV, b.extrasUAV, b.argsUAV };
+	ID3D11UnorderedAccessView* uavs[4 + 2 * (size_t)GrassMeshLibrary::LODTier::kCount] = { b.compactedUAV, b.extrasUAV, drawCountUAVs[b.cullSlot].get() };
 	for (size_t tier = 0; tier < (size_t)GrassMeshLibrary::LODTier::kCount; ++tier) {
 		const GrassBucket::LODBin& bin = b.lodBins[tier];
 		uavs[3 + tier * 2 + 0] = bin.active ? bin.compactedUAV : nullptr;
@@ -699,33 +784,72 @@ void GrassOptimizations::CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
 	ctx->CSSetUnorderedAccessViews(0, (UINT)std::size(uavs), uavs, nullptr);
 
 	ID3D11ShaderResourceView* sliceTableSRV = sliceTable ? sliceTable->srv.get() : nullptr;
-	ID3D11ShaderResourceView* srvs[4] = { b.instanceSRV, b.originSRV,
-		hiZ.GetSRV(), sliceTableSRV };
-	ctx->CSSetShaderResources(0, 4, srvs);
+	ID3D11ShaderResourceView* srvs[5] = { b.instanceSRV, b.groupSRV,
+		hiZ.GetSRV(), sliceTableSRV, b.complexSRV };
+	ctx->CSSetShaderResources(0, 5, srvs);
 
 	ID3D11Buffer* bucketCB = cullBucketCB->CB();
-	UINT first = b.cullSlot * 16;
+	UINT first = b.cullSlot * (kSlotBytes / 16);
 	UINT num = 16;
 	ctx1->CSSetConstantBuffers1(1, 1, &bucketCB, &first, &num);
 
 	// Skipping the dispatch keeps the instance count at zero for the draw.
-	if (b.visibleInstances && b.sliceTableCount && sliceTableSRV)
-		ctx->Dispatch((b.visibleInstances + 63) / 64, 1, 1);
-
-	// The LOD counter UAV must be unbound before its values can be copied into the draw arguments.
-	ID3D11UnorderedAccessView* nullUAVs[std::size(uavs)] = {};
-	ctx->CSSetUnorderedAccessViews(0, (UINT)std::size(nullUAVs), nullUAVs, nullptr);
-	for (size_t tier = 0; tier < (size_t)GrassMeshLibrary::LODTier::kCount; ++tier) {
-		const GrassBucket::LODBin& bin = b.lodBins[tier];
-		if (!bin.active || !bin.argsBuf)
-			continue;
-		const UINT countOffset = (UINT)(tier * sizeof(uint32_t));
-		const D3D11_BOX countBox{ countOffset, 0, 0, static_cast<UINT>(countOffset + sizeof(uint32_t)), 1, 1 };
-		ctx->CopySubresourceRegion(bin.argsBuf, 0, instanceCountOffset, 0, 0, b.lodCounterBuf, 0, &countBox);
+	if (b.groupCount && b.sliceTableCount && sliceTableSRV) {
+		// Large buckets continue on further rows, staying under the per-dimension group limit.
+		const UINT width = std::min(b.groupCount, (uint32_t)D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION);
+		ctx->Dispatch(width, (b.groupCount + width - 1) / width, 1);
 	}
 }
 
-bool GrassOptimizations::EnsureCullBucketCapacity(uint32_t slots, [[maybe_unused]] ID3D11Device* device)
+void GrassOptimizations::UploadDrawArgs(ID3D11DeviceContext* ctx)
+{
+	drawArgsCPU.assign(visibleBuckets.size(), {});
+	for (const GrassBucket* b : visibleBuckets)
+		drawArgsCPU[b->cullSlot][argsByteOffset / sizeof(uint32_t)] = b->indexCount;
+	const D3D11_BOX argsBox{ 0, 0, 0, (UINT)(drawArgsCPU.size() * argsSlotBytes), 1, 1 };
+	ctx->UpdateSubresource(drawArgs->resource.get(), 0, &argsBox, drawArgsCPU.data(), 0, 0);
+}
+
+bool GrassOptimizations::EnsureDrawArgsCapacity(uint32_t slots, ID3D11Device* device)
+{
+	if (drawArgs && drawCountUAVs.size() >= slots)
+		return true;
+
+	constexpr uint32_t kMaxSlots = UINT32_MAX / argsSlotBytes;
+	if (slots > kMaxSlots)
+		return false;
+	uint32_t cap = drawCountUAVs.empty() ? 64u : (uint32_t)drawCountUAVs.size();
+	while (cap < slots)
+		cap = std::min(cap * 2, kMaxSlots);
+
+	try {
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = cap * argsSlotBytes;
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+		auto buffer = std::make_unique<Buffer>(bd, nullptr, "GrassOptimizations::DrawArgs");
+		std::vector<winrt::com_ptr<ID3D11UnorderedAccessView>> views(cap);
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
+		uav.Format = DXGI_FORMAT_R32_TYPELESS;
+		uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		uav.Buffer.NumElements = 1;
+		uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+		for (uint32_t slot = 0; slot < cap; ++slot) {
+			uav.Buffer.FirstElement = (slot * argsSlotBytes + instanceCountOffset) / sizeof(uint32_t);
+			DX::ThrowIfFailed(device->CreateUnorderedAccessView(buffer->resource.get(), &uav, views[slot].put()));
+			Util::SetResourceName(views[slot].get(), "GrassOptimizations::DrawCount UAV");
+		}
+		drawCountUAVs = std::move(views);
+		drawArgs = std::move(buffer);
+	} catch (...) {
+		logger::error("[GRASS OPTIMIZATIONS] shared draw args create failed slots={}", cap);
+		return false;
+	}
+	return true;
+}
+
+bool GrassOptimizations::EnsureCullBucketCapacity(uint32_t slots)
 {
 	if (cullBucketCB && cullBucketCBSlots >= slots)
 		return true;
@@ -804,6 +928,140 @@ void GrassOptimizations::Hooks::BSGrassShader_SetupGeometry::thunk(RE::BSShader*
 	auto* shadowState = globals::game::shadowState;
 	shadowState->SetPSTextureAddressMode(0, RE::BSGraphics::TextureAddressMode::kClampSClampT);
 	shadowState->SetPSTextureFilterMode(0, RE::BSGraphics::TextureFilterMode::kAnisotropic);
+}
+
+void GrassOptimizations::Hooks::BSGrassShader_SetupMaterial::thunk([[maybe_unused]] RE::BSShader* This, const RE::BSLightingShaderMaterialBase* material)
+{
+	globals::features::grassOptimizations.pendingMaterial = material;
+}
+
+bool GrassOptimizations::SetupGrassPass(RE::BSShader* shader, RE::BSRenderPass* pass)
+{
+	const auto* material = std::exchange(pendingMaterial, nullptr);
+
+	if (loaded && SetupOptimizedPass(pass))
+		return true;
+
+	if (material)
+		Hooks::BSGrassShader_SetupMaterial::func(shader, material);
+	return false;
+}
+
+bool GrassOptimizations::SetupOptimizedPass(RE::BSRenderPass* pass)
+{
+	auto* geometry = pass->geometry;
+	auto* shaderProperty = pass->shaderProperty;
+	if (!geometry || !shaderProperty || shaderProperty->GetRTTI() != globals::rtti::BSGrassShaderPropertyRTTI.get())
+		return false;
+	auto* material = static_cast<RE::BSLightingShaderMaterialBase*>(shaderProperty->material);
+	if (!material || !material->diffuseTexture || !material->diffuseTexture->rendererTexture)
+		return false;
+
+	auto* smState = globals::game::smState;
+	auto* sceneNode = smState->shadowSceneNode[0];
+	auto* sunLight = sceneNode && sceneNode->GetRuntimeData().sunLight ? skyrim_cast<RE::NiDirectionalLight*>(sceneNode->GetRuntimeData().sunLight->light.get()) : nullptr;
+	if (smState->liteBrite || !sunLight)
+		return false;
+
+	const bool pbrTechnique = static_cast<SIE::ShaderCache::GrassShaderTechniques>(globals::state->currentPixelDescriptor & 0b1111) ==
+	                          SIE::ShaderCache::GrassShaderTechniques::TruePbr;
+
+	std::scoped_lock lk(bucketStore.bucketMutex);
+	auto* b = bucketStore.FindBucket(static_cast<RE::BSMultiStreamInstanceTriShape*>(geometry));
+	if (!b || !b->totalInstances || !b->optimizedReady.load(std::memory_order_relaxed) || (pbrTechnique && !b->pbrMaterial))
+		return false;
+
+	// The draw hook skips this pass, so it needs no setup.
+	if (!b->cullVisible || (b->drawnFrame == globals::game::graphicsState->frameCount && b->drawnPassKey == GetPassKey(pass)))
+		return true;
+
+	if (!BindPerGeometry(geometry, shaderProperty, sunLight))
+		return false;
+	auto* shadowState = globals::game::shadowState;
+	shadowState->SetPSTexture(0, material->diffuseTexture->rendererTexture);
+	shadowState->SetPSTextureAddressMode(0, RE::BSGraphics::TextureAddressMode::kClampSClampT);
+	if (pbrTechnique) {
+		TruePBR::SetGrassPBRTextures(static_cast<const BSLightingShaderMaterialPBR*>(material));
+
+		ID3D11Buffer* bucketCB = cullBucketCB->CB();
+		UINT first = (b->cullSlot * kSlotBytes + kSlotMaterialOffset) / 16;
+		UINT num = 16;
+		ctx1->PSSetConstantBuffers1(1, 1, &bucketCB, &first, &num);
+	}
+	return true;
+}
+
+bool GrassOptimizations::BindPerGeometry(const RE::BSGeometry* geometry, const RE::BSShaderProperty* shaderProperty, RE::NiDirectionalLight* sunLight)
+{
+	// Engine globals vanilla SetupGeometry reads. SetFogNearColor writes the fog colour to its PerGeometry copy at c16.
+	static const auto* fogNearColor = reinterpret_cast<const float*>(REL::RelocationID(527805, 414756).address() + 0x100);
+	static const auto* grassWindAmount = reinterpret_cast<const float*>(REL::RelocationID(527802, 414753).address());
+	static const auto* grassWindAmountMax = reinterpret_cast<const float*>(REL::RelocationID(504665, 373550).address());
+	static const auto* windGrassMultiplier = reinterpret_cast<const float*>(REL::RelocationID(513337, 391112).address());
+
+	if (!perGeometryCB || !ctx1)
+		return false;
+
+	GrassPerGeometry data{};
+	std::memcpy(data.fogNearColor, fogNearColor, sizeof(data.fogNearColor));
+
+	// The wind blows along the model's Y axis.
+	RE::NiPoint3 windDirection{ geometry->world.rotate.entry[1][0], geometry->world.rotate.entry[1][1], geometry->world.rotate.entry[1][2] };
+	windDirection.Unitize();
+	data.windVector[0] = windDirection.x;
+	data.windVector[1] = windDirection.y;
+	data.windVector[2] = std::min(*grassWindAmount, *grassWindAmountMax) * *windGrassMultiplier;
+
+	const auto& sunDirection = sunLight->GetWorldDirection();
+	data.dirLightDirection[0] = -sunDirection.x;
+	data.dirLightDirection[1] = -sunDirection.y;
+	data.dirLightDirection[2] = -sunDirection.z;
+
+	const auto& sun = sunLight->GetLightRuntimeData();
+	data.dirLightColor[0] = sun.diffuse.red;
+	data.dirLightColor[1] = sun.diffuse.green;
+	data.dirLightColor[2] = sun.diffuse.blue;
+	data.ambientColor[0] = sun.ambient.red;
+	data.ambientColor[1] = sun.ambient.green;
+	data.ambientColor[2] = sun.ambient.blue;
+
+	const bool uniformScale = shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kUniformScale);
+	data.scaleMask[0] = uniformScale ? 1.0f : 0.0f;
+	data.scaleMask[1] = uniformScale ? 1.0f : 0.0f;
+	data.scaleMask[2] = 1.0f;
+
+	auto variant = std::ranges::find_if(perGeometryVariants, [&](const GrassPerGeometry& v) { return std::memcmp(&v, &data, sizeof(data)) == 0; });
+	if (variant == perGeometryVariants.end()) {
+		if (perGeometryVariants.size() == kMaxPerGeometryVariants)
+			perGeometryVariants.clear();
+		perGeometryVariants.push_back(data);
+
+		auto* ctx = globals::d3d::context;
+		D3D11_MAPPED_SUBRESOURCE m{};
+		if (FAILED(ctx->Map(perGeometryCB->CB(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			perGeometryVariants.clear();
+			return false;
+		}
+		auto* bytes = static_cast<uint8_t*>(m.pData);
+		for (size_t i = 0; i < perGeometryVariants.size(); ++i)
+			std::memcpy(bytes + (i + 1) * kPerGeometrySlotBytes, &perGeometryVariants[i], sizeof(GrassPerGeometry));
+		ctx->Unmap(perGeometryCB->CB(), 0);
+		variant = perGeometryVariants.end() - 1;
+	}
+	ID3D11Buffer* cb = perGeometryCB->CB();
+	UINT first = (UINT)(variant - perGeometryVariants.begin()) * (kPerGeometrySlotBytes / 16);
+	UINT num = 2 * (kPerGeometrySlotBytes / 16);
+	ctx1->VSSetConstantBuffers1(2, 1, &cb, &first, &num);
+	ctx1->PSSetConstantBuffers1(2, 1, &cb, &first, &num);
+	return true;
+}
+
+uint64_t GrassOptimizations::GetPassKey(const RE::BSRenderPass* pass)
+{
+	uint32_t descriptor = 0;
+	if (globals::game::currentPixelShader && *globals::game::currentPixelShader)
+		descriptor = (*globals::game::currentPixelShader)->id;
+	return (static_cast<uint64_t>(pass->passEnum) << 32) | descriptor;
 }
 
 static size_t GIDGroupBytes(const RE::BSMultiStreamInstanceTriShape::GroupHeader* header)
@@ -922,31 +1180,22 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	const uint64_t descVal = *reinterpret_cast<uint64_t*>(&geometry->GetGeometryRuntimeData().vertexDesc);
 	const uint32_t frame = globals::game::graphicsState->frameCount;
 
-	GrassBucket* b = nullptr;
-	{
-		std::scoped_lock lk(self.bucketStore.bucketMutex);
-
-		const uint32_t meshId = self.bucketStore.meshLibrary.ResolveMeshId(geometry);
-		const uint32_t triCount = meshId ? 0u : (uint32_t)geometry->GetTrishapeRuntimeData().triangleCount;
-		auto* material = static_cast<RE::BSGrassShaderProperty*>(shaderProperty.get())->material;
-		auto it = self.bucketStore.buckets.find({ meshId, material, meshId ? nullptr : diffuseTexture, triCount, meshId ? 0u : descVal });
-		if (it == self.bucketStore.buckets.end() || !it->second.totalInstances || !it->second.instanceBuf) {
-			VanillaDrawInstanceTriShape(geometry);
-			return;
-		}
-		b = &it->second;
-
-		// Since draws are dispatch per shape, ensure each bucket is only drawn once per frame per technique.
-		uint32_t descriptor = 0;
-		if (globals::game::currentPixelShader && *globals::game::currentPixelShader)
-			descriptor = (*globals::game::currentPixelShader)->id;
-		const uint64_t passKey = (static_cast<uint64_t>(pass->passEnum) << 32) | descriptor;
-
-		if (b->drawnFrame == frame && b->drawnPassKey == passKey)
-			return;
-		b->drawnFrame = frame;
-		b->drawnPassKey = passKey;
+	// Keep the capture and its GPU resources alive through all of this bucket's draws.
+	std::scoped_lock lk(self.bucketStore.bucketMutex);
+	// Look up by shape, like OnVisible; a key rebuilt from engine state can miss the capture.
+	auto* b = self.bucketStore.FindBucket(geometry);
+	if (!b || !b->totalInstances || !b->optimizedReady.load(std::memory_order_relaxed)) {
+		VanillaDrawInstanceTriShape(geometry);
+		return;
 	}
+
+	// Multiple shapes share a bucket; draw it once per frame and technique.
+	const uint64_t passKey = GetPassKey(pass);
+
+	if (b->drawnFrame == frame && b->drawnPassKey == passKey)
+		return;
+	b->drawnFrame = frame;
+	b->drawnPassKey = passKey;
 
 	if (!b->cullVisible) {
 		return;
@@ -960,14 +1209,6 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	if (!meshVB || !indexB)
 		return;
 
-	if (!b->argsIndexCountWritten) {
-		const uint32_t indexCount = 3u * geometry->GetTrishapeRuntimeData().triangleCount;
-		const D3D11_BOX argBox{ argsByteOffset, 0, 0, argsByteOffset + sizeof(uint32_t), 1, 1 };
-		ctx->UpdateSubresource(b->argsBuf, 0, &argBox, &indexCount, 0, 0);
-		b->argsIndexCountWritten = true;
-	}
-
-	// Replicate vanilla state setup
 	auto& shadowState = globals::game::shadowState->GetRuntimeData();
 	if (shadowState.vertexDesc != descVal) {
 		shadowState.vertexDesc = descVal;
@@ -978,7 +1219,17 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 		shadowState.stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_PRIMITIVE_TOPO);
 	}
 	static REL::Relocation<void (*)(uint32_t)> SetDirtyStates{ REL::RelocationID(75580, 77386) };
+
+	// SetDirtyStates binds each dirty pixel texture on its own; bind the material's slots in one call instead.
+	constexpr uint32_t kMaterialTextureBits = 0x1F;
+	const uint32_t materialTextures = shadowState.PSResourceModifiedBits & kMaterialTextureBits;
+	shadowState.PSResourceModifiedBits &= ~kMaterialTextureBits;
 	SetDirtyStates(0);
+	if (materialTextures) {
+		const uint32_t firstTexture = std::countr_zero(materialTextures);
+		const uint32_t textureCount = std::bit_width(materialTextures) - firstTexture;
+		ctx->PSSetShaderResources(firstTexture, textureCount, reinterpret_cast<ID3D11ShaderResourceView* const*>(&shadowState.PSTexture[firstTexture]));
+	}
 
 	ctx->IASetIndexBuffer(indexB, DXGI_FORMAT_R16_UINT, 0);
 
@@ -991,28 +1242,21 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 	vbs[1] = b->compactedBuf;
 	ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
 	ctx->VSSetShaderResources(2, 1, &b->extrasSRV);
-	ctx->DrawIndexedInstancedIndirect(b->argsBuf, argsByteOffset);
-
-	std::array<const GrassMeshLibrary::LODMesh*, (size_t)GrassMeshLibrary::LODTier::kCount> lodMeshes{};
-	{
-		std::scoped_lock lk(self.bucketStore.bucketMutex);
-		for (uint32_t tier = 0; tier < (uint32_t)GrassMeshLibrary::LODTier::kCount; ++tier)
-			lodMeshes[tier] = self.bucketStore.meshLibrary.GetLODMesh(b->meshId, (GrassMeshLibrary::LODTier)tier);
-	}
+	ctx->DrawIndexedInstancedIndirect(self.drawArgs->resource.get(), b->cullSlot * argsSlotBytes + argsByteOffset);
 
 	for (uint32_t tier = 0; tier < (uint32_t)GrassMeshLibrary::LODTier::kCount; ++tier) {
 		GrassBucket::LODBin& bin = b->lodBins[tier];
 		if (!bin.active)
 			continue;
 
-		const GrassMeshLibrary::LODMesh* lod = lodMeshes[tier];
+		const auto* lod = self.bucketStore.meshLibrary.GetLODMesh(b->meshId, (GrassMeshLibrary::LODTier)tier);
 		if (!lod || !lod->vertexBuffer || !lod->indexBuffer)
 			continue;
 
-		if (!bin.argsIndexCountWritten) {
+		if (bin.argsIndexCount != lod->indexCount) {
 			const D3D11_BOX argBox{ argsByteOffset, 0, 0, argsByteOffset + sizeof(uint32_t), 1, 1 };
 			ctx->UpdateSubresource(bin.argsBuf, 0, &argBox, &lod->indexCount, 0, 0);
-			bin.argsIndexCountWritten = true;
+			bin.argsIndexCount = lod->indexCount;
 		}
 
 		if (shadowState.vertexDesc != lod->descVal) {

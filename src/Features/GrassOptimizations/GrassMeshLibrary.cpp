@@ -17,7 +17,6 @@ namespace
 		return nullptr;
 	}
 
-	/** @brief Returns the filename without directories or extension. */
 	std::string StemOf(const char* path)
 	{
 		const std::string p = path;
@@ -29,39 +28,53 @@ namespace
 	}
 }
 
+GrassMeshLibrary::~GrassMeshLibrary()
+{
+	if (loader) {
+		{
+			std::scoped_lock lk(loader->mutex);
+			loaderThread.request_stop();
+		}
+		loader->wake.notify_one();
+	}
+}
+
 void GrassMeshLibrary::RecordModelPath(RE::BSMultiStreamInstanceTriShape* shape, const char* modelPath)
 {
 	if (!shape || !modelPath || !*modelPath)
 		return;
 
 	std::scoped_lock lk(stemMutex);
-	stemByShape.insert_or_assign(shape, StemOf(modelPath));
+	const auto stem = StemOf(modelPath);
+	if (auto it = stemByShape.find(shape); it == stemByShape.end() || it->second != stem)
+		idByShape.erase(shape);
+	stemByShape.insert_or_assign(shape, stem);
 }
 
 uint32_t GrassMeshLibrary::ResolveMeshId(RE::BSMultiStreamInstanceTriShape* shape)
 {
 	if (!shape)
 		return 0;
+	std::scoped_lock lk(stemMutex);
 	if (auto it = idByShape.find(shape); it != idByShape.end())
 		return it->second;
 
-	// LoadGrassType records every grass type at creation, before any instance of it is captured.
 	std::string stem;
-	{
-		std::scoped_lock lk(stemMutex);
-		if (auto it = stemByShape.find(shape); it != stemByShape.end())
-			stem = it->second;
-	}
+	if (auto it = stemByShape.find(shape); it != stemByShape.end())
+		stem = it->second;
 
 	uint32_t meshId = 0;
 	if (!stem.empty()) {
-		const auto it = std::find(stems.begin(), stems.end(), stem);
-		meshId = static_cast<uint32_t>(std::distance(stems.begin(), it)) + 1;  // ids are 1-based, with 0 reserved for unresolved shapes
-		if (it == stems.end())
+		auto [it, inserted] = meshIdByStem.try_emplace(stem, static_cast<uint32_t>(stems.size()) + 1);
+		meshId = it->second;  // ids remain stable after LOD resource eviction
+		if (inserted) {
 			stems.push_back(stem);
+			activeBuckets.push_back(0);
+		}
 	}
 
-	idByShape.emplace(shape, meshId);
+	if (meshId)
+		idByShape.emplace(shape, meshId);  // a not-yet-recorded model path may become available later
 	return meshId;
 }
 
@@ -73,14 +86,68 @@ void GrassMeshLibrary::EnsureLODMeshes(uint32_t meshId)
 	if (lodMeshes.size() < stems.size())
 		lodMeshes.resize(stems.size());
 
-	for (uint32_t tier = 0; tier < (uint32_t)LODTier::kCount; ++tier)
-		LoadLODMesh(lodMeshes[meshId - 1][tier], stems[meshId - 1], (LODTier)tier);
+	for (uint32_t tier = 0; tier < (uint32_t)LODTier::kCount; ++tier) {
+		auto& entry = lodMeshes[meshId - 1][tier];
+		if (entry.attemptedLoad || entry.queued)
+			continue;
+		entry.queued = true;
+
+		if (!loader) {
+			loader = std::make_unique<Loader>();
+			loaderThread = std::jthread([state = loader.get()](std::stop_token stop) {
+				for (;;) {
+					LoadJob job;
+					{
+						std::unique_lock lk(state->mutex);
+						state->wake.wait(lk, [&] { return stop.stop_requested() || !state->jobs.empty(); });
+						if (stop.stop_requested())
+							return;
+						job = std::move(state->jobs.front());
+						state->jobs.pop_front();
+					}
+					LoadResult result{ job.meshId, job.tier, {} };
+					LoadLODMesh(result.mesh, job.stem, job.tier);
+					std::scoped_lock lk(state->mutex);
+					state->results.push_back(std::move(result));
+				}
+			});
+		}
+		{
+			std::scoped_lock lk(loader->mutex);
+			loader->jobs.push_back({ meshId, (LODTier)tier, stems[meshId - 1] });
+		}
+		loader->wake.notify_one();
+	}
+}
+
+void GrassMeshLibrary::CommitLoadedLODMeshes()
+{
+	if (!loader)
+		return;
+
+	static thread_local std::vector<LoadResult> done;
+	done.clear();
+	{
+		std::scoped_lock lk(loader->mutex);
+		done.swap(loader->results);
+	}
+
+	for (auto& result : done) {
+		auto& entry = lodMeshes[result.meshId - 1][(size_t)result.tier];
+		if (!activeBuckets[result.meshId - 1] || !result.mesh.valid) {
+			// Drop unused or rejected model trees, preserving the negative cache for failed loads.
+			entry = {};
+			entry.attemptedLoad = !result.mesh.valid;
+			continue;
+		}
+		entry = std::move(result.mesh);
+	}
+	// Release discarded model trees on the render thread, like ReleaseMesh.
+	done.clear();
 }
 
 void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODTier tier)
 {
-	if (entry.attemptedLoad)
-		return;
 	entry.attemptedLoad = true;
 
 	const std::string modelPath = "LOD\\Grass\\" + stem + (tier == LODTier::kFar ? "_LOD1.nif" : "_LOD0.nif");
@@ -98,14 +165,13 @@ void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODT
 				entry.keepAlive = RE::NiPointer<RE::NiAVObject>(root.get());
 				entry.vertexBuffer = reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer);
 				entry.indexBuffer = reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer);
-				// Alter the descriptor to match the BSMultistreaminstanceTrishapes of normal grass
+				// Match the source grass instancing flags while retaining the LOD vertex format.
 				entry.descVal = *reinterpret_cast<const uint64_t*>(&grd.vertexDesc) | 0x8000000000000080ull;
 				entry.meshStride = VertexStrideFromDesc(entry.descVal);
 				entry.indexCount = 3u * ts->GetTrishapeRuntimeData().triangleCount;
-				// A zero stride means the descriptor decoded to nothing, which would draw garbage vertices.
-				entry.valid = entry.meshStride != 0;
+				entry.valid = entry.meshStride != 0 && entry.indexCount != 0;
 				if (!entry.valid)
-					logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} rejected: vertex stride decoded to 0 from descVal={:016X}", modelPath, entry.descVal);
+					logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} rejected: indices={} stride={} descVal={:016X}", modelPath, entry.indexCount, entry.meshStride, entry.descVal);
 				else
 					logger::info("[GRASS OPTIMIZATIONS] LOD mesh {} loaded: tris={} stride={} descVal={:016X}",
 						modelPath, entry.indexCount / 3, entry.meshStride, entry.descVal);
@@ -116,7 +182,6 @@ void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODT
 			logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} has no TriShape", modelPath);
 		}
 	}
-	// If the file absent, that grass type keeps its full mesh.
 }
 
 const GrassMeshLibrary::LODMesh* GrassMeshLibrary::GetLODMesh(uint32_t meshId, LODTier tier) const
@@ -134,7 +199,27 @@ const GrassMeshLibrary::LODMesh* GrassMeshLibrary::GetLODMesh(uint32_t meshId, L
 
 void GrassMeshLibrary::ForgetShape(RE::BSMultiStreamInstanceTriShape* shape)
 {
-	idByShape.erase(shape);
 	std::scoped_lock lk(stemMutex);
+	idByShape.erase(shape);
 	stemByShape.erase(shape);
+}
+
+void GrassMeshLibrary::RetainMesh(uint32_t meshId)
+{
+	if (meshId && meshId <= activeBuckets.size())
+		++activeBuckets[meshId - 1];
+}
+
+void GrassMeshLibrary::ReleaseMesh(uint32_t meshId)
+{
+	if (!meshId || meshId > activeBuckets.size() || !activeBuckets[meshId - 1])
+		return;
+	if (--activeBuckets[meshId - 1] || meshId > lodMeshes.size())
+		return;
+
+	for (auto& entry : lodMeshes[meshId - 1]) {
+		// Missing/invalid files stay cached; successfully loaded models may be demanded again.
+		if (entry.valid)
+			entry = {};
+	}
 }

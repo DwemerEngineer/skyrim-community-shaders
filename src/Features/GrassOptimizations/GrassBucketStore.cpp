@@ -1,5 +1,6 @@
 #include "GrassBucketStore.h"
 
+#include "TruePBR/BSLightingShaderMaterialPBR.h"
 
 void GrassBucketStore::SetupResources()
 {
@@ -18,17 +19,6 @@ void GrassBucketStore::SetupResources()
 		uav.Buffer.FirstElement = 0;
 		uav.Buffer.NumElements = 1;
 		detectResult->CreateUAV(uav);
-	}
-
-	{
-		D3D11_BUFFER_DESC bd{};
-		bd.ByteWidth = sizeof(uint32_t);
-		bd.Usage = D3D11_USAGE_STAGING;
-		bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-		// Match the source buffer's structure so the copy works.
-		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-		bd.StructureByteStride = sizeof(uint32_t);
-		detectStaging = std::make_unique<Buffer>(bd, nullptr, "GrassOptimizations::DetectStaging");
 	}
 }
 
@@ -52,37 +42,75 @@ ID3D11ComputeShader* GrassBucketStore::GetDetectCS()
 	return detectCS;
 }
 
+void GrassBucketStore::ProcessRemovals()
+{
+	std::vector<ShapeIdentity> rems;
+	{
+		std::scoped_lock lk(pendingMutex);
+		rems.swap(pendingRemoves);
+		std::erase_if(pendingCaptures, [this](const PendingCapture& pc) {
+			auto it = liveShapes.find(pc.shape);
+			return it == liveShapes.end() || it->second != pc.generation;
+		});
+	}
+	std::sort(rems.begin(), rems.end());
+	rems.erase(std::unique(rems.begin(), rems.end()), rems.end());
+	ApplyRemovals(rems);
+	if (buckets.empty())
+		compactionScratch.reset();
+}
+
 void GrassBucketStore::ApplyPending(ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
 	std::vector<PendingCapture> caps;
-	std::vector<RE::BSMultiStreamInstanceTriShape*> rems;
+	std::vector<ShapeIdentity> rems;
 	{
 		std::scoped_lock lk(pendingMutex);
 		caps.swap(pendingCaptures);
 		rems.swap(pendingRemoves);
 	}
-
+	std::sort(rems.begin(), rems.end());
+	rems.erase(std::unique(rems.begin(), rems.end()), rems.end());
 	ApplyRemovals(rems);
-	ApplyCaptures(caps);
+	static thread_local std::vector<BucketKey> emptied;
+	emptied.clear();
+	{
+		// Capture commits and destruction share this lock; no engine loading or GPU work inside it.
+		std::scoped_lock lk(pendingMutex);
+		std::erase_if(caps, [this](const PendingCapture& pc) {
+			auto it = liveShapes.find(pc.shape);
+			return it == liveShapes.end() || it->second != pc.generation;
+		});
+		ApplyCaptures(caps, emptied);
+	}
+	// Released outside pendingMutex: dropping LOD model trees may reenter the destruction hook.
+	// A later capture in the batch may have refilled a bucket, so only erase ones still empty.
+	for (const auto& key : emptied) {
+		if (auto it = buckets.find(key); it != buckets.end() && it->second.slices.empty())
+			EraseBucket(it->second);
+	}
 	UploadDirtyBuckets(device, ctx);
-}
-
-void GrassBucketStore::RefreshComplexGrass(float threshold, ID3D11DeviceContext* ctx)
-{
-	if (threshold == cachedComplexThreshold)
-		return;
-
-	cachedComplexThreshold = threshold;
-
-	for (auto& [key, b] : buckets)
-		b.isComplex = DetectComplexGrass(b.diffuseTexture.get(), ctx);
 }
 
 void GrassBucketStore::StageRemoval(RE::BSMultiStreamInstanceTriShape* shape)
 {
 	std::scoped_lock lk(pendingMutex);
-	std::erase_if(pendingCaptures, [shape](const PendingCapture& pc) { return pc.shape == shape; });
-	pendingRemoves.push_back(shape);
+	if (auto it = liveShapes.find(shape); it != liveShapes.end()) {
+		pendingRemoves.push_back({ shape, it->second });
+		std::unique_lock shapeLock(shapeBucketMutex);
+		if (auto bucket = shapeBucketId.find(shape); bucket != shapeBucketId.end())
+			bucket->second.current->optimizedReady.store(false, std::memory_order_relaxed);
+		liveShapes.erase(it);
+	}
+	// Forget before the engine frees the address, so a later model-path registration survives.
+	meshLibrary.ForgetShape(shape);
+}
+
+GrassBucket* GrassBucketStore::FindBucket(RE::BSMultiStreamInstanceTriShape* shape)
+{
+	std::shared_lock lk(shapeBucketMutex);
+	auto it = shapeBucketId.find(shape);
+	return it == shapeBucketId.end() ? nullptr : it->second.current;
 }
 
 bool GrassBucketStore::ClaimQueueSlot(RE::BSMultiStreamInstanceTriShape* shape, uint32_t frame)
@@ -90,175 +118,307 @@ bool GrassBucketStore::ClaimQueueSlot(RE::BSMultiStreamInstanceTriShape* shape, 
 	std::shared_lock lk(shapeBucketMutex);
 
 	auto it = shapeBucketId.find(shape);
-	// A bucket with no instance buffer falls back to vanilla per-shape drawing, so all shapes must still be queued. Checked here so the map does not need to track buffer state.
+	// A bucket not ready for optimized drawing falls back to vanilla per-shape drawing, so all shapes must still be queued.
 	// Deliberately read without bucketMutex, which UpdateGrass holds whole and would serialise every culling job.
-	if (it == shapeBucketId.end() || !it->second->instanceBuf)
+	if (it == shapeBucketId.end() || !it->second.current->optimizedReady.load(std::memory_order_relaxed))
 		return true;
 
-	auto& lastQueued = it->second->lastQueuedFrame;
+	auto& lastQueued = it->second.current->lastQueuedFrame;
 	uint32_t prev = lastQueued.load(std::memory_order_relaxed);
 	if (prev == frame)
-		return false; 
+		return false;
 	return lastQueued.compare_exchange_strong(prev, frame, std::memory_order_relaxed);
 }
 
-void GrassBucketStore::DiscardPending()
-{
-	std::scoped_lock lk(pendingMutex);
-	pendingCaptures.clear();
-	pendingCaptures.shrink_to_fit();
-	pendingRemoves.clear();
-}
-
-void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstanceTriShape*>& removes)
+void GrassBucketStore::ApplyRemovals(const std::vector<ShapeIdentity>& removes)
 {
 	if (removes.empty())
 		return;
 
-	// A sorted, reused buffer to avoid reallocating during repeated cell loads.
-	static thread_local std::vector<RE::BSMultiStreamInstanceTriShape*> dead;
-	dead.assign(removes.begin(), removes.end());
-	std::sort(dead.begin(), dead.end());
-
-	const auto isDead = [](RE::BSMultiStreamInstanceTriShape* p) {
-		return std::binary_search(dead.begin(), dead.end(), p);
-	};
-
+	// ApplyPending supplies sorted, unique shape keys. Gather before erasing the lookup entries.
+	static thread_local std::vector<GrassBucket*> affected;
+	affected.clear();
 	{
 		std::unique_lock lk(shapeBucketMutex);
-		for (auto* s : removes)
-			shapeBucketId.erase(s);
+		for (const auto& dead : removes) {
+			if (auto it = shapeBucketId.find(dead.shape); it != shapeBucketId.end() && it->second.generation == dead.generation) {
+				affected.push_back(it->second.current);
+				shapeBucketId.erase(it);
+			}
+		}
 	}
+	std::sort(affected.begin(), affected.end(), std::less<GrassBucket*>{});
+	affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
 
-	for (auto* s : removes)
-		meshLibrary.ForgetShape(s);
-
-	for (auto it = buckets.begin(); it != buckets.end();) {
-		auto& b = it->second;
-		const size_t before = b.slices.size();
-
-		// Compact in place, record the first removed so the rebuild re-uploads only from there.
-		uint32_t firstRemoved = UINT32_MAX;
-		size_t write = 0;
-		uint32_t removedInstances = 0;
-		// firstNewSlice indexes b.slices, so compaction shifts it. Left stale it points past the pending
-		// slices and AppendNewSlices would upload none of them, leaving their records unwritten.
-		uint32_t remappedFirstNew = UINT32_MAX;
-
-		for (size_t read = 0; read < before; ++read) {
-			if ((uint32_t)read == b.firstNewSlice)
-				remappedFirstNew = (uint32_t)write;
-			if (isDead(b.slices[read].shape)) {
-				if (firstRemoved == UINT32_MAX)
-					firstRemoved = (uint32_t)write;
-				removedInstances += b.slices[read].count;
-				continue;
-			}
-			if (write != read) {
-				b.slices[write] = std::move(b.slices[read]);
-				b.sliceBounds[write] = b.sliceBounds[read];
-			}
-			++write;
-		}
-
-		b.slices.resize(write);
-		b.sliceBounds.resize(write);
-
-		if (b.firstNewSlice != UINT32_MAX)
-			b.firstNewSlice = (remappedFirstNew != UINT32_MAX) ? remappedFirstNew : (uint32_t)write;
-
-		if (write != before) {
-			b.clustersValid = false;
-			b.totalInstances -= std::min(removedInstances, b.totalInstances);
-		}
-
-		if (b.slices.empty()) {
-			// Culling jobs read this bucket through shapeBucketId while holding the lock shared. Taking it
-			// exclusively blocks until those reads finish, and erasing the entry stops any later job from
-			// reaching it, so destroying the bucket here is safe.
-			std::unique_lock lk(shapeBucketMutex);
-			std::erase_if(shapeBucketId, [dying = &b](const auto& entry) { return entry.second == dying; });
-			it = buckets.erase(it);
-			continue;
-		}
-
-		if (b.slices.size() != before) {
-			b.needsCompact = true;
-			b.coarseValid = false;
-			b.rebuildFromSlice = (b.rebuildFromSlice == UINT32_MAX) ? firstRemoved : std::min(b.rebuildFromSlice, firstRemoved);
-		}
-
-		++it;
+	const auto isDead = [&removes](const BucketSlice& slice) {
+		return std::binary_search(removes.begin(), removes.end(), ShapeIdentity{ slice.shape, slice.generation });
+	};
+	// The exclusive lock above retired every reference to an emptied bucket and waited for culling readers.
+	for (auto* bucket : affected) {
+		if (ExtractSlices(*bucket, isDead, nullptr))
+			EraseBucket(*bucket);
 	}
 }
 
-void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures)
+void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures, std::vector<BucketKey>& emptied)
 {
 	// Queue pending adds so additions can be processed under one lock
-	static thread_local std::vector<std::pair<RE::BSMultiStreamInstanceTriShape*, GrassBucket*>> pendingMapAdds;
+	static thread_local std::vector<std::pair<ShapeIdentity, GrassBucket*>> pendingMapAdds;
 	pendingMapAdds.clear();
-
-	auto* ctx = globals::d3d::context;
 
 	for (auto& pc : captures) {
 		const uint32_t meshId = meshLibrary.ResolveMeshId(pc.shape);
 		const uint32_t triCount = meshId ? 0u : pc.triangleCount;
-		const BucketKey bk{ meshId, pc.material, meshId ? nullptr : pc.diffuseTexture.get(), triCount, meshId ? 0u : pc.descVal };
-		auto& b = buckets[bk];
-		b.meshId = meshId;
-		b.diffuseTexture = pc.diffuseTexture;
-
-		if (b.firstNewSlice == UINT32_MAX)
-			b.firstNewSlice = (uint32_t)b.slices.size();
-
-		if (!b.typeParamsValid) {
-			CacheBucketTypeParams(b, pc);
-			b.isComplex = DetectComplexGrass(pc.diffuseTexture.get(), ctx);
+		BucketKey bk{ meshId, pc.material, meshId ? nullptr : pc.diffuseTexture.get(), triCount, meshId ? 0u : pc.descVal };
+		bk.material = CanonicalMaterial(bk, pc.material, pc.pbrMaterial);
+		auto [it, inserted] = buckets.try_emplace(bk);
+		auto& b = it->second;
+		if (inserted) {
+			b.key = bk;
+			b.meshId = meshId;
+			b.material.reset(bk.material);
+			b.pbrMaterial = pc.pbrMaterial;
+			keysByMesh[meshId].push_back(bk);
+			meshLibrary.RetainMesh(meshId);
 		}
-		if (frameParams.enableMeshLOD)
-			meshLibrary.EnsureLODMeshes(meshId);
+		if (b.diffuseTexture != pc.diffuseTexture) {
+			ReleaseComplexTexture(b.diffuseTexture.get());
+			b.diffuseTexture = pc.diffuseTexture;
+			++complexCache[b.diffuseTexture.get()].activeUsers;
+			b.complexSRV = nullptr;
+		}
 
+		CacheBucketTypeParams(b, pc);
 		BucketSlice s;
 		s.shape = pc.shape;
+		s.generation = pc.generation;
 		s.count = pc.count;
 		s.fadeStart = frameParams.fadeStart;
 		s.origin = pc.origin;
 		s.localMin = pc.localMin;
 		s.localMax = pc.localMax;
 		s.data = std::move(pc.bytes);
-
-		SliceBounds sb;
-		sb.lo[0] = pc.origin.x + pc.localMin.x;
-		sb.lo[1] = pc.origin.y + pc.localMin.y;
-		sb.lo[2] = pc.origin.z + pc.localMin.z;
-		sb.hi[0] = pc.origin.x + pc.localMax.x;
-		sb.hi[1] = pc.origin.y + pc.localMax.y;
-		sb.hi[2] = pc.origin.z + pc.localMax.z;
-
-		b.totalInstances += pc.count;
-		b.slices.push_back(std::move(s));
+		AppendSlice(b, std::move(s));
 		if (pc.shape)
-			pendingMapAdds.emplace_back(pc.shape, &b);
-		b.sliceBounds.push_back(sb);
-		b.clustersValid = false;
-		b.coarseValid = false;
+			pendingMapAdds.emplace_back(ShapeIdentity{ pc.shape, pc.generation }, &b);
 	}
 
-	if (!pendingMapAdds.empty()) {
+	if (pendingMapAdds.empty())
+		return;
+
+	// A capture that resolves to another bucket (a late model path or material) takes the shape's earlier
+	// slices with it; left behind, they would be culled every frame in a bucket no shape draws.
+	struct Migration
+	{
+		GrassBucket* from;
+		GrassBucket* to;
+		ShapeIdentity previous;
+		bool sameShape;
+	};
+	static thread_local std::vector<Migration> migrations;
+	migrations.clear();
+	{
 		std::unique_lock lk(shapeBucketMutex);
-		for (const auto& [shape, bucket] : pendingMapAdds)
-			shapeBucketId[shape] = bucket;
+		for (const auto& [identity, bucket] : pendingMapAdds) {
+			auto& entry = shapeBucketId[identity.shape];
+			if (entry.current && entry.current != bucket)
+				migrations.push_back({ entry.current, bucket, ShapeIdentity{ identity.shape, entry.generation }, entry.generation == identity.generation });
+			entry.generation = identity.generation;
+			entry.current = bucket;
+		}
+	}
+	for (const auto& m : migrations) {
+		if (m.sameShape) {
+			MigrateShapeSlices(*m.from, *m.to, m.previous, emptied);
+			continue;
+		}
+		// The address was reused before the old shape's removal arrived; its slices are dead.
+		const auto isPrevious = [&m](const BucketSlice& slice) {
+			return slice.shape == m.previous.shape && slice.generation == m.previous.generation;
+		};
+		if (ExtractSlices(*m.from, isPrevious, nullptr))
+			emptied.push_back(m.from->key);
 	}
 }
 
-bool GrassBucketStore::CompactBucket(GrassBucket& b, ID3D11Device* device, ID3D11DeviceContext* ctx)
+void GrassBucketStore::AppendSlice(GrassBucket& b, BucketSlice&& slice)
 {
-	if (!b.instanceBuf || !b.originBuf || !b.capacityInstances)
+	pendingUploads.insert(&b);
+	if (b.firstNewSlice == UINT32_MAX)
+		b.firstNewSlice = (uint32_t)b.slices.size();
+
+	slice.bufferOffset = UINT32_MAX;
+
+	SliceBounds sb;
+	sb.lo[0] = slice.origin.x + slice.localMin.x;
+	sb.lo[1] = slice.origin.y + slice.localMin.y;
+	sb.lo[2] = slice.origin.z + slice.localMin.z;
+	sb.hi[0] = slice.origin.x + slice.localMax.x;
+	sb.hi[1] = slice.origin.y + slice.localMax.y;
+	sb.hi[2] = slice.origin.z + slice.localMax.z;
+
+	// Expanding a padded box never needs to revisit old slices. Removal-invalidated boxes
+	// stay invalid until UpdateCoarseBounds recomputes their surviving extrema.
+	if (b.coarseValid || b.slices.empty()) {
+		const float pad = b.modelRadius + 128.0f;
+		const RE::NiPoint3 lo{ sb.lo[0] - pad, sb.lo[1] - pad, sb.lo[2] - pad };
+		const RE::NiPoint3 hi{ sb.hi[0] + pad, sb.hi[1] + pad, sb.hi[2] + pad };
+		if (b.slices.empty()) {
+			b.coarseMin = lo;
+			b.coarseMax = hi;
+		} else {
+			b.coarseMin.x = std::min(b.coarseMin.x, lo.x);
+			b.coarseMin.y = std::min(b.coarseMin.y, lo.y);
+			b.coarseMin.z = std::min(b.coarseMin.z, lo.z);
+			b.coarseMax.x = std::max(b.coarseMax.x, hi.x);
+			b.coarseMax.y = std::max(b.coarseMax.y, hi.y);
+			b.coarseMax.z = std::max(b.coarseMax.z, hi.z);
+		}
+		b.coarseValid = true;
+	}
+	b.totalInstances += slice.count;
+	b.slices.push_back(std::move(slice));
+	b.sliceBounds.push_back(sb);
+}
+
+template <class Pred>
+bool GrassBucketStore::ExtractSlices(GrassBucket& b, Pred isTarget, std::vector<BucketSlice>* moved)
+{
+	const size_t before = b.slices.size();
+
+	// Compact in place, record the first removed so the rebuild re-uploads only from there.
+	uint32_t firstRemoved = UINT32_MAX;
+	size_t write = 0;
+	uint32_t removedInstances = 0;
+	// firstNewSlice indexes b.slices, so compaction shifts it. Left stale it points past the pending
+	// slices and AppendNewSlices would upload none of them, leaving their records unwritten.
+	uint32_t remappedFirstNew = UINT32_MAX;
+
+	for (size_t read = 0; read < before; ++read) {
+		if ((uint32_t)read == b.firstNewSlice)
+			remappedFirstNew = (uint32_t)write;
+		if (isTarget(b.slices[read])) {
+			if (firstRemoved == UINT32_MAX)
+				firstRemoved = (uint32_t)write;
+			removedInstances += b.slices[read].count;
+			if (moved)
+				moved->push_back(std::move(b.slices[read]));
+			continue;
+		}
+		if (write != read) {
+			b.slices[write] = std::move(b.slices[read]);
+			b.sliceBounds[write] = b.sliceBounds[read];
+		}
+		++write;
+	}
+
+	if (write == before)
+		return false;
+
+	b.slices.resize(write);
+	b.sliceBounds.resize(write);
+
+	if (b.firstNewSlice != UINT32_MAX)
+		b.firstNewSlice = (remappedFirstNew != UINT32_MAX) ? remappedFirstNew : (uint32_t)write;
+
+	b.clustersValid = false;
+	b.totalInstances -= std::min(removedInstances, b.totalInstances);
+
+	if (b.slices.empty())
+		return true;
+
+	b.needsCompact = true;
+	pendingUploads.insert(&b);
+	b.coarseValid = false;
+	b.rebuildFromSlice = (b.rebuildFromSlice == UINT32_MAX) ? firstRemoved : std::min(b.rebuildFromSlice, firstRemoved);
+	return false;
+}
+
+void GrassBucketStore::MigrateShapeSlices(GrassBucket& from, GrassBucket& to, const ShapeIdentity& identity, std::vector<BucketKey>& emptied)
+{
+	static thread_local std::vector<BucketSlice> moved;
+	moved.clear();
+	const auto isShape = [&identity](const BucketSlice& slice) {
+		return slice.shape == identity.shape && slice.generation == identity.generation;
+	};
+	const bool fromEmpty = ExtractSlices(from, isShape, &moved);
+	for (auto& slice : moved)
+		AppendSlice(to, std::move(slice));
+	if (fromEmpty)
+		emptied.push_back(from.key);
+}
+
+void GrassBucketStore::EraseBucket(GrassBucket& b)
+{
+	pendingUploads.erase(&b);
+	pendingShrinks.erase(&b);
+	ReleaseComplexTexture(b.diffuseTexture.get());
+	meshLibrary.ReleaseMesh(b.meshId);
+	if (auto keys = keysByMesh.find(b.meshId); keys != keysByMesh.end()) {
+		std::erase(keys->second, b.key);
+		if (keys->second.empty())
+			keysByMesh.erase(keys);
+	}
+	buckets.erase(b.key);
+}
+
+RE::BSShaderMaterial* GrassBucketStore::CanonicalMaterial(const BucketKey& key, RE::BSShaderMaterial* material, bool pbr) const
+{
+	const auto keys = keysByMesh.find(key.meshId);
+	if (!material || keys == keysByMesh.end())
+		return material;
+	for (const BucketKey& existing : keys->second) {
+		if (existing.tex != key.tex || existing.triCount != key.triCount || existing.descVal != key.descVal)
+			continue;
+		const auto bucket = buckets.find(existing);
+		if (bucket != buckets.end() && bucket->second.pbrMaterial == pbr && SameDrawMaterial(existing.material, material, pbr))
+			return existing.material;
+	}
+	return material;
+}
+
+bool GrassBucketStore::SameDrawMaterial(RE::BSShaderMaterial* a, RE::BSShaderMaterial* b, bool pbr)
+{
+	if (a == b)
+		return true;
+	// Grass materials are lighting materials; the same vtable means the same concrete class.
+	if (!a || !b || *reinterpret_cast<void**>(a) != *reinterpret_cast<void**>(b) || a->GetType() != RE::BSShaderMaterial::Type::kLighting)
+		return false;
+
+	auto* la = static_cast<RE::BSLightingShaderMaterialBase*>(a);
+	auto* lb = static_cast<RE::BSLightingShaderMaterialBase*>(b);
+	for (int i = 0; i < 2; ++i) {
+		if (la->texCoordOffset[i] != lb->texCoordOffset[i] || la->texCoordScale[i] != lb->texCoordScale[i])
+			return false;
+	}
+	if (la->specularColor != lb->specularColor || la->diffuseTexture != lb->diffuseTexture ||
+		la->diffuseRenderTargetSourceIndex != lb->diffuseRenderTargetSourceIndex || la->normalTexture != lb->normalTexture ||
+		la->rimSoftLightingTexture != lb->rimSoftLightingTexture || la->specularBackLightingTexture != lb->specularBackLightingTexture ||
+		la->textureClampMode != lb->textureClampMode || la->materialAlpha != lb->materialAlpha ||
+		la->refractionPower != lb->refractionPower || la->specularPower != lb->specularPower ||
+		la->specularColorScale != lb->specularColorScale || la->subSurfaceLightRolloff != lb->subSurfaceLightRolloff ||
+		la->rimLightPower != lb->rimLightPower)
+		return false;
+	if (!pbr)
+		return true;
+
+	// The PBR grass path binds these too; see TruePBR's BSGrassShader_SetupMaterial.
+	auto* pa = static_cast<BSLightingShaderMaterialPBR*>(a);
+	auto* pb = static_cast<BSLightingShaderMaterialPBR*>(b);
+	return pa->rmaosTexture == pb->rmaosTexture && pa->featuresTexture0 == pb->featuresTexture0 &&
+	       pa->pbrFlags == pb->pbrFlags && pa->GetRoughnessScale() == pb->GetRoughnessScale() &&
+	       pa->GetSpecularLevel() == pb->GetSpecularLevel() && pa->GetSubsurfaceColor() == pb->GetSubsurfaceColor() &&
+	       pa->GetSubsurfaceOpacity() == pb->GetSubsurfaceOpacity();
+}
+
+bool GrassBucketStore::CompactBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
+{
+	if (!b.instanceBuf || !b.capacityInstances)
 		return false;
 
 	const uint32_t surviving = (b.firstNewSlice == UINT32_MAX) ? (uint32_t)b.slices.size() : b.firstNewSlice;
 
-	// Split the survivors which have fragmented by removals into runs of still contiguous offsets, so they can be copied back into a new contiguous buffer.
+	// Group contiguous survivors before closing removal gaps through the shared scratch buffer.
 	struct Run
 	{
 		uint32_t oldFirst;
@@ -286,40 +446,38 @@ bool GrassBucketStore::CompactBucket(GrassBucket& b, ID3D11Device* device, ID3D1
 		return false;
 
 	// Only trailing slices went, so everything still resident is already where it belongs.
-	if (runs.size() == 1 && runs[0].oldFirst == 0)
+	if (runs.size() == 1 && runs[0].oldFirst == 0) {
+		b.residentInstances = newOffset;
 		return true;
-
-	// D3D11 doesn't allow overlapping copies within one resource, so shift the survivors into a new buffer and swap it in.
-	ID3D11Buffer* oldInstance = b.instanceBuf;
-	ID3D11Buffer* oldOrigin = b.originBuf;
-	ID3D11ShaderResourceView* oldInstanceSRV = b.instanceSRV;
-	ID3D11ShaderResourceView* oldOriginSRV = b.originSRV;
-	b.instanceBuf = nullptr;
-	b.originBuf = nullptr;
-	b.instanceSRV = nullptr;
-	b.originSRV = nullptr;
-
-	if (!CreateBucketSourceBuffers(b, b.capacityInstances, device)) {
-		auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
-		rel(b.instanceBuf);
-		rel(b.originBuf);
-		rel(b.instanceSRV);
-		rel(b.originSRV);
-		b.instanceBuf = oldInstance;
-		b.originBuf = oldOrigin;
-		b.instanceSRV = oldInstanceSRV;
-		b.originSRV = oldOriginSRV;
-		return false;  // offsets are untouched, so a CPU rebuild is still valid
 	}
 
-	constexpr UINT kRecordBytes = kGrassStride;
-	constexpr UINT kOriginBytes = 4 * (UINT)sizeof(float);
+	// A bounded shared scratch buffer avoids allocating two full-capacity source buffers on every
+	// cell unload. Copies move left; later source chunks remain intact after each destination write.
+	constexpr uint32_t kChunkInstances = 16384;
+	if (!compactionScratch) {
+		try {
+			D3D11_BUFFER_DESC bd{};
+			bd.ByteWidth = kChunkInstances * kGrassStride;
+			bd.Usage = D3D11_USAGE_DEFAULT;
+			compactionScratch = std::make_unique<Buffer>(bd, nullptr, "GrassOptimizations::CompactionScratch");
+		} catch (...) {
+			return false;  // no offsets or resident data have changed
+		}
+	}
 	for (const Run& run : runs) {
-		const D3D11_BOX ibox{ run.oldFirst * kRecordBytes, 0, 0, (run.oldFirst + run.instances) * kRecordBytes, 1, 1 };
-		ctx->CopySubresourceRegion(b.instanceBuf, 0, run.newFirst * kRecordBytes, 0, 0, oldInstance, 0, &ibox);
-
-		const D3D11_BOX obox{ run.oldFirst * kOriginBytes, 0, 0, (run.oldFirst + run.instances) * kOriginBytes, 1, 1 };
-		ctx->CopySubresourceRegion(b.originBuf, 0, run.newFirst * kOriginBytes, 0, 0, oldOrigin, 0, &obox);
+		if (run.oldFirst == run.newFirst)
+			continue;
+		for (uint32_t offset = 0; offset < run.instances;) {
+			const uint32_t count = std::min(kChunkInstances, run.instances - offset);
+			const UINT recordBytes = count * kGrassStride;
+			const uint32_t oldFirst = run.oldFirst + offset;
+			const uint32_t newFirst = run.newFirst + offset;
+			const D3D11_BOX records{ oldFirst * kGrassStride, 0, 0, oldFirst * kGrassStride + recordBytes, 1, 1 };
+			ctx->CopySubresourceRegion(compactionScratch->resource.get(), 0, 0, 0, 0, b.instanceBuf, 0, &records);
+			const D3D11_BOX scratchRecords{ 0, 0, 0, recordBytes, 1, 1 };
+			ctx->CopySubresourceRegion(b.instanceBuf, 0, newFirst * kGrassStride, 0, 0, compactionScratch->resource.get(), 0, &scratchRecords);
+			offset += count;
+		}
 	}
 
 	newOffset = 0;
@@ -328,19 +486,23 @@ bool GrassBucketStore::CompactBucket(GrassBucket& b, ID3D11Device* device, ID3D1
 		newOffset += b.slices[i].count;
 	}
 
-	oldInstanceSRV->Release();
-	oldOriginSRV->Release();
-	oldInstance->Release();
-	oldOrigin->Release();
+	b.residentInstances = newOffset;
 	return true;
 }
 
 void GrassBucketStore::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
-	for (auto& [key, b] : buckets) {
+	const auto canShrink = [](const GrassBucket& b) {
+		return !b.dirty && !b.needsCompact && b.firstNewSlice == UINT32_MAX &&
+		       b.capacityInstances > 4096 && b.totalInstances <= b.capacityInstances / 4;
+	};
+	for (auto it = pendingUploads.begin(); it != pendingUploads.end();) {
+		auto& b = **it;
+		if (frameParams.enableMeshLOD && b.firstNewSlice != UINT32_MAX)
+			meshLibrary.EnsureLODMeshes(b.meshId);
 		if (b.needsCompact) {
 			b.needsCompact = false;
-			if (CompactBucket(b, device, ctx)) {
+			if (CompactBucket(b, ctx)) {
 				b.rebuildFromSlice = UINT32_MAX;  // survivors sit contiguously again
 			} else {
 				b.dirty = true;
@@ -355,6 +517,35 @@ void GrassBucketStore::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceCont
 			else
 				AppendNewSlices(b, ctx);
 		}
+
+		if (canShrink(b)) {
+			pendingShrinks.insert(&b);
+		} else {
+			pendingShrinks.erase(&b);
+			b.underutilizedFrames = 0;
+		}
+		// Keep allocation/upload failures queued for the next grass frame.
+		if (b.dirty || b.needsCompact || b.firstNewSlice != UINT32_MAX)
+			++it;
+		else
+			it = pendingUploads.erase(it);
+	}
+
+	// Ten seconds at 60 grass updates/sec, with at least 2x headroom after shrinking.
+	// Run before this frame's cull/draw; D3D11 retains old resources for queued commands.
+	for (auto it = pendingShrinks.begin(); it != pendingShrinks.end();) {
+		auto& b = **it;
+		if (++b.underutilizedFrames >= 600) {
+			uint32_t cap = 4096;
+			while (cap < b.totalInstances * 2)
+				cap *= 2;
+			ResizeBucketBuffers(b, cap, device, ctx, b.residentInstances);
+			b.underutilizedFrames = 0;
+		}
+		if (canShrink(b))
+			++it;
+		else
+			it = pendingShrinks.erase(it);
 	}
 }
 
@@ -400,6 +591,8 @@ bool GrassBucketStore::StageCapture(RE::BSMultiStreamInstanceTriShape* shape, co
 	PendingCapture pc;
 	pc.shape = shape;
 	pc.material = material;
+	// TruePBR marks converted grass properties with kMenuScreen.
+	pc.pbrMaterial = grassProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kMenuScreen);
 	pc.descVal = descVal;
 	pc.diffuseTexture = RE::NiPointer<RE::NiSourceTexture>(tex);
 	pc.count = count;
@@ -434,12 +627,17 @@ bool GrassBucketStore::StageCapture(RE::BSMultiStreamInstanceTriShape* shape, co
 	}
 
 	std::scoped_lock lk(pendingMutex);
+	auto [identity, inserted] = liveShapes.try_emplace(shape, 0);
+	if (inserted)
+		identity->second = ++nextGeneration;
+	pc.generation = identity->second;
 	pendingCaptures.push_back(std::move(pc));
 	return true;
 }
 
 void GrassBucketStore::CacheBucketTypeParams(GrassBucket& b, const PendingCapture& pc)
 {
+	b.indexCount = 3u * pc.triangleCount;
 	if (b.typeParamsValid)
 		return;
 
@@ -457,21 +655,21 @@ void GrassBucketStore::CacheBucketTypeParams(GrassBucket& b, const PendingCaptur
 
 void GrassBucketStore::RebuildBucket(GrassBucket& bucket, ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
-	// Rebuild only from the tail. Do a full rebuild when both are UINT32_MAX, or when the first stale slice is not contiguous with the previous slices.
+	// Preserve the resident prefix and upload only the stale or newly appended tail.
 	uint32_t from = std::min(bucket.rebuildFromSlice, bucket.firstNewSlice);
 	if (from == UINT32_MAX || from > (uint32_t)bucket.slices.size())
 		from = 0;
 
-	// A partial rebuild is only valid if everything below `from` sits contiguously.
+	// Removals record the first stale slice; everything below it is still contiguous.
+	// Ordinary growth preserves the resident prefix without walking it again.
 	uint32_t startInstance = 0;
-	for (uint32_t i = 0; i < from; ++i) {
-		const auto& s = bucket.slices[i];
-		if (s.bufferOffset == UINT32_MAX || s.bufferOffset != startInstance) {
+	if (from) {
+		const auto& s = bucket.slices[from - 1];
+		if (s.bufferOffset == UINT32_MAX) {
 			from = 0;
-			startInstance = 0;
-			break;
+		} else {
+			startInstance = s.bufferOffset + s.count;
 		}
-		startInstance += s.count;
 	}
 
 	// Copy from the old buffer starting with the given start instance to the new buffer on the GPU, so the rebuild below still only uploads the tail.
@@ -482,109 +680,46 @@ void GrassBucketStore::RebuildBucket(GrassBucket& bucket, ID3D11Device* device, 
 		bucket.dirty = false;
 		bucket.rebuildFromSlice = UINT32_MAX;
 		bucket.firstNewSlice = UINT32_MAX;
+		bucket.residentInstances = 0;
 		return;
 	}
 
-	uint32_t tailInstances = 0;
-	for (uint32_t i = from; i < (uint32_t)bucket.slices.size(); ++i)
-		tailInstances += bucket.slices[i].count;
-
-	if (tailInstances) {
-		// Reused across cell loads, so flattening allocates nothing once grown.
-		static thread_local std::vector<uint8_t> records;
-		static thread_local std::vector<float> origins;
-
-		records.clear();
-		records.reserve((size_t)tailInstances * kGrassStride);
-		origins.resize((size_t)tailInstances * 4);
-		float* op = origins.data();
-
-		uint32_t off = startInstance;
-		for (uint32_t i = from; i < (uint32_t)bucket.slices.size(); ++i) {
-			auto& s = bucket.slices[i];
-			s.bufferOffset = off;
-			records.insert(records.end(), s.data.begin(), s.data.end());
-			for (uint32_t j = 0; j < s.count; ++j) {
-				*op++ = s.origin.x;
-				*op++ = s.origin.y;
-				*op++ = s.origin.z;
-				*op++ = s.fadeStart;
-			}
-			off += s.count;
-		}
-
-		// One upload per buffer covering the whole tail, not one per slice.
-		const D3D11_BOX ibox{ startInstance * kGrassStride, 0, 0, (startInstance + tailInstances) * kGrassStride, 1, 1 };
-		ctx->UpdateSubresource(bucket.instanceBuf, 0, &ibox, records.data(), 0, 0);
-
-		const D3D11_BOX obox{ startInstance * 4 * (UINT)sizeof(float), 0, 0,
-			(startInstance + tailInstances) * 4 * (UINT)sizeof(float), 1, 1 };
-		ctx->UpdateSubresource(bucket.originBuf, 0, &obox, origins.data(), 0, 0);
-	}
+	UploadSliceTail(bucket, from, startInstance, ctx);
 
 	bucket.dirty = false;
+	bucket.residentInstances = bucket.totalInstances;
 	bucket.rebuildFromSlice = UINT32_MAX;
 	bucket.firstNewSlice = UINT32_MAX;
 }
 
 void GrassBucketStore::AppendNewSlices(GrassBucket& bucket, ID3D11DeviceContext* ctx)
 {
-	if (bucket.totalInstances > bucket.capacityInstances) {
-		bucket.dirty = true;
-		RebuildBucket(bucket, globals::d3d::device, ctx);
-		return;
-	}
-
-	uint32_t prefix = 0;
-	for (uint32_t i = 0; i < bucket.firstNewSlice; ++i) {
-		const auto& s = bucket.slices[i];
-		if (s.bufferOffset == UINT32_MAX || s.bufferOffset != prefix) {
-			bucket.dirty = true;
-			RebuildBucket(bucket, globals::d3d::device, ctx);
-			return;
-		}
-		prefix += s.count;
-	}
-
-	uint32_t tailInstances = 0;
-	for (uint32_t i = bucket.firstNewSlice; i < (uint32_t)bucket.slices.size(); ++i)
-		tailInstances += bucket.slices[i].count;
-
-	if (!tailInstances) {
-		bucket.firstNewSlice = UINT32_MAX;
-		return;
-	}
-
-	static thread_local std::vector<uint8_t> recTail;
-	static thread_local std::vector<float> originTail;
-
-	recTail.clear();
-	recTail.reserve((size_t)tailInstances * kGrassStride);
-	originTail.resize((size_t)tailInstances * 4);
-	float* op = originTail.data();
-
-	uint32_t off = prefix;
-	for (uint32_t i = bucket.firstNewSlice; i < (uint32_t)bucket.slices.size(); ++i) {
-		auto& s = bucket.slices[i];
-		s.bufferOffset = off;
-		recTail.insert(recTail.end(), s.data.begin(), s.data.end());
-		for (uint32_t j = 0; j < s.count; ++j) {
-			*op++ = s.origin.x;
-			*op++ = s.origin.y;
-			*op++ = s.origin.z;
-			*op++ = s.fadeStart;
-		}
-		off += s.count;
-	}
-
-	const D3D11_BOX ibox{ prefix * kGrassStride, 0, 0, off * kGrassStride, 1, 1 };
-	ctx->UpdateSubresource(bucket.instanceBuf, 0, &ibox, recTail.data(), 0, 0);
-
-	const D3D11_BOX obox{ prefix * 4 * (UINT)sizeof(float), 0, 0,
-		off * 4 * (UINT)sizeof(float), 1, 1 };
-	ctx->UpdateSubresource(bucket.originBuf, 0, &obox, originTail.data(), 0, 0);
-
+	UploadSliceTail(bucket, bucket.firstNewSlice, bucket.residentInstances, ctx);
 	bucket.firstNewSlice = UINT32_MAX;
+}
+
+void GrassBucketStore::UploadSliceTail(GrassBucket& bucket, uint32_t from, uint32_t prefix, ID3D11DeviceContext* ctx)
+{
+	const uint32_t tailInstances = bucket.totalInstances - prefix;
+	if (!tailInstances)
+		return;
+
+	// Reuse storage across cell loads and upload the flattened tail in one call.
+	static thread_local std::vector<uint8_t> records;
+	records.clear();
+	records.reserve((size_t)tailInstances * kGrassStride);
+
+	uint32_t offset = prefix;
+	for (uint32_t i = from; i < (uint32_t)bucket.slices.size(); ++i) {
+		auto& slice = bucket.slices[i];
+		slice.bufferOffset = offset;
+		records.insert(records.end(), slice.data.begin(), slice.data.end());
+		offset += slice.count;
+	}
+
+	const D3D11_BOX box{ prefix * kGrassStride, 0, 0, offset * kGrassStride, 1, 1 };
+	ctx->UpdateSubresource(bucket.instanceBuf, 0, &box, records.data(), 0, 0);
+	bucket.residentInstances = offset;
 }
 
 // The widest allocation is kGrassStride bytes per instance, so a larger capacity wraps its ByteWidth
@@ -605,51 +740,36 @@ bool GrassBucketStore::EnsureBucketCapacity(GrassBucket& b, uint32_t needed, ID3
 	while (cap < needed)
 		cap = std::min(cap * 2, kMaxBucketInstances);
 
-	// Hold the old instance/origin buffers across the reallocation so the data up to preserve can be copied to the new buffers on the GPU.
-	const uint32_t preserve = std::min(preserveInstances, b.capacityInstances);
-	struct OldBuffers
-	{
-		ID3D11Buffer* instance;
-		ID3D11Buffer* origin;
-		~OldBuffers()
-		{
-			if (instance)
-				instance->Release();
-			if (origin)
-				origin->Release();
-		}
-	} old{ b.instanceBuf, b.originBuf };
+	return ResizeBucketBuffers(b, cap, device, ctx, preserveInstances);
+}
 
-	b.instanceBuf = nullptr;
-	b.originBuf = nullptr;
-
-	b.ReleaseResources();
-
-	if (!CreateBucketSourceBuffers(b, cap, device) ||
-		!CreateBucketCullScratch(b, cap, device) ||
-		!CreateBucketArgsBuffer(b, device)) {
-		b.ReleaseResources();
-		b.capacityInstances = 0;
-		// Ensure buffer offset is reset, so the next rebuild will not start from a stale offset. The rebuild will re-upload the whole bucket, so the offsets will be set correctly.
-		for (auto& s : b.slices)
-			s.bufferOffset = UINT32_MAX;
+bool GrassBucketStore::ResizeBucketBuffers(GrassBucket& b, uint32_t capacity, ID3D11Device* device, ID3D11DeviceContext* ctx, uint32_t preserveInstances)
+{
+	// Allocate every replacement before releasing anything, so failed growth/shrink is retryable.
+	GrassBucket replacement;
+	if (!CreateBucketSourceBuffers(replacement, capacity, device) ||
+		!CreateBucketCullScratch(replacement, capacity, device) ||
+		!CreateBucketLODCounters(replacement, device))
 		return false;
+
+	const uint32_t preserve = std::min({ preserveInstances, b.residentInstances, capacity });
+	if (preserve) {
+		const D3D11_BOX ibox{ 0, 0, 0, preserve * kGrassStride, 1, 1 };
+		ctx->CopySubresourceRegion(replacement.instanceBuf, 0, 0, 0, 0, b.instanceBuf, 0, &ibox);
 	}
 
-	// Carry the unchanged head across on the GPU, so the caller still uploads only the tail.
-	if (preserve && ctx) {
-		if (old.instance && b.instanceBuf) {
-			const D3D11_BOX box{ 0, 0, 0, preserve * kGrassStride, 1, 1 };
-			ctx->CopySubresourceRegion(b.instanceBuf, 0, 0, 0, 0, old.instance, 0, &box);
-		}
-		if (old.origin && b.originBuf) {
-			const D3D11_BOX box{ 0, 0, 0, preserve * 4 * (UINT)sizeof(float), 1, 1 };
-			ctx->CopySubresourceRegion(b.originBuf, 0, 0, 0, 0, old.origin, 0, &box);
-		}
-	}
-
-	b.capacityInstances = cap;
-	b.dirty = true;
+	b.ReleaseResources();  // also retires LOD bins, whose capacity and indirect args must be recreated
+	std::swap(b.instanceBuf, replacement.instanceBuf);
+	std::swap(b.instanceSRV, replacement.instanceSRV);
+	std::swap(b.compactedBuf, replacement.compactedBuf);
+	std::swap(b.compactedUAV, replacement.compactedUAV);
+	std::swap(b.extrasBuf, replacement.extrasBuf);
+	std::swap(b.extrasUAV, replacement.extrasUAV);
+	std::swap(b.extrasSRV, replacement.extrasSRV);
+	std::swap(b.lodCounterBuf, replacement.lodCounterBuf);
+	std::swap(b.lodCounterUAV, replacement.lodCounterUAV);
+	b.capacityInstances = capacity;
+	b.residentInstances = preserve;
 	return true;
 }
 
@@ -679,32 +799,6 @@ bool GrassBucketStore::CreateBucketSourceBuffers(GrassBucket& b, uint32_t capaci
 		}
 		Util::SetResourceName(b.instanceSRV, "GrassOptimizations::InstanceBuf SRV");
 	}
-
-	// Origin + spawn time.
-	{
-		D3D11_BUFFER_DESC bd{};
-		bd.ByteWidth = capacity * 4 * sizeof(float);
-		bd.Usage = D3D11_USAGE_DEFAULT;
-		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-		bd.StructureByteStride = 4 * sizeof(float);
-		if (FAILED(device->CreateBuffer(&bd, nullptr, &b.originBuf)) || !b.originBuf) {
-			logger::error("[GRASS OPTIMIZATIONS] origin buffer create failed");
-			return false;
-		}
-		Util::SetResourceName(b.originBuf, "GrassOptimizations::OriginBuf");
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-		sv.Format = DXGI_FORMAT_UNKNOWN;
-		sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-		sv.Buffer.NumElements = capacity;
-		if (FAILED(device->CreateShaderResourceView(b.originBuf, &sv, &b.originSRV)) || !b.originSRV) {
-			logger::error("[GRASS OPTIMIZATIONS] origin SRV create failed");
-			return false;
-		}
-		Util::SetResourceName(b.originSRV, "GrassOptimizations::OriginBuf SRV");
-	}
-
 	return true;
 }
 
@@ -775,56 +869,150 @@ bool GrassBucketStore::CreateBucketCullScratch(GrassBucket& b, uint32_t capacity
 	return true;
 }
 
-bool GrassBucketStore::CreateBucketArgsBuffer(GrassBucket& b, ID3D11Device* device)
+bool GrassBucketStore::CreateBucketLODCounters(GrassBucket& b, ID3D11Device* device)
 {
-	// 3 uints of padding, so that the instanceCount is UAV accessible, so the cull CS can write to it directly.
-	// Then the 5-uint args block at instanceCountOffset.
-	const uint32_t initArgs[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-	D3D11_SUBRESOURCE_DATA init{ initArgs, 0, 0 };
-
+	const uint32_t initLODCounts[(size_t)GrassMeshLibrary::LODTier::kCount] = {};
+	D3D11_SUBRESOURCE_DATA init{ initLODCounts, 0, 0 };
 	D3D11_BUFFER_DESC bd{};
-	bd.ByteWidth = 8 * sizeof(uint32_t);
+	bd.ByteWidth = sizeof(initLODCounts);
 	bd.Usage = D3D11_USAGE_DEFAULT;
 	bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-	bd.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-
-	if (FAILED(device->CreateBuffer(&bd, &init, &b.argsBuf)) || !b.argsBuf) {
-		logger::error("[GRASS OPTIMIZATIONS] args buffer create failed");
-		return false;
-	}
-	Util::SetResourceName(b.argsBuf, "GrassOptimizations::ArgsBuf");
-
-	// Windows on to the instance count, with the shader's address 0 mapping to it, so clearing the view resets the count without disturbing indexCount. 
+	bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
 	D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
 	uav.Format = DXGI_FORMAT_R32_TYPELESS;
 	uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-	uav.Buffer.FirstElement = instanceCountOffset / sizeof(uint32_t);
-	uav.Buffer.NumElements = 1;
+	uav.Buffer.NumElements = (UINT)std::size(initLODCounts);
 	uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
-	if (FAILED(device->CreateUnorderedAccessView(b.argsBuf, &uav, &b.argsUAV)) || !b.argsUAV) {
-		logger::error("[GRASS OPTIMIZATIONS] args UAV create failed");
-		return false;
-	}
-	Util::SetResourceName(b.argsUAV, "GrassOptimizations::ArgsBuf UAV");
-
-	const uint32_t initLODCounts[(size_t)GrassMeshLibrary::LODTier::kCount] = {};
-	bd.ByteWidth = sizeof(initLODCounts);
-	bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-	init.pSysMem = initLODCounts;
 	if (FAILED(device->CreateBuffer(&bd, &init, &b.lodCounterBuf)) || !b.lodCounterBuf) {
 		logger::error("[GRASS OPTIMIZATIONS] LOD counter buffer create failed");
 		return false;
 	}
 	Util::SetResourceName(b.lodCounterBuf, "GrassOptimizations::LODCounterBuf");
 
-	uav.Buffer.FirstElement = 0;
-	uav.Buffer.NumElements = (UINT)std::size(initLODCounts);
 	if (FAILED(device->CreateUnorderedAccessView(b.lodCounterBuf, &uav, &b.lodCounterUAV)) || !b.lodCounterUAV) {
 		logger::error("[GRASS OPTIMIZATIONS] LOD counter UAV create failed");
 		return false;
 	}
 	Util::SetResourceName(b.lodCounterUAV, "GrassOptimizations::LODCounterBuf UAV");
 
+	return true;
+}
+
+void GrassBucketStore::MergeSlicesIntoRuns(GrassBucket& b)
+{
+	// Slice origins are the grass shape's block origin, shared by a whole block of cells, so group
+	// by where each slice's instances actually are.
+	const auto cellOf = [](const SliceBounds& bounds) {
+		constexpr float kCellSize = 4096.0f;
+		const auto cellX = (int32_t)std::floor((bounds.lo[0] + bounds.hi[0]) * 0.5f / kCellSize);
+		const auto cellY = (int32_t)std::floor((bounds.lo[1] + bounds.hi[1]) * 0.5f / kCellSize);
+		return ((uint64_t)(uint32_t)cellX << 32) | (uint32_t)cellY;
+	};
+
+	if (!b.clustersValid) {
+		b.sliceRunBatches.clear();
+		b.sliceRunCount = 0;
+		b.cullGroups.clear();
+		b.clusteredSlices = 0;
+		b.residentGroups = 0;
+	}
+	const float pad = b.modelRadius + 64.0f;
+	for (uint32_t i = b.clusteredSlices; i < (uint32_t)b.slices.size(); ++i) {
+		const auto& slice = b.slices[i];
+		if (slice.bufferOffset == UINT32_MAX || !slice.count)
+			continue;
+
+		// Groups carry their own source offsets, so runs need a shared cell but not contiguous records.
+		const bool continues = i && b.sliceRunCount &&
+		                       b.slices[i - 1].bufferOffset != UINT32_MAX && b.slices[i - 1].count &&
+		                       cellOf(b.sliceBounds[i]) == cellOf(b.sliceBounds[i - 1]);
+		if (!continues) {
+			if (b.sliceRunCount % 4 == 0)
+				b.sliceRunBatches.emplace_back();
+			++b.sliceRunCount;
+		}
+		auto& batch = b.sliceRunBatches.back();
+		const uint32_t lane = (b.sliceRunCount - 1) % 4;
+		const auto& bounds = b.sliceBounds[i];
+		const float loX = bounds.lo[0] - pad, loY = bounds.lo[1] - pad, loZ = bounds.lo[2] - pad;
+		const float hiX = bounds.hi[0] + pad, hiY = bounds.hi[1] + pad, hiZ = bounds.hi[2] + pad;
+		if (continues) {
+			batch.loX[lane] = std::min(batch.loX[lane], loX);
+			batch.loY[lane] = std::min(batch.loY[lane], loY);
+			batch.loZ[lane] = std::min(batch.loZ[lane], loZ);
+			batch.hiX[lane] = std::max(batch.hiX[lane], hiX);
+			batch.hiY[lane] = std::max(batch.hiY[lane], hiY);
+			batch.hiZ[lane] = std::max(batch.hiZ[lane], hiZ);
+		} else {
+			batch.loX[lane] = loX;
+			batch.loY[lane] = loY;
+			batch.loZ[lane] = loZ;
+			batch.hiX[lane] = hiX;
+			batch.hiY[lane] = hiY;
+			batch.hiZ[lane] = hiZ;
+			batch.firstGroup[lane] = (uint32_t)b.cullGroups.size();
+		}
+
+		// Groups never span slices, so the cull reads each instance's origin from its group.
+		for (uint32_t first = 0; first < slice.count; first += kCullGroupSize) {
+			b.cullGroups.push_back({ { slice.origin.x, slice.origin.y, slice.origin.z }, slice.fadeStart,
+				slice.bufferOffset + first, std::min(kCullGroupSize, slice.count - first) });
+			++batch.groupCount[lane];
+		}
+	}
+	b.clusteredSlices = (uint32_t)b.slices.size();
+	b.clustersValid = true;
+}
+
+bool GrassBucketStore::UploadCullGroups(GrassBucket& b, ID3D11Device* device, ID3D11DeviceContext* ctx)
+{
+	const uint32_t count = (uint32_t)b.cullGroups.size();
+	if (count > b.groupCapacity || !b.groupBuf) {
+		uint32_t cap = b.groupCapacity ? b.groupCapacity : 256;
+		while (cap < count)
+			cap *= 2;
+
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = cap * sizeof(CullGroup);
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = sizeof(CullGroup);
+		ID3D11Buffer* buf = nullptr;
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &buf)) || !buf) {
+			logger::error("[GRASS OPTIMIZATIONS] group buffer create failed groups={}", cap);
+			return false;
+		}
+		Util::SetResourceName(buf, "GrassOptimizations::GroupBuf");
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+		sv.Format = DXGI_FORMAT_UNKNOWN;
+		sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+		sv.Buffer.NumElements = cap;
+		ID3D11ShaderResourceView* srv = nullptr;
+		if (FAILED(device->CreateShaderResourceView(buf, &sv, &srv)) || !srv) {
+			logger::error("[GRASS OPTIMIZATIONS] group SRV create failed");
+			buf->Release();
+			return false;
+		}
+		Util::SetResourceName(srv, "GrassOptimizations::GroupBuf SRV");
+
+		if (b.groupSRV)
+			b.groupSRV->Release();
+		if (b.groupBuf)
+			b.groupBuf->Release();
+		b.groupBuf = buf;
+		b.groupSRV = srv;
+		b.groupCapacity = cap;
+		b.residentGroups = 0;
+	}
+
+	// Runs only grow at the tail until a removal rebuilds them, so only new groups are uploaded.
+	if (count > b.residentGroups) {
+		const D3D11_BOX box{ b.residentGroups * (UINT)sizeof(CullGroup), 0, 0, count * (UINT)sizeof(CullGroup), 1, 1 };
+		ctx->UpdateSubresource(b.groupBuf, 0, &box, b.cullGroups.data() + b.residentGroups, 0, 0);
+		b.residentGroups = count;
+	}
 	return true;
 }
 
@@ -845,7 +1033,7 @@ void GrassBucketStore::UpdateCoarseBounds(GrassBucket& b)
 		mx = { 0.0f, 0.0f, 0.0f };
 	}
 
-	// Generously pad to prevent instances on the screen edge from being visibly culled. 
+	// Generously pad to prevent instances on the screen edge from being visibly culled.
 	const float pad = b.modelRadius + 128.0f;
 	mn.x -= pad;
 	mn.y -= pad;
@@ -859,44 +1047,60 @@ void GrassBucketStore::UpdateCoarseBounds(GrassBucket& b)
 	b.coarseValid = true;
 }
 
-bool GrassBucketStore::DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11DeviceContext* ctx)
+void GrassBucketStore::RefreshComplexGrass(GrassBucket& b, ID3D11DeviceContext* ctx)
 {
+	b.complexSRV = DetectComplexGrass(b.diffuseTexture.get(), ctx);
+}
+
+ID3D11ShaderResourceView* GrassBucketStore::DetectComplexGrass(RE::NiSourceTexture* tex, ID3D11DeviceContext* ctx)
+{
+	const auto found = complexCache.find(tex);
+	if (found == complexCache.end())
+		return nullptr;  // the pixel shader classifies the texture instead
+	auto& entry = found->second;
 	auto* rt = tex ? tex->rendererTexture : nullptr;
 	auto* resourceView = rt ? rt->resourceView : nullptr;
-	if (auto it = complexCache.find(tex); it != complexCache.end() && it->second.resourceView == resourceView) {
-		it->second.complex = std::abs(it->second.normalLength - 1.0f) < cachedComplexThreshold;
-		return it->second.complex;
-	}
+	if (entry.normalLength && entry.resourceView == resourceView)
+		return entry.normalLength->srv.get();
+	if (!resourceView || !GetDetectCS() || !detectResult)
+		return nullptr;  // retry textures whose renderer resource is not ready yet
 
-	bool complex = false;
-	float normalLength = 0.0f;
-
-	if (GetDetectCS() && detectResult && detectStaging && resourceView) {
-		UINT initialCount = 0;
-		ID3D11UnorderedAccessView* resultUAV = detectResult->uav.get();
-		ctx->CSSetUnorderedAccessViews(0, 1, &resultUAV, &initialCount);
-		ctx->CSSetShader(detectCS, nullptr, 0);
-		ctx->CSSetShaderResources(0, 1, &resourceView);
-		ctx->Dispatch(1, 1, 1);
-
-		ID3D11UnorderedAccessView* nullUAV = nullptr;
-		ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-		ID3D11ShaderResourceView* nullSRV = nullptr;
-		ctx->CSSetShaderResources(0, 1, &nullSRV);
-
-		// Stalls once per unique texture on load rather than every frame or requiring a CPU readback of the full texture.
-		ctx->CopyResource(detectStaging->resource.get(), detectResult->resource.get());
-		D3D11_MAPPED_SUBRESOURCE m{};
-		if (SUCCEEDED(ctx->Map(detectStaging->resource.get(), 0, D3D11_MAP_READ, 0, &m))) {
-			// Compare using the decoded length from the shader to avoid requring a constant buffer
-			std::memcpy(&normalLength, m.pData, sizeof(float));
-			complex = std::abs(normalLength - 1.0f) < cachedComplexThreshold;
-			ctx->Unmap(detectStaging->resource.get(), 0);
+	if (!entry.normalLength) {
+		try {
+			const float unknown = 0.0f;
+			D3D11_SUBRESOURCE_DATA init{ &unknown, 0, 0 };
+			entry.normalLength = std::make_unique<Buffer>(StructuredBufferDesc<float>(uint64_t{ 1 }, false, false), &init, "GrassOptimizations::NormalLength");
+			D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+			sv.Format = DXGI_FORMAT_UNKNOWN;
+			sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+			sv.Buffer.NumElements = 1;
+			entry.normalLength->CreateSRV(sv);
+		} catch (...) {
+			entry.normalLength.reset();
+			return nullptr;
 		}
 	}
+	ID3D11UnorderedAccessView* resultUAV = detectResult->uav.get();
+	ctx->CSSetUnorderedAccessViews(0, 1, &resultUAV, nullptr);
+	ctx->CSSetShader(detectCS, nullptr, 0);
+	ctx->CSSetShaderResources(0, 1, &resourceView);
+	ctx->Dispatch(1, 1, 1);
+	ID3D11UnorderedAccessView* nullUAV = nullptr;
+	ID3D11ShaderResourceView* nullSRV = nullptr;
+	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+	ctx->CSSetShaderResources(0, 1, &nullSRV);
+	// The cull shader consumes the result after this copy; no staging allocation or CPU wait.
+	ctx->CopyResource(entry.normalLength->resource.get(), detectResult->resource.get());
+	entry.resourceView = resourceView;
+	return entry.normalLength->srv.get();
+}
 
-	complexCache.insert_or_assign(tex, ComplexEntry{ RE::NiPointer<RE::NiSourceTexture>(tex), resourceView, normalLength, complex });
-	return complex;
+void GrassBucketStore::ReleaseComplexTexture(RE::NiSourceTexture* tex)
+{
+	if (auto it = complexCache.find(tex); it != complexCache.end()) {
+		if (--it->second.activeUsers == 0)
+			complexCache.erase(it);
+	}
 }
 
 bool GrassBucketStore::EnsureLODBin(GrassBucket& b, GrassMeshLibrary::LODTier tier, ID3D11Device* device)
