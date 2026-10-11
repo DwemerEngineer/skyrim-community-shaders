@@ -66,7 +66,7 @@ public:
 
 	/** @brief Releases the cached compute shaders so they recompile on next use. */
 	virtual void ClearShaderCache() override;
-	/** @brief Processes removals and completed LOD loads at Present, including interiors without grass draws. */
+	/** @brief Process removals and completed LOD loads at Present, including frames without grass draws. */
 	virtual void Reset() override;
 
 	/** @brief Installs the grass capture, culling and draw hooks after all plugins have loaded. */
@@ -79,7 +79,7 @@ public:
 	{
 		float frustumPlanes[6][4];
 
-		// Main camera's camera-relative view-projection rows, from the PerFrame snapshot.
+		// Preserve the main camera's camera-relative view-projection rows from PerFrame.
 		float cameraViewProj[4][4];
 		float cameraPos[4];
 
@@ -145,13 +145,13 @@ public:
 		{
 			__m128 nx, ny, nz, d;
 		};
-		Plane planes[6];  // broadcast coefficients for four-run tests
+		Plane planes[6];  // Broadcast each coefficient to test four runs at once.
 	};
 
 	/** @brief Transposes the frustum once per frame. Inactive planes become always-pass slots. */
 	static void BuildFrustumSoA(FrustumSoA& out, const RE::NiFrustumPlanes& f);
 
-	/** @brief Rejects a coarse AABB and returns the plane mask that its children still need to test. */
+	/** @brief Test a coarse AABB and return the planes its children still need to test. */
 	static bool ClassifyAabb(const FrustumSoA& f, __m128 lo, __m128 hi, uint32_t& intersectingPlanes);
 
 	/** @brief Derives world-space frustum planes from the camera frustum and transform. */
@@ -163,11 +163,11 @@ public:
 	/** @brief Appends this bucket's visible slice runs to sliceTableCPU and records the window in the bucket. */
 	void CullBucketSlices(GrassBucket& b, const FrustumSoA& frustumSoA, __m128 camPosV);
 
-	/** @brief Traverses cached bounds over cell-run blocks, appending whole visible blocks and testing partial blocks with SSE. */
+	/** @brief Cull cached blocks of cell runs and test partially visible blocks with SSE. */
 	void CullBucketSliceBlocks(GrassBucket& b, const FrustumSoA& frustumSoA, __m128 camPosV, uint32_t planeMask, bool allWithinDistance);
 
 	/** @brief Fills the per-bucket cull constant buffer, uploads the slice table and issues the cull dispatches. */
-	void UploadCullState(ID3D11Device* device, ID3D11DeviceContext* ctx);
+	void UploadCullState(ID3D11DeviceContext* ctx);
 
 	/** @brief Binds a bucket's resources and dispatches the instance culling compute shader. */
 	void CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx);
@@ -175,29 +175,22 @@ public:
 	/** @brief Grows the slotted per-bucket constant buffer to hold at least `slots` entries. */
 	bool EnsureCullBucketCapacity(uint32_t slots);
 
-	/** @brief Grows the shared indirect args buffer and its per-slot instance-count UAVs transactionally. */
-	bool EnsureDrawArgsCapacity(uint32_t slots, ID3D11Device* device);
-
-	/** @brief Initializes this frame's full-detail indirect draws and resets their survivor counts in one upload. */
-	void UploadDrawArgs(ID3D11DeviceContext* ctx);
-
 	/**
-	 * @brief Stands in for BSGrassShader's vanilla SetupMaterial and SetupGeometry, called from the innermost SetupGeometry hook.
+	 * @brief Replace vanilla grass setup for optimized passes from the innermost SetupGeometry hook.
 	 *
-	 * Passes the optimized path draws take their constants from per-frame buffers; every other pass runs the
-	 * deferred SetupMaterial chain.
+	 * Optimized passes use cached constant buffers; other passes run the deferred SetupMaterial chain.
 	 *
-	 * @return True when the vanilla SetupGeometry must be skipped.
+	 * @return A true result tells the caller to skip vanilla SetupGeometry.
 	 */
 	bool SetupGrassPass(RE::BSShader* shader, RE::BSRenderPass* pass);
 
-	/** @brief Sets up a pass the optimized path draws. Returns false to fall back to the vanilla setup. */
+	/** @brief Set up an optimized draw pass and return false when vanilla setup is required. */
 	bool SetupOptimizedPass(RE::BSRenderPass* pass);
 
-	/** @brief Binds an optimized draw's PerGeometry constants to VS and PS b2, uploading a new variant if needed. */
+	/** @brief Bind an optimized draw's PerGeometry constants to VS and PS b2, uploading a new variant if needed. */
 	bool BindPerGeometry(const RE::BSGeometry* geometry, const RE::BSShaderProperty* shaderProperty, RE::NiDirectionalLight* sunLight);
 
-	/** @brief Identifies a pass's technique, so each bucket draws once per technique. */
+	/** @brief Identify the pass and pixel shader so each bucket draws once per technique. */
 	static uint64_t GetPassKey(const RE::BSRenderPass* pass);
 
 	GrassBucketStore bucketStore;
@@ -213,15 +206,14 @@ public:
 	bool cullCSFailed = false;
 
 	std::unique_ptr<ConstantBuffer> cullParamsCB;
-	// Slotted per-bucket constants: one slot per visible bucket, one map fills them all, recreated when
-	// the bucket count outgrows it. A slot holds the cull constants, bound via CSSetConstantBuffers1, then
-	// the PBR PerMaterial constants its draws bind via PSSetConstantBuffers1.
+	// Upload every visible bucket's constants in one map, growing the buffer when necessary.
+	// Each slot contains culling constants for CS b1 and PBR material constants for PS b1.
 	std::unique_ptr<ConstantBuffer> cullBucketCB;
 	uint32_t cullBucketCBSlots = 0;
 	static constexpr uint32_t kSlotBytes = 512;
 	static constexpr uint32_t kSlotMaterialOffset = 256;
 
-	// The PerGeometry fields the GRASS_OPTIMIZATIONS shaders read, c16-c21 of RunGrass.hlsl's PerGeometry.
+	// Match the c16-c21 fields read by GRASS_OPTIMIZATIONS in RunGrass.hlsl.
 	struct alignas(16) GrassPerGeometry
 	{
 		float fogNearColor[4];
@@ -233,8 +225,8 @@ public:
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassPerGeometry);
 
-	// Every optimized draw shares one of a few PerGeometry variants. Variant i sits at constant 16 of the
-	// 32-constant window starting at slot i, so neighbouring windows overlap only in the unread matrices.
+	// Place each variant at c16 of a 32-constant window.
+	// Adjacent windows overlap only in the matrices that optimized shaders do not read.
 	std::unique_ptr<ConstantBuffer> perGeometryCB;
 	std::vector<GrassPerGeometry> perGeometryVariants;
 	static constexpr uint32_t kMaxPerGeometryVariants = 15;
@@ -247,13 +239,8 @@ public:
 	std::unique_ptr<Buffer> sliceTable;
 	uint32_t sliceTableCapacity = 0;
 	std::vector<std::pair<uint32_t, uint32_t>> sliceTableCPU;
-	// This frame's visible buckets, in cull slot order.
+	// Store this frame's visible buckets in cull-slot order.
 	std::vector<GrassBucket*> visibleBuckets;
-	// One upload initializes every full-detail draw and resets all of its survivor counts.
-	// Each count UAV exposes one DWORD at slot * argsSlotBytes + instanceCountOffset.
-	std::unique_ptr<Buffer> drawArgs;
-	std::vector<winrt::com_ptr<ID3D11UnorderedAccessView>> drawCountUAVs;
-	std::vector<std::array<uint32_t, argsSlotBytes / sizeof(uint32_t)>> drawArgsCPU;
 
 	float timeAccum = 0.0f;
 	float fadeInTimeRcp = 0.0f;
@@ -264,7 +251,7 @@ public:
 	float maxGrassDistance = 0.0f;
 	float maxDistSq = 0.0f;
 
-	// Last PerFrame snapshot taken from the main camera, reused while a shadow camera is uploaded.
+	// Retain the last main-camera PerFrame snapshot while shadow-camera data is uploaded.
 	Matrix mainCameraViewProj;
 	float4 mainCameraPos;
 	bool mainCameraValid = false;
@@ -358,7 +345,7 @@ public:
 			stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 
 			stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
-			// Installed after TruePBR's, so the whole SetupMaterial chain waits for SetupGrassPass.
+			// Install after TruePBR so SetupGrassPass can defer the complete SetupMaterial chain.
 			stl::write_vfunc<0x4, BSGrassShader_SetupMaterial>(RE::VTABLE_BSGrassShader[0]);
 
 			// Capture raw instance data for cached grass.

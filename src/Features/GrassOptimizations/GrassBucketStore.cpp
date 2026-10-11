@@ -75,7 +75,7 @@ void GrassBucketStore::ApplyPending(ID3D11Device* device, ID3D11DeviceContext* c
 	static thread_local std::vector<BucketKey> emptied;
 	emptied.clear();
 	{
-		// Capture commits and destruction share this lock; no engine loading or GPU work inside it.
+		// Keep engine loading and GPU work outside the lock shared by capture commits and destruction.
 		std::scoped_lock lk(pendingMutex);
 		std::erase_if(caps, [this](const PendingCapture& pc) {
 			auto it = liveShapes.find(pc.shape);
@@ -83,7 +83,7 @@ void GrassBucketStore::ApplyPending(ID3D11Device* device, ID3D11DeviceContext* c
 		});
 		ApplyCaptures(caps, emptied);
 	}
-	// Released outside pendingMutex: dropping LOD model trees may reenter the destruction hook.
+	// Release LOD trees outside pendingMutex because their destruction can reenter the removal hook.
 	// A later capture in the batch may have refilled a bucket, so only erase ones still empty.
 	for (const auto& key : emptied) {
 		if (auto it = buckets.find(key); it != buckets.end() && it->second.slices.empty())
@@ -102,7 +102,7 @@ void GrassBucketStore::StageRemoval(RE::BSMultiStreamInstanceTriShape* shape)
 			bucket->second.current->optimizedReady.store(false, std::memory_order_relaxed);
 		liveShapes.erase(it);
 	}
-	// Forget before the engine frees the address, so a later model-path registration survives.
+	// Forget the shape before the engine frees its address so a later model-path registration survives.
 	meshLibrary.ForgetShape(shape);
 }
 
@@ -205,8 +205,7 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures, std:
 	if (pendingMapAdds.empty())
 		return;
 
-	// A capture that resolves to another bucket (a late model path or material) takes the shape's earlier
-	// slices with it; left behind, they would be culled every frame in a bucket no shape draws.
+	// Move a shape's earlier slices when its model path or material changes so every bucket keeps a draw representative.
 	struct Migration
 	{
 		GrassBucket* from;
@@ -256,8 +255,8 @@ void GrassBucketStore::AppendSlice(GrassBucket& b, BucketSlice&& slice)
 	sb.hi[1] = slice.origin.y + slice.localMax.y;
 	sb.hi[2] = slice.origin.z + slice.localMax.z;
 
-	// Expanding a padded box never needs to revisit old slices. Removal-invalidated boxes
-	// stay invalid until UpdateCoarseBounds recomputes their surviving extrema.
+	// Extend valid padded bounds without revisiting existing slices.
+	// Recompute invalidated bounds in UpdateCoarseBounds after removals.
 	if (b.coarseValid || b.slices.empty()) {
 		const float pad = b.modelRadius + 128.0f;
 		const RE::NiPoint3 lo{ sb.lo[0] - pad, sb.lo[1] - pad, sb.lo[2] - pad };
@@ -285,12 +284,11 @@ bool GrassBucketStore::ExtractSlices(GrassBucket& b, Pred isTarget, std::vector<
 {
 	const size_t before = b.slices.size();
 
-	// Compact in place, record the first removed so the rebuild re-uploads only from there.
+	// Record the first removed slice so rebuilding only uploads the affected tail.
 	uint32_t firstRemoved = UINT32_MAX;
 	size_t write = 0;
 	uint32_t removedInstances = 0;
-	// firstNewSlice indexes b.slices, so compaction shifts it. Left stale it points past the pending
-	// slices and AppendNewSlices would upload none of them, leaving their records unwritten.
+	// Remap firstNewSlice after compaction so pending slices remain in the upload range.
 	uint32_t remappedFirstNew = UINT32_MAX;
 
 	for (size_t read = 0; read < before; ++read) {
@@ -401,7 +399,7 @@ bool GrassBucketStore::SameDrawMaterial(RE::BSShaderMaterial* a, RE::BSShaderMat
 	if (!pbr)
 		return true;
 
-	// The PBR grass path binds these too; see TruePBR's BSGrassShader_SetupMaterial.
+	// Compare the additional material state bound by TruePBR's grass setup.
 	auto* pa = static_cast<BSLightingShaderMaterialPBR*>(a);
 	auto* pb = static_cast<BSLightingShaderMaterialPBR*>(b);
 	return pa->rmaosTexture == pb->rmaosTexture && pa->featuresTexture0 == pb->featuresTexture0 &&
@@ -450,8 +448,8 @@ bool GrassBucketStore::CompactBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
 		return true;
 	}
 
-	// A bounded shared scratch buffer avoids allocating two full-capacity source buffers on every
-	// cell unload. Copies move left; later source chunks remain intact after each destination write.
+	// Reuse a bounded scratch buffer to avoid allocating another full-capacity source buffer on cell unload.
+	// Copy chunks toward lower offsets so later source chunks remain intact.
 	constexpr uint32_t kChunkInstances = 16384;
 	if (!compactionScratch) {
 		try {
@@ -460,7 +458,7 @@ bool GrassBucketStore::CompactBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
 			bd.Usage = D3D11_USAGE_DEFAULT;
 			compactionScratch = std::make_unique<Buffer>(bd, nullptr, "GrassOptimizations::CompactionScratch");
 		} catch (...) {
-			return false;  // no offsets or resident data have changed
+			return false;  // No offsets or resident data have changed.
 		}
 	}
 	for (const Run& run : runs) {
@@ -530,8 +528,8 @@ void GrassBucketStore::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceCont
 			it = pendingUploads.erase(it);
 	}
 
-	// Ten seconds at 60 grass updates/sec, with at least 2x headroom after shrinking.
-	// Run before this frame's cull/draw; D3D11 retains old resources for queued commands.
+	// Shrink after 600 grass updates, leaving at least twice the required capacity.
+	// Shrink before culling and drawing; D3D11 retains resources referenced by queued commands.
 	for (auto it = pendingShrinks.begin(); it != pendingShrinks.end();) {
 		auto& b = **it;
 		if (++b.underutilizedFrames >= 600) {
@@ -748,7 +746,7 @@ bool GrassBucketStore::ResizeBucketBuffers(GrassBucket& b, uint32_t capacity, ID
 	GrassBucket replacement;
 	if (!CreateBucketSourceBuffers(replacement, capacity, device) ||
 		!CreateBucketCullScratch(replacement, capacity, device) ||
-		!CreateBucketLODCounters(replacement, device))
+		!CreateBucketCounters(replacement, device))
 		return false;
 
 	const uint32_t preserve = std::min({ preserveInstances, b.residentInstances, capacity });
@@ -757,7 +755,7 @@ bool GrassBucketStore::ResizeBucketBuffers(GrassBucket& b, uint32_t capacity, ID
 		ctx->CopySubresourceRegion(replacement.instanceBuf, 0, 0, 0, 0, b.instanceBuf, 0, &ibox);
 	}
 
-	b.ReleaseResources();  // also retires LOD bins, whose capacity and indirect args must be recreated
+	b.ReleaseResources();  // This also retires LOD bins so their capacity and arguments are recreated.
 	std::swap(b.instanceBuf, replacement.instanceBuf);
 	std::swap(b.instanceSRV, replacement.instanceSRV);
 	std::swap(b.compactedBuf, replacement.compactedBuf);
@@ -767,6 +765,8 @@ bool GrassBucketStore::ResizeBucketBuffers(GrassBucket& b, uint32_t capacity, ID
 	std::swap(b.extrasSRV, replacement.extrasSRV);
 	std::swap(b.lodCounterBuf, replacement.lodCounterBuf);
 	std::swap(b.lodCounterUAV, replacement.lodCounterUAV);
+	std::swap(b.argsBuf, replacement.argsBuf);
+	std::swap(b.argsUAV, replacement.argsUAV);
 	b.capacityInstances = capacity;
 	b.residentInstances = preserve;
 	return true;
@@ -868,8 +868,36 @@ bool GrassBucketStore::CreateBucketCullScratch(GrassBucket& b, uint32_t capacity
 	return true;
 }
 
-bool GrassBucketStore::CreateBucketLODCounters(GrassBucket& b, ID3D11Device* device)
+bool GrassBucketStore::CreateBucketCounters(GrassBucket& b, ID3D11Device* device)
 {
+	{
+		const uint32_t initArgs[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+		D3D11_SUBRESOURCE_DATA init{ initArgs, 0, 0 };
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = sizeof(initArgs);
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+		if (FAILED(device->CreateBuffer(&bd, &init, &b.argsBuf)) || !b.argsBuf) {
+			logger::error("[GRASS OPTIMIZATIONS] args buffer create failed");
+			return false;
+		}
+		Util::SetResourceName(b.argsBuf, "GrassOptimizations::ArgsBuf");
+
+		// The shader's address 0 maps to the instance count, so clearing the view leaves the index count alone.
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uav{};
+		uav.Format = DXGI_FORMAT_R32_TYPELESS;
+		uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		uav.Buffer.FirstElement = instanceCountOffset / sizeof(uint32_t);
+		uav.Buffer.NumElements = 1;
+		uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+		if (FAILED(device->CreateUnorderedAccessView(b.argsBuf, &uav, &b.argsUAV)) || !b.argsUAV) {
+			logger::error("[GRASS OPTIMIZATIONS] args UAV create failed");
+			return false;
+		}
+		Util::SetResourceName(b.argsUAV, "GrassOptimizations::ArgsBuf UAV");
+	}
+
 	const uint32_t initLODCounts[(size_t)GrassMeshLibrary::LODTier::kCount] = {};
 	D3D11_SUBRESOURCE_DATA init{ initLODCounts, 0, 0 };
 	D3D11_BUFFER_DESC bd{};
@@ -899,8 +927,7 @@ bool GrassBucketStore::CreateBucketLODCounters(GrassBucket& b, ID3D11Device* dev
 
 void GrassBucketStore::MergeSlicesIntoRuns(GrassBucket& b)
 {
-	// Slice origins are the grass shape's block origin, shared by a whole block of cells, so group
-	// by where each slice's instances actually are.
+	// Group slices by their instance bounds because several cells can share a shape origin.
 	const auto cellOf = [](const SliceBounds& bounds) {
 		constexpr float kCellSize = 4096.0f;
 		const auto cellX = (int32_t)std::floor((bounds.lo[0] + bounds.hi[0]) * 0.5f / kCellSize);
@@ -984,8 +1011,8 @@ void GrassBucketStore::MergeSlicesIntoRuns(GrassBucket& b)
 			++block.groupCount[blockLane];
 		}
 	}
-	// Only traverse parents when run order has spatial locality. Wide, scattered parents add
-	// tests without avoiding leaf work; keep those buckets on the flat SSE path instead.
+	// Use parent bounds only when run order has spatial locality.
+	// Scattered parents rarely eliminate leaf tests, so use the flat SSE path for those buckets.
 	b.sliceBlocksUseful = false;
 	if (b.sliceRunCount >= GrassBucket::kRunsPerCullBlock * 2) {
 		float loX = FLT_MAX, loY = FLT_MAX, hiX = -FLT_MAX, hiY = -FLT_MAX;
@@ -1098,14 +1125,14 @@ ID3D11ShaderResourceView* GrassBucketStore::DetectComplexGrass(RE::NiSourceTextu
 {
 	const auto found = complexCache.find(tex);
 	if (found == complexCache.end())
-		return nullptr;  // the pixel shader classifies the texture instead
+		return nullptr;  // The pixel shader classifies the texture instead.
 	auto& entry = found->second;
 	auto* rt = tex ? tex->rendererTexture : nullptr;
 	auto* resourceView = rt ? rt->resourceView : nullptr;
 	if (entry.normalLength && entry.resourceView == resourceView)
 		return entry.normalLength->srv.get();
 	if (!resourceView || !GetDetectCS() || !detectResult)
-		return nullptr;  // retry textures whose renderer resource is not ready yet
+		return nullptr;  // Retry textures whose renderer resource is not ready yet.
 
 	if (!entry.normalLength) {
 		try {
@@ -1131,7 +1158,7 @@ ID3D11ShaderResourceView* GrassBucketStore::DetectComplexGrass(RE::NiSourceTextu
 	ID3D11ShaderResourceView* nullSRV = nullptr;
 	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
 	ctx->CSSetShaderResources(0, 1, &nullSRV);
-	// The cull shader consumes the result after this copy; no staging allocation or CPU wait.
+	// Copy the classification for the cull shader without allocating staging memory or waiting on the CPU.
 	ctx->CopyResource(entry.normalLength->resource.get(), detectResult->resource.get());
 	entry.resourceView = resourceView;
 	return entry.normalLength->srv.get();
