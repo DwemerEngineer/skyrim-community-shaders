@@ -277,7 +277,7 @@ namespace GrassExtensions
 	{
 		static void thunk(RE::BSShader* shader, RE::BSRenderPass* pass, uint32_t renderFlags)
 		{
-			// Grass Optimizations stands in for the vanilla setup, pixel constants included, on the passes it draws.
+			// Replace vanilla setup and pixel constants for passes handled by Grass Optimizations.
 			if (!globals::features::grassOptimizations.SetupGrassPass(shader, pass)) {
 				func(shader, pass, renderFlags);
 				LegacyGraphicsCompatibility::BindLegacyGrassPerGeometryToPixelShader();

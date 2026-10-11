@@ -5,7 +5,7 @@ cbuffer CullParams : register(b0)
 {
 	float4 FrustumPlanes[6];
 
-	// Main camera's camera-relative view-projection rows. PerFrame holds the light's camera during shadow passes.
+	// Use the main camera's projection because PerFrame contains the light's camera during shadow passes.
 	float4 CameraViewProj[4];
 	float4 CameraPos;
 
@@ -58,11 +58,11 @@ cbuffer CullBucket : register(b1)
 	uint SliceTableOffset;
 	uint SliceCount;
 	float FarLODEnabled;
-	// Groups per dispatch row, so large buckets stay under the 65535 group limit.
+	// Split large buckets across rows to stay within the 65,535-group dispatch limit.
 	uint DispatchWidth;
 };
 
-// Up to 64 contiguous source instances of one slice.
+// Each group covers up to 64 contiguous instances from one slice.
 struct CullGroup
 {
 	float3 Origin;
@@ -72,11 +72,11 @@ struct CullGroup
 };
 
 ByteAddressBuffer Instances : register(t0);
-// Every run's groups for this bucket, rebuilt only when its slices change.
+// Cache every run's groups until the bucket's slices change.
 StructuredBuffer<CullGroup> Groups : register(t1);
 // Scene-depth max pyramid; see GrassHiZCS.hlsl.
 Texture2D<float> HiZ : register(t2);
-// .x is the run's first group; .y is the dispatch-group index it starts at.
+// Each entry stores the run's first source group in .x and its first dispatch-group index in .y.
 StructuredBuffer<uint2> SliceTable : register(t3);
 StructuredBuffer<float> TextureNormalLength : register(t4);
 
@@ -98,7 +98,7 @@ static const uint FarLODCountOffset = 4;
 static const uint TierCount = 3;
 static const uint TierCulled = TierCount;
 
-// Per-tier survivors and output offsets, so each group issues one global atomic per tier.
+// Shared survivor counts and output offsets let each group issue one global atomic per tier.
 groupshared uint GroupTierCount[TierCount];
 groupshared uint GroupTierBase[TierCount];
 
@@ -126,13 +126,13 @@ float WindScalar(float basis, float timer)
 	return (t1 + t2) * 0.3 + t3;
 }
 
-// Projects a camera-relative direction, without the matrix's translation column.
+// Project a camera-relative direction without the matrix's translation column.
 float4 ProjectDirection(float3 v)
 {
 	return float4(dot(CameraViewProj[0].xyz, v), dot(CameraViewProj[1].xyz, v), dot(CameraViewProj[2].xyz, v), dot(CameraViewProj[3].xyz, v));
 }
 
-// Returns the instance's LOD tier, or TierCulled.
+// Return the instance's LOD tier or TierCulled.
 uint CullInstance(uint idx, CullGroup group, out uint4 raw0, out uint4 raw1, out float4 e0, out float4 e1)
 {
 	raw1 = 0;
@@ -226,7 +226,7 @@ uint CullInstance(uint idx, CullGroup group, out uint4 raw0, out uint4 raw1, out
 		if (clipC.w > 0.0) {
 			const float2 uv = (clipC.xy / clipC.w) * float2(0.5, -0.5) + 0.5;
 			const float2 tc = uv * HiZSize;
-			// Projected radius in level-0 Hi-Z texels.
+			// Measure the projected radius in level-0 Hi-Z texels.
 			const float rT = projPxOcc / HiZTexelPixels;
 
 			// Select a mip coarse enough to cover the sphere with a 2x2 footprint.

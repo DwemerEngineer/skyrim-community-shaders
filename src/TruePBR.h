@@ -122,7 +122,7 @@ public:
 	 */
 	void SetupGrassMaterial(RE::BSLightingShaderProperty* sourceProperty, RE::BSLightingShaderProperty* grassProperty);
 
-	/** @brief PBR grass PerMaterial constants, laid out as RunGrass.hlsl's PerMaterial (b1). */
+	/** @brief Match the PBR PerMaterial layout at b1 in RunGrass.hlsl. */
 	struct alignas(16) GrassPBRConstants
 	{
 		uint32_t flags;
@@ -130,10 +130,10 @@ public:
 		float params2[4];
 	};
 
-	/** @brief Points the renderer shadow state at a PBR grass material's textures and samplers. */
+	/** @brief Set the renderer's textures and samplers for a PBR grass material. */
 	static void SetGrassPBRTextures(const BSLightingShaderMaterialPBR* material);
 
-	/** @brief Returns a PBR grass material's PerMaterial constants. */
+	/** @brief Return a PBR grass material's PerMaterial constants. */
 	static GrassPBRConstants GetGrassPBRConstants(const BSLightingShaderMaterialPBR* material);
 
 	/**
