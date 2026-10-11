@@ -168,8 +168,7 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures, std:
 
 	for (auto& pc : captures) {
 		const uint32_t meshId = meshLibrary.ResolveMeshId(pc.shape);
-		const uint32_t triCount = meshId ? 0u : pc.triangleCount;
-		BucketKey bk{ meshId, pc.material, meshId ? nullptr : pc.diffuseTexture.get(), triCount, meshId ? 0u : pc.descVal };
+		BucketKey bk{ meshId, pc.material, meshId ? nullptr : pc.diffuseTexture.get(), pc.triangleCount, meshId ? 0u : pc.descVal };
 		bk.material = CanonicalMaterial(bk, pc.material, pc.pbrMaterial);
 		auto [it, inserted] = buckets.try_emplace(bk);
 		auto& b = it->second;

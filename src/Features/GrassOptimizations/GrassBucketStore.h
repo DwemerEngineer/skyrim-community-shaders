@@ -5,10 +5,11 @@
 
 struct BucketKey
 {
+	// Mesh ids come from the model's file name, so the triangle count keeps same-named models in other folders apart.
 	uint32_t meshId = 0;
 	// An optimized draw shares the representative shape's material state.
 	RE::BSShaderMaterial* material = nullptr;
-	// Unresolved meshes also require texture and geometry identity.
+	// Unresolved meshes also require texture and vertex format identity.
 	RE::NiSourceTexture* tex = nullptr;
 	uint32_t triCount = 0;
 	uint64_t descVal = 0;
