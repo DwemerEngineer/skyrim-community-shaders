@@ -256,7 +256,8 @@ public:
 		IsSun = 1 << 4,
 		SuppressExternalEmittance = 1 << 5,
 		AdditiveLighting = 1 << 6,
-		// 7 and 8 are reserved for the night sky flags
+		IsAurora = 1 << 7,
+		IsMoon = 1 << 8,
 		NoSkyScattering = 1 << 9  ///< Cloud layer drawn without Effects11 cloud scattering
 	};
 
@@ -322,6 +323,11 @@ public:
 	 * @param a_pass The render pass to inspect.
 	 */
 	void UpdateSkyShaderPermutation(RE::BSRenderPass* a_pass);
+	/**
+	 * @brief Flags effect shader passes that draw the aurora (sky objects under the sky's aurora root).
+	 * @param a_pass The render pass to inspect.
+	 */
+	void UpdateEffectShaderPermutation(RE::BSRenderPass* a_pass);
 	/**
 	 * @brief Checks whether directional shadows are available for the current scene.
 	 * @returns true if directional shadows are present, false otherwise.
