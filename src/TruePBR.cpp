@@ -598,7 +598,7 @@ namespace Permutations
 		constexpr std::array projectedUvFlags{ Deferred, AnisoLighting, DoAlphaTest, Snow };
 		constexpr std::array lodObjectsFlags{ Deferred, WorldMap, DoAlphaTest, ProjectedUV };
 		constexpr std::array treeFlags{ Deferred, AnisoLighting, Skinned, DoAlphaTest };
-		constexpr std::array landFlags{ Deferred, AnisoLighting };
+		constexpr std::array landFlags{ Deferred, AnisoLighting, LandscapeSeams };
 
 		constexpr uint32_t defaultConstantFlags = static_cast<uint32_t>(TruePbr) | static_cast<uint32_t>(VC);
 		constexpr uint32_t projectedUvConstantFlags = static_cast<uint32_t>(TruePbr) | static_cast<uint32_t>(VC) | static_cast<uint32_t>(ProjectedUV);
@@ -776,7 +776,7 @@ struct BSLightingShaderProperty_LoadBinary
 
 static bool IsPBRShaderProperty(const RE::BSShaderProperty* property)
 {
-	return property->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kVertexLighting) && (property->material->GetFeature() == RE::BSShaderMaterial::Feature::kDefault || property->material->GetFeature() == RE::BSShaderMaterial::Feature::kMultiTexLandLODBlend);
+	return property->material != nullptr && property->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kVertexLighting) && (property->material->GetFeature() == RE::BSShaderMaterial::Feature::kDefault || property->material->GetFeature() == RE::BSShaderMaterial::Feature::kMultiTexLandLODBlend);
 }
 
 struct BSLightingShaderProperty_GetRenderPasses
