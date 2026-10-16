@@ -2,21 +2,6 @@
 
 namespace
 {
-	RE::BSTriShape* FindFirstTriShape(RE::NiAVObject* obj)
-	{
-		if (!obj)
-			return nullptr;
-		if (auto* ts = obj->AsTriShape())
-			return ts;
-		if (auto* node = obj->AsNode()) {
-			for (auto& child : node->GetChildren()) {
-				if (auto* ts = FindFirstTriShape(child.get()))
-					return ts;
-			}
-		}
-		return nullptr;
-	}
-
 	std::string StemOf(const char* path)
 	{
 		const std::string p = path;
@@ -124,6 +109,29 @@ void GrassMeshLibrary::CommitLoadedLODMeshes()
 	done.clear();
 }
 
+bool GrassMeshLibrary::FindLODShape(RE::NiAVObject* object, RE::BSTriShape*& shape)
+{
+	if (!object)
+		return true;
+
+	if (object->local != RE::NiTransform{})
+		return false;
+
+	if (auto* geometry = object->AsTriShape()) {
+		if (shape)
+			return false;
+
+		shape = geometry;
+	} else if (auto* node = object->AsNode()) {
+		for (const auto& child : node->GetChildren()) {
+			if (!FindLODShape(child.get(), shape))
+				return false;
+		}
+	}
+
+	return true;
+}
+
 void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODTier tier)
 {
 	entry.attemptedLoad = true;
@@ -135,29 +143,35 @@ void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODT
 	args.unkA = false;
 	args.postProcess = false;
 	RE::NiPointer<RE::NiNode> root;
+
 	if (RE::BSModelDB::Demand(modelPath.c_str(), root, args) == RE::BSResource::ErrorCode::kNone && root) {
-		if (auto* ts = FindFirstTriShape(root.get())) {
+		entry.keepAlive = RE::NiPointer<RE::NiAVObject>(root.get());
+		RE::BSTriShape* ts = nullptr;
+
+		if (FindLODShape(root.get(), ts) && ts) {
 			auto& grd = ts->GetGeometryRuntimeData();
 			auto* rd = grd.rendererData;
+
 			if (rd && rd->vertexBuffer && rd->indexBuffer) {
-				entry.keepAlive = RE::NiPointer<RE::NiAVObject>(root.get());
 				entry.vertexBuffer = reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer);
 				entry.indexBuffer = reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer);
 				// Match the source grass instancing flags while retaining the LOD vertex format.
 				entry.descVal = *reinterpret_cast<const uint64_t*>(&grd.vertexDesc) | 0x8000000000000080ull;
 				entry.meshStride = VertexStrideFromDesc(entry.descVal);
 				entry.indexCount = 3u * ts->GetTrishapeRuntimeData().triangleCount;
-				entry.valid = entry.meshStride != 0 && entry.indexCount != 0;
-				if (!entry.valid)
-					logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} rejected: indices={} stride={} descVal={:016X}", modelPath, entry.indexCount, entry.meshStride, entry.descVal);
+				const auto& bound = ts->GetModelData().modelBound;
+				entry.boundExtent = bound.center.Length() + bound.radius;
+
+				if (entry.meshStride != 0 && entry.indexCount != 0)
+					entry.valid = true;
 				else
-					logger::info("[GRASS OPTIMIZATIONS] LOD mesh {} loaded: tris={} stride={} descVal={:016X}",
-						modelPath, entry.indexCount / 3, entry.meshStride, entry.descVal);
+					logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} rejected: indices={} stride={} descVal={:016X}", modelPath, entry.indexCount, entry.meshStride, entry.descVal);
+
 			} else {
 				logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} has no GPU buffers", modelPath);
 			}
 		} else {
-			logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} has no TriShape", modelPath);
+			logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} requires one TriShape with baked node and geometry transforms", modelPath);
 		}
 	}
 }

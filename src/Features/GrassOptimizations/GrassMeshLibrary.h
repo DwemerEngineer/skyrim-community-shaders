@@ -29,6 +29,7 @@ public:
 		ID3D11Buffer* vertexBuffer = nullptr;
 		ID3D11Buffer* indexBuffer = nullptr;
 		uint32_t indexCount = 0;
+		float boundExtent = 0.0f;
 		// The LOD .nif is authored separately, so its vertex format need not match the source mesh's.
 		uint32_t meshStride = 0;
 		uint64_t descVal = 0;
@@ -60,6 +61,8 @@ public:
 	void ReleaseMesh(uint32_t meshId);
 
 private:
+	static bool FindLODShape(RE::NiAVObject* object, RE::BSTriShape*& shape);
+
 	/** @brief Loads one tier's .nif into an entry. Runs on the loader thread. */
 	static void LoadLODMesh(LODMesh& entry, const std::string& stem, LODTier tier);
 
