@@ -1,82 +1,186 @@
 #include "GrassMeshLibrary.h"
-
-namespace
-{
-	std::string StemOf(const char* path)
-	{
-		const std::string p = path;
-		const size_t slash = p.find_last_of("\\/");
-		const size_t start = slash == std::string::npos ? 0 : slash + 1;
-		const size_t dot = p.find_last_of('.');
-		const size_t len = (dot == std::string::npos || dot < start) ? std::string::npos : dot - start;
-		return p.substr(start, len);
-	}
-}
+#include "TruePBR/BSLightingShaderMaterialPBR.h"
 
 GrassMeshLibrary::~GrassMeshLibrary()
 {
 	loader.reset();
 }
 
-void GrassMeshLibrary::RecordModelPath(RE::BSMultiStreamInstanceTriShape* shape, const char* modelPath)
+std::string GrassMeshLibrary::StemOf(const char* path)
 {
-	if (!shape || !modelPath || !*modelPath)
-		return;
-
-	std::scoped_lock lk(stemMutex);
-	const auto stem = StemOf(modelPath);
-	if (auto it = stemByShape.find(shape); it == stemByShape.end() || it->second != stem)
-		idByShape.erase(shape);
-	stemByShape.insert_or_assign(shape, stem);
+	const std::string_view p = path;
+	const size_t slash = p.find_last_of("\\/");
+	const size_t start = slash == std::string::npos ? 0 : slash + 1;
+	const size_t dot = p.find_last_of('.');
+	const size_t len = (dot == std::string::npos || dot < start) ? std::string::npos : dot - start;
+	return std::string(p.substr(start, len));
 }
 
-uint32_t GrassMeshLibrary::ResolveMeshId(RE::BSMultiStreamInstanceTriShape* shape)
+GrassMeshLibrary::MeshRecord& GrassMeshLibrary::RegisterMesh(const char* modelPath)
 {
-	if (!shape)
-		return 0;
-	std::scoped_lock lk(stemMutex);
-	if (auto it = idByShape.find(shape); it != idByShape.end())
-		return it->second;
+	const auto stem = StemOf(modelPath);
+	std::scoped_lock lock(meshMutex);
+	auto [entry, inserted] = meshes.try_emplace(stem);
+	if (inserted)
+		entry->second.stem = stem;
 
-	std::string stem;
-	if (auto it = stemByShape.find(shape); it != stemByShape.end())
-		stem = it->second;
+	return entry->second;
+}
 
-	uint32_t meshId = 0;
-	if (!stem.empty()) {
-		auto [it, inserted] = meshIdByStem.try_emplace(stem, static_cast<uint32_t>(stems.size()) + 1);
-		meshId = it->second;  // ids remain stable after LOD resource eviction
-		if (inserted) {
-			stems.push_back(stem);
-			activeBuckets.push_back(0);
+bool GrassMeshLibrary::CreateAsset(GrassAsset& asset, RE::BSMultiStreamInstanceTriShape* geometryTemplate)
+{
+	asset.proxy.reset(static_cast<RE::BSMultiStreamInstanceTriShape*>(geometryTemplate->Clone()));
+	if (!asset.proxy)
+		return false;
+
+	auto& geometry = asset.proxy->GetGeometryRuntimeData();
+	geometry.vertexDesc = std::bit_cast<RE::BSGraphics::VertexDesc>(asset.key.descVal);
+	geometry.shaderProperty.reset(static_cast<RE::BSShaderProperty*>(geometry.shaderProperty->Clone()));
+
+	auto* property = static_cast<RE::BSGrassShaderProperty*>(geometry.shaderProperty.get());
+	property->SetMaterial(asset.material.get(), false);
+	property->wavePeriod = asset.key.draw.wavePeriod;
+
+	if (asset.key.draw.uniformScale)
+		property->flags.set(RE::BSShaderProperty::EShaderPropertyFlag::kUniformScale);
+	else
+		property->flags.reset(RE::BSShaderProperty::EShaderPropertyFlag::kUniformScale);
+
+	if (asset.key.draw.pbrMaterial)
+		property->flags.set(RE::BSShaderProperty::EShaderPropertyFlag::kMenuScreen);
+	else
+		property->flags.reset(RE::BSShaderProperty::EShaderPropertyFlag::kMenuScreen);
+
+	if (asset.key.draw.sphereNormal)
+		property->flags.set(RE::BSShaderProperty::EShaderPropertyFlag::kEffectLighting);
+	else
+		property->flags.reset(RE::BSShaderProperty::EShaderPropertyFlag::kEffectLighting);
+
+	++asset.key.mesh->activeBuckets;
+	++complexCache[asset.diffuseTexture.get()].activeUsers;
+
+	return true;
+}
+
+void GrassMeshLibrary::ReleaseAsset(const GrassAsset& asset)
+{
+	auto* tex = asset.diffuseTexture.get();
+	if (auto it = complexCache.find(tex); it != complexCache.end()) {
+		if (--it->second.activeUsers == 0)
+			complexCache.erase(it);
+	}
+
+	ReleaseMesh(*asset.key.mesh);
+}
+
+GrassMaterialKey GrassMeshLibrary::CaptureMaterial(RE::BSShaderMaterial* material, bool pbr)
+{
+	auto* m = static_cast<RE::BSLightingShaderMaterialBase*>(material);
+	GrassMaterialKey key;
+	key.textures[0] = m->diffuseTexture.get();
+
+	if (pbr) {
+		auto* pm = static_cast<BSLightingShaderMaterialPBR*>(material);
+		key.textures = { m->diffuseTexture.get(), m->normalTexture.get(), pm->rmaosTexture.get(), pm->featuresTexture0.get() };
+		key.clampMode = (uint32_t)m->textureClampMode;
+		key.constants = TruePBR::GetGrassPBRConstants(pm);
+	}
+
+	return key;
+}
+
+void GrassMeshLibrary::ClearShaderCache()
+{
+	detectCS = nullptr;
+	detectCSFailed = false;
+}
+
+ID3D11ShaderResourceView* GrassMeshLibrary::GetComplexGrass(RE::NiSourceTexture* tex, ID3D11DeviceContext* ctx)
+{
+	// Without a classification the pixel shader tests the texture itself.
+	const auto found = complexCache.find(tex);
+	if (found == complexCache.end())
+		return nullptr;
+
+	auto& entry = found->second;
+	auto* rt = tex ? tex->rendererTexture : nullptr;
+	auto* resourceView = rt ? rt->resourceView : nullptr;
+	if (entry.normalLength && entry.resourceView == resourceView) {
+		return entry.normalLength->srv.get();
+	}
+
+	if (!resourceView || !GetDetectCS())
+		return nullptr;  // Retry textures whose renderer resource is not ready yet.
+
+	if (!entry.normalLength) {
+		try {
+			const float unknown = 0.0f;
+			D3D11_SUBRESOURCE_DATA init{ &unknown, 0, 0 };
+			entry.normalLength = std::make_unique<Buffer>(StructuredBufferDesc<float>(uint64_t{ 1 }), &init, "GrassOptimizations::NormalLength");
+
+			D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+			sv.Format = DXGI_FORMAT_UNKNOWN;
+			sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+			sv.Buffer.NumElements = 1;
+			entry.normalLength->CreateSRV(sv);
+
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uv{};
+			uv.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+			uv.Buffer.NumElements = 1;
+			entry.normalLength->CreateUAV(uv);
+
+		} catch (...) {
+			entry.normalLength.reset();
+			return nullptr;
+		}
+	}
+	// The previous grass draw may still have this result bound for reading.
+	ID3D11ShaderResourceView* nullSRV = nullptr;
+	ctx->VSSetShaderResources(5, 1, &nullSRV);
+
+	ID3D11UnorderedAccessView* resultUAV = entry.normalLength->uav.get();
+	ctx->CSSetUnorderedAccessViews(0, 1, &resultUAV, nullptr);
+
+	ctx->CSSetShader(detectCS.get(), nullptr, 0);
+	ctx->CSSetShaderResources(0, 1, &resourceView);
+	ctx->Dispatch(1, 1, 1);
+
+	ID3D11UnorderedAccessView* nullUAV = nullptr;
+	ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+	ctx->CSSetShaderResources(0, 1, &nullSRV);
+
+	entry.resourceView = resourceView;
+	return entry.normalLength->srv.get();
+}
+
+ID3D11ComputeShader* GrassMeshLibrary::GetDetectCS()
+{
+	if (!detectCS && !detectCSFailed) {
+		detectCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\DetectComplexCS.hlsl", {}, "cs_5_0")));
+
+		if (!detectCS) {
+			detectCSFailed = true;
+			logger::error("[GRASS OPTIMIZATIONS] detect CS load failed — complex detection disabled");
 		}
 	}
 
-	if (meshId)
-		idByShape.emplace(shape, meshId);  // a not-yet-recorded model path may become available later
-	return meshId;
+	return detectCS.get();
 }
 
-void GrassMeshLibrary::EnsureLODMeshes(uint32_t meshId)
+void GrassMeshLibrary::EnsureLODMeshes(MeshRecord& mesh)
 {
-	if (meshId == 0 || meshId > stems.size())
-		return;
-
-	if (lodMeshes.size() < stems.size())
-		lodMeshes.resize(stems.size());
-
 	for (uint32_t tier = 0; tier < (uint32_t)LODTier::kCount; ++tier) {
-		auto& entry = lodMeshes[meshId - 1][tier];
-		if (entry.attemptedLoad || entry.queued)
+		auto& entry = mesh.lodMeshes[tier];
+		if (entry.state != LoadState::kUnrequested)
 			continue;
 
-		entry.queued = true;
+		entry.state = LoadState::kQueued;
 		if (!loader)
 			loader = std::make_unique<BS::thread_pool<>>(1);
 
-		loader->detach_task([this, meshId, stem = stems[meshId - 1], tier = (LODTier)tier] {
-			LoadResult result{ meshId, tier, {} };
-			LoadLODMesh(result.mesh, stem, tier);
+		loader->detach_task([this, target = &mesh, tier = (LODTier)tier] {
+			LoadResult result{ target, tier, {} };
+			LoadLODMesh(result.mesh, target->stem, tier);
 			std::scoped_lock lock(resultMutex);
 			results.push_back(std::move(result));
 		});
@@ -96,17 +200,39 @@ void GrassMeshLibrary::CommitLoadedLODMeshes()
 	}
 
 	for (auto& result : done) {
-		auto& entry = lodMeshes[result.meshId - 1][(size_t)result.tier];
-		if (!activeBuckets[result.meshId - 1] || !result.mesh.valid) {
-			// Drop unused or rejected model trees, preserving the negative cache for failed loads.
+		auto& entry = result.target->lodMeshes[(size_t)result.tier];
+		if (!result.target->activeBuckets || result.mesh.state != LoadState::kReady) {
+			// Release unused model trees and keep failed loads cached.
 			entry = {};
-			entry.attemptedLoad = !result.mesh.valid;
+			if (result.mesh.state != LoadState::kReady)
+				entry.state = LoadState::kUnavailable;
 			continue;
 		}
 		entry = std::move(result.mesh);
 	}
-	// Release discarded model trees on the render thread, like ReleaseMesh.
+
 	done.clear();
+}
+
+const GrassMeshLibrary::LODMesh* GrassMeshLibrary::GetLODMesh(const MeshRecord& mesh, LODTier tier)
+{
+	const auto& entries = mesh.lodMeshes;
+	if (entries[(size_t)tier].state == LoadState::kReady)
+		return &entries[(size_t)tier];
+
+	const auto& middle = entries[(size_t)LODTier::kMiddle];
+	return tier == LODTier::kFar && middle.state == LoadState::kReady ? &middle : nullptr;
+}
+
+void GrassMeshLibrary::ReleaseMesh(MeshRecord& mesh)
+{
+	if (--mesh.activeBuckets)
+		return;
+
+	for (auto& entry : mesh.lodMeshes) {
+		if (entry.state == LoadState::kReady)
+			entry = {};
+	}
 }
 
 bool GrassMeshLibrary::FindLODShape(RE::NiAVObject* object, RE::BSTriShape*& shape)
@@ -134,7 +260,7 @@ bool GrassMeshLibrary::FindLODShape(RE::NiAVObject* object, RE::BSTriShape*& sha
 
 void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODTier tier)
 {
-	entry.attemptedLoad = true;
+	entry.state = LoadState::kUnavailable;
 
 	const std::string modelPath = "LOD\\Grass\\" + stem + (tier == LODTier::kFar ? "_LOD1.nif" : "_LOD0.nif");
 
@@ -163,7 +289,7 @@ void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODT
 				entry.boundExtent = bound.center.Length() + bound.radius;
 
 				if (entry.meshStride != 0 && entry.indexCount != 0)
-					entry.valid = true;
+					entry.state = LoadState::kReady;
 				else
 					logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} rejected: indices={} stride={} descVal={:016X}", modelPath, entry.indexCount, entry.meshStride, entry.descVal);
 
@@ -173,45 +299,5 @@ void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODT
 		} else {
 			logger::warn("[GRASS OPTIMIZATIONS] LOD mesh {} requires one TriShape with baked node and geometry transforms", modelPath);
 		}
-	}
-}
-
-const GrassMeshLibrary::LODMesh* GrassMeshLibrary::GetLODMesh(uint32_t meshId, LODTier tier) const
-{
-	if (meshId == 0 || meshId > lodMeshes.size())
-		return nullptr;
-
-	const auto& entries = lodMeshes[meshId - 1];
-	if (entries[(size_t)tier].valid)
-		return &entries[(size_t)tier];
-
-	const LODMesh& middle = entries[(size_t)LODTier::kMiddle];
-	return (tier == LODTier::kFar && middle.valid) ? &middle : nullptr;
-}
-
-void GrassMeshLibrary::ForgetShape(RE::BSMultiStreamInstanceTriShape* shape)
-{
-	std::scoped_lock lk(stemMutex);
-	idByShape.erase(shape);
-	stemByShape.erase(shape);
-}
-
-void GrassMeshLibrary::RetainMesh(uint32_t meshId)
-{
-	if (meshId && meshId <= activeBuckets.size())
-		++activeBuckets[meshId - 1];
-}
-
-void GrassMeshLibrary::ReleaseMesh(uint32_t meshId)
-{
-	if (!meshId || meshId > activeBuckets.size() || !activeBuckets[meshId - 1])
-		return;
-	if (--activeBuckets[meshId - 1] || meshId > lodMeshes.size())
-		return;
-
-	for (auto& entry : lodMeshes[meshId - 1]) {
-		// Missing/invalid files stay cached; successfully loaded models may be demanded again.
-		if (entry.valid)
-			entry = {};
 	}
 }

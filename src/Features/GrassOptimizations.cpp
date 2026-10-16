@@ -1,9 +1,11 @@
 #include "GrassOptimizations.h"
-#include "GrassLighting.h"
-#include "ShaderCache.h"
-#include "State.h"
+
+#include <span>
+
+#include "Profiler.h"
 #include "TruePBR.h"
 #include "TruePBR/BSLightingShaderMaterialPBR.h"
+#include "Utils/VersionedRelocation.h"
 
 #define I18N_KEY_PREFIX "feature.grass_optimizations."
 
@@ -176,391 +178,145 @@ void GrassOptimizations::DrawSettings()
 	ImGui::EndDisabled();
 }
 
+bool GrassOptimizations::HasShaderDefine(RE::BSShader::Type shaderType)
+{
+	return shaderType == RE::BSShader::Type::Grass;
+}
+
 void GrassOptimizations::PostPostLoad()
 {
 	Hooks::Install();
 }
 
-bool GrassOptimizations::HasShaderDefine(RE::BSShader::Type shaderType)
-{
-	switch (shaderType) {
-	case RE::BSShader::Type::Grass:
-		return true;
-	default:
-		return false;
-	}
-}
-
 void GrassOptimizations::Reset()
 {
-	std::scoped_lock lk(bucketStore.bucketMutex);
-	bucketStore.ProcessRemovals();
+	// Bucket mutations stay on the render thread, so draw setup needs no lock.
+	bucketStore.EndFrame();
 	bucketStore.meshLibrary.CommitLoadedLODMeshes();
 }
 
 void GrassOptimizations::ClearShaderCache()
 {
-	auto release = [](ID3D11ComputeShader*& shader) {
-		if (shader)
-			shader->Release();
-		shader = nullptr;
-	};
-	release(cullCS);
+	cullCS = nullptr;
 	cullCSFailed = false;
 	hiZ.ClearShaderCache();
-	bucketStore.ClearShaderCache();
+	bucketStore.meshLibrary.ClearShaderCache();
 }
 
-void GrassOptimizations::Hooks::BSMultiStreamInstanceTriShape_dtor::thunk(RE::BSMultiStreamInstanceTriShape* shape)
+RE::NiDirectionalLight* GrassOptimizations::GetSunLight()
 {
-	globals::features::grassOptimizations.bucketStore.StageRemoval(shape);
-	func(shape);
+	auto* sceneNode = globals::game::smState->shadowSceneNode[0];
+	auto* sun = sceneNode ? sceneNode->GetRuntimeData().sunLight : nullptr;
+	return sun ? skyrim_cast<RE::NiDirectionalLight*>(sun->light.get()) : nullptr;
 }
 
-void GrassOptimizations::Hooks::BSMultiStreamInstanceTriShape_OnVisible::thunk(RE::BSMultiStreamInstanceTriShape* This, RE::NiCullingProcess* process, std::int32_t alphaGroupIndex)
+void GrassOptimizations::UpdateGrass(const RE::NiCamera* cam)
 {
-	auto prop = This->GetGeometryRuntimeData().shaderProperty;
-	if (prop && prop->GetRTTI() == globals::rtti::BSGrassShaderPropertyRTTI.get()) {
-		auto& self = globals::features::grassOptimizations;
+	auto* ctx = globals::d3d::context;
 
-		// Only queue one representative shape per frame for each bucket to skip redundant setup.
-		if (!self.bucketStore.ClaimQueueSlot(This, globals::game::graphicsState->frameCount))
-			return;
+	const bool canCull = GetCullCS() && ctx1 && cullParamsCB && GetSunLight() && !globals::game::smState->liteBrite;
 
-		// Skips redundant and costly frustum checks since they are now handled by the coarse slice cull and CS.
-		auto& shape = *This;
-		process->AppendVirtual(shape, alphaGroupIndex);
+	if (auto* grassManager = RE::BGSGrassManager::GetSingleton())
+		Hooks::NiNode_OnVisible::grassRoot.store(grassManager->grassNode.get(), std::memory_order_relaxed);
+
+	timeAccum += globals::game::smState->timerValues[1];
+	prevTimeBase = timeBase;
+	timeBase = globals::game::smState->timerValues[4] * 0.0016666667f * 6.2831802f;
+
+	const auto iniFloat = [](const char* name, float fallback) {
+		auto* setting = RE::GetINISetting(name);
+		return setting ? setting->GetFloat() : fallback;
+	};
+
+	if (fadeInTimeRcp == 0.0f) {
+		const float t = iniFloat("fGrassFadeInTime:Grass", 0.0f);
+		fadeInTimeRcp = t > 0.0f ? 1.0f / t : 1e6f;
+	}
+
+	if (vanillaMaxDistance == 0.0f) {
+		grassStartFadeDistance = iniFloat("fGrassStartFadeDistance:Grass", 6000.0f);
+		vanillaMaxDistance = grassStartFadeDistance + iniFloat("fGrassFadeRange:Grass", 2000.0f);
+	}
+
+	maxGrassDistance = settings.RenderDistanceOverride > 0.0f ? settings.RenderDistanceOverride : vanillaMaxDistance;
+	maxDistSq = maxGrassDistance * maxGrassDistance;
+
+	// Start the fade one frame early, matching the engine and avoiding a gap when grass is replaced.
+	bucketStore.BeginFrame({ settings.EnableMeshLOD, settings.EnableMidLOD, settings.EnableFarLOD, timeAccum - globals::game::smState->timerValues[1] });
+
+	globals::profiler->BeginPass("GrassOptimizations::UploadPending");
+	bucketStore.UploadPending(ctx);
+	globals::profiler->EndPass();
+
+	if (!canCull || !cam) {
+		// Clear stale cull results before returning to engine draws.
+		DisableOptimizedDraws();
 		return;
 	}
 
-	func(This, process, alphaGroupIndex);
-}
-
-void GrassOptimizations::Hooks::DoneAddingInstances::thunk(RE::BSMultiStreamInstanceTriShape* shape,
-	RE::BSTArray<std::uint32_t>& a_instances)
-{
-	auto& self = globals::features::grassOptimizations;
-
-	auto& rt = shape->GetMultiStreamTrishapeRuntimeData();
-	auto prop = shape->GetGeometryRuntimeData().shaderProperty;
-	if (rt.groupAlloc && prop && prop->GetRTTI() == globals::rtti::BSGrassShaderPropertyRTTI.get()) {
-		if (auto* tex = prop->GetBaseTexture()) {
-			const uint64_t descVal = *reinterpret_cast<uint64_t*>(&shape->GetGeometryRuntimeData().vertexDesc);
-			self.bucketStore.StageCapture(shape, rt.groupAlloc, rt.instanceCount,
-				2u * rt.instanceSize, descVal, tex);
-		}
-	}
-	func(shape, a_instances);
-}
-
-void GrassOptimizations::Hooks::BSGrassShader_SetupGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* a2, std::uint32_t flags)
-{
-	auto& self = globals::features::grassOptimizations;
-
-	const auto frame = globals::game::graphicsState->frameCount;
-	if (self.lastFrame != frame) {
-		self.UpdateGrass();
-		self.lastFrame = frame;
-	}
-
-	func(This, a2, flags);
-
-	auto* shadowState = globals::game::shadowState;
-	shadowState->SetPSTextureAddressMode(0, RE::BSGraphics::TextureAddressMode::kClampSClampT);
-	shadowState->SetPSTextureFilterMode(0, RE::BSGraphics::TextureFilterMode::kAnisotropic);
-}
-
-void GrassOptimizations::Hooks::BSGrassShader_SetupMaterial::thunk([[maybe_unused]] RE::BSShader* This, const RE::BSLightingShaderMaterialBase* material)
-{
-	globals::features::grassOptimizations.pendingMaterial = material;
+	CullGrass(cam);
 }
 
 bool GrassOptimizations::SetupGrassPass(RE::BSShader* shader, RE::BSRenderPass* pass)
 {
-	const auto* material = std::exchange(pendingMaterial, nullptr);
-
-	if (loaded && SetupOptimizedPass(pass))
+	if (auto* bucket = loaded ? bucketStore.FindBucket(pass->geometry) : nullptr) {
+		if (HasCurrentCull() && bucket->optimizedReady && bucket->sliceTableCount)
+			SetupOptimizedPass(*bucket);
 		return true;
+	}
 
-	if (material)
-		Hooks::BSGrassShader_SetupMaterial::func(shader, material);
+	if (loaded && HasCurrentCull() && pass->geometry->GetType().get() == RE::BSGeometry::Type::kMultiStreamInstanceTriShape) {
+		if (auto shape = bucketStore.FindRenderedShape(static_cast<RE::BSMultiStreamInstanceTriShape*>(pass->geometry)); shape && bucketStore.IsShapeOptimized(*shape))
+			return true;
+	}
+
+	// Native coverage owns its material setup because optimized passes bind their own material state.
+	const auto* shaderProperty = pass->shaderProperty;
+	if (loaded && shaderProperty && shaderProperty->material)
+		Hooks::BSGrassShader_SetupMaterial::func(shader, static_cast<const RE::BSLightingShaderMaterialBase*>(shaderProperty->material));
 	return false;
 }
 
-bool GrassOptimizations::SetupOptimizedPass(RE::BSRenderPass* pass)
+void GrassOptimizations::SetupOptimizedPass(const GrassBucket& b)
 {
-	auto* geometry = pass->geometry;
-	auto* shaderProperty = pass->shaderProperty;
-	if (!geometry || !shaderProperty || shaderProperty->GetRTTI() != globals::rtti::BSGrassShaderPropertyRTTI.get())
-		return false;
-	auto* material = static_cast<RE::BSLightingShaderMaterialBase*>(shaderProperty->material);
-	if (!material || !material->diffuseTexture || !material->diffuseTexture->rendererTexture)
-		return false;
+	ID3D11Buffer* bucketCB = cullBucketCB->CB();
+	UINT windowFirst = (b.cullSlot * kSlotBytes + kSlotMaterialOffset) / 16;
+	UINT geometryNum = 32;
 
-	auto* smState = globals::game::smState;
-	auto* sceneNode = smState->shadowSceneNode[0];
-	auto* sunLight = sceneNode && sceneNode->GetRuntimeData().sunLight ? skyrim_cast<RE::NiDirectionalLight*>(sceneNode->GetRuntimeData().sunLight->light.get()) : nullptr;
-	if (smState->liteBrite || !sunLight)
-		return false;
-
-	const bool pbrTechnique = static_cast<SIE::ShaderCache::GrassShaderTechniques>(globals::state->currentPixelDescriptor & 0b1111) ==
-	                          SIE::ShaderCache::GrassShaderTechniques::TruePbr;
-
-	std::scoped_lock lk(bucketStore.bucketMutex);
-	auto* b = bucketStore.FindBucket(static_cast<RE::BSMultiStreamInstanceTriShape*>(geometry));
-	if (!b || !b->totalInstances || !b->optimizedReady.load(std::memory_order_relaxed) || (pbrTechnique && !b->pbrMaterial))
-		return false;
-
-	// The draw hook skips this pass, so it needs no setup.
-	if (!b->cullVisible || (b->drawnFrame == globals::game::graphicsState->frameCount && b->drawnPassKey == GetPassKey(pass)))
-		return true;
-
-	if (!BindPerGeometry(geometry, shaderProperty, sunLight))
-		return false;
-	auto* shadowState = globals::game::shadowState;
-	shadowState->SetPSTexture(0, material->diffuseTexture->rendererTexture);
-	shadowState->SetPSTextureAddressMode(0, RE::BSGraphics::TextureAddressMode::kClampSClampT);
-	if (pbrTechnique) {
-		TruePBR::SetGrassPBRTextures(static_cast<const BSLightingShaderMaterialPBR*>(material));
-
-		ID3D11Buffer* bucketCB = cullBucketCB->CB();
-		UINT first = (b->cullSlot * kSlotBytes + kSlotMaterialOffset) / 16;
-		UINT num = 16;
-		ctx1->PSSetConstantBuffers1(1, 1, &bucketCB, &first, &num);
-	}
-	return true;
-}
-
-bool GrassOptimizations::BindPerGeometry(const RE::BSGeometry* geometry, const RE::BSShaderProperty* shaderProperty, RE::NiDirectionalLight* sunLight)
-{
-	// SetFogNearColor stores the fog color at c16 in vanilla PerGeometry constants.
-	static const auto* fogNearColor = reinterpret_cast<const float*>(REL::RelocationID(527805, 414756).address() + 0x100);
-	static const auto* grassWindAmount = reinterpret_cast<const float*>(REL::RelocationID(527802, 414753).address());
-	static const auto* grassWindAmountMax = reinterpret_cast<const float*>(REL::RelocationID(504665, 373550).address());
-	static const auto* windGrassMultiplier = reinterpret_cast<const float*>(REL::RelocationID(513337, 391112).address());
-
-	if (!perGeometryCB || !ctx1)
-		return false;
-
-	GrassPerGeometry data{};
-	std::memcpy(data.fogNearColor, fogNearColor, sizeof(data.fogNearColor));
-
-	// The wind blows along the model's Y axis.
-	RE::NiPoint3 windDirection{ geometry->world.rotate.entry[1][0], geometry->world.rotate.entry[1][1], geometry->world.rotate.entry[1][2] };
-	windDirection.Unitize();
-	data.windVector[0] = windDirection.x;
-	data.windVector[1] = windDirection.y;
-	data.windVector[2] = std::min(*grassWindAmount, *grassWindAmountMax) * *windGrassMultiplier;
-
-	const auto& sunDirection = sunLight->GetWorldDirection();
-	data.dirLightDirection[0] = -sunDirection.x;
-	data.dirLightDirection[1] = -sunDirection.y;
-	data.dirLightDirection[2] = -sunDirection.z;
-
-	const auto& sun = sunLight->GetLightRuntimeData();
-	data.dirLightColor[0] = sun.diffuse.red;
-	data.dirLightColor[1] = sun.diffuse.green;
-	data.dirLightColor[2] = sun.diffuse.blue;
-	data.ambientColor[0] = sun.ambient.red;
-	data.ambientColor[1] = sun.ambient.green;
-	data.ambientColor[2] = sun.ambient.blue;
-
-	const bool uniformScale = shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kUniformScale);
-	data.scaleMask[0] = uniformScale ? 1.0f : 0.0f;
-	data.scaleMask[1] = uniformScale ? 1.0f : 0.0f;
-	data.scaleMask[2] = 1.0f;
-
-	auto variant = std::ranges::find_if(perGeometryVariants, [&](const GrassPerGeometry& v) { return std::memcmp(&v, &data, sizeof(data)) == 0; });
-	if (variant == perGeometryVariants.end()) {
-		if (perGeometryVariants.size() == kMaxPerGeometryVariants)
-			perGeometryVariants.clear();
-		perGeometryVariants.push_back(data);
-
-		auto* ctx = globals::d3d::context;
-		D3D11_MAPPED_SUBRESOURCE m{};
-		if (FAILED(ctx->Map(perGeometryCB->CB(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-			perGeometryVariants.clear();
-			return false;
-		}
-		auto* bytes = static_cast<uint8_t*>(m.pData);
-		for (size_t i = 0; i < perGeometryVariants.size(); ++i)
-			std::memcpy(bytes + (i + 1) * kPerGeometrySlotBytes, &perGeometryVariants[i], sizeof(GrassPerGeometry));
-		ctx->Unmap(perGeometryCB->CB(), 0);
-		variant = perGeometryVariants.end() - 1;
-	}
-	ID3D11Buffer* cb = perGeometryCB->CB();
-	UINT first = (UINT)(variant - perGeometryVariants.begin()) * (kPerGeometrySlotBytes / 16);
-	UINT num = 2 * (kPerGeometrySlotBytes / 16);
-	ctx1->VSSetConstantBuffers1(2, 1, &cb, &first, &num);
-	ctx1->PSSetConstantBuffers1(2, 1, &cb, &first, &num);
-	return true;
-}
-
-uint64_t GrassOptimizations::GetPassKey(const RE::BSRenderPass* pass)
-{
-	uint32_t descriptor = 0;
-	if (globals::game::currentPixelShader && *globals::game::currentPixelShader)
-		descriptor = (*globals::game::currentPixelShader)->id;
-	return (static_cast<uint64_t>(pass->passEnum) << 32) | descriptor;
-}
-
-static size_t GIDGroupBytes(const RE::BSMultiStreamInstanceTriShape::GroupHeader* header)
-{
-	if (!header || !header->numShortsPerInstance)
-		return 0;
-	return (size_t)header->groupInstanceCount * header->numShortsPerInstance * sizeof(std::uint16_t);
-}
-
-std::uint32_t GrassOptimizations::Hooks::AddGroupGIDBuffer::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSMultiStreamInstanceTriShape::GroupHeader* a2, std::uint16_t* a3)
-{
-	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3, GIDGroupBytes(a2));
-	return func(a1, a2, a3);
-}
-
-std::uint32_t GrassOptimizations::Hooks::AddQueuedGroupGIDBuffer::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSMultiStreamInstanceTriShape::GroupHeader* a2, std::uint16_t* a3, RE::BSTArray<std::uint32_t>& a4)
-{
-	globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, a2, a3, GIDGroupBytes(a2));
-	return func(a1, a2, a3, a4);
-}
-
-thread_local RE::BSMultiStreamInstanceTriShape::GroupHeader tl_lastFileGroupHeader{};
-thread_local std::vector<uint16_t> tl_lastFileInstanceData;
-thread_local bool tl_haveFileGroup = false;
-
-void GrassOptimizations::Hooks::ReadGroupHeaderStreamTraits::thunk(RE::BSStreamHeader* streamHeader, RE::BSMultiStreamInstanceTriShape::GroupHeader* groupHeader, uint32_t size)
-{
-	func(streamHeader, groupHeader, size);
-	std::memcpy(&tl_lastFileGroupHeader, groupHeader, std::min<uint32_t>(size, sizeof(tl_lastFileGroupHeader)));
-}
-
-void GrassOptimizations::Hooks::ReadInstanceGroupStreamTraits::thunk(RE::BSStreamHeader* streamHeader, uint16_t* instanceData, uint32_t size)
-{
-	func(streamHeader, instanceData, size);
-	tl_lastFileInstanceData.resize((size + sizeof(uint16_t) - 1) / sizeof(uint16_t));
-	std::memcpy(tl_lastFileInstanceData.data(), instanceData, size);
-	tl_haveFileGroup = true;
-}
-
-void GrassOptimizations::Hooks::AddGroupQueuedGIDFile::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSStream* a2, RE::BSTArray<std::uint32_t>& a3)
-{
-	tl_haveFileGroup = false;
-	func(a1, a2, a3);
-
-	if (tl_haveFileGroup) {
-		globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, &tl_lastFileGroupHeader,
-			tl_lastFileInstanceData.data(), tl_lastFileInstanceData.size() * sizeof(uint16_t));
-		tl_haveFileGroup = false;
+	ctx1->VSSetConstantBuffers1(2, 1, &bucketCB, &windowFirst, &geometryNum);
+	ctx1->PSSetConstantBuffers1(2, 1, &bucketCB, &windowFirst, &geometryNum);
+	// BSGrassShader_SetupGeometry sets this texture's address and filter modes once the hook chain returns.
+	globals::game::shadowState->SetPSTexture(0, b.asset.diffuseTexture->rendererTexture);
+	if (b.asset.key.draw.pbrMaterial) {
+		TruePBR::SetGrassPBRTextures(static_cast<const BSLightingShaderMaterialPBR*>(b.asset.material.get()));
+		UINT materialNum = 16;
+		ctx1->PSSetConstantBuffers1(1, 1, &bucketCB, &windowFirst, &materialNum);
 	}
 }
 
-void GrassOptimizations::Hooks::AddGroupGIDFile::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSStream* a2)
-{
-	tl_haveFileGroup = false;
-	func(a1, a2);
-
-	if (tl_haveFileGroup) {
-		globals::features::grassOptimizations.bucketStore.CaptureGIDGroup(a1, &tl_lastFileGroupHeader,
-			tl_lastFileInstanceData.data(), tl_lastFileInstanceData.size() * sizeof(uint16_t));
-		tl_haveFileGroup = false;
-	}
-}
-
-RE::BSMultiStreamInstanceTriShape* GrassOptimizations::Hooks::LoadGrassType::thunk(RE::BGSGrassManager* grassManager, RE::GrassParam* a_param, uint32_t CellXDivided, uint32_t CellYDivided, uint64_t* typeKey, RE::BSFixedString* modelPath)
-{
-	auto* shape = func(grassManager, a_param, CellXDivided, CellYDivided, typeKey, modelPath);
-
-	if (shape && modelPath)
-		globals::features::grassOptimizations.bucketStore.meshLibrary.RecordModelPath(shape, modelPath->c_str());
-
-	return shape;
-}
-
-void VanillaDrawInstanceTriShape(RE::BSMultiStreamInstanceTriShape* geometry)
+void GrassOptimizations::DrawBucket(GrassBucket& b)
 {
 	auto* ctx = globals::d3d::context;
-	auto& groups = geometry->GetMultiStreamTrishapeRuntimeData().instanceGroups;
-
-	for (uint32_t i = 0; i < groups.size(); ++i) {
-		auto curInstanceGroup = groups[i];
-		if (!curInstanceGroup || !curInstanceGroup->isVisible)
-			continue;
-
-		uint32_t indexCount = 0;
-		uint32_t* indexCountPtr = &indexCount;
-		static REL::Relocation<ID3D11Buffer** (*)(RE::BSGraphics::Renderer*, uint64_t, uint32_t**, uint32_t)> MapDynamicBuffer{ REL::RelocationID(75561, 77362) };
-		auto buffer = MapDynamicBuffer(globals::game::renderer, 1, &indexCountPtr, 7);
-		if (buffer && indexCountPtr) {
-			*indexCountPtr = i;
-			if (*buffer)
-				ctx->Unmap(*buffer, 0);
-			ctx->VSSetConstantBuffers(7u, 1u, buffer);
-		}
-
-		static REL::Relocation<void (*)(RE::BSGraphics::Renderer*, RE::BSGraphics::TriShape*, uint32_t, uint32_t, uint32_t, RE::BSGraphics::VertexDesc, RE::BSGraphics::VertexBuffer*)> DrawInstancedTriShape{ REL::RelocationID(75479, 77265) };
-		DrawInstancedTriShape(globals::game::renderer, geometry->GetGeometryRuntimeData().rendererData, 0, geometry->GetTrishapeRuntimeData().triangleCount, curInstanceGroup->instanceCount, geometry->GetGeometryRuntimeData().vertexDesc, curInstanceGroup->vertexBuffer);
-	}
-}
-
-void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pass, RE::BSMultiStreamInstanceTriShape* geometry)
-{
-	auto& self = globals::features::grassOptimizations;
-	auto* ctx = globals::d3d::context;
-
-	auto shaderProperty = geometry->GetGeometryRuntimeData().shaderProperty;
-	if (!shaderProperty || shaderProperty->GetRTTI() != globals::rtti::BSGrassShaderPropertyRTTI.get()) {
-		VanillaDrawInstanceTriShape(geometry);
-		return;
-	}
-	RE::NiSourceTexture* diffuseTexture = shaderProperty->GetBaseTexture();
-	if (!diffuseTexture) {
-		VanillaDrawInstanceTriShape(geometry);
-		return;
-	}
-
-	const uint64_t descVal = *reinterpret_cast<uint64_t*>(&geometry->GetGeometryRuntimeData().vertexDesc);
-	const uint32_t frame = globals::game::graphicsState->frameCount;
-
-	// Keep the bucket and its GPU resources alive through every draw.
-	std::scoped_lock lk(self.bucketStore.bucketMutex);
-	// Look up the bucket by shape because a key rebuilt from engine state can miss the capture.
-	auto* b = self.bucketStore.FindBucket(geometry);
-	if (!b || !b->totalInstances || !b->optimizedReady.load(std::memory_order_relaxed)) {
-		VanillaDrawInstanceTriShape(geometry);
-		return;
-	}
-
-	// Multiple shapes share a bucket; draw it once per frame and technique.
-	const uint64_t passKey = GetPassKey(pass);
-
-	if (b->drawnFrame == frame && b->drawnPassKey == passKey)
-		return;
-	b->drawnFrame = frame;
-	b->drawnPassKey = passKey;
-
-	if (!b->cullVisible) {
-		return;
-	}
-
-	auto* rendererData = geometry->GetGeometryRuntimeData().rendererData;
-	if (!rendererData)
-		return;
-	auto* meshVB = reinterpret_cast<ID3D11Buffer*>(rendererData->vertexBuffer);
-	auto* indexB = reinterpret_cast<ID3D11Buffer*>(rendererData->indexBuffer);
-	if (!meshVB || !indexB)
+	const uint64_t descVal = b.asset.key.descVal;
+	auto* meshVB = b.asset.vertexBuffer.get();
+	auto* indexB = b.asset.indexBuffer.get();
+	const UINT meshStride = VertexStrideFromDesc(descVal);
+	if (!meshVB || !indexB || !meshStride)
 		return;
 
 	auto& shadowState = globals::game::shadowState->GetRuntimeData();
-	if (shadowState.vertexDesc != descVal) {
-		shadowState.vertexDesc = descVal;
-		shadowState.stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_VERTEX_DESC);
-	}
+	static REL::Relocation<void (*)(uint32_t)> SetDirtyStates{ REL::RelocationID(75580, 77386) };
 	if (shadowState.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
 		shadowState.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 		shadowState.stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_PRIMITIVE_TOPO);
 	}
-	static REL::Relocation<void (*)(uint32_t)> SetDirtyStates{ REL::RelocationID(75580, 77386) };
 
-	// SetDirtyStates binds each dirty pixel texture on its own; bind the material's slots in one call instead.
+	if (shadowState.vertexDesc != descVal) {
+		shadowState.vertexDesc = descVal;
+		shadowState.stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_VERTEX_DESC);
+	}
+
+	// Batch material texture bindings instead of letting SetDirtyStates bind each slot separately.
 	constexpr uint32_t kMaterialTextureBits = 0x1F;
 	const uint32_t materialTextures = shadowState.PSResourceModifiedBits & kMaterialTextureBits;
 	shadowState.PSResourceModifiedBits &= ~kMaterialTextureBits;
@@ -571,47 +327,254 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 		ctx->PSSetShaderResources(firstTexture, textureCount, reinterpret_cast<ID3D11ShaderResourceView* const*>(&shadowState.PSTexture[firstTexture]));
 	}
 
-	ctx->IASetIndexBuffer(indexB, DXGI_FORMAT_R16_UINT, 0);
+	// The vertex shader uses the bucket's cull constants to identify complex grass.
+	ID3D11Buffer* bucketCB = cullBucketCB->CB();
+	UINT bucketFirst = b.cullSlot * (kSlotBytes / 16);
+	UINT bucketNum = 16;
+	ctx1->VSSetConstantBuffers1(13, 1, &bucketCB, &bucketFirst, &bucketNum);
 
-	ID3D11Buffer* vbs[2] = { meshVB, nullptr };
-	UINT strides[2] = { VertexStrideFromDesc(descVal), kGrassStride };
-	UINT offsets[2] = { 0, 0 };
-	if (!strides[0])
+	for (uint32_t tier = 0; tier < kTierCount; ++tier) {
+
+		ID3D11Buffer* vertexBuffer = meshVB;
+		ID3D11Buffer* indexBuffer = indexB;
+		UINT stride = meshStride;
+
+		if (tier) {
+			const auto* lod = b.lodMeshes[tier - 1];
+			if (!lod)
+				continue;
+
+			vertexBuffer = lod->vertexBuffer;
+			indexBuffer = lod->indexBuffer;
+			stride = lod->meshStride;
+
+			if (shadowState.vertexDesc != lod->descVal) {
+				shadowState.vertexDesc = lod->descVal;
+				shadowState.stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_VERTEX_DESC);
+				SetDirtyStates(0);
+			}
+		}
+
+		// A zero-stride instance stream satisfies the input layout while the shader reads cull records.
+		ID3D11Buffer* vbs[2] = { vertexBuffer, vertexBuffer };
+		const UINT strides[2] = { stride, 0 };
+		const UINT offsets[2] = { 0, 0 };
+		ID3D11ShaderResourceView* instanceViews[4] = { b.output->compactedSRVs[tier].get(), b.source.instances->srv.get(), b.groups->srv.get(), b.complexSRV };
+
+		ctx->IASetIndexBuffer(indexBuffer, DXGI_FORMAT_R16_UINT, 0);
+		ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
+		ctx->VSSetShaderResources(2, 4, instanceViews);
+
+		ctx->DrawIndexedInstancedIndirect(bucketStore.arguments->resource.get(), (b.cullSlot * kTierCount + tier) * kArgsStride);
+	}
+}
+
+void GrassOptimizations::Hooks::BSMultiStreamInstanceTriShape_dtor::thunk(RE::BSMultiStreamInstanceTriShape* shape)
+{
+	globals::features::grassOptimizations.bucketStore.StageRemoval(shape);
+	func(shape);
+}
+
+std::uint32_t GrassOptimizations::Hooks::AddGroup::thunk(RE::BSMultiStreamInstanceTriShape* shape, std::uint32_t count, std::uint16_t* instanceData, std::uint32_t instanceShorts, float boundPadding)
+{
+	const auto index = func(shape, count, instanceData, instanceShorts, boundPadding);
+	globals::features::grassOptimizations.bucketStore.CaptureEngineGroup(shape, index);
+	return index;
+}
+
+void GrassOptimizations::Hooks::RemoveGroup::thunk(RE::BSMultiStreamInstanceTriShape* shape, std::uint32_t index)
+{
+	globals::features::grassOptimizations.bucketStore.RemoveEngineGroup(shape, index, func.get());
+}
+
+std::uint32_t GrassOptimizations::Hooks::AddGroupGIDBuffer::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSMultiStreamInstanceTriShape::GroupHeader* a2, std::uint16_t* a3)
+{
+	const auto index = func(a1, a2, a3);
+	globals::features::grassOptimizations.bucketStore.CaptureEngineGroup(a1, index);
+	return index;
+}
+
+void GrassOptimizations::Hooks::AddGroupGIDFile::thunk(RE::BSMultiStreamInstanceTriShape* a1, RE::BSStream* a2)
+{
+	// The file loader does not return a group index, so identify the first changed slot.
+	static thread_local std::vector<void*> groupsBefore;
+	const auto& groups = a1->GetMultiStreamTrishapeRuntimeData().instanceGroups;
+	groupsBefore.assign(groups.begin(), groups.end());
+
+	func(a1, a2);
+
+	uint32_t index = 0;
+	while (index < groups.size() && (!groups[index] || (index < groupsBefore.size() && groups[index] == groupsBefore[index])))
+		++index;
+
+	if (index < groups.size())
+		globals::features::grassOptimizations.bucketStore.CaptureEngineGroup(a1, index);
+}
+
+RE::BSMultiStreamInstanceTriShape* GrassOptimizations::Hooks::LoadGrassType::thunk(RE::BGSGrassManager* grassManager, RE::GrassParam* a_param, uint32_t CellXDivided, uint32_t CellYDivided, uint64_t* typeKey, RE::BSFixedString* modelPath)
+{
+	auto* shape = func(grassManager, a_param, CellXDivided, CellYDivided, typeKey, modelPath);
+
+	if (shape && modelPath)
+		globals::features::grassOptimizations.bucketStore.RegisterModel(shape, modelPath->c_str());
+
+	return shape;
+}
+
+void GrassOptimizations::Hooks::NiNode_OnVisible::thunk(RE::NiNode* This, RE::NiCullingProcess* process, std::int32_t alphaGroupIndex)
+{
+	auto& self = globals::features::grassOptimizations;
+	if (This != grassRoot.load(std::memory_order_relaxed) || !self.loaded)
+		return func(This, process, alphaGroupIndex);
+
+	// Match vanilla gate
+	if (std::bit_cast<std::uint32_t>(This->worldBound.radius) == 0 && !This->GetFlags().any(RE::NiAVObject::Flag::kAlwaysDraw))
 		return;
 
-	vbs[1] = b->compactedBuf;
-	ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
-	ctx->VSSetShaderResources(2, 1, &b->extrasSRV);
-	ctx->DrawIndexedInstancedIndirect(b->argsBuf, argsByteOffset);
+	// Queue optimized buckets for the main view, or for any view after two frames without a main-view visit.
+	const auto frame = globals::game::graphicsState->frameCount;
+	const bool mainView = process->camera && process->camera == RE::Main::WorldRootCamera();
+	if (mainView)
+		mainViewVisitFrame.store(frame, std::memory_order_relaxed);
 
-	for (uint32_t tier = 0; tier < (uint32_t)GrassMeshLibrary::LODTier::kCount; ++tier) {
-		GrassBucket::LODBin& bin = b->lodBins[tier];
-		if (!bin.active)
-			continue;
+	const bool queueOptimized = mainView || frame - mainViewVisitFrame.load(std::memory_order_relaxed) > 2;
 
-		const auto* lod = self.bucketStore.meshLibrary.GetLODMesh(b->meshId, (GrassMeshLibrary::LODTier)tier);
-		if (!lod || !lod->vertexBuffer || !lod->indexBuffer)
-			continue;
+	const auto snapshot = self.bucketStore.AcquireCullSnapshot();
+	const auto cull = [&](RE::NiAVObject* child) {
+		if (!snapshot || !snapshot->IsDirect(child))
+			child->Cull(process, alphaGroupIndex);
+		else if (queueOptimized)
+			process->AppendVirtual(*static_cast<RE::BSGeometry*>(child), alphaGroupIndex);
+	};
 
-		if (bin.argsIndexCount != lod->indexCount) {
-			const D3D11_BOX argBox{ argsByteOffset, 0, 0, argsByteOffset + sizeof(uint32_t), 1, 1 };
-			ctx->UpdateSubresource(bin.argsBuf, 0, &argBox, &lod->indexCount, 0, 0);
-			bin.argsIndexCount = lod->indexCount;
-		}
-
-		if (shadowState.vertexDesc != lod->descVal) {
-			shadowState.vertexDesc = lod->descVal;
-			shadowState.stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_VERTEX_DESC);
-			SetDirtyStates(0);
-		}
-
-		ctx->IASetIndexBuffer(lod->indexBuffer, DXGI_FORMAT_R16_UINT, 0);
-
-		vbs[0] = lod->vertexBuffer;
-		vbs[1] = bin.compactedBuf;
-		strides[0] = lod->meshStride;
-		ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
-		ctx->VSSetShaderResources(2, 1, &bin.extrasSRV);
-		ctx->DrawIndexedInstancedIndirect(bin.argsBuf, argsByteOffset);
+	// Visit direct shapes before shapes in child nodes, matching the engine's flattened grass order.
+	auto& rootChildren = This->GetChildren();
+	const std::span children(rootChildren.begin(), rootChildren.free_idx());
+	for (const auto& child : children) {
+		if (child && !child->AsNode())
+			cull(child.get());
 	}
+
+	for (const auto& child : children) {
+		if (auto* childNode = child ? child->AsNode() : nullptr) {
+			auto& nodeChildren = childNode->GetChildren();
+			for (const auto& shape : std::span(nodeChildren.begin(), nodeChildren.free_idx())) {
+				if (shape)
+					cull(shape.get());
+			}
+		}
+	}
+
+	if (snapshot && queueOptimized) {
+		for (const auto& proxy : snapshot->proxies)
+			process->AppendVirtual(*proxy, alphaGroupIndex);
+	}
+}
+
+void GrassOptimizations::Hooks::BSGrassShader_SetupGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* a2, std::uint32_t flags)
+{
+	auto& self = globals::features::grassOptimizations;
+
+	// Update from a main-view pass, so occlusion and fades see the main camera's PerFrame data.
+	const auto frame = globals::game::graphicsState->frameCount;
+	if (self.lastFrame != frame) {
+		const auto* cam = RE::Main::WorldRootCamera();
+		if (!cam || IsMainCameraPerFrame(cam->world.translate)) {
+			self.UpdateGrass(cam);
+			self.lastFrame = frame;
+		}
+	}
+
+	func(This, a2, flags);
+
+	auto* shadowState = globals::game::shadowState;
+	shadowState->SetPSTextureAddressMode(0, RE::BSGraphics::TextureAddressMode::kClampSClampT);
+	shadowState->SetPSTextureFilterMode(0, RE::BSGraphics::TextureFilterMode::kAnisotropic);
+}
+
+void GrassOptimizations::Hooks::BSGrassShader_SetupMaterial::thunk(RE::BSShader* This, const RE::BSLightingShaderMaterialBase* material)
+{
+	if (!globals::features::grassOptimizations.loaded)
+		func(This, material);
+}
+
+void GrassOptimizations::Hooks::DrawVanilla(RE::BSMultiStreamInstanceTriShape* geometry)
+{
+	auto& self = globals::features::grassOptimizations;
+	const bool optimized = self.loaded && self.HasCurrentCull();
+	const auto shape = optimized ? self.bucketStore.FindRenderedShape(geometry) : nullptr;
+	if (shape && self.bucketStore.IsShapeOptimized(*shape))
+		return;
+
+	auto* ctx = globals::d3d::context;
+	auto& groups = geometry->GetMultiStreamTrishapeRuntimeData().instanceGroups;
+
+	const auto snapshot = self.bucketStore.AcquireCullSnapshot();
+	const bool direct = self.loaded && snapshot && snapshot->IsDirect(geometry);
+
+	if (auto& cb = globals::features::grassOptimizations.vanillaDrawCB) {
+		ID3D11Buffer* marker = cb->CB();
+		ctx->VSSetConstantBuffers(13, 1, &marker);
+	}
+
+	for (uint32_t i = 0; i < groups.size(); ++i) {
+		auto* curInstanceGroup = groups[i];
+		if (!curInstanceGroup || (!direct && !curInstanceGroup->isVisible))
+			continue;
+
+		if (shape && self.bucketStore.IsGroupOptimized(*shape, i))
+			continue;
+
+		static REL::Relocation<void (*)(RE::BSGraphics::Renderer*, RE::BSGraphics::TriShape*, uint32_t, uint32_t, uint32_t, RE::BSGraphics::VertexDesc, RE::BSGraphics::VertexBuffer*)> DrawInstancedTriShape{ REL::RelocationID(75479, 77265) };
+		DrawInstancedTriShape(globals::game::renderer, geometry->GetGeometryRuntimeData().rendererData, 0, geometry->GetTrishapeRuntimeData().triangleCount, curInstanceGroup->instanceCount, geometry->GetGeometryRuntimeData().vertexDesc, curInstanceGroup->vertexBuffer);
+	}
+}
+
+void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass*, RE::BSMultiStreamInstanceTriShape* geometry)
+{
+	auto& self = globals::features::grassOptimizations;
+	if (auto* bucket = self.loaded ? self.bucketStore.FindBucket(geometry) : nullptr) {
+		if (self.HasCurrentCull() && bucket->optimizedReady && bucket->sliceTableCount)
+			self.DrawBucket(*bucket);
+	} else {
+		DrawVanilla(geometry);
+	}
+}
+
+void GrassOptimizations::Hooks::Install()
+{
+	auto& trampoline = SKSE::GetTrampoline();
+
+	stl::write_vfunc<0x0, BSMultiStreamInstanceTriShape_dtor>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
+	stl::write_vfunc<0x34, NiNode_OnVisible>(RE::VTABLE_NiNode[0]);
+	stl::write_vfunc<0x3C, AddGroup>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
+	stl::write_vfunc<0x3D, RemoveGroup>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
+
+	stl::write_vfunc<0x6, BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);
+	stl::write_vfunc<0x4, BSGrassShader_SetupMaterial>(RE::VTABLE_BSGrassShader[0]);
+
+	// Capture loaded cache groups here. Queued cache-generation groups use engine draws until attached.
+	stl::write_thunk_call<AddGroupGIDBuffer>(REL::RelocationID(15205, 15373).address() + Util::VersionedRelocation::Select(0x806, 0x75D, 0x76F));
+	stl::write_thunk_call<AddGroupGIDFile>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x39B, 0x38B));
+
+	// Record each grass type's source .nif path alongside its shape.
+	stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15204, 15372).address() + Util::VersionedRelocation::Select(0x2F5, 0x2F5, 0x305));
+	stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15205, 15373).address() + Util::VersionedRelocation::Select(0x62B, 0x597, 0x590));
+	stl::write_thunk_call<LoadGrassType>(REL::RelocationID(15206, 15374).address() + REL::Relocate(0x25C, 0x25C));
+
+	std::uint8_t patch[] = { 0x4C, 0x89, 0xF2 };  // mov rdx, r14
+	REL::safe_write(REL::RelocationID(100847, 107637).address() + REL::Relocate(0x660, 0x648), patch, sizeof(patch));
+	stl::write_thunk_call<DrawInstanceTriShape>(REL::RelocationID(100847, 107637).address() + REL::Relocate(0x663, 0x64B));
+	trampoline.write_branch<5>(REL::RelocationID(100847, 107637).address() + REL::Relocate(0x668, 0x650), REL::RelocationID(100847, 107637).address() + REL::Relocate(0x759, 0x73A));
+
+	// Skip mapping the vanilla dynamic fade buffer.
+	if (REL::Module::IsAE()) {
+		trampoline.write_branch<5>(
+			REL::RelocationID(99996, 106685).address() + Util::VersionedRelocation::Select(0x595, 0x595, 0x6A2),
+			REL::RelocationID(99996, 106685).address() + Util::VersionedRelocation::Select(0x6C6, 0x6C6, 0x7D6));
+	} else {
+		REL::safe_write(REL::RelocationID(99996, 106685).address() + 0x54D, REL::NOP5);
+	}
+
+	logger::info("[GRASS OPTIMIZATIONS] Installed hooks");
 }

@@ -125,12 +125,14 @@ public:
 	void SetupGrassMaterial(RE::BSLightingShaderProperty* sourceProperty, RE::BSLightingShaderProperty* grassProperty);
 
 	/** @brief Match the PBR PerMaterial layout at b1 in RunGrass.hlsl. */
-	struct alignas(16) GrassPBRConstants
+	struct GrassPBRConstants
 	{
 		uint32_t flags;
 		float params1[3];
 		float params2[4];
+		bool operator==(const GrassPBRConstants&) const = default;
 	};
+	static_assert(sizeof(GrassPBRConstants) == 32);
 
 	/** @brief Set the renderer's textures and samplers for a PBR grass material. */
 	static void SetGrassPBRTextures(const BSLightingShaderMaterialPBR* material);

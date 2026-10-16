@@ -120,10 +120,6 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 	if (!srcSRV)
 		return false;
 
-	const float effX = (float)srcW / std::max(1.0f, (float)screenSize.x);
-	const float effY = (float)srcH / std::max(1.0f, (float)screenSize.y);
-	texelPixels = kDownsampleFactor / std::clamp(std::max(effX, effY), 0.01f, 1.0f);
-
 	// Allocate at nominal resolution to avoid resizing as dynamic resolution changes.
 	// Pad to SPD tiles so mip reduction preserves edge texels and conservative depth bounds.
 	const auto padToTile = [](uint32_t v) { return (v + tileSize - 1) & ~(tileSize - 1); };

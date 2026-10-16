@@ -3,47 +3,26 @@
 #include "Buffer.h"
 #include "GrassMeshLibrary.h"
 
-struct BucketKey
-{
-	// Mesh ids come from the model's file name, so the triangle count keeps same-named models in other folders apart.
-	uint32_t meshId = 0;
-	// An optimized draw shares the representative shape's material state.
-	RE::BSShaderMaterial* material = nullptr;
-	// Unresolved meshes also require texture and vertex format identity.
-	RE::NiSourceTexture* tex = nullptr;
-	uint32_t triCount = 0;
-	uint64_t descVal = 0;
-	bool operator==(const BucketKey&) const = default;
-};
+struct GrassBucket;
+struct GrassShape;
 
-struct BucketKeyHash
-{
-	size_t operator()(const BucketKey& k) const
-	{
-		return (std::hash<uint32_t>{}(k.meshId) * 31) ^
-		       std::hash<void*>{}(k.material) ^
-		       std::hash<void*>{}(k.tex) ^
-		       (std::hash<uint32_t>{}(k.triCount) * 131) ^
-		       (std::hash<uint64_t>{}(k.descVal) << 1);
-	}
-};
+inline constexpr uint32_t kGrassStride = 32;   // The engine supplies 32-byte instance records.
+inline constexpr uint32_t kSourceStride = 32;  // Retain the engine record layout during the bucket migration.
+inline constexpr uint32_t kCullGroupSize = 64;
+inline constexpr uint32_t kMaxRecordGroups = 1u << 19;
 
-/** @brief One captured group of grass instances: raw half-packed records plus placement data. */
-struct BucketSlice
-{
-	RE::BSMultiStreamInstanceTriShape* shape = nullptr;
-	uint64_t generation = 0;
-	std::vector<uint8_t> data;  // raw 32-byte half-packed instance records
-	uint32_t count = 0;
-	float fadeStart = 0.0f;
-	RE::NiPoint3 origin;
-	uint32_t bufferOffset = UINT32_MAX;
-	// Origin-relative extent decoded at capture; world AABB = origin + [localMin, localMax].
-	RE::NiPoint3 localMin{ 0.0f, 0.0f, 0.0f };
-	RE::NiPoint3 localMax{ 0.0f, 0.0f, 0.0f };
-};
+// Draw tiers use the full mesh followed by the middle and far LOD meshes.
+inline constexpr uint32_t kTierCount = 1 + (uint32_t)GrassMeshLibrary::LODTier::kCount;
+inline constexpr uint32_t kCullRecordStride = 16;
+// Each indirect draw stores five DWORDs, with the instance count second.
+inline constexpr uint32_t kArgsStride = 5 * sizeof(uint32_t);
 
-// Use world-space slice bounds to build cached CPU culling runs.
+// Newly captured slices share this per-frame upload budget.
+inline constexpr uint64_t kUploadBudgetBytes = 16ull << 20;
+// Compaction shares this per-frame copy budget, but one slice may exceed it to guarantee progress.
+inline constexpr uint64_t kDefragBudgetBytes = 8ull << 20;
+
+/** @brief Stores world-space bounds for CPU culling. */
 struct SliceBounds
 {
 	alignas(16) float lo[4]{};
@@ -51,34 +30,51 @@ struct SliceBounds
 };
 static_assert(sizeof(SliceBounds) == 32);
 
-/** @brief A capture queued by the cell-load hooks, applied to a bucket on the next grass frame. */
-struct PendingCapture
+/** @brief Distinguishes native group lifetimes when the engine reuses a group slot. */
+struct GrassGroup
 {
-	RE::BSMultiStreamInstanceTriShape* shape = nullptr;
-	uint64_t generation = 0;
-	RE::BSShaderMaterial* material = nullptr;
-	bool pbrMaterial = false;
-	RE::NiPointer<RE::NiSourceTexture> diffuseTexture;
-	std::vector<uint8_t> bytes;
-	uint32_t count = 0;
-	uint32_t triangleCount = 0;
-	uint64_t descVal = 0;
-	RE::NiPoint3 origin;
-	RE::NiPoint3 localMin{ 0.0f, 0.0f, 0.0f };
-	RE::NiPoint3 localMax{ 0.0f, 0.0f, 0.0f };
-	RE::NiPoint3 boundCenter;
-	float modelRadius = 0.0f;
-	float wavePeriod = 1.0f;
+	std::atomic<bool> current{ true };
 };
 
-// Pad indirect args so their second DWORD, the instance count, starts at a 16-byte-aligned UAV window.
-inline constexpr uint32_t argsByteOffset = 12;
-inline constexpr uint32_t instanceCountOffset = argsByteOffset + sizeof(uint32_t);  // 16
-static_assert(instanceCountOffset % 16 == 0);
+/** @brief Stores a captured group's packed instances and placement data. */
+struct GrassChunk
+{
+	GrassBucket* bucket = nullptr;
+	GrassShape* owner = nullptr;
+	std::shared_ptr<GrassGroup> lifetime;
+	// Grass shapes span cells, so removals identify slices by engine group.
+	uint32_t engineGroup = UINT32_MAX;
 
-inline constexpr uint32_t kCullGroupSize = 64;
+	std::vector<uint8_t> data;
+	uint32_t count = 0;
+	uint32_t bufferOffset = UINT32_MAX;
+	uint32_t firstCullGroup = UINT32_MAX;  // This slice's groups stay contiguous while the bucket's clusters are valid.
 
-/** @brief Match the HLSL CullGroup layout for one slice's contiguous source instances. */
+	RE::NiPoint3 origin;
+	float maxScale = 1.0f;
+	float fadeStart = 0.0f;
+	SliceBounds bounds;
+};
+
+/** @brief Tracks a native shape's registration and owns its captured chunks. */
+struct GrassShape
+{
+	RE::BSMultiStreamInstanceTriShape* native = nullptr;
+	GrassMeshLibrary::MeshRecord* mesh = nullptr;
+	RE::NiPointer<RE::BSMultiStreamInstanceTriShape> geometry;
+
+	std::atomic<bool> registered{ true };
+	std::atomic<uint32_t> pendingChanges{ 0 };
+	// The lifecycle mutex protects groups, while the render thread owns chunks.
+	std::unordered_map<uint32_t, std::shared_ptr<GrassGroup>> groups;
+
+	GrassBucket* current = nullptr;
+	std::unordered_map<uint32_t, std::unique_ptr<GrassChunk>> chunks;
+	uint32_t residentInstances = 0;
+	bool admitted = false;
+};
+
+/** @brief Matches the HLSL layout for one contiguous group of source instances. */
 struct CullGroup
 {
 	float origin[3];
@@ -88,196 +84,133 @@ struct CullGroup
 };
 static_assert(sizeof(CullGroup) == 24);
 
-/** @brief Contains the instance data, GPU buffers and per-frame cull results for each grass type. */
+/** @brief Owns source records retained across views and asynchronous resizes. */
+struct GrassSourceBuffers
+{
+	uint32_t capacity = 0;
+	std::unique_ptr<Buffer> instances;
+};
+
+/** @brief Owns a shared output page with one view per LOD tier. */
+struct GrassCullBuffers
+{
+	std::unique_ptr<Buffer> records;
+	std::array<winrt::com_ptr<ID3D11ShaderResourceView>, kTierCount> compactedSRVs;
+
+	uint32_t capacity = 0;
+	uint32_t tiers = 0;
+	uint32_t used = 0;
+
+	uint32_t idleFrames = 0;
+	uint32_t underutilizedFrames = 0;
+};
+
+/** @brief Holds allocation results until the render thread adopts them. */
+struct BucketAllocation
+{
+	uint32_t capacity = 0;
+	GrassSourceBuffers source;
+
+	bool ok = false;
+	std::atomic<bool> done{ false };
+};
+
+/** @brief Owns source data and culling state for one mesh and material combination. */
 struct GrassBucket
 {
-	BucketKey key;  // Erase this bucket without scanning the map.
-	ID3D11Buffer* instanceBuf = nullptr;
-	ID3D11ShaderResourceView* instanceSRV = nullptr;
-	// Upload cached cull groups only when the runs change.
-	ID3D11Buffer* groupBuf = nullptr;
-	ID3D11ShaderResourceView* groupSRV = nullptr;
-
-	ID3D11Buffer* compactedBuf = nullptr;
-	ID3D11UnorderedAccessView* compactedUAV = nullptr;
-	ID3D11Buffer* extrasBuf = nullptr;
-	ID3D11UnorderedAccessView* extrasUAV = nullptr;
-	ID3D11ShaderResourceView* extrasSRV = nullptr;
-	// Holds the middle and far LOD counts in one UAV; copied into their indirect args after culling.
-	ID3D11Buffer* lodCounterBuf = nullptr;
-	ID3D11UnorderedAccessView* lodCounterUAV = nullptr;
-	// Give each bucket its own indirect arguments so the driver can overlap cull dispatches that write to different resources.
-	ID3D11Buffer* argsBuf = nullptr;
-	ID3D11UnorderedAccessView* argsUAV = nullptr;  // Expose only the instance count to the cull shader.
-	uint32_t argsIndexCount = 0;                   // Cache the index count currently stored in argsBuf.
-
-	/** @brief A compaction bin and indirect draw for one LOD tier, allocated only when that tier's mesh loaded. */
-	struct LODBin
-	{
-		ID3D11Buffer* compactedBuf = nullptr;
-		ID3D11UnorderedAccessView* compactedUAV = nullptr;
-		ID3D11Buffer* extrasBuf = nullptr;
-		ID3D11UnorderedAccessView* extrasUAV = nullptr;
-		ID3D11ShaderResourceView* extrasSRV = nullptr;
-		ID3D11Buffer* argsBuf = nullptr;
-		uint32_t argsIndexCount = 0;
-		uint32_t capacityInstances = 0;
-		bool active = false;
-
-		/** @brief Releases this bin's buffers and views. */
-		void Release()
-		{
-			auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
-			rel(compactedUAV);
-			rel(compactedBuf);
-			rel(extrasSRV);
-			rel(extrasUAV);
-			rel(extrasBuf);
-			rel(argsBuf);
-			capacityInstances = 0;
-			argsIndexCount = 0;
-			active = false;
-		}
-	};
-
-	// Indexed by GrassMeshLibrary::LODTier. Instances land in the main bin unless a tier claims them.
-	std::array<LODBin, (size_t)GrassMeshLibrary::LODTier::kCount> lodBins;
-
-	// Source mesh id, for easy lookup of the LOD mesh.
-	uint32_t meshId = 0;
-	// Retain the key's material for comparisons with later captures.
-	RE::BSTSmartPointer<RE::BSShaderMaterial> material;
-	bool pbrMaterial = false;
-	// BucketKey only carries the texture for unresolved meshes, so keep it here for re-detection. Owned,
-	// since re-detection dereferences it long after the shader property that supplied it may have gone.
-	RE::NiPointer<RE::NiSourceTexture> diffuseTexture;
-
-	uint32_t cullSlot = UINT32_MAX;
-	bool typeParamsValid = false;
-	float wavePeriod = 1.0f;
-	RE::NiPoint3 boundCenter{};
-	float modelRadius = 128.0f;
-	float distScale = 1.0f;
-	float minPixelScale = 1.0f;
-	ID3D11ShaderResourceView* complexSRV = nullptr;  // The active texture cache owns this view.
-	std::atomic<bool> optimizedReady{ false };
-	uint32_t indexCount = 0;  // Copy this mesh's index count into argsBuf when it changes.
-
-	uint32_t capacityInstances = 0;  // Source and cull buffers share this capacity.
-	uint32_t totalInstances = 0;     // This count includes the pending upload tail.
-	uint32_t residentInstances = 0;  // This count covers the contiguous uploaded or compacted prefix.
-	uint32_t underutilizedFrames = 0;
-	std::vector<BucketSlice> slices;
-	std::vector<SliceBounds> sliceBounds;  // parallel to slices; same size, same order
-
-	// Each SSE lane tests one of four adjacent runs.
-	// Cache bounds with modelRadius + 64 padding until the slices change.
+	/** @brief Stores four padded run bounds in SSE lanes. */
 	struct alignas(16) SliceRunBatch
 	{
 		float loX[4]{}, loY[4]{}, loZ[4]{};
 		float hiX[4]{}, hiY[4]{}, hiZ[4]{};
-		uint32_t firstGroup[4]{};  // These windows preserve the run order in cullGroups.
+		uint32_t firstGroup[4]{};  // Each lane indexes a contiguous range in cullGroups.
 		uint32_t groupCount[4]{};
+
+		/** @brief Starts or extends a lane's padded bounds with one slice. */
+		void IncludeBounds(uint32_t lane, const SliceBounds& bounds, float pad, bool starts)
+		{
+			const float lx = bounds.lo[0] - pad, ly = bounds.lo[1] - pad, lz = bounds.lo[2] - pad;
+			const float hx = bounds.hi[0] + pad, hy = bounds.hi[1] + pad, hz = bounds.hi[2] + pad;
+			loX[lane] = starts ? lx : std::min(loX[lane], lx);
+			loY[lane] = starts ? ly : std::min(loY[lane], ly);
+			loZ[lane] = starts ? lz : std::min(loZ[lane], lz);
+			hiX[lane] = starts ? hx : std::max(hiX[lane], hx);
+			hiY[lane] = starts ? hy : std::max(hiY[lane], hy);
+			hiZ[lane] = starts ? hz : std::max(hiZ[lane], hz);
+		}
 	};
 	static_assert(sizeof(SliceRunBatch) == 128);
 	STATIC_ASSERT_ALIGNAS_16(SliceRunBatch);
 
-	std::vector<SliceRunBatch> sliceRunBatches;
-	uint32_t sliceRunCount = 0;  // Exclude unused lanes in the final batch.
-	// One parent bounds a contiguous block of cell runs; four parents share an SSE batch.
-	static constexpr uint32_t kRunsPerCullBlock = 16;
+	// Each parent bounds this many cell runs, and four parents share an SSE batch.
+	inline static constexpr uint32_t kRunsPerCullBlock = 16;
 	static_assert(kRunsPerCullBlock % 4 == 0);
-	std::vector<SliceRunBatch> sliceBlockBatches;
-	bool sliceBlocksUseful = false;  // Scattered run order can make parent bounds too broad.
-	// Keep thread groups in their original run order.
-	std::vector<CullGroup> cullGroups;
-	uint32_t groupCapacity = 0;
-	uint32_t residentGroups = 0;   // These leading groups are already resident in groupBuf.
-	uint32_t clusteredSlices = 0;  // Cached runs cover [0, clusteredSlices); additions extend only the tail.
-	bool clustersValid = false;
-	bool dirty = false;
-	// Compact removal gaps on the GPU instead of uploading the surviving instances again.
-	bool needsCompact = false;
-	uint32_t firstNewSlice = UINT32_MAX;  // UINT32_MAX means there is no pending upload tail.
-	// The lowest stale slice that the rebuild will start from. When set to UINT32_MAX and dirty is true, all slices are rebuilt.
-	uint32_t rebuildFromSlice = UINT32_MAX;
-
-	// Atomic to make sure only one culling job queues the bucket per frame, ensuring setup is only done once per type per frame.
-	std::atomic<uint32_t> lastQueuedFrame{ UINT32_MAX };
-
-	uint32_t drawnFrame = UINT32_MAX;
-	// Identifies the pass by the passEnum + pixel-shader descriptor to prevent buckets from being drawn more than once per frame.
-	uint64_t drawnPassKey = UINT64_MAX;
-
-	RE::NiPoint3 coarseMin{};
-	RE::NiPoint3 coarseMax{};
-	bool coarseValid = false;
-	bool cullVisible = false;
-
-	// Select this bucket's visible slice ranges and dispatch groups from the shared table.
-	uint32_t sliceTableOffset = 0;
-	uint32_t sliceTableCount = 0;
-	uint32_t groupCount = 0;
-
-	/** @brief Drops this frame's cull verdict, so a skipped or failed cull cannot be reissued from stale args. */
-	void ResetCullState()
-	{
-		cullSlot = UINT32_MAX;
-		cullVisible = false;
-		sliceTableCount = 0;
-		groupCount = 0;
-	}
 
 	GrassBucket() = default;
-	// Owns raw COM pointers released in the destructor, so a copy would double-release them.
 	GrassBucket(const GrassBucket&) = delete;
 	GrassBucket& operator=(const GrassBucket&) = delete;
 
-	/** @brief Releases the GPU buffers and views, while keeping the instance data and slices. */
-	void ReleaseResources()
+	/** @brief Returns whether captured slices are waiting for upload. */
+	bool HasPendingSlices() const { return uploadedSlices < slices.size(); }
+
+	/** @brief Clears per-frame culling state to prevent draws from using stale results. */
+	void ResetCullState()
 	{
-		auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
-		rel(instanceBuf);
-		rel(instanceSRV);
-		rel(groupBuf);
-		rel(groupSRV);
-		rel(compactedBuf);
-		rel(compactedUAV);
-		rel(extrasBuf);
-		rel(extrasUAV);
-		rel(extrasSRV);
-		rel(lodCounterUAV);
-		rel(lodCounterBuf);
-		rel(argsUAV);
-		rel(argsBuf);
-		argsIndexCount = 0;
-		for (LODBin& bin : lodBins)
-			bin.Release();
-		capacityInstances = 0;
-		residentInstances = 0;
-		groupCapacity = 0;
-		residentGroups = 0;
+		output = nullptr;
+		cullSlot = UINT32_MAX;
+		sliceTableCount = 0;
+		groupCount = 0;
+		lodMeshes = {};
 	}
 
-	/** @brief Releases everything including instance data and slices. */
-	void Release()
-	{
-		ReleaseResources();
-		totalInstances = 0;
-		slices.clear();
-		sliceBounds.clear();
-		sliceRunBatches.clear();
-		sliceRunCount = 0;
-		sliceBlockBatches.clear();
-		sliceBlocksUseful = false;
-		cullGroups.clear();
-		clusteredSlices = 0;
-		clustersValid = false;
-		coarseValid = false;
-		firstNewSlice = UINT32_MAX;
-		rebuildFromSlice = UINT32_MAX;
-		underutilizedFrames = 0;
-	}
+	GrassAsset asset;
 
-	~GrassBucket() { Release(); }
+	GrassSourceBuffers source;
+	// The allocation worker prepares source replacements for the render thread to adopt.
+	std::shared_ptr<BucketAllocation> allocation;
+	std::vector<GrassChunk*> slices;
+
+	uint32_t totalInstances = 0;     // This includes instances awaiting upload.
+	uint32_t residentInstances = 0;  // This marks the end of resident records, including removal gaps.
+	uint32_t uploadedSlices = 0;     // Uploaded slices form a prefix in increasing source-offset order.
+	uint32_t underutilizedFrames = 0;
+	bool fragmented = false;
+
+	float boundExtent = 0.0f;
+	float maxScale = 1.0f;
+	float boundsPadding = 0.0f;
+	RE::NiPoint3 coarseMin{};
+	RE::NiPoint3 coarseMax{};
+	bool coarseValid = false;
+
+	std::unique_ptr<Buffer> groups;
+	std::vector<CullGroup> cullGroups;
+	uint32_t groupCapacity = 0;
+	uint32_t residentGroups = 0;  // Uploaded groups form a prefix of cullGroups.
+	// Removed groups keep zero counts until the cached runs are rebuilt.
+	uint32_t deadGroups = 0;
+	// Removals and compaction mark resident group ranges for upload.
+	std::vector<std::pair<uint32_t, uint32_t>> dirtyGroupRanges;
+
+	std::vector<SliceRunBatch> sliceRunBatches;
+	uint32_t sliceRunCount = 0;  // This excludes unused lanes in the final batch.
+	std::vector<SliceRunBatch> sliceBlockBatches;
+	uint32_t clusteredSlices = 0;  // Cached runs cover this slice prefix, and additions extend its tail.
+	bool clustersValid = false;
+	bool sliceBlocksUseful = false;  // Scattered run order can make parent bounds too broad.
+
+	// Keep the resolved LOD selection for all draws in this frame.
+	std::array<const GrassMeshLibrary::LODMesh*, kTierCount - 1> lodMeshes{};
+	ID3D11ShaderResourceView* complexSRV = nullptr;  // The active texture cache owns this view.
+	float distScale = 1.0f;
+	float minPixelScale = 1.0f;
+	GrassCullBuffers* output = nullptr;
+	uint32_t outputOffset = 0;
+	uint32_t cullSlot = UINT32_MAX;
+
+	// This window selects visible source runs from the shared slice table.
+	uint32_t sliceTableOffset = 0;
+	uint32_t sliceTableCount = 0;
+	uint32_t groupCount = 0;
+	bool optimizedReady = false;
 };

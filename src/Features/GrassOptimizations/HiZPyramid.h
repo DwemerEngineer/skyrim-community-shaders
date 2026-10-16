@@ -20,8 +20,6 @@ public:
 	uint32_t GetWidth() const { return width; }
 	/** @brief Returns the base level height in texels. */
 	uint32_t GetHeight() const { return height; }
-	/** @brief Returns nominal screen pixels per base-level texel. */
-	float GetTexelPixels() const { return texelPixels; }
 	/** @brief Returns the valid mip count, including only the base level if SPD is unavailable. */
 	uint32_t GetMipCount() const { return spdCS ? mipCount : 1u; }
 
@@ -66,7 +64,6 @@ private:
 
 	uint32_t width = 0;
 	uint32_t height = 0;
-	float texelPixels = (float)kDownsampleFactor;
 	uint32_t paddedWidth = 0;
 	uint32_t paddedHeight = 0;
 	uint32_t mipCount = 1;
