@@ -1,6 +1,8 @@
 #include "Features/GrassLighting.h"
 #include "Features/GrassOptimizations.h"
 
+#include <bit>
+
 void GrassOptimizations::SetupResources()
 {
 	cullParamsCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<CullParamsCB>(), "GrassOptimizations::CullParamsCB");
@@ -169,6 +171,10 @@ uint32_t GrassBucketStore::ReservedInstanceCapacity(uint32_t needed)
 
 uint32_t GrassBucketStore::GrownInstanceCapacity(uint32_t current, uint32_t needed)
 {
+	// Small buckets start at a power of two instead of reserving 4096 records.
+	if (!current)
+		return std::clamp(std::bit_ceil(needed), 256u, kMaxBucketInstances);
+
 	return (uint32_t)std::min<uint64_t>(kMaxBucketInstances, std::max<uint64_t>(ReservedInstanceCapacity(needed), 2ull * current));
 }
 
