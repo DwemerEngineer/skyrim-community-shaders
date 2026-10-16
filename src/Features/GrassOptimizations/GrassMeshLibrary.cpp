@@ -30,13 +30,7 @@ namespace
 
 GrassMeshLibrary::~GrassMeshLibrary()
 {
-	if (loader) {
-		{
-			std::scoped_lock lk(loader->mutex);
-			loaderThread.request_stop();
-		}
-		loader->wake.notify_one();
-	}
+	loader.reset();
 }
 
 void GrassMeshLibrary::RecordModelPath(RE::BSMultiStreamInstanceTriShape* shape, const char* modelPath)
@@ -90,33 +84,17 @@ void GrassMeshLibrary::EnsureLODMeshes(uint32_t meshId)
 		auto& entry = lodMeshes[meshId - 1][tier];
 		if (entry.attemptedLoad || entry.queued)
 			continue;
-		entry.queued = true;
 
-		if (!loader) {
-			loader = std::make_unique<Loader>();
-			loaderThread = std::jthread([state = loader.get()](std::stop_token stop) {
-				for (;;) {
-					LoadJob job;
-					{
-						std::unique_lock lk(state->mutex);
-						state->wake.wait(lk, [&] { return stop.stop_requested() || !state->jobs.empty(); });
-						if (stop.stop_requested())
-							return;
-						job = std::move(state->jobs.front());
-						state->jobs.pop_front();
-					}
-					LoadResult result{ job.meshId, job.tier, {} };
-					LoadLODMesh(result.mesh, job.stem, job.tier);
-					std::scoped_lock lk(state->mutex);
-					state->results.push_back(std::move(result));
-				}
-			});
-		}
-		{
-			std::scoped_lock lk(loader->mutex);
-			loader->jobs.push_back({ meshId, (LODTier)tier, stems[meshId - 1] });
-		}
-		loader->wake.notify_one();
+		entry.queued = true;
+		if (!loader)
+			loader = std::make_unique<BS::thread_pool<>>(1);
+
+		loader->detach_task([this, meshId, stem = stems[meshId - 1], tier = (LODTier)tier] {
+			LoadResult result{ meshId, tier, {} };
+			LoadLODMesh(result.mesh, stem, tier);
+			std::scoped_lock lock(resultMutex);
+			results.push_back(std::move(result));
+		});
 	}
 }
 
@@ -128,8 +106,8 @@ void GrassMeshLibrary::CommitLoadedLODMeshes()
 	static thread_local std::vector<LoadResult> done;
 	done.clear();
 	{
-		std::scoped_lock lk(loader->mutex);
-		done.swap(loader->results);
+		std::scoped_lock lk(resultMutex);
+		done.swap(results);
 	}
 
 	for (auto& result : done) {

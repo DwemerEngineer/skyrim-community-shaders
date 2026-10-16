@@ -1,6 +1,6 @@
 #pragma once
 
-#include <thread>
+#include <BS_thread_pool.hpp>
 
 /** @brief Byte stride of the per-instance records. */
 constexpr uint32_t kGrassStride = 32;
@@ -76,26 +76,13 @@ private:
 	// Parallel to stems, indexed by meshId - 1 then by LODTier. A deque to keep GetLODMesh's pointers valid after growth.
 	std::deque<std::array<LODMesh, (size_t)LODTier::kCount>> lodMeshes;
 
-	struct LoadJob
-	{
-		uint32_t meshId;
-		LODTier tier;
-		std::string stem;
-	};
 	struct LoadResult
 	{
 		uint32_t meshId;
 		LODTier tier;
 		LODMesh mesh;
 	};
-	struct Loader
-	{
-		std::mutex mutex;
-		std::condition_variable wake;
-		std::deque<LoadJob> jobs;
-		std::vector<LoadResult> results;
-	};
-	std::unique_ptr<Loader> loader;
-	// Declared last so the worker joins before its queues and loaded model trees are destroyed.
-	std::jthread loaderThread;
+	std::mutex resultMutex;
+	std::vector<LoadResult> results;
+	std::unique_ptr<BS::thread_pool<>> loader;
 };
