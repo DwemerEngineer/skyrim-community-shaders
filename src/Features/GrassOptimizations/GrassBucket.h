@@ -7,7 +7,7 @@ struct GrassBucket;
 struct GrassShape;
 
 inline constexpr uint32_t kGrassStride = 32;   // The engine supplies 32-byte instance records.
-inline constexpr uint32_t kSourceStride = 32;  // Retain the engine record layout during the bucket migration.
+inline constexpr uint32_t kSourceStride = 16;  // GrassInstance.hlsli defines the packed record layout.
 inline constexpr uint32_t kCullGroupSize = 64;
 inline constexpr uint32_t kMaxRecordGroups = 1u << 19;
 

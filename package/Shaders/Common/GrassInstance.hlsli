@@ -5,7 +5,7 @@
 
 namespace GrassInstance
 {
-	static const uint Stride = 32;
+	static const uint Stride = 16;
 	static const uint RecordStride = 16;
 
 	// The packed word contains a 19-bit group index, 9-bit fade and 4-bit flags.
@@ -55,15 +55,34 @@ namespace GrassInstance
 		return (sineTerm + harmonicTerm) * 0.3 + cosineTerm;
 	}
 
-	// Decode the engine's two half-packed instance vectors.
-	void Decode(uint4 first, uint4 second, out float4 data1, out float4 data2, out float4 data3, out float4 data4)
+	float DecodeQuaternionComponent(uint bits)
 	{
-		data1 = float4(f16tof32(first.x), f16tof32(first.x >> 16), f16tof32(first.y), f16tof32(first.y >> 16));
-		data2 = float4(f16tof32(first.z), f16tof32(first.z >> 16), f16tof32(first.w), f16tof32(first.w >> 16));
-		data3 = float4(f16tof32(second.x), f16tof32(second.x >> 16), f16tof32(second.y), f16tof32(second.y >> 16));
-		data4 = float4(f16tof32(second.z), f16tof32(second.z >> 16), f16tof32(second.w), f16tof32(second.w >> 16));
+		return ((float)(bits & 0x7FFF) - 16384.0) * (0.70710678 / 16383.0);
 	}
 
+	// Restore the vanilla layout from packed data
+	void Decode(uint4 packed, out float4 data1, out float4 data2, out float4 data3, out float4 data4)
+	{
+		const float a = DecodeQuaternionComponent(packed.z);
+		const float b = DecodeQuaternionComponent(packed.z >> 15);
+		const float c = DecodeQuaternionComponent(packed.w);
+
+		// The largest quaternion component was omitted and is reconstructed as the positive remainder.
+		const float big = sqrt(saturate(1.0 - a * a - b * b - c * c));
+		const uint omitted = packed.z >> 30;
+		const float4 q = omitted == 0 ? float4(big, a, b, c) : omitted == 1 ? float4(a, big, b, c) : omitted == 2 ? float4(a, b, big, c) : float4(a, b, c, big);
+		const float x = q.x, y = q.y, z = q.z, w = q.w;
+
+		const float3x3 rotation = float3x3(
+			1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w),
+			2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w),
+			2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y));
+
+		data1 = float4(f16tof32(packed.x), f16tof32(packed.x >> 16), f16tof32(packed.y), (float)(packed.y >> 16) / 65535.0);
+		data2 = float4(rotation[0], rotation[2][1]);
+		data3 = float4(rotation[1], rotation[2][2]);
+		data4 = float4(rotation[2][0], f16tof32(packed.w >> 16), 0.0, 0.0);
+	}
 }
 
 #endif  // __GRASS_INSTANCE_DEPENDENCY_HLSL__

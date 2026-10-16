@@ -242,7 +242,7 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 
 	const uint4 record = InstanceRecords.Load4((GrassOutputOffset + instanceID) * GrassInstance::RecordStride);
 	// Decode packed source records into the engine instance layout.
-	GrassInstance::Decode(GrassInstances.Load4(record.x * GrassInstance::Stride), GrassInstances.Load4(record.x * GrassInstance::Stride + 16), input.InstanceData1, input.InstanceData2, input.InstanceData3, input.InstanceData4);
+	GrassInstance::Decode(GrassInstances.Load4(record.x * GrassInstance::Stride), input.InstanceData1, input.InstanceData2, input.InstanceData3, input.InstanceData4);
 
 	uint groupIndex, flags;
 	float fade;

@@ -120,7 +120,7 @@ uint CullInstance(uint idx, GrassInstance::CullGroup group, out float2 wind, out
 	flags = 0;
 
 	float4 data1, data2, data3, data4;
-	GrassInstance::Decode(Instances.Load4(idx * GrassInstance::Stride), Instances.Load4(idx * GrassInstance::Stride + 16), data1, data2, data3, data4);
+	GrassInstance::Decode(Instances.Load4(idx * GrassInstance::Stride), data1, data2, data3, data4);
 
 	const float2 localXY = data1.xy;
 	const float localZ = data1.z;

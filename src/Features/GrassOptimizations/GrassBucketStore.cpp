@@ -196,28 +196,66 @@ std::optional<PendingCapture> GrassBucketStore::CaptureMetadata(RE::BSMultiStrea
 }
 
 // The engine stores position and brightness in halves 0-3, rotation rows at (4,5,6), (8,9,10), (12,7,11), and size variance at 13.
+// Pack the orthonormal rotation as a quaternion with its largest component omitted; Common/GrassInstance.hlsli decodes it.
 void GrassBucketStore::PackInstances(GrassChunk& slice, const void* sourceData)
 {
 	using DirectX::PackedVector::XMConvertHalfToFloat;
-	const auto* sourceBytes = static_cast<const uint8_t*>(sourceData);
-	slice.data.assign(sourceBytes, sourceBytes + (size_t)slice.count * kGrassStride);
+	slice.data.resize((size_t)slice.count * kSourceStride);
 	slice.maxScale = 1.0f;
 	RE::NiPoint3 localMin{ FLT_MAX, FLT_MAX, FLT_MAX };
 	RE::NiPoint3 localMax{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
 
+	const auto* sourceBytes = static_cast<const uint8_t*>(sourceData);
+	const auto packComponent = [](float component) {
+		const float normalized = std::clamp(component * std::numbers::sqrt2_v<float>, -1.0f, 1.0f);
+		return (uint32_t)(std::lround(normalized * 16383.0f) + 16384);
+	};
+
 	for (uint32_t instanceIndex = 0; instanceIndex < slice.count; ++instanceIndex) {
 		uint16_t halfValues[16];
 		std::memcpy(halfValues, sourceBytes + (size_t)instanceIndex * kGrassStride, sizeof(halfValues));
-		const float x = XMConvertHalfToFloat(halfValues[0]);
-		const float y = XMConvertHalfToFloat(halfValues[1]);
-		const float z = XMConvertHalfToFloat(halfValues[2]);
+		float values[16];
+
+		for (int componentIndex = 0; componentIndex < 13; ++componentIndex)
+			values[componentIndex] = XMConvertHalfToFloat(halfValues[componentIndex]);
+
 		slice.maxScale = std::max(slice.maxScale, std::abs(1.0f + XMConvertHalfToFloat(halfValues[13])));
-		localMin.x = std::min(localMin.x, x);
-		localMin.y = std::min(localMin.y, y);
-		localMin.z = std::min(localMin.z, z);
-		localMax.x = std::max(localMax.x, x);
-		localMax.y = std::max(localMax.y, y);
-		localMax.z = std::max(localMax.z, z);
+		localMin.x = std::min(localMin.x, values[0]);
+		localMin.y = std::min(localMin.y, values[1]);
+		localMin.z = std::min(localMin.z, values[2]);
+		localMax.x = std::max(localMax.x, values[0]);
+		localMax.y = std::max(localMax.y, values[1]);
+		localMax.z = std::max(localMax.z, values[2]);
+
+		const DirectX::XMFLOAT3X3 rotation{ values[4], values[5], values[6], values[8], values[9], values[10], values[12], values[7], values[11] };
+		DirectX::XMFLOAT4 quaternion;
+		// Engine rotation rows act on column vectors, while DirectXMath uses row vectors.
+		DirectX::XMStoreFloat4(&quaternion, DirectX::XMQuaternionRotationMatrix(DirectX::XMMatrixTranspose(DirectX::XMLoadFloat3x3(&rotation))));
+		const float components[]{ quaternion.x, quaternion.y, quaternion.z, quaternion.w };
+		uint32_t omittedComponent = 0;
+		for (uint32_t componentIndex = 1; componentIndex < 4; ++componentIndex) {
+			if (std::abs(components[componentIndex]) > std::abs(components[omittedComponent]))
+				omittedComponent = componentIndex;
+		}
+
+		const float rotationSign = components[omittedComponent] < 0.0f ? -1.0f : 1.0f;
+		const float rotationLength = std::sqrt(components[0] * components[0] + components[1] * components[1] + components[2] * components[2] + components[3] * components[3]);
+		uint32_t packedComponents[3];
+
+		for (uint32_t componentIndex = 0, packedIndex = 0; componentIndex < 4; ++componentIndex) {
+			if (componentIndex != omittedComponent)
+				packedComponents[packedIndex++] = packComponent(rotationSign * components[componentIndex] / rotationLength);
+		}
+
+		const uint32_t brightness = (uint32_t)std::lround(std::clamp(values[3], 0.0f, 1.0f) * 65535.0f);
+		const uint32_t packed[4] = {
+			(uint32_t)halfValues[0] | ((uint32_t)halfValues[1] << 16),
+			(uint32_t)halfValues[2] | (brightness << 16),
+			packedComponents[0] | (packedComponents[1] << 15) | (omittedComponent << 30),
+			packedComponents[2] | ((uint32_t)halfValues[13] << 16),
+		};
+
+		std::memcpy(slice.data.data() + (size_t)instanceIndex * kSourceStride, packed, sizeof(packed));
 	}
 
 	slice.bounds.lo[0] = slice.origin.x + localMin.x;
