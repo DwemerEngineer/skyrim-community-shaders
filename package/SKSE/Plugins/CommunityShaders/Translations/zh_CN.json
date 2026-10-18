@@ -877,7 +877,7 @@
     "feature.grass_lighting.detection_threshold_tooltip": "检测复杂草地纹理的阈值。值越低越严格。",
     "feature.grass_lighting.effects": "效果",
     "feature.grass_lighting.far_lod_brightness_tooltip": "调高或调低，直到最远处的 LOD 草地亮度与前方的中距离 LOD 草地一致。需要在草地优化中启用远距离 LOD。",
-    "feature.grass_lighting.far_lod_brightness": "远距离 LOD 草地",
+    "feature.grass_lighting.far_lod_brightness": "远距离 LOD 亮度",
     "feature.grass_lighting.glossiness": "光泽度",
     "feature.grass_lighting.glossiness_tooltip": "高光光泽度。",
     "feature.grass_lighting.key_feature_1": "增强的草地光照模型",
