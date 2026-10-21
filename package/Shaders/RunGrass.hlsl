@@ -581,23 +581,22 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float4 shadowColor = TexShadowMaskSampler.Load(int3(input.HPosition.xy, 0));
 	float dirDetailedShadow = SharedData::InInterior ? 1.0 : shadowColor.x;
-	float2 screenSpaceShadows = 1.0;
-#				if defined(SCREEN_SPACE_SHADOWS)
-#					ifdef GRASS_OPTIMIZATIONS
-	if (!SharedData::InInterior && input.IsFar <= 0.5)
-#					else
-	if (!SharedData::InInterior)
-#					endif
-		screenSpaceShadows = ScreenSpaceShadows::GetScreenSpaceShadows(input.HPosition.xyz, screenUV, screenNoise);
-#				endif  // SCREEN_SPACE_SHADOWS
 
 	float dirSoftShadow = dirDetailedShadow;
 	float skylightingShadowVisibility = 1.0;
 #				if defined(SKYLIGHTING)
 	sh2 skylightingSH = Skylighting::Sample(input.WorldPosition.xyz, normal, skylightingShadowVisibility);
 #				endif
-	dirDetailedShadow *= screenSpaceShadows.x;
-	dirSoftShadow *= dot(normal, SharedData::DirLightDirection.xyz) >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
+
+#				if defined(SCREEN_SPACE_SHADOWS)
+#					ifdef GRASS_OPTIMIZATIONS
+	if (!SharedData::InInterior && input.IsFar <= 0.5)
+#					else
+	if (!SharedData::InInterior)
+#					endif
+		dirDetailedShadow *= ScreenSpaceShadows::GetThinSurfaceScreenSpaceShadow(input.HPosition.xyz, screenUV, screenNoise,
+			dot(faceNormal, SharedData::DirLightDirection.xyz));
+#				endif  // SCREEN_SPACE_SHADOWS
 
 	float canopyVisibility = GrassLighting::GetCanopyVisibility(input.VertexNormal.w);
 	float dirClumpVisibility = canopyVisibility * GrassLighting::GetClumpLightVisibility(clumpNormal, SharedData::DirLightDirection.xyz);
@@ -867,12 +866,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #					else
 	if (!SharedData::InInterior)
 #					endif
-	{
-		float2 screenSpaceShadows = ScreenSpaceShadows::GetScreenSpaceShadows(input.HPosition.xyz, screenUV, screenNoise);
-		if (dirNdotL >= 0.0)
-			dirDetailedShadow *= screenSpaceShadows.x;
-		dirTransmissionShadow *= dirNdotL >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
-	}
+		dirDetailedShadow *= ScreenSpaceShadows::GetThinSurfaceScreenSpaceShadow(input.HPosition.xyz, screenUV, screenNoise,
+			dot(faceNormal, SharedData::DirLightDirection.xyz));
 #				endif  // SCREEN_SPACE_SHADOWS
 
 	float3 diffuseColor = 0;

@@ -2377,10 +2377,22 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	if defined(SCREEN_SPACE_SHADOWS) && defined(DEFERRED)
 	if (!SharedData::InInterior) {
-		float2 screenSpaceShadows = ScreenSpaceShadows::GetScreenSpaceShadows(input.Position.xyz, screenUV, screenNoise);
-		if (dirLightAngle >= 0.0)
-			dirDetailedShadow *= screenSpaceShadows.x;
-		dirTransmissionContactShadow = dirLightAngle >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
+#		if defined(TRUE_PBR)
+		if (foliageNormals) {
+			float foliageFaceLightAngle = dot(foliageFaceNormal, DirLightDirection);
+			dirDetailedShadow *= ScreenSpaceShadows::GetThinSurfaceScreenSpaceShadow(input.Position.xyz, screenUV, screenNoise, foliageFaceLightAngle);
+			if ((PBRFlags & PBR::Flags::Subsurface) == 0) {
+				float2 screenSpaceShadows = ScreenSpaceShadows::GetScreenSpaceShadows(input.Position.xyz, screenUV, screenNoise);
+				dirTransmissionContactShadow = foliageFaceLightAngle >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
+			}
+		} else
+#		endif
+		{
+			float2 screenSpaceShadows = ScreenSpaceShadows::GetScreenSpaceShadows(input.Position.xyz, screenUV, screenNoise);
+			if (dirLightAngle >= 0.0)
+				dirDetailedShadow *= screenSpaceShadows.x;
+			dirTransmissionContactShadow = dirLightAngle >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
+		}
 	}
 #	endif
 
