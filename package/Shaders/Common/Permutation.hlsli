@@ -106,7 +106,7 @@ namespace Permutation
 		float EffectRadius;
 		uint BaseTextureIsWorking;
 		uint RenderToUI;
-		uint pad;
+		float GrassCanopyHeight;  // Model-space height of the grass mesh being drawn
 	};
 
 }

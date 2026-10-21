@@ -36,12 +36,15 @@ public:
 		float FarLODBrightness = 1.0f;
 		float PBRWrappedLightingAmount = 0.5f;
 		float SubsurfaceBalance = 1.0f;
-		float pad0[2]{};
+		float CanopyOcclusion = 0.5f;
+		float ClumpShading = 0.5f;
 	};
 	STATIC_ASSERT_ALIGNAS_16(Settings);
 	static_assert(sizeof(Settings) == 48);
 	static_assert(offsetof(Settings, PBRWrappedLightingAmount) == 32);
 	static_assert(offsetof(Settings, SubsurfaceBalance) == 36);
+	static_assert(offsetof(Settings, CanopyOcclusion) == 40);
+	static_assert(offsetof(Settings, ClumpShading) == 44);
 
 	Settings settings;
 

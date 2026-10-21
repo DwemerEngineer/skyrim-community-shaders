@@ -52,6 +52,8 @@ struct VS_OUTPUT
 	float3 PreviousWorldPosition: POSITION2;
 #	ifdef GRASS_LIGHTING
 	float4 VertexNormal: POSITION4;
+	// Unnormalized direction around the plant, for rounding clump shading.
+	float3 ClumpNormal: POSITION5;
 #	else
 	float DirLightAngle: TEXCOORD1;
 #		ifndef GRASS_OPTIMIZATIONS
@@ -134,6 +136,18 @@ float3 CalculateWindDisplacement(VS_INPUT input, float windTimer)
 }
 
 #	ifdef GRASS_LIGHTING
+// Grass meshes are rooted at the model origin.
+float GetCanopyHeight(VS_INPUT input)
+{
+	return saturate(input.Position.z / max(Permutation::GrassCanopyHeight, 1.0));
+}
+
+// A pivot below the root gives the clump a dome-shaped normal field.
+float3 GetClumpNormal(VS_INPUT input, float3x3 world3x3)
+{
+	return mul(world3x3, input.Position.xyz + float3(0, 0, 0.5 * max(Permutation::GrassCanopyHeight, 1.0)));
+}
+
 float4 GetMSPosition(VS_INPUT input, float3x3 world3x3)
 #	else
 float4 GetMSPosition(VS_INPUT input)
@@ -219,7 +233,8 @@ VS_OUTPUT VanillaVertex(VS_INPUT input)
 #		ifdef GRASS_LIGHTING
 	// Vertex normal needs to be transformed to world-space for lighting calculations.
 	vsout.VertexNormal.xyz = mul(world3x3, input.Normal.xyz * 2.0 - 1.0);
-	vsout.VertexNormal.w = input.Color.w;
+	vsout.VertexNormal.w = GetCanopyHeight(input);
+	vsout.ClumpNormal = GetClumpNormal(input, world3x3);
 #		else
 	float3 instanceNormal = float3(input.InstanceData2.z, input.InstanceData3.zw);
 	vsout.DirLightAngle = saturate(dot(DirLightDirection.xyz, instanceNormal));
@@ -306,7 +321,8 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.LodTier = (float)(flags >> GrassInstance::FlagTierShift);
 #			ifdef GRASS_LIGHTING
 	vsout.VertexNormal.xyz = mul(world3x3, input.Normal.xyz * 2.0 - 1.0);
-	vsout.VertexNormal.w = input.Color.w;
+	vsout.VertexNormal.w = GetCanopyHeight(input);
+	vsout.ClumpNormal = GetClumpNormal(input, world3x3);
 #			endif
 #		endif
 
@@ -483,9 +499,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float3 viewDirection = -normalize(input.WorldPosition.xyz);
 	float3 vertexNormal = normalize(input.VertexNormal.xyz);
+	float3 clumpNormal = normalize(input.ClumpNormal);
 	float3 faceNormal = PBR::GetFoliageFaceNormal(input.WorldPosition.xyz, viewDirection, vertexNormal);
 	// Bent normals may face away from the camera on visible cards. Orient by the geometric face instead.
 	if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal)) {
+		vertexNormal = GrassLighting::GetClumpBlendedNormal(vertexNormal, clumpNormal);
 		vertexNormal = dot(vertexNormal, faceNormal) < 0.0f ? -vertexNormal : vertexNormal;
 	}
 
@@ -581,6 +599,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	dirDetailedShadow *= screenSpaceShadows.x;
 	dirSoftShadow *= dot(normal, SharedData::DirLightDirection.xyz) >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
 
+	float canopyVisibility = GrassLighting::GetCanopyVisibility(input.VertexNormal.w);
+	float dirClumpVisibility = canopyVisibility * GrassLighting::GetClumpLightVisibility(clumpNormal, SharedData::DirLightDirection.xyz);
+	dirDetailedShadow *= dirClumpVisibility;
+	dirSoftShadow *= dirClumpVisibility;
+
 	float wrap = saturate(SharedData::grassLightingSettings.PBRWrappedLightingAmount);
 	DirectLightingOutput totalLighting = (DirectLightingOutput)0;
 	DirectContext dirContext = CreateDirectLightingContext(normal, normal, vertexNormal, viewDirection, viewDirection,
@@ -613,6 +636,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				else if (light.lightFlags & LightLimitFix::LightFlags::Shadow)
 					lightShadow = shadowColor[light.shadowLightIndex];
 				float3 lightDirection = lightVector / max(lightDist, EPSILON_DIVISION);
+				lightShadow *= canopyVisibility * GrassLighting::GetClumpLightVisibility(clumpNormal, lightDirection);
 				DirectContext pointContext = CreateDirectLightingContext(normal, normal, vertexNormal, viewDirection, viewDirection,
 					lightDirection, lightDirection, lightColor, lightShadow, lightShadow);
 				DirectLightingOutput pointOutput;
@@ -628,6 +652,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	IndirectLobeWeights indirectLobes;
 	IndirectContext indirectContext = CreateIndirectLightingContext(normal, vertexNormal, viewDirection);
 	PBR::GetIndirectLobeWeightsFoliage(indirectLobes, indirectContext, material, grassSurface);
+	indirectLobes.diffuse *= canopyVisibility;
+	indirectLobes.specular *= canopyVisibility;
+	indirectLobes.frontTransmission *= canopyVisibility;
+	indirectLobes.backTransmission *= canopyVisibility;
 
 	float3 directColor = totalLighting.diffuse + totalLighting.transmission;
 	float3 directionalAmbientColor = Color::Ambient(max(0, SharedData::GetAmbient(normal)));
@@ -777,9 +805,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float2 screenUV = FrameBuffer::ViewToUV(viewPosition);
 	float screenNoise = Random::InterleavedGradientNoise(input.HPosition.xy, SharedData::FrameCount);
 
+	float3 clumpNormal = normalize(input.ClumpNormal);
 	float3 faceNormal = PBR::GetFoliageFaceNormal(input.WorldPosition.xyz, viewDirection, normal);
 	// Bent normals may face away from the camera on visible cards. Orient by the geometric face instead.
 	if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal)) {
+		normal = GrassLighting::GetClumpBlendedNormal(normal, clumpNormal);
 		normal = dot(normal, faceNormal) < 0.0f ? -normal : normal;
 	}
 
@@ -882,6 +912,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Receiver opacity cannot determine whether the object blocking sunlight transmits it.
 	dirTransmissionShadow = min(dirTransmissionShadow, dirShadow);
 
+	float canopyVisibility = GrassLighting::GetCanopyVisibility(input.VertexNormal.w);
+	float dirClumpVisibility = canopyVisibility * GrassLighting::GetClumpLightVisibility(clumpNormal, SharedData::DirLightDirection.xyz);
+	dirDetailedShadow *= dirClumpVisibility;
+	dirTransmissionShadow *= dirClumpVisibility;
+
 	float3 albedo = baseColor.xyz * vertexColor;
 	float3 reflectionAlbedo, frontTransmissionAlbedo, backTransmissionAlbedo;
 	GrassLighting::GetSubsurfaceAlbedos(albedo, SharedData::grassLightingSettings.SubsurfaceScatteringAmount,
@@ -936,7 +971,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 				float3 normalizedLightDirection = normalize(lightDirection);
 
-				lightColor *= lightShadow;
+				lightColor *= lightShadow * canopyVisibility * GrassLighting::GetClumpLightVisibility(clumpNormal, normalizedLightDirection);
 
 				float NdotL = dot(normal, normalizedLightDirection);
 				float3 lightDiffuseColor, lightTransmissionColor;
@@ -965,7 +1000,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		directionalAmbientColor = ImageBasedLighting::GetDiffuseIBL(directionalAmbientColor, -normal);
 #				endif
 
-	directionalAmbientColor *= reflectionAlbedo;
+	directionalAmbientColor *= reflectionAlbedo * canopyVisibility;
 	diffuseColor += directionalAmbientColor;
 
 #				if defined(SKYLIGHTING)
@@ -974,7 +1009,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	[unroll] for (uint side = 0; side < 2; ++side)
 	{
-		float3 transmissionAlbedo = (side == 0 ? frontTransmissionAlbedo : backTransmissionAlbedo);
+		float3 transmissionAlbedo = (side == 0 ? frontTransmissionAlbedo : backTransmissionAlbedo) * canopyVisibility;
 		[branch] if (any(transmissionAlbedo > 0.0))
 		{
 			float3 transmissionNormal = side == 0 ? normal : -normal;

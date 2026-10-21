@@ -16,7 +16,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MidLODBrightness,
 	FarLODBrightness,
 	PBRWrappedLightingAmount,
-	SubsurfaceBalance)
+	SubsurfaceBalance,
+	CanopyOcclusion,
+	ClumpShading)
 
 void GrassLighting::DrawSettings()
 {
@@ -53,6 +55,15 @@ void GrassLighting::DrawSettings()
 		ImGui::SliderFloat(T(TKEY("sss_balance"), "SSS Balance"), &settings.SubsurfaceBalance, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextWrapped("%s", T(TKEY("sss_balance_tooltip"), "Share of non-PBR subsurface light sent to the side of a blade facing away from the light, shining through; the lit side receives the rest. 0 keeps it on the lit side, 0.5 splits it equally and 1 (default) sends all of it through. Does not change reflected light or the total subsurface strength. PBR balance is controlled by the material."));
+		}
+
+		ImGui::SliderFloat(T(TKEY("canopy_occlusion"), "Canopy Occlusion"), &settings.CanopyOcclusion, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextWrapped("%s", T(TKEY("canopy_occlusion_tooltip"), "Darkens grass toward the root of each plant, where the blades above block sunlight and sky. Zero disables it; 1 leaves roots almost unlit. Applies to PBR and non-PBR grass."));
+		}
+		ImGui::SliderFloat(T(TKEY("clump_shading"), "Clump Shading"), &settings.ClumpShading, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextWrapped("%s", T(TKEY("clump_shading_tooltip"), "Shades each plant as a rounded volume: blade normals bend toward the plant's dome shape, and the side of the plant facing away from a light is dimmed because that light must pass through the plant to reach it. Zero keeps flat per-blade shading. Applies to PBR and non-PBR grass."));
 		}
 
 		ImGui::Spacing();
@@ -108,6 +119,8 @@ void GrassLighting::LoadSettings(json& o_json)
 	settings = o_json;
 	settings.SubsurfaceScatteringAmount = std::clamp(settings.SubsurfaceScatteringAmount, 0.0f, 1.0f);
 	settings.SubsurfaceBalance = std::clamp(settings.SubsurfaceBalance, 0.0f, 1.0f);
+	settings.CanopyOcclusion = std::clamp(settings.CanopyOcclusion, 0.0f, 1.0f);
+	settings.ClumpShading = std::clamp(settings.ClumpShading, 0.0f, 1.0f);
 }
 
 void GrassLighting::SaveSettings(json& o_json)
