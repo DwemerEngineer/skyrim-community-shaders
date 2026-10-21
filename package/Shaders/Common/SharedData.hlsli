@@ -54,7 +54,8 @@ namespace SharedData
 		float MidLODBrightness;
 		float FarLODBrightness;
 		float PBRWrappedLightingAmount;
-		float3 pad0;
+		float SubsurfaceBalance;
+		float2 pad0;
 	};
 
 	struct CPMSettings

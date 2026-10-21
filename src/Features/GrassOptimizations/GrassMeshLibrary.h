@@ -171,6 +171,8 @@ struct BucketKeyHash
 			combine(value);
 		for (float value : m.constants.params3)
 			combine(value);
+		for (float value : m.constants.params4)
+			combine(value);
 
 		combine(k.draw.wavePeriod);
 

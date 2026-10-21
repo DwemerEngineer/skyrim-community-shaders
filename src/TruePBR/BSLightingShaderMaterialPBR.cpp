@@ -48,6 +48,8 @@ void BSLightingShaderMaterialPBR::CopyMembers(RE::BSShaderMaterial* that)
 
 	loadedWithFeature = pbrThat->loadedWithFeature;
 	pbrFlags = pbrThat->pbrFlags;
+	subsurfaceBalance = pbrThat->subsurfaceBalance;
+	foliageParameters = pbrThat->foliageParameters;
 	coatRoughness = pbrThat->coatRoughness;
 	coatSpecularLevel = pbrThat->coatSpecularLevel;
 	fuzzColor = pbrThat->fuzzColor;
@@ -72,6 +74,8 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 	struct HashContainer
 	{
 		uint32_t pbrFlags = 0;
+		float subsurfaceBalance = 0.75f;
+		std::array<float, 3> foliageParameters = { 0.5f, 0.5f, 1.f };
 		float coatRoughness = 0.f;
 		float coatSpecularLevel = 0.f;
 		std::array<float, 3> fuzzColor = { 0.f, 0.f, 0.f };
@@ -96,6 +100,8 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 	} hashes;
 
 	hashes.pbrFlags = pbrFlags.underlying();
+	hashes.subsurfaceBalance = subsurfaceBalance;
+	hashes.foliageParameters = foliageParameters;
 	hashes.coatRoughness = coatRoughness * 100.f;
 	hashes.coatSpecularLevel = coatSpecularLevel * 100.f;
 	hashes.fuzzColor[0] = fuzzColor[0] * 100.f;
@@ -140,6 +146,15 @@ void BSLightingShaderMaterialPBR::ApplyTextureSetData(const TruePBR::PBRTextureS
 	specularColorScale = textureSetData.roughnessScale;
 	specularPower = textureSetData.specularLevel;
 	rimLightPower = textureSetData.displacementScale;
+	subsurfaceBalance = std::clamp(textureSetData.subsurfaceBalance, 0.f, 1.f);
+	if (textureSetData.foliage) {
+		pbrFlags.set(PBRFlags::Foliage);
+	} else {
+		pbrFlags.reset(PBRFlags::Foliage);
+	}
+	foliageParameters = { std::clamp(textureSetData.foliageSpecularWeight, 0.f, 1.f),
+		std::clamp(textureSetData.foliageBackSpecularWeight, 0.f, 1.f),
+		std::clamp(textureSetData.foliageBackRoughnessScale, 0.f, 3.f) };
 
 	if (pbrFlags.any(PBRFlags::TwoLayer)) {
 		specularColor = textureSetData.coatColor;
@@ -336,6 +351,16 @@ const RE::NiColor& BSLightingShaderMaterialPBR::GetSubsurfaceColor() const
 float BSLightingShaderMaterialPBR::GetSubsurfaceOpacity() const
 {
 	return subSurfaceLightRolloff;
+}
+
+float BSLightingShaderMaterialPBR::GetSubsurfaceBalance() const
+{
+	return subsurfaceBalance;
+}
+
+const std::array<float, 3>& BSLightingShaderMaterialPBR::GetFoliageParameters() const
+{
+	return foliageParameters;
 }
 
 const RE::NiColor& BSLightingShaderMaterialPBR::GetCoatColor() const

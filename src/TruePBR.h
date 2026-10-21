@@ -131,9 +131,10 @@ public:
 		float params1[3];
 		float params2[4];
 		float params3[4];
+		float params4[4];
 		bool operator==(const GrassPBRConstants&) const = default;
 	};
-	static_assert(sizeof(GrassPBRConstants) == 48);
+	static_assert(sizeof(GrassPBRConstants) == 64 && offsetof(GrassPBRConstants, params4) == 48);
 
 	/** @brief Set the renderer's textures and samplers for a PBR grass material. */
 	static void SetGrassPBRTextures(const BSLightingShaderMaterialPBR* material);
@@ -170,6 +171,11 @@ public:
 
 		RE::NiColor subsurfaceColor;
 		float subsurfaceOpacity = 0.f;
+		float subsurfaceBalance = 0.75f;
+		bool foliage = false;
+		float foliageSpecularWeight = 0.5f;
+		float foliageBackSpecularWeight = 0.5f;
+		float foliageBackRoughnessScale = 1.f;
 
 		RE::NiColor coatColor = { 1.f, 1.f, 1.f };
 		float coatStrength = 1.f;

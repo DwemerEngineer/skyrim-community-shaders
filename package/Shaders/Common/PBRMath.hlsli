@@ -2,6 +2,7 @@
 #define __PBR_MATH_HLSL__
 
 #include "Common/BRDF.hlsli"
+#include "Common/ColorManagement.hlsli"
 #include "Common/Math.hlsli"
 
 namespace PBR
@@ -33,6 +34,18 @@ namespace PBR
 		static const uint HairMarschner = (1 << 10);
 		static const uint Glint = (1 << 11);
 		static const uint ProjectedGlint = (1 << 12);
+		static const uint Foliage = (1 << 13);
+	}
+
+	bool IsFoliageMaterial(uint flags)
+	{
+#if defined(LANDSCAPE) || defined(LODLANDSCAPE)
+		return false;
+#elif defined(TREE_ANIM)
+		return (flags & (Flags::Foliage | Flags::Subsurface)) != 0;
+#else
+		return (flags & Flags::Foliage) != 0;
+#endif
 	}
 
 	namespace TerrainFlags
@@ -103,28 +116,67 @@ namespace PBR
 		return F0 * specularBRDF.x + specularBRDF.y;
 	}
 
-
-	/** @brief Splits a thin foliage sheet so its underside is never darker than its lit face; lower opacity favors the underside.
-	 *  @param baseColor Color of the lit face
-	 *  @param scatteringColor Color of light transmitted to the underside
-	 */
-	void GetFoliageSubsurfaceAlbedos(float3 baseColor, float3 scatteringColor, float opacity,
-		out float3 reflectionAlbedo, out float3 transmissionAlbedo)
+	float3 GetFoliageNormal(float3 N, float3 V)
 	{
-		// OpenPBR thin sheet at full subsurface weight: R = (1-g)/2, T = (1+g)/2, with forward anisotropy
-		// g = 0.5 * (1 - opacity) in [0, 0.5]. Opacity 1 is OpenPBR's balanced default, opacity 0 transmits 75%.
-		float transmittedShare = 0.5f + 0.25f * (1.0f - saturate(opacity));
-		reflectionAlbedo = baseColor * (1.0f - transmittedShare);
-		transmissionAlbedo = scatteringColor * transmittedShare;
+		return dot(N, V) < 0.0f ? -N : N;
 	}
 
-	/** @brief Normalized foliage reflection with optional wrap, and transmission confined to backlighting. */
+	// Bent vertex normals do not identify the visible card face. Derivatives require uniform control flow.
+	float3 GetFoliageFaceNormal(float3 worldPosition, float3 V, float3 fallbackNormal)
+	{
+		float3 faceNormal = cross(ddx(worldPosition), ddy(worldPosition));
+		float lengthSq = dot(faceNormal, faceNormal);
+		faceNormal = lengthSq > 1e-12f ? faceNormal * rsqrt(lengthSq) : fallbackNormal;
+		return GetFoliageNormal(faceNormal, V);
+	}
+
+	// Normal-variance filtering from Tokuyoshi and Kaplanyan (2019).
+	float FilterFoliageRoughness(float roughness, float3 normalDx, float3 normalDy)
+	{
+		float variance = 0.25f * (dot(normalDx, normalDx) + dot(normalDy, normalDy));
+		float kernelRoughnessSq = min(2.0f * variance, 0.18f);
+		float roughnessSq = roughness * roughness;
+		return sqrt(sqrt(saturate(roughnessSq * roughnessSq + kernelRoughnessSq)));
+	}
+
+	void GetFoliageSubsurfaceAlbedos(float3 baseColor, float3 scatteringColor, float opacity, float balance,
+		out float reflectionWeight, out float3 frontTransmissionAlbedo, out float3 backTransmissionAlbedo)
+	{
+		float subsurfaceShare = 1.0f - saturate(opacity);
+		float backShare = saturate(balance);
+		// Light scattered inside the sheet is no longer available for surface reflection.
+		float3 weights = float3(subsurfaceShare * (1.0f - backShare), subsurfaceShare * backShare, 1.0f - subsurfaceShare);
+		float3 litFaceAlbedo = weights.z * baseColor + weights.x * scatteringColor;
+#if defined(TRUE_PBR) && (defined(TREE_ANIM) || defined(LIGHTING))
+		// Subsurface share and balance are linear energy shares, not gamma-encoded material colors.
+		if (IsFoliageMaterial(PBRFlags)) {
+			// Both lit-face lobes leave the same side, so they must sum before encoding.
+			litFaceAlbedo = Color::LinearToPBRMaterial(weights.z * Color::PBRMaterialToLinear(baseColor) + weights.x * Color::PBRMaterialToLinear(scatteringColor));
+			weights = Color::LinearToPBRMaterial(weights);
+		}
+#endif
+		reflectionWeight = weights.z;
+		frontTransmissionAlbedo = saturate(litFaceAlbedo - baseColor * weights.z);
+		backTransmissionAlbedo = saturate(scatteringColor * weights.y);
+	}
+
+	// Light crossing a card exits away from a face turned toward the light, whatever its bent normal says.
+	float GetFoliageBackTransmissionVisibility(float3 faceNormal, float3 L)
+	{
+		return 1.0f - saturate(4.0f * dot(faceNormal, L));
+	}
+
+	// Approximate canopy transmission using receiver opacity when occluder material is unavailable.
+	float GetFoliageShadowVisibility(float shadow, float opacity)
+	{
+		return lerp(1.0f - saturate(opacity), 1.0f, saturate(shadow));
+	}
+
+	// The squared denominator preserves lobe energy as wrap broadens the terminator.
 	float2 GetFoliageDiffuseCosines(float NdotL, float wrap)
 	{
-		// Wrap only reflection; transmission must not illuminate the light-facing side.
-		// The squared denominator normalizes the wrapped reflection lobe over the sphere.
-		float reflectionCosine = saturate((NdotL + wrap) / ((1.0f + wrap) * (1.0f + wrap)));
-		return float2(reflectionCosine, saturate(-NdotL));
+		float normalization = 1.0f / ((1.0f + wrap) * (1.0f + wrap));
+		return float2(saturate((NdotL + wrap) * normalization), saturate((wrap - NdotL) * normalization));
 	}
 
 	/** @brief Evaluates thin-foliage diffuse lobes with separate reflection and transmission shadows. */
@@ -135,6 +187,22 @@ namespace PBR
 		float2 diffuseCosines = GetFoliageDiffuseCosines(NdotL, wrap);
 		reflection = reflectionAlbedo * diffuseCosines.x * irradiance * reflectionShadow;
 		transmission = transmissionAlbedo * diffuseCosines.y * irradiance * transmissionShadow;
+	}
+
+	void GetFoliageDirectScattering(float3 reflectionAlbedo, float3 frontTransmissionAlbedo, float3 backTransmissionAlbedo,
+		float3 shineThroughAlbedo, float opacity, float3 irradiance, float NdotL, float wrap, float reflectionShadow, float2 transmissionShadows,
+		out float3 reflection, out float3 transmission)
+	{
+		float3 transmittance = (1.0f - saturate(opacity)).xxx;
+#if defined(TRUE_PBR) && (defined(TREE_ANIM) || defined(LIGHTING))
+		if (IsFoliageMaterial(PBRFlags))
+			transmittance = Color::LinearToPBRMaterial(transmittance);
+#endif
+		// Share the wrapped shading response so flat card boundaries do not split the transmission lobe.
+		float3 transmissionAlbedo = saturate(shineThroughAlbedo * transmittance + backTransmissionAlbedo);
+		GetFoliageDirectScattering(reflectionAlbedo, transmissionAlbedo, irradiance,
+			NdotL, wrap, reflectionShadow, transmissionShadows.y, reflection, transmission);
+		transmission += frontTransmissionAlbedo * saturate(NdotL) * irradiance * transmissionShadows.x;
 	}
 
 	/// @brief Directional albedo of the OpenPBR fuzz layer (Zeltner et al. 2022 sheen)
@@ -150,7 +218,6 @@ namespace PBR
 		float d = (NdotV - m) / s;
 		return exp(-0.5 * d * d) / (s * sqrt(Math::TAU)) + o;
 	}
-
 
 	/// @brief Evaluate the OpenPBR fuzz lobe (Zeltner et al. 2022 sheen) as a linearly transformed cosine
 	/// @param L Light direction
@@ -175,7 +242,6 @@ namespace PBR
 		float scale = aInv / dot(wo, wo);
 		return max(wo.z, 0.0) * Math::INV_PI * scale * scale;
 	}
-
 
 	/// @brief Evaluate the fuzz lobe on the viewer-side face of a thin-walled surface lit from behind
 	/// @param L Light direction, behind the surface

@@ -15,7 +15,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ComplexGrassThreshold,
 	MidLODBrightness,
 	FarLODBrightness,
-	PBRWrappedLightingAmount)
+	PBRWrappedLightingAmount,
+	SubsurfaceBalance)
 
 void GrassLighting::DrawSettings()
 {
@@ -47,12 +48,11 @@ void GrassLighting::DrawSettings()
 	if (ImGui::TreeNodeEx(T(TKEY("effects"), "Effects"), ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::SliderFloat(T(TKEY("sss_amount"), "SSS Amount"), &settings.SubsurfaceScatteringAmount, 0.0f, 1.0f);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("%s", T(TKEY("sss_tooltip"),
-								  "Subsurface Scattering (SSS) amount. "
-								  "Soft lighting controls how evenly lit an object is. "
-								  "Back lighting illuminates the back face of an object. "
-								  "Combined to model the transport of light through the surface. "
-								  "Applies to non-PBR grass. PBR subsurface scattering is controlled by the material and its texture."));
+			ImGui::TextWrapped("%s", T(TKEY("sss_tooltip"), "Subsurface scattering strength for non-PBR grass. Zero disables it. SSS Balance distributes the subsurface light between the two sides without changing its total. PBR subsurface scattering is controlled by the material and its texture."));
+		}
+		ImGui::SliderFloat(T(TKEY("sss_balance"), "SSS Balance"), &settings.SubsurfaceBalance, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextWrapped("%s", T(TKEY("sss_balance_tooltip"), "Share of non-PBR subsurface light sent to the side of a blade facing away from the light, shining through; the lit side receives the rest. 0 keeps it on the lit side, 0.5 splits it equally and 1 (default) sends all of it through. Does not change reflected light or the total subsurface strength. PBR balance is controlled by the material."));
 		}
 
 		ImGui::Spacing();
@@ -63,7 +63,7 @@ void GrassLighting::DrawSettings()
 	if (ImGui::TreeNodeEx(T(TKEY("pbr_grass"), "PBR Grass"), ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::SliderFloat(T(TKEY("pbr_wrapped_lighting_amount"), "PBR Wrapped Lighting Amount"), &settings.PBRWrappedLightingAmount, 0.0f, 1.0f);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextWrapped("%s", T(TKEY("pbr_wrapped_lighting_tooltip"), "Softens lighting around the edges of PBR grass. Zero uses Lambert reflection and transmission on opposite sides of the blade. Higher values broaden reflection while preserving its energy. Transmission remains on the backlit side."));
+			ImGui::TextWrapped("%s", T(TKEY("pbr_wrapped_lighting_tooltip"), "Softens lighting on PBR grass by overlapping the lit-side and shine-through lighting where a blade turns edge-on to the light. Zero uses plain Lambert lighting, which can leave normal-mapped streaks nearly black under a high sun. Default 0.5. Each side keeps its total energy."));
 		}
 		ImGui::TreePop();
 	}
@@ -106,6 +106,8 @@ void GrassLighting::DrawSettings()
 void GrassLighting::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	settings.SubsurfaceScatteringAmount = std::clamp(settings.SubsurfaceScatteringAmount, 0.0f, 1.0f);
+	settings.SubsurfaceBalance = std::clamp(settings.SubsurfaceBalance, 0.0f, 1.0f);
 }
 
 void GrassLighting::SaveSettings(json& o_json)

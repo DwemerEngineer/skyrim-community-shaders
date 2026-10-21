@@ -118,6 +118,7 @@ namespace ShaderConstants
 		const int32_t PBRParams1 = 15;
 		const int32_t PBRParams2 = 16;
 		const int32_t PBRParams3 = 17;
+		const int32_t PBRParams4 = 18;
 	};
 
 	struct EffectPS
