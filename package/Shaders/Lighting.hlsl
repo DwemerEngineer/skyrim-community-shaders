@@ -2956,7 +2956,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	directionalAmbientColor *= outputAlbedo;
 
 #	if defined(SKYLIGHTING)
-	Skylighting::ApplySkylighting(color.xyz, directionalAmbientColor, outputAlbedo, skylightingDiffuse);
+	float3 skylightingAlbedo = outputAlbedo;
+#		if defined(TRUE_PBR)
+	skylightingAlbedo /= Color::PBRLightingScale;
+#		endif
+	Skylighting::ApplySkylighting(color.xyz, directionalAmbientColor, skylightingAlbedo, skylightingDiffuse);
 #	endif
 
 #	if !defined(DEFERRED)
