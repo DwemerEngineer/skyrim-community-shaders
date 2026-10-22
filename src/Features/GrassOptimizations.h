@@ -369,10 +369,15 @@ private:
 			inline static REL::Relocation<decltype(thunk)> func;
 		};
 
-		// DoneAddingInstances adds each chunk of generated instances through this virtual, which returns the group index.
 		struct AddGroup
 		{
 			static std::uint32_t thunk(RE::BSMultiStreamInstanceTriShape* shape, std::uint32_t count, std::uint16_t* instanceData, std::uint32_t instanceShorts, float boundPadding);
+			inline static REL::Relocation<decltype(thunk)> func;
+		};
+
+		struct DoneAddingInstances
+		{
+			static void thunk(RE::BSMultiStreamInstanceTriShape* shape, RE::BSTArray<std::uint32_t>& groupIndices);
 			inline static REL::Relocation<decltype(thunk)> func;
 		};
 

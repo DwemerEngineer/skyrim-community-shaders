@@ -381,6 +381,13 @@ std::uint32_t GrassOptimizations::Hooks::AddGroup::thunk(RE::BSMultiStreamInstan
 	return index;
 }
 
+void GrassOptimizations::Hooks::DoneAddingInstances::thunk(RE::BSMultiStreamInstanceTriShape* shape, RE::BSTArray<std::uint32_t>& groupIndices)
+{
+	AttachQueuedGroups::pendingCapture.store(true, std::memory_order_release);
+	func(shape, groupIndices);
+	AttachQueuedGroups::pendingCapture.store(true, std::memory_order_release);
+}
+
 void GrassOptimizations::Hooks::RemoveGroup::thunk(RE::BSMultiStreamInstanceTriShape* shape, std::uint32_t index)
 {
 	globals::features::grassOptimizations.bucketStore.RemoveEngineGroup(shape, index, func.get());
@@ -570,6 +577,7 @@ void GrassOptimizations::Hooks::Install()
 
 	stl::write_vfunc<0x0, BSMultiStreamInstanceTriShape_dtor>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 	stl::write_vfunc<0x34, NiNode_OnVisible>(RE::VTABLE_NiNode[0]);
+	stl::write_vfunc<0x3A, DoneAddingInstances>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 	stl::write_vfunc<0x3C, AddGroup>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 	stl::write_vfunc<0x3D, RemoveGroup>(RE::VTABLE_BSMultiStreamInstanceTriShape[0]);
 
