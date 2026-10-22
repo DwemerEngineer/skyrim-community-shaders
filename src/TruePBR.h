@@ -172,10 +172,11 @@ public:
 		RE::NiColor subsurfaceColor;
 		float subsurfaceOpacity = 0.f;
 		float subsurfaceBalance = 0.75f;
+		bool thinSurface = false;
 		bool foliage = false;
-		float foliageSpecularWeight = 0.5f;
-		float foliageBackSpecularWeight = 0.5f;
-		float foliageBackRoughnessScale = 1.f;
+		float thinSurfaceSpecularWeight = 0.5f;
+		float thinSurfaceBackSpecularWeight = 0.5f;
+		float thinSurfaceBackRoughnessScale = 1.f;
 
 		RE::NiColor coatColor = { 1.f, 1.f, 1.f };
 		float coatStrength = 1.f;

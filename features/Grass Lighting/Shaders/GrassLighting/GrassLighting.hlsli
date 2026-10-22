@@ -1,4 +1,4 @@
-#include "Common/FoliageLighting.hlsli"
+#include "Common/PBRMath.hlsli"
 
 namespace GrassLighting
 {
@@ -6,7 +6,7 @@ namespace GrassLighting
 		out float3 reflectionAlbedo, out float3 frontTransmissionAlbedo, out float3 backTransmissionAlbedo)
 	{
 		float reflectionWeight;
-		PBR::GetFoliageSubsurfaceAlbedos(albedo, albedo, 1.0 - 0.5 * saturate(amount), balance,
+		PBR::GetThinSurfaceSubsurfaceAlbedos(albedo, albedo, 1.0 - 0.5 * saturate(amount), balance,
 			reflectionWeight, frontTransmissionAlbedo, backTransmissionAlbedo);
 		reflectionAlbedo = albedo * reflectionWeight;
 	}

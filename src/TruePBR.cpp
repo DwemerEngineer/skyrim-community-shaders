@@ -29,10 +29,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	subsurfaceColor,
 	subsurfaceOpacity,
 	subsurfaceBalance,
+	thinSurface,
 	foliage,
-	foliageSpecularWeight,
-	foliageBackSpecularWeight,
-	foliageBackRoughnessScale,
+	thinSurfaceSpecularWeight,
+	thinSurfaceBackSpecularWeight,
+	thinSurfaceBackRoughnessScale,
 	coatColor,
 	coatStrength,
 	coatRoughness,
@@ -155,26 +156,31 @@ void TruePBR::DrawSettings()
 					wasEdited = true;
 				}
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("%s", T(TKEY("subsurface_opacity_tooltip"), "Controls subsurface thickness. For trees and grass, 0 allows full subsurface scattering and 1 blocks it. Multiplied by subsurface texture alpha; does not control mesh alpha transparency."));
+					ImGui::Text("%s", T(TKEY("subsurface_opacity_tooltip"), "Controls subsurface thickness. For thin surfaces, including trees and grass, 0 allows full subsurface scattering and 1 blocks it. Multiplied by subsurface texture alpha; does not control mesh alpha transparency."));
 				if (ImGui::SliderFloat(T(TKEY("subsurface_balance"), "Subsurface Balance"), &selectedPbrTextureSet->subsurfaceBalance, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp)) {
 					wasEdited = true;
 				}
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("%s", T(TKEY("subsurface_balance_tooltip"), "For trees and grass, the share of subsurface light sent to the side facing away from the light, shining through; the lit side receives the rest. 0 keeps it on the lit side, 0.5 splits it equally and 1 sends all of it through. Default 0.75 favors the side facing away. Affects direct and ambient lighting without changing reflected light or the total subsurface strength."));
+					ImGui::Text("%s", T(TKEY("subsurface_balance_tooltip"), "For thin surfaces, including trees and grass, the share of subsurface light sent to the side facing away from the light, shining through; the lit side receives the rest. 0 keeps it on the lit side, 0.5 splits it equally and 1 sends all of it through. Default 0.75 favors the side facing away. Affects direct and ambient lighting without changing reflected light or the total subsurface strength."));
 
 				ImGui::TreePop();
 			}
-			if (ImGui::TreeNodeEx(T(TKEY("foliage"), "Foliage"))) {
-				if (ImGui::Checkbox(T(TKEY("foliage_enabled"), "Use Foliage Model"), &selectedPbrTextureSet->foliage)) {
+			if (ImGui::TreeNodeEx(T(TKEY("thin_surface"), "Thin Surface"))) {
+				if (ImGui::Checkbox(T(TKEY("thin_surface_enabled"), "Thin Surface"), &selectedPbrTextureSet->thinSurface)) {
 					wasEdited = true;
 				}
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("%s", T(TKEY("foliage_enabled_tooltip"), "Opts other PBR models into foliage surface lighting without enabling tree animation or subsurface. Grass and trees with subsurface use the model automatically. Does not apply to landscape, coat or hair materials."));
-				wasEdited |= ImGui::SliderFloat(T(TKEY("foliage_specular_weight"), "Front Specular Weight"), &selectedPbrTextureSet->foliageSpecularWeight, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
-				wasEdited |= ImGui::SliderFloat(T(TKEY("foliage_back_specular_weight"), "Back Specular Weight"), &selectedPbrTextureSet->foliageBackSpecularWeight, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
-				wasEdited |= ImGui::SliderFloat(T(TKEY("foliage_back_roughness_scale"), "Back Roughness Scale"), &selectedPbrTextureSet->foliageBackRoughnessScale, 0.f, 3.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+					ImGui::Text("%s", T(TKEY("thin_surface_enabled_tooltip"), "Lights the material as a thin two-sided sheet, such as leaves, paper or cloth. Each side is shaded from its own face, and subsurface light passes through to the side facing away from a light. Does not apply to landscape, coat or hair materials."));
+				if (ImGui::Checkbox(T(TKEY("foliage_enabled"), "Foliage"), &selectedPbrTextureSet->foliage)) {
+					wasEdited = true;
+				}
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("%s", T(TKEY("foliage_tooltip"), "For foliage materials, specular weights scale the complete surface reflection, including grazing angles, for direct and indirect lighting. Roughness scale applies to back faces. Defaults: 0.5, 0.5, 1.0. Front and back follow mesh winding. The subsurface method is unchanged."));
+					ImGui::Text("%s", T(TKEY("foliage_enabled_tooltip"), "Thin surface lighting with foliage approximations: shadows and sky occlusion assume nearby occluders are leaves that pass some light, and normal-map roughness is filtered for leaf cards. Implies Thin Surface. Grass and trees with subsurface use it automatically."));
+				wasEdited |= ImGui::SliderFloat(T(TKEY("thin_surface_specular_weight"), "Front Specular Weight"), &selectedPbrTextureSet->thinSurfaceSpecularWeight, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+				wasEdited |= ImGui::SliderFloat(T(TKEY("thin_surface_back_specular_weight"), "Back Specular Weight"), &selectedPbrTextureSet->thinSurfaceBackSpecularWeight, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+				wasEdited |= ImGui::SliderFloat(T(TKEY("thin_surface_back_roughness_scale"), "Back Roughness Scale"), &selectedPbrTextureSet->thinSurfaceBackRoughnessScale, 0.f, 3.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("%s", T(TKEY("thin_surface_tooltip"), "For thin surfaces, specular weights scale the complete surface reflection of each side, including grazing angles, for direct and indirect lighting. Roughness scale applies to back faces. Defaults: 0.5, 0.5, 1.0. Front and back follow mesh winding."));
 				ImGui::TreePop();
 			}
 			if (ImGui::TreeNodeEx(T(TKEY("coat"), "Coat"))) {
@@ -987,11 +993,16 @@ bool TruePBR::BSLightingShader_SetupMaterial(RE::BSLightingShader* shader, RE::B
 			shadowState->SetPSTextureFilterMode(5, RE::BSGraphics::TextureFilterMode::kAnisotropic);
 
 			stl::enumeration<PBRShaderFlags> shaderFlags;
-			if (pbrMaterial->pbrFlags.any(PBRFlags::Foliage) && !pbrMaterial->pbrFlags.any(PBRFlags::TwoLayer, PBRFlags::HairMarschner)) {
-				shaderFlags.set(PBRShaderFlags::Foliage);
+			if (!pbrMaterial->pbrFlags.any(PBRFlags::TwoLayer, PBRFlags::HairMarschner)) {
+				if (pbrMaterial->pbrFlags.any(PBRFlags::ThinSurface)) {
+					shaderFlags.set(PBRShaderFlags::ThinSurface);
+				}
+				if (pbrMaterial->pbrFlags.any(PBRFlags::Foliage)) {
+					shaderFlags.set(PBRShaderFlags::Foliage);
+				}
 			}
-			const auto& foliageParams = pbrMaterial->GetFoliageParameters();
-			std::array<float, 4> lightingEffectParams{ pbrMaterial->GetSubsurfaceBalance(), foliageParams[0], foliageParams[1], foliageParams[2] };
+			const auto& thinSurfaceParams = pbrMaterial->GetThinSurfaceParameters();
+			std::array<float, 4> lightingEffectParams{ pbrMaterial->GetSubsurfaceBalance(), thinSurfaceParams[0], thinSurfaceParams[1], thinSurfaceParams[2] };
 			shadowState->SetPSConstant(lightingEffectParams, RE::BSGraphics::ConstantGroupLevel::PerMaterial, lightingPSConstants.LightingEffectParams);
 			if (pbrMaterial->pbrFlags.any(PBRFlags::TwoLayer)) {
 				shaderFlags.set(PBRShaderFlags::TwoLayer);
@@ -1460,7 +1471,7 @@ TruePBR::GrassPBRConstants TruePBR::GetGrassPBRConstants(const BSLightingShaderM
 
 	const auto& subsurfaceColor = material->GetSubsurfaceColor();
 	const auto& fuzzColor = material->GetFuzzColor();
-	const auto& foliageParams = material->GetFoliageParameters();
+	const auto& thinSurfaceParams = material->GetThinSurfaceParameters();
 	const auto& linearLighting = globals::features::linearLighting;
 	return {
 		shaderFlags.underlying(),
@@ -1469,7 +1480,7 @@ TruePBR::GrassPBRConstants TruePBR::GetGrassPBRConstants(const BSLightingShaderM
 			hasSubsurface ? subsurfaceColor.blue : 0.0f, hasSubsurface ? material->GetSubsurfaceOpacity() : 1.0f },
 		{ hasFuzz ? fuzzColor.red : 0.0f, hasFuzz ? fuzzColor.green : 0.0f,
 			hasFuzz ? fuzzColor.blue : 0.0f, hasFuzz ? material->GetFuzzWeight() : 0.0f },
-		{ material->GetSubsurfaceBalance(), foliageParams[0], foliageParams[1], foliageParams[2] }
+		{ material->GetSubsurfaceBalance(), thinSurfaceParams[0], thinSurfaceParams[1], thinSurfaceParams[2] }
 	};
 }
 

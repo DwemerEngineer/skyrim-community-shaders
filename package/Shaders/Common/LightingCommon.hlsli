@@ -99,7 +99,7 @@ struct MaterialProperties
 	float3 SubsurfaceColor;
 	float Thickness;
 	float SubsurfaceBalance;
-	float FoliageSpecularWeight;
+	float ThinSurfaceSpecularWeight;
 	float3 CoatColor;
 	float CoatStrength;
 	float CoatRoughness;

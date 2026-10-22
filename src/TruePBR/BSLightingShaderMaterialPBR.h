@@ -12,6 +12,7 @@ enum class PBRFlags : uint32_t
 	Fuzz = 1 << 5,
 	HairMarschner = 1 << 6,
 	Foliage = 1 << 7,
+	ThinSurface = 1 << 8,
 };
 
 enum class PBRShaderFlags : uint32_t
@@ -30,6 +31,7 @@ enum class PBRShaderFlags : uint32_t
 	Glint = 1 << 11,
 	ProjectedGlint = 1 << 12,
 	Foliage = 1 << 13,
+	ThinSurface = 1 << 14,
 };
 
 /**
@@ -168,8 +170,8 @@ public:
 	float GetSubsurfaceOpacity() const;
 	/** @brief Returns the back-side share of subsurface scattering. */
 	float GetSubsurfaceBalance() const;
-	/** @brief Returns front/back foliage specular weights and back-face roughness scale. */
-	const std::array<float, 3>& GetFoliageParameters() const;
+	/** @brief Returns front/back thin-surface specular weights and back-face roughness scale. */
+	const std::array<float, 3>& GetThinSurfaceParameters() const;
 
 	/** @brief Returns the clearcoat layer color (stored in specularColor). */
 	const RE::NiColor& GetCoatColor() const;
@@ -204,7 +206,7 @@ public:
 
 	stl::enumeration<PBRFlags> pbrFlags;
 	float subsurfaceBalance = 0.75f;
-	std::array<float, 3> foliageParameters = { 0.5f, 0.5f, 1.f };
+	std::array<float, 3> thinSurfaceParameters = { 0.5f, 0.5f, 1.f };
 
 	float coatRoughness = 1.f;
 	float coatSpecularLevel = 0.04f;

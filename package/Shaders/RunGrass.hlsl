@@ -455,8 +455,8 @@ cbuffer PerMaterial : register(b1)
 	float4 PBRParams4 : packoffset(c3);    // subsurface balance, front/back specular weights, back roughness scale
 };
 
-#			include "Common/LightingEval.hlsli"
 #		endif
+#		include "Common/LightingEval.hlsli"
 #		include "GrassLighting/GrassLighting.hlsli"
 
 #		if defined(TRUE_PBR)
@@ -500,7 +500,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 viewDirection = -normalize(input.WorldPosition.xyz);
 	float3 vertexNormal = normalize(input.VertexNormal.xyz);
 	float3 clumpNormal = normalize(input.ClumpNormal);
-	float3 faceNormal = PBR::GetFoliageFaceNormal(input.WorldPosition.xyz, viewDirection, vertexNormal);
+	float3 faceNormal = PBR::GetThinSurfaceFaceNormal(input.WorldPosition.xyz, viewDirection, vertexNormal);
 	// Bent normals may face away from the camera on visible cards. Orient by the geometric face instead.
 	if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal)) {
 		vertexNormal = GrassLighting::GetClumpBlendedNormal(vertexNormal, clumpNormal);
@@ -527,7 +527,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		           float4(PBRParams1.x, 1, 1, PBRParams1.y);
 	}
 	MaterialProperties material = (MaterialProperties)0;
-	material.FoliageSpecularWeight = saturate(frontFace ? PBRParams4.y : PBRParams4.z);
+	material.ThinSurfaceSpecularWeight = saturate(frontFace ? PBRParams4.y : PBRParams4.z);
 	material.Roughness = clamp(rawRMAOS.x * (frontFace ? 1.0f : PBRParams4.w), PBR::Constants::MinRoughness, PBR::Constants::MaxRoughness);
 	material.Metallic = saturate(rawRMAOS.y);
 	material.AO = rawRMAOS.z;
@@ -566,7 +566,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			material.FuzzWeight *= fuzz.w;
 		}
 	}
-	PBR::FoliageSurface grassSurface = PBR::CreateFoliageSurface(material, clamp(abs(dot(normal, viewDirection)), EPSILON_DOT_CLAMP, 1.0f), pbrDetail);
+	PBR::ThinSurface grassSurface = PBR::CreateThinSurface(material, clamp(abs(dot(normal, viewDirection)), EPSILON_DOT_CLAMP, 1.0f), pbrDetail);
 
 	float3 viewPosition = mul(FrameBuffer::CameraView, float4(input.WorldPosition.xyz, 1)).xyz;
 	float2 screenUV = FrameBuffer::ViewToUV(viewPosition);
@@ -608,7 +608,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	DirectContext dirContext = CreateDirectLightingContext(normal, normal, vertexNormal, viewDirection, viewDirection,
 		SharedData::DirLightDirection.xyz, SharedData::DirLightDirection.xyz, dirLightColor, dirDetailedShadow, dirSoftShadow);
 	DirectLightingOutput dirOutput;
-	PBR::GetDirectLightInputFoliage(dirOutput, dirContext, material, grassSurface, pbrDetail, wrap);
+	PBR::GetDirectLightInputThinSurface(dirOutput, dirContext, material, grassSurface, pbrDetail, wrap);
 	totalLighting.diffuse += dirOutput.diffuse;
 	totalLighting.specular += dirOutput.specular;
 	totalLighting.transmission += dirOutput.transmission;
@@ -639,7 +639,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				DirectContext pointContext = CreateDirectLightingContext(normal, normal, vertexNormal, viewDirection, viewDirection,
 					lightDirection, lightDirection, lightColor, lightShadow, lightShadow);
 				DirectLightingOutput pointOutput;
-				PBR::GetDirectLightInputFoliage(pointOutput, pointContext, material, grassSurface, pbrDetail, wrap);
+				PBR::GetDirectLightInputThinSurface(pointOutput, pointContext, material, grassSurface, pbrDetail, wrap);
 				totalLighting.diffuse += pointOutput.diffuse;
 				totalLighting.specular += pointOutput.specular;
 				totalLighting.transmission += pointOutput.transmission;
@@ -650,7 +650,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	IndirectLobeWeights indirectLobes;
 	IndirectContext indirectContext = CreateIndirectLightingContext(normal, vertexNormal, viewDirection);
-	PBR::GetIndirectLobeWeightsFoliage(indirectLobes, indirectContext, material, grassSurface);
+	PBR::GetIndirectLobeWeightsThinSurface(indirectLobes, indirectContext, material, grassSurface);
 	indirectLobes.diffuse *= canopyVisibility;
 	indirectLobes.specular *= canopyVisibility;
 	indirectLobes.frontTransmission *= canopyVisibility;
@@ -680,7 +680,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float3 transmissionNormal = side == 0 ? normal : -normal;
 			float3 ambientColor = Color::Ambient(max(0, SharedData::GetAmbient(transmissionNormal)));
 			float3 transmittedAmbientColor;
-			directColor += GetFoliageTransmissionLighting(ambientColor, transmissionWeight, transmissionNormal,
+			directColor += GetThinSurfaceTransmissionLighting(ambientColor, transmissionWeight, transmissionNormal,
 				input.WorldPosition.xyz, vertexAO, material.Thickness, transmittedAmbientColor
 #				if defined(SKYLIGHTING)
 				,
@@ -719,7 +719,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #				endif
 
-	float3 normalVS = normalize(FrameBuffer::WorldToView(PBR::GetFoliageNormal(normal, viewDirection), false));
+	float3 normalVS = normalize(FrameBuffer::WorldToView(PBR::GetThinSurfaceNormal(normal, viewDirection), false));
 	psout.Diffuse = float4(outputColor, 1);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(normalVS), 1 - material.Roughness, 1);
 	psout.Albedo = float4(outputAlbedo, 1);
@@ -805,7 +805,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float screenNoise = Random::InterleavedGradientNoise(input.HPosition.xy, SharedData::FrameCount);
 
 	float3 clumpNormal = normalize(input.ClumpNormal);
-	float3 faceNormal = PBR::GetFoliageFaceNormal(input.WorldPosition.xyz, viewDirection, normal);
+	float3 faceNormal = PBR::GetThinSurfaceFaceNormal(input.WorldPosition.xyz, viewDirection, normal);
 	// Bent normals may face away from the camera on visible cards. Orient by the geometric face instead.
 	if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal)) {
 		normal = GrassLighting::GetClumpBlendedNormal(normal, clumpNormal);
@@ -829,7 +829,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float3 specularNormal = normal;
 	if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal))
-		specularNormal = PBR::GetFoliageNormal(normal, viewDirection);
+		specularNormal = PBR::GetThinSurfaceNormal(normal, viewDirection);
 
 	if (!complex || SharedData::grassLightingSettings.OverrideComplexGrassSettings)
 		baseColor.xyz *= SharedData::grassLightingSettings.BasicGrassBrightness;
@@ -918,7 +918,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		SharedData::grassLightingSettings.SubsurfaceBalance, reflectionAlbedo, frontTransmissionAlbedo, backTransmissionAlbedo);
 	float3 shineThroughAlbedo = hasSubsurface ? albedo : 0.0;
 	float3 transmissionRadiance;
-	PBR::GetFoliageDirectScattering(reflectionAlbedo, frontTransmissionAlbedo, backTransmissionAlbedo, shineThroughAlbedo, grassOpacity, dirLightColor * Color::BRDFScale,
+	PBR::GetThinSurfaceDirectScattering(reflectionAlbedo, frontTransmissionAlbedo, backTransmissionAlbedo, shineThroughAlbedo, grassOpacity, dirLightColor * Color::BRDFScale,
 		dirNdotL, 0.0, dirDetailedShadow, dirTransmissionShadow, lightsDiffuseColor, transmissionRadiance);
 
 #				ifdef GRASS_OPTIMIZATIONS
@@ -970,7 +970,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 				float NdotL = dot(normal, normalizedLightDirection);
 				float3 lightDiffuseColor, lightTransmissionColor;
-				PBR::GetFoliageDirectScattering(reflectionAlbedo, frontTransmissionAlbedo, backTransmissionAlbedo, shineThroughAlbedo, grassOpacity, lightColor * Color::BRDFScale,
+				PBR::GetThinSurfaceDirectScattering(reflectionAlbedo, frontTransmissionAlbedo, backTransmissionAlbedo, shineThroughAlbedo, grassOpacity, lightColor * Color::BRDFScale,
 					NdotL, 0.0, 1.0, 1.0, lightDiffuseColor, lightTransmissionColor);
 				lightsDiffuseColor += lightDiffuseColor;
 				transmissionRadiance += lightTransmissionColor;
@@ -1010,7 +1010,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float3 transmissionNormal = side == 0 ? normal : -normal;
 			float3 ambientColor = Color::Ambient(max(0, SharedData::GetAmbient(transmissionNormal)));
 			float3 transmittedAmbientColor;
-			float3 indirectTransmissionColor = GetFoliageTransmissionLighting(ambientColor, transmissionAlbedo, transmissionNormal,
+			float3 indirectTransmissionColor = GetThinSurfaceTransmissionLighting(ambientColor, transmissionAlbedo, transmissionNormal,
 				input.WorldPosition.xyz, vertexAO, grassOpacity, transmittedAmbientColor
 #				if defined(SKYLIGHTING)
 				,

@@ -987,12 +987,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 viewDirection = -normalize(input.WorldPosition.xyz);
 #	if defined(TRUE_PBR)
 	const bool isFoliage = PBR::IsFoliageMaterial(PBRFlags);
+	const bool isThinSurface = PBR::IsThinSurfaceMaterial(PBRFlags);
 #		if defined(TREE_ANIM)
 	const bool foliageNormals = true;
 #		else
 	const bool foliageNormals = isFoliage;
 #		endif
-	float3 foliageFaceNormal = PBR::GetFoliageFaceNormal(input.WorldPosition.xyz, viewDirection, float3(0, 0, 1));
+	const bool thinSurfaceNormals = foliageNormals || isThinSurface;
+	float3 thinSurfaceFaceNormal = PBR::GetThinSurfaceFaceNormal(input.WorldPosition.xyz, viewDirection, float3(0, 0, 1));
 #	endif
 
 	float2 screenUV = FrameBuffer::ViewToUV(viewPosition);
@@ -1013,7 +1015,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if !defined(TREE_ANIM) && !defined(LOD)
 	// Fix incorrect vertex normals on double-sided meshes
 #			if defined(TRUE_PBR)
-	if (!frontFace && !isFoliage)
+	if (!frontFace && !isThinSurface)
 #			else
 	if (!frontFace)
 #			endif
@@ -1027,8 +1029,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	tbnTr[2] = normalize(tbnTr[2]);
 
 #		if defined(TRUE_PBR)
-	// Winding is constant per triangle, so this cannot split bent normals mid-card like a per-pixel flip.
-	if (foliageNormals && !frontFace)
+	// Winding is constant per triangle, so this cannot split bent normals mid-surface like a per-pixel flip.
+	if (thinSurfaceNormals && !frontFace)
 		tbnTr = -tbnTr;
 #		endif
 
@@ -1907,8 +1909,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 screenSpaceNormal = normalize(FrameBuffer::WorldToView(worldNormal, false));
 #	if defined(TRUE_PBR)
 	// Lighting uses the face-oriented normal. Deferred reflections need it facing the camera.
-	if (foliageNormals)
-		screenSpaceNormal = normalize(FrameBuffer::WorldToView(PBR::GetFoliageNormal(worldNormal, viewDirection), false));
+	if (thinSurfaceNormals)
+		screenSpaceNormal = normalize(FrameBuffer::WorldToView(PBR::GetThinSurfaceNormal(worldNormal, viewDirection), false));
 #	endif
 
 #	if defined(CS_HAIR_SHADING)
@@ -1934,9 +1936,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	material.Noise = screenNoise;
 
 	material.Roughness = clamp(rawRMAOS.x, PBR::Constants::MinRoughness, PBR::Constants::MaxRoughness);
-	material.FoliageSpecularWeight = 1.0f;
-	if (isFoliage) {
-		material.FoliageSpecularWeight = saturate(frontFace ? LightingEffectParams.y : LightingEffectParams.z);
+	material.ThinSurfaceSpecularWeight = 1.0f;
+	if (isThinSurface) {
+		material.ThinSurfaceSpecularWeight = saturate(frontFace ? LightingEffectParams.y : LightingEffectParams.z);
 		material.Roughness = clamp(rawRMAOS.x * (frontFace ? 1.0f : LightingEffectParams.w), PBR::Constants::MinRoughness, PBR::Constants::MaxRoughness);
 	}
 	if (foliageNormals)
@@ -1993,7 +1995,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 			material.Thickness *= sampledSubsurfaceProperties.w;
 		}
-		else if (isFoliage)
+		else if (isThinSurface)
 			material.SubsurfaceColor *= material.BaseColor;
 		material.Thickness = lerp(material.Thickness, 1, projectedMaterialWeight);
 	}
@@ -2378,12 +2380,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if defined(SCREEN_SPACE_SHADOWS) && defined(DEFERRED)
 	if (!SharedData::InInterior) {
 #		if defined(TRUE_PBR)
-		if (foliageNormals) {
-			float foliageFaceLightAngle = dot(foliageFaceNormal, DirLightDirection);
-			dirDetailedShadow *= ScreenSpaceShadows::GetThinSurfaceScreenSpaceShadow(input.Position.xyz, screenUV, screenNoise, foliageFaceLightAngle);
+		if (thinSurfaceNormals) {
+			float faceLightAngle = dot(thinSurfaceFaceNormal, DirLightDirection);
+			dirDetailedShadow *= ScreenSpaceShadows::GetThinSurfaceScreenSpaceShadow(input.Position.xyz, screenUV, screenNoise, faceLightAngle);
 			if ((PBRFlags & PBR::Flags::Subsurface) == 0) {
 				float2 screenSpaceShadows = ScreenSpaceShadows::GetScreenSpaceShadows(input.Position.xyz, screenUV, screenNoise);
-				dirTransmissionContactShadow = foliageFaceLightAngle >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
+				dirTransmissionContactShadow = faceLightAngle >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
 			}
 		} else
 #		endif
@@ -2459,8 +2461,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	DirectLightingOutput dirLightOutput;
 #	if defined(TRUE_PBR)
 	dirLightContext = CreateDirectLightingContext(worldNormal.xyz, coatWorldNormal, vertexNormal.xyz, refractedViewDirection, viewDirection, refractedDirLightDirection, DirLightDirection, dirLightColor, dirDetailedShadow, dirSoftShadow);
-	if (foliageNormals)
-		dirLightContext.backTransmissionVisibility = PBR::GetFoliageBackTransmissionVisibility(foliageFaceNormal, DirLightDirection);
+	if (thinSurfaceNormals)
+		dirLightContext.backTransmissionVisibility = PBR::GetThinSurfaceBackTransmissionVisibility(thinSurfaceFaceNormal, DirLightDirection);
 #	else
 	dirLightContext = CreateDirectLightingContext(worldNormal.xyz, vertexNormal.xyz, viewDirection, DirLightDirection, dirLightColor, dirDetailedShadow, dirSoftShadow);
 #		if defined(CS_HAIR_SHADING)
@@ -2527,8 +2529,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			}
 #				endif
 			pointLightContext = CreateDirectLightingContext(worldNormal.xyz, coatWorldNormal, vertexNormal.xyz, refractedViewDirection, viewDirection, refractedLightDirection, normalizedLightDirection, lightColor, lightShadow, lightShadow);
-			if (foliageNormals)
-				pointLightContext.backTransmissionVisibility = PBR::GetFoliageBackTransmissionVisibility(foliageFaceNormal, normalizedLightDirection);
+			if (thinSurfaceNormals)
+				pointLightContext.backTransmissionVisibility = PBR::GetThinSurfaceBackTransmissionVisibility(thinSurfaceFaceNormal, normalizedLightDirection);
 		}
 #			else
 		pointLightContext = CreateDirectLightingContext(worldNormal.xyz, vertexNormal.xyz, viewDirection, normalizedLightDirection, lightColor, lightShadow, lightShadow);
@@ -2651,8 +2653,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float pointLightShadow = lightShadow * parallaxShadow;
 #			if defined(TRUE_PBR)
 		pointLightContext = CreateDirectLightingContext(worldNormal.xyz, coatWorldNormal, vertexNormal.xyz, refractedViewDirection, viewDirection, refractedLightDirection, normalizedLightDirection, lightColor, pointLightShadow, pointLightShadow);
-		if (foliageNormals)
-			pointLightContext.backTransmissionVisibility = PBR::GetFoliageBackTransmissionVisibility(foliageFaceNormal, normalizedLightDirection);
+		if (thinSurfaceNormals)
+			pointLightContext.backTransmissionVisibility = PBR::GetThinSurfaceBackTransmissionVisibility(thinSurfaceFaceNormal, normalizedLightDirection);
 #			else
 		pointLightContext = CreateDirectLightingContext(worldNormal.xyz, vertexNormal.xyz, viewDirection, normalizedLightDirection, lightColor, pointLightShadow, pointLightShadow);
 #				if defined(CS_HAIR_SHADING)
@@ -2896,8 +2898,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float3 transmissionNormal = side == 0 ? ambientNormal : -ambientNormal;
 			float3 ambientColor = Color::Ambient(max(0, mul(DirectionalAmbient, float4(transmissionNormal, 1.0))));
 			float3 transmittedAmbient;
-			float3 indirectTransmissionColor = GetFoliageTransmissionLighting(ambientColor, transmissionWeight, transmissionNormal,
-				input.WorldPosition.xyz, vertexAO, material.Thickness, transmittedAmbient
+			float3 indirectTransmissionColor = GetThinSurfaceTransmissionLighting(ambientColor, transmissionWeight, transmissionNormal,
+				input.WorldPosition.xyz, vertexAO, isFoliage ? material.Thickness : 1.0f, transmittedAmbient
 #		if defined(IBL)
 				,
 				SampColorSampler, SharedData::iblSettings.UseStaticIBL && !inWorld && !inReflection
@@ -2968,8 +2970,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	color.xyz += specularColor;
 	float3 specularNormal = worldNormal;
 #		if defined(TRUE_PBR)
-	if (foliageNormals)
-		specularNormal = PBR::GetFoliageNormal(specularNormal, viewDirection);
+	if (thinSurfaceNormals)
+		specularNormal = PBR::GetThinSurfaceNormal(specularNormal, viewDirection);
 #		endif
 
 	if (any(indirectLobeWeights.specular > 0)
