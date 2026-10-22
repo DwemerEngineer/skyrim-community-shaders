@@ -149,9 +149,12 @@ namespace PBR
 		// Light scattered inside the sheet is no longer available for surface reflection.
 		float3 weights = float3(subsurfaceShare * (1.0f - backShare), subsurfaceShare * backShare, 1.0f - subsurfaceShare);
 		float3 litFaceAlbedo = weights.z * baseColor + weights.x * scatteringColor;
-#if defined(TRUE_PBR) && (defined(TREE_ANIM) || defined(LIGHTING))
+#if defined(TRUE_PBR) && (defined(TREE_ANIM) || defined(LIGHTING) || defined(GRASS_LIGHTING))
 		// Subsurface share and balance are linear energy shares, not gamma-encoded material colors.
-		if (IsThinSurfaceMaterial(PBRFlags)) {
+#	if !defined(GRASS_LIGHTING)
+		if (IsThinSurfaceMaterial(PBRFlags))
+#	endif
+		{
 			// Both lit-face lobes leave the same side, so they must sum before encoding.
 			litFaceAlbedo = Color::LinearToPBRMaterial(weights.z * Color::PBRMaterialToLinear(baseColor) + weights.x * Color::PBRMaterialToLinear(scatteringColor));
 			weights = Color::LinearToPBRMaterial(weights);
@@ -190,8 +193,10 @@ namespace PBR
 		out float3 reflection, out float3 transmission)
 	{
 		float3 transmittance = (1.0f - saturate(opacity)).xxx;
-#if defined(TRUE_PBR) && (defined(TREE_ANIM) || defined(LIGHTING))
+#if defined(TRUE_PBR) && (defined(TREE_ANIM) || defined(LIGHTING) || defined(GRASS_LIGHTING))
+#	if !defined(GRASS_LIGHTING)
 		if (IsThinSurfaceMaterial(PBRFlags))
+#	endif
 			transmittance = Color::LinearToPBRMaterial(transmittance);
 #endif
 		// Share the wrapped shading response so flat sheet boundaries do not split the transmission lobe.
