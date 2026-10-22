@@ -33,15 +33,15 @@ public:
 	struct Settings
 	{
 		float MinPixelSize = 2.0f;
-		float FullDetailPixelSize = 16.0f;
-		float MinDensity = 0.03f;
+		float FullDetailPixelSize = 12.0f;
+		float MinDensity = 0.07f;
 		float MeshCostBias = 0.25f;
 		float CostBiasStartDistance = 6000.0f;
 		float InvisibleFadeCull = 0.0f;
 		float RenderDistanceOverride = 0.0f;
 		float EdgeFadeStart = 0.85f;
 		bool EnableOcclusionCulling = true;
-		float SimpleShadingPixelSize = 0.0f;
+		float SimpleShadingPixelSize = 8.0f;
 		float OcclusionBias = 0.001f;
 		float CollisionDistance = 2048.0f;
 		bool EnableMeshLOD = false;
@@ -117,7 +117,8 @@ private:
 		float costBiasStartDist;
 
 		float farLODPixelSize;
-		float pad0[3];
+		float densityDistanceRcp;
+		float pad0[2];
 	};
 	STATIC_ASSERT_ALIGNAS_16(CullParamsCB);
 

@@ -52,7 +52,7 @@ void GrassOptimizations::DrawSettings()
 	ImGui::SliderFloat(T(TKEY("full_detail_pixel_size"), "Full-Detail Pixel Size"), &settings.FullDetailPixelSize, 4.0f, 128.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("full_detail_pixel_size_tooltip"),
-							  "Instances whose on-screen radius is above this render at full density. Below it, density is increasingly thinned down to Minimum Density at Min Pixel Size. Increasing this setting improves performance by removing closer grass."));
+							  "Instances whose on-screen radius is above this render at full density. Below it, density thinning increases over the full INI grass distance. A shorter Grass Render Distance cuts this ramp off early without changing density closer to the player. Min Pixel Size remains a hard cutoff. Increasing this setting improves performance by removing closer grass."));
 	}
 
 	ImGui::SliderFloat(T(TKEY("min_pixel_size"), "Min Pixel Size"), &settings.MinPixelSize, 1.0f, 32.0f, "%.1f px");
@@ -64,7 +64,7 @@ void GrassOptimizations::DrawSettings()
 	Util::PercentageSlider(T(TKEY("min_density"), "Minimum Density"), &settings.MinDensity);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("min_density_tooltip"),
-							  "The percentage of grass that remains at the smallest (Min Pixel Size) LOD level before culling."));
+							  "The lowest density targeted by pixel-based thinning at the full INI grass distance. Closer grass retains more density, and Min Pixel Size still removes instances below its cutoff."));
 	}
 
 	Util::PercentageSlider(T(TKEY("mesh_cost_bias"), "Mesh Cost Bias"), &settings.MeshCostBias);
