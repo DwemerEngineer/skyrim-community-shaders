@@ -682,6 +682,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	[branch] if ((PBRFlags & PBR::Flags::Subsurface) != 0)
 		skylightingDiffuse = PBR::GetFoliageShadowVisibility(skylightingDiffuse, material.Thickness);
 	Skylighting::ApplySkylighting(directColor, directionalAmbientColor, outputAlbedo, skylightingDiffuse);
+	sh2 backSkylightingSH = skylightingSH;
+	[branch] if (any(indirectLobes.backTransmission > 0.0f))
+	{
+		float unusedShadowVisibility;
+		backSkylightingSH = Skylighting::Sample(input.WorldPosition.xyz, -normal, unusedShadowVisibility, false);
+	}
 #				endif
 
 	[unroll] for (uint side = 0; side < 2; ++side)
@@ -696,7 +702,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				input.WorldPosition.xyz, vertexAO, material.Thickness, transmittedAmbientColor
 #				if defined(SKYLIGHTING)
 				,
-				skylightingSH
+				side == 0 ? skylightingSH : backSkylightingSH
 #				endif
 			);
 			directionalAmbientColor += transmittedAmbientColor;
