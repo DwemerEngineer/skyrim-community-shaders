@@ -890,6 +890,8 @@ namespace SIE
 				{ "LandscapeTexture5GlintParameters", lightingPSConstants.LandscapeTexture5GlintParameters },
 				{ "LandscapeTexture6GlintParameters", lightingPSConstants.LandscapeTexture6GlintParameters },
 				{ "MaterialObjectRGBScale", lightingPSConstants.MaterialObjectRGBScale },
+				{ "IceParams1", lightingPSConstants.IceParams1 },
+				{ "IceParams2", lightingPSConstants.IceParams2 },
 			};
 
 			auto& bloodSplatterVS = result[static_cast<size_t>(RE::BSShader::Type::BloodSplatter)]

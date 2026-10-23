@@ -138,6 +138,16 @@ namespace PBR
 				reflectionWeight, surface.frontTransmissionAlbedo, surface.backTransmissionAlbedo);
 			surface.reflectionAlbedo *= reflectionWeight;
 		}
+#if !defined(LANDSCAPE) && !defined(LODLANDSCAPE)
+		else if ((PBRFlags & Flags::Ice) != 0)
+		{
+			// Through the sheet, light loses what the ice absorbs and what the exit face reflects. Mixed in linear, then encoded.
+			float3 transmittance = material.IceTransmissionWeight * material.IceViewTransmittance *
+			                       IceInterfaceTransmittance(material.Roughness, NdotV, material.IceEnergyCompensation.y);
+			surface.backTransmissionAlbedo = Color::LinearToPBRMaterial(transmittance * Color::PBRMaterialToLinear(saturate(material.BaseColor)));
+			surface.reflectionAlbedo *= 1.0f - material.IceTransmissionWeight;
+		}
+#endif
 
 		[branch] if (doSpecular)
 		{
@@ -283,6 +293,26 @@ namespace PBR
 #else
 			float3 kD = 1 - F;
 #endif
+#if !defined(LANDSCAPE) && !defined(LODLANDSCAPE)
+			[branch] if ((PBRFlags & Flags::Ice) != 0)
+			{
+				// Exact Fresnel and energy-compensated lobes. The base below is lit and seen through the absorbing depth.
+				float D = BRDF::D_GGX(material.Roughness, satNdotH);
+				float visibility = BRDF::Vis_SmithJoint(material.Roughness, specularNdotV, max(specularNdotL, EPSILON_DOT_CLAMP));
+				F = BRDF::F_DielectricCos(Constants::IceIOR, satVdotH);
+				Fr = D * visibility * F * material.IceEnergyCompensation.x;
+				float3 lightTransmittance = IceInterfaceTransmittance(material.Roughness, satNdotL, material.IceEnergyCompensation.x) *
+				                            IceAbsorption(material.IceAbsorption, IcePathLength(material.IceDepth, satNdotL));
+				kD = (1.0f - material.IceTransmissionWeight) * lightTransmittance * material.IceViewTransmittance;
+
+				[branch] if (NdotL < 0.0f && material.IceTransmissionWeight > 0.0f)
+				{
+					// A light behind the ice shows through the exit face, which carries the leaving-side compensation
+					float transmission = IceTransmissionLobe(material.Roughness, N, V, L) * material.IceEnergyCompensation.y * material.IceTransmissionWeight;
+					lightingOutput.transmission += transmission * IceAbsorption(material.IceAbsorption, IcePathLength(material.IceDepth, satNdotV)) * softLightColor;
+				}
+			}
+#endif
 
 			lightingOutput.diffuse += detailedLightColor * satNdotL * BRDF::Diffuse_Lambert() * kD;
 			lightingOutput.specular += Fr * detailedLightColor * specularNdotL;
@@ -392,6 +422,18 @@ namespace PBR
 
 			// Energy conservation: diffuse receives only what specular does not reflect
 			lobeWeights.diffuse *= 1 - lobeWeights.specular;
+
+#if !defined(LANDSCAPE) && !defined(LODLANDSCAPE)
+			[branch] if ((PBRFlags & Flags::Ice) != 0)
+			{
+				// Ambient light reaches the base and returns along the view path. The clear share sees through the ice instead.
+				lobeWeights.specular *= material.IceEnergyCompensation.x;
+				lobeWeights.diffuse = material.BaseColor * (1.0f - material.IceTransmissionWeight) * material.IceViewTransmittance * material.IceViewTransmittance;
+				lobeWeights.iceTransmission = material.IceTransmissionWeight * material.IceViewTransmittance;
+				// A parallel back face reflects part of that light out along the mirror direction
+				lobeWeights.specular += lobeWeights.iceTransmission * lobeWeights.specular * material.IceViewTransmittance;
+			}
+#endif
 
 #if !defined(LANDSCAPE) && !defined(LODLANDSCAPE)
 			[branch] if ((PBRFlags & Flags::TwoLayer) != 0)

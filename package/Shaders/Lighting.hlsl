@@ -564,6 +564,11 @@ cbuffer PerMaterial : register(b1)
 	float4 PBRParams2 : packoffset(c16);    // subsurface color, subsurface opacity
 
 	float3 MaterialObjectRGBScale : packoffset(c17);  // RGB multipliers for material objects
+
+#	if defined(TRUE_PBR) && !defined(LANDSCAPE)
+	float4 IceParams1 : packoffset(c18);  // absorption coefficient per game unit in xyz, transmission weight in w
+	float IceParams2 : packoffset(c19);   // depth below the surface in game units
+#	endif
 };
 
 cbuffer PerGeometry : register(b2)
@@ -1109,6 +1114,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					DEST = TEX.SampleBias(SAMP, UV, SharedData::MipBias);                        \
 				}                                                                                \
 			}
+#		define MESH_TV_SAMPLE_BIAS_BY(DEST, TEX, SAMP, UV, BIAS)                 \
+			{                                                                     \
+				[branch] if (applyMeshTV)                                         \
+				{                                                                 \
+					DEST = StochasticEffectBias(TEX, SAMP, UV, meshOffset, BIAS); \
+				}                                                                 \
+				else                                                              \
+				{                                                                 \
+					DEST = TEX.SampleBias(SAMP, UV, BIAS);                        \
+				}                                                                 \
+			}
 #		define MESH_TV_HEIGHT(DEST, TEX, SAMP, UV, MIP, CHANNEL)                            \
 			{                                                                                \
 				[branch] if (applyMeshTV)                                                    \
@@ -1123,6 +1139,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	else
 #		define MESH_TV_SAMPLE(DEST, TEX, SAMP, UV) DEST = TEX.Sample(SAMP, UV)
 #		define MESH_TV_SAMPLE_BIAS(DEST, TEX, SAMP, UV) DEST = TEX.SampleBias(SAMP, UV, SharedData::MipBias)
+#		define MESH_TV_SAMPLE_BIAS_BY(DEST, TEX, SAMP, UV, BIAS) DEST = TEX.SampleBias(SAMP, UV, BIAS)
 #		define MESH_TV_HEIGHT(DEST, TEX, SAMP, UV, MIP, CHANNEL) DEST = TEX.SampleLevel(SAMP, UV, MIP)[CHANNEL]
 #	endif
 
@@ -1225,6 +1242,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 entryNormalTS = 0;
 	float eta = 1;
 	float3 refractedViewDirection = viewDirection;
+	float3 iceViewDirection = viewDirection;
 	float4 sampledCoatColor = PBRParams2;
 	float3 complexSpecular = 1.0;  // Declare complexSpecular at a higher scope so it's available throughout the shader (NEEDED FOR STOCH. FIX)
 
@@ -1314,9 +1332,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		else
 		{
 			displacementParams.HeightScale *= PBRParams1.y;
+			[branch] if ((PBRFlags & PBR::Flags::Ice) != 0)
+			{
+				// The march follows the view ray refracted into the ice
+				float3 iceEntryNormal = normalize(mul(tbn, TransformNormal(TexNormalSampler.Sample(SampNormalSampler, uvOriginal).xyz)));
+				iceViewDirection = -refract(-viewDirection, iceEntryNormal, 1.0f / PBR::Constants::IceIOR);
+			}
 		}
 		mipLevel = ExtendedMaterials::GetMipLevel(uv, TexParallaxSampler);
-		uv = ExtendedMaterials::GetParallaxCoords(viewPosition.z, uv, mipLevel, refractedViewDirection, tbnTr, screenNoise, TexParallaxSampler, SampParallaxSampler, 0, displacementParams, applyMeshTV, meshOffset, pixelOffset);
+		float3 parallaxViewDirection = (PBRFlags & PBR::Flags::Ice) != 0 ? iceViewDirection : refractedViewDirection;
+		uv = ExtendedMaterials::GetParallaxCoords(viewPosition.z, uv, mipLevel, parallaxViewDirection, tbnTr, screenNoise, TexParallaxSampler, SampParallaxSampler, 0, displacementParams, applyMeshTV, meshOffset, pixelOffset);
 		if (SharedData::extendedMaterialSettings.EnableShadows && parallaxShadowQuality > 0.0) {
 			MESH_TV_HEIGHT(sh0, TexParallaxSampler, SampParallaxSampler, uv, mipLevel, 0);
 		}
@@ -1329,6 +1354,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	MESH_TV_SAMPLE(envMaskSample, TexEnvMaskSampler, SampEnvMaskSampler, uv);
 	float envMaskBase = envMaskSample.x;
 #	endif  // EMAT
+
+#	if defined(TRUE_PBR)
+	// Ice below the parallax hit, in game units. Without parallax the full depth is used.
+	float iceDepth = 0;
+#		if !defined(LANDSCAPE) && !defined(LODLANDSCAPE)
+	[branch] if ((PBRFlags & PBR::Flags::Ice) != 0)
+	{
+		iceDepth = (1.0f - saturate(pixelOffset)) * IceParams2;
+	}
+#		endif
+#	endif
 
 #	if defined(SNOW)
 	bool useSnowSpecular = true;
@@ -1512,8 +1548,19 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	rawRMAOS = blendedRMAOS;
 #		endif
 #	else  // Non-landscape code
+#		if defined(TRUE_PBR)
+	MESH_TV_SAMPLE_BIAS(rawRMAOS, TexRMAOSSampler, SampRMAOSSampler, diffuseUv);
+	rawRMAOS *= float4(PBRParams1.x, 1, 1, PBRParams1.z);
+	if ((PBRFlags & PBR::Flags::Glint) != 0) {
+		glintParameters = MultiLayerParallaxData;
+	}
+	// Detail seen through deep or frosted ice softens
+	float baseColorMipBias = SharedData::MipBias + log2(1.0f + iceDepth * saturate(rawRMAOS.x) * PBR::Constants::IceDepthBlur);
+#		else
+	float baseColorMipBias = SharedData::MipBias;
+#		endif
 	float4 sampledBaseColor;
-	MESH_TV_SAMPLE_BIAS(sampledBaseColor, TexColorSampler, SampColorSampler, diffuseUv);
+	MESH_TV_SAMPLE_BIAS_BY(sampledBaseColor, TexColorSampler, SampColorSampler, diffuseUv, baseColorMipBias);
 #		if defined(ENABLE_LL) && defined(FACEGEN)
 	sampledBaseColor.rgb = GetFacegenBaseColor(sampledBaseColor.rgb, uv);
 #		elif defined(ENABLE_LL) && defined(FACEGEN_RGB_TINT)
@@ -1524,13 +1571,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float4 normalColor;
 	MESH_TV_SAMPLE_BIAS(normalColor, TexNormalSampler, SampNormalSampler, uv);
 	normal = normalColor;
-#		if defined(TRUE_PBR)
-	MESH_TV_SAMPLE_BIAS(rawRMAOS, TexRMAOSSampler, SampRMAOSSampler, diffuseUv);
-	rawRMAOS *= float4(PBRParams1.x, 1, 1, PBRParams1.z);
-	if ((PBRFlags & PBR::Flags::Glint) != 0) {
-		glintParameters = MultiLayerParallaxData;
-	}
-#		endif
 #	endif
 
 #	if defined(LOD_BLENDING)
@@ -2021,6 +2061,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			}
 		}
 		material.CoatStrength = lerp(material.CoatStrength, 0, projectedMaterialWeight);
+	}
+	else if ((PBRFlags & PBR::Flags::Ice) != 0)
+	{
+		material.F0 = PBR::Constants::IceF0;
+		material.IceAbsorption = IceParams1.xyz;
+		material.IceTransmissionWeight = IceParams1.w;
+		material.IceDepth = iceDepth;
+		float iceNdotV = saturate(abs(dot(worldNormal, viewDirection)));
+		material.IceEnergyCompensation = PBR::IceEnergyCompensation(material.Roughness, iceNdotV);
+		material.IceViewTransmittance = PBR::IceInterfaceTransmittance(material.Roughness, iceNdotV, material.IceEnergyCompensation.x) *
+		                                PBR::IceAbsorption(material.IceAbsorption, PBR::IcePathLength(material.IceDepth, iceNdotV));
 	}
 
 	[branch] if ((PBRFlags & PBR::Flags::Fuzz) != 0)
@@ -2913,6 +2964,28 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			transmittedAmbientColor += transmittedAmbient;
 		}
 	}
+
+#		if defined(DEFERRED) || !defined(DYNAMIC_CUBEMAPS)
+	[branch] if (any(indirectLobeWeights.iceTransmission > 0.0f))
+	{
+		// Without a cubemap, the ambient along the transmission peak stands in for the scene behind the ice. IBL and skylighting apply as for thin surfaces.
+		float3 iceTransmissionDirection = PBR::GetIceTransmissionDirection(PBR::GetThinSurfaceNormal(worldNormal, viewDirection), viewDirection, material.Roughness);
+		float3 iceAmbientColor = Color::Ambient(max(0, mul(DirectionalAmbient, float4(iceTransmissionDirection, 1.0))));
+		float3 iceTransmittedAmbient;
+		color.xyz += GetThinSurfaceTransmissionLighting(iceAmbientColor, indirectLobeWeights.iceTransmission, iceTransmissionDirection,
+			input.WorldPosition.xyz, vertexAO, 1.0f, iceTransmittedAmbient
+#			if defined(IBL)
+			,
+			SampColorSampler, SharedData::iblSettings.UseStaticIBL && !inWorld && !inReflection
+#			endif
+#			if defined(SKYLIGHTING)
+			,
+			skylightingSH
+#			endif
+		);
+		transmittedAmbientColor += iceTransmittedAmbient;
+	}
+#		endif
 #	endif
 
 	color.xyz *= vertexColor;
@@ -2995,6 +3068,21 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			endif
 #		else
 		color.xyz += indirectLobeWeights.specular * directionalAmbientColor;
+#		endif
+
+#		if defined(TRUE_PBR) && defined(DYNAMIC_CUBEMAPS)
+	[branch] if (any(indirectLobeWeights.iceTransmission > 0.0f))
+	{
+		// One lookup at the off-specular transmission peak. Mirroring about -N makes the reflected direction the peak.
+		float3 iceNormal = PBR::GetThinSurfaceNormal(worldNormal, viewDirection);
+		float3 iceTransmissionDirection = PBR::GetIceTransmissionDirection(iceNormal, viewDirection, material.Roughness);
+		float3 iceLookupDirection = -reflect(iceTransmissionDirection, iceNormal);
+#			if defined(SKYLIGHTING)
+		color.xyz += indirectLobeWeights.iceTransmission * DynamicCubemaps::GetDynamicCubemapSpecularIrradiance(-iceNormal, iceLookupDirection, 0.3f * material.Roughness, skylightingSH);
+#			else
+		color.xyz += indirectLobeWeights.iceTransmission * DynamicCubemaps::GetDynamicCubemapSpecularIrradiance(-iceNormal, iceLookupDirection, 0.3f * material.Roughness);
+#			endif
+	}
 #		endif
 
 	color.xyz = ColorManagement::LinearToScene(color.xyz);

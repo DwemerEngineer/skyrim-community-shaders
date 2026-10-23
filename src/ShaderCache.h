@@ -80,6 +80,8 @@ namespace ShaderConstants
 		const int32_t LandscapeTexture6GlintParameters = 49;
 
 		const int32_t MaterialObjectRGBScale = 50;  // RGB multipliers for material objects
+		const int32_t IceParams1 = 51;
+		const int32_t IceParams2 = 52;
 
 		const int32_t ShadowSampleParam = -1;
 		const int32_t EndSplitDistances = -1;

@@ -55,6 +55,7 @@ struct IndirectLobeWeights
 #if defined(TRUE_PBR)
 	float3 frontTransmission;
 	float3 backTransmission;
+	float3 iceTransmission;
 #endif
 };
 
@@ -112,6 +113,11 @@ struct MaterialProperties
 	float GlintDensityRandomization;
 	Glints::GlintCachedVars GlintCache;
 	float Noise;
+	float3 IceAbsorption;
+	float IceDepth;
+	float IceTransmissionWeight;
+	float2 IceEnergyCompensation;
+	float3 IceViewTransmittance;
 #endif
 };
 

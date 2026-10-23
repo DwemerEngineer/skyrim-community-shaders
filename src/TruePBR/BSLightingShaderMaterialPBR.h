@@ -13,6 +13,7 @@ enum class PBRFlags : uint32_t
 	HairMarschner = 1 << 6,
 	Foliage = 1 << 7,
 	ThinSurface = 1 << 8,
+	Ice = 1 << 9,
 };
 
 enum class PBRShaderFlags : uint32_t
@@ -32,6 +33,7 @@ enum class PBRShaderFlags : uint32_t
 	ProjectedGlint = 1 << 12,
 	Foliage = 1 << 13,
 	ThinSurface = 1 << 14,
+	Ice = 1 << 15,
 };
 
 /**
@@ -146,6 +148,13 @@ public:
 	/** @brief Applies the four finite values in the NIF PBRThinSurface extra-data block. */
 	bool ApplyNifThinSurfaceParameters(std::span<const float> parameters);
 	/**
+	 * @brief Enables ice and applies the six finite values in the NIF PBRIce extra-data block.
+	 *
+	 * The values are the absorption color, the absorption distance in meters, the transmission weight
+	 * and the depth in meters, as in the texture set JSON.
+	 */
+	bool ApplyNifIceParameters(std::span<const float> parameters);
+	/**
 	 * @brief Applies projected material object parameters (base color scale, roughness, specular, glint) to this material.
 	 * @param materialObjectData The material object configuration to apply.
 	 */
@@ -174,6 +183,13 @@ public:
 	float GetSubsurfaceBalance() const;
 	/** @brief Returns front/back thin-surface specular weights and back-face roughness scale. */
 	const std::array<float, 3>& GetThinSurfaceParameters() const;
+
+	/** @brief Returns the ice absorption coefficient per game unit for each color channel. */
+	const std::array<float, 3>& GetIceAbsorption() const;
+	/** @brief Returns the strength of light transmitted through ice. */
+	float GetIceTransmissionWeight() const;
+	/** @brief Returns the scale applied to the depth light travels through ice. */
+	float GetIceDepthScale() const;
 
 	/** @brief Returns the clearcoat layer color (stored in specularColor). */
 	const RE::NiColor& GetCoatColor() const;
@@ -209,8 +225,13 @@ public:
 	stl::enumeration<PBRFlags> pbrFlags;
 	// Retain NIF defaults when texture-set parameters are reapplied.
 	stl::enumeration<PBRFlags> nifThinSurfaceFlags;
+	bool nifIce = false;
 	float subsurfaceBalance = 0.75f;
 	std::array<float, 3> thinSurfaceParameters = { 0.5f, 0.5f, 1.f };
+
+	std::array<float, 3> iceAbsorption = { 0.f, 0.f, 0.f };
+	float iceTransmissionWeight = 1.f;
+	float iceDepthScale = 1.f;
 
 	float coatRoughness = 1.f;
 	float coatSpecularLevel = 0.04f;

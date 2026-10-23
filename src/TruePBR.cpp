@@ -34,6 +34,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	thinSurfaceSpecularWeight,
 	thinSurfaceBackSpecularWeight,
 	thinSurfaceBackRoughnessScale,
+	ice,
+	iceAbsorptionColor,
+	iceAbsorptionDistance,
+	iceTransmissionWeight,
+	iceDepthScale,
 	coatColor,
 	coatStrength,
 	coatRoughness,
@@ -181,6 +186,28 @@ void TruePBR::DrawSettings()
 				wasEdited |= ImGui::SliderFloat(T(TKEY("thin_surface_back_roughness_scale"), "Back Roughness Scale"), &selectedPbrTextureSet->thinSurfaceBackRoughnessScale, 0.f, 3.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::Text("%s", T(TKEY("thin_surface_tooltip"), "For thin surfaces, specular weights scale the complete surface reflection of each side, including grazing angles, for direct and indirect lighting. Roughness scale applies to back faces. Defaults: 0.5, 0.5, 1.0. Front and back follow mesh winding."));
+				ImGui::TreePop();
+			}
+			if (ImGui::TreeNodeEx(T(TKEY("ice"), "Ice"))) {
+				if (ImGui::Checkbox(T(TKEY("ice_enabled"), "Ice"), &selectedPbrTextureSet->ice)) {
+					wasEdited = true;
+				}
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("%s", T(TKEY("ice_enabled_tooltip"), "Lights the material as clear ice: a rough refractive surface with light absorbed inside it. Replaces subsurface. Does not apply to landscape, coat or hair materials."));
+				if (ImGui::ColorPicker3(T(TKEY("ice_absorption_color"), "Absorption Color"), &selectedPbrTextureSet->iceAbsorptionColor.red)) {
+					wasEdited = true;
+				}
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("%s", T(TKEY("ice_absorption_color_tooltip"), "Color of white light after travelling the absorption distance through the ice. Brighter colors absorb less. Channels below 0.01 are treated as 0.01."));
+				wasEdited |= ImGui::SliderFloat(T(TKEY("ice_absorption_distance"), "Absorption Distance"), &selectedPbrTextureSet->iceAbsorptionDistance, 0.05f, 50.f, "%.2f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("%s", T(TKEY("ice_absorption_distance_tooltip"), "Distance in meters at which light inside the ice reaches the absorption color. Larger values give clearer ice."));
+				wasEdited |= ImGui::SliderFloat(T(TKEY("ice_transmission_weight"), "Transmission Weight"), &selectedPbrTextureSet->iceTransmissionWeight, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("%s", T(TKEY("ice_transmission_weight_tooltip"), "Strength of light passing through the ice. 1 is physically based; lower values make the ice more opaque without changing its surface reflection."));
+				wasEdited |= ImGui::SliderFloat(T(TKEY("ice_depth_scale"), "Depth"), &selectedPbrTextureSet->iceDepthScale, 0.f, 10.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("%s", T(TKEY("ice_depth_scale_tooltip"), "Depth in meters of the ice below the surface at the lowest point of the height map. Thin ice uses it as its thickness."));
 				ImGui::TreePop();
 			}
 			if (ImGui::TreeNodeEx(T(TKEY("coat"), "Coat"))) {
@@ -390,8 +417,92 @@ void TruePBR::Prepass()
 	auto context = globals::d3d::context;
 	if (!glintsNoiseTexture)
 		SetupGlintsTexture();
-	ID3D11ShaderResourceView* srv = glintsNoiseTexture->srv.get();
-	context->PSSetShaderResources(20, 1, &srv);
+	if (!iceEnergyLUTAttempted) {
+		iceEnergyLUTAttempted = true;
+		SetupIceEnergyLUT();
+	}
+	ID3D11ShaderResourceView* srvs[2] = { glintsNoiseTexture->srv.get(), iceEnergyLUT ? iceEnergyLUT->srv.get() : nullptr };
+	context->PSSetShaderResources(20, ARRAYSIZE(srvs), srvs);
+}
+
+void TruePBR::SetupIceEnergyLUT()
+{
+	constexpr uint lutSize = 32;
+
+	D3D11_TEXTURE2D_DESC tex_desc{
+		.Width = lutSize,
+		.Height = lutSize,
+		.MipLevels = 1,
+		.ArraySize = 1,
+		.Format = DXGI_FORMAT_R16G16_FLOAT,
+		.SampleDesc = { .Count = 1, .Quality = 0 },
+		.Usage = D3D11_USAGE_DEFAULT,
+		.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+		.CPUAccessFlags = 0,
+		.MiscFlags = 0
+	};
+	D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {
+		.Format = tex_desc.Format,
+		.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+		.Texture2D = {
+			.MostDetailedMip = 0,
+			.MipLevels = 1 }
+	};
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {
+		.Format = tex_desc.Format,
+		.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+		.Texture2D = { .MipSlice = 0 }
+	};
+
+	// Compile
+	auto bakeProgram = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\TruePBR\\IceEnergyLUTCS.hlsl", {}, "cs_5_0"));
+	if (!bakeProgram) {
+		logger::error("Failed to compile ice energy LUT shader!");
+		return;
+	}
+
+	iceEnergyLUT = eastl::make_unique<Texture2D>(tex_desc, "TruePBR::IceEnergyLUT");
+	iceEnergyLUT->CreateSRV(srv_desc);
+	iceEnergyLUT->CreateUAV(uav_desc);
+
+	// Generate the LUT
+	{
+		auto context = globals::d3d::context;
+
+		struct OldState
+		{
+			ID3D11ComputeShader* shader;
+			ID3D11UnorderedAccessView* uav[1];
+			ID3D11ClassInstance* instance;
+			UINT numInstances;
+		};
+
+		OldState newer{}, old{};
+		context->CSGetShader(&old.shader, &old.instance, &old.numInstances);
+		context->CSGetUnorderedAccessViews(0, ARRAYSIZE(old.uav), old.uav);
+
+		{
+			newer.uav[0] = iceEnergyLUT->uav.get();
+			context->CSSetShader(bakeProgram, nullptr, 0);
+			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(newer.uav), newer.uav, nullptr);
+			context->Dispatch((lutSize + 7) >> 3, (lutSize + 7) >> 3, 1);
+		}
+
+		context->CSSetShader(old.shader, &old.instance, old.numInstances);
+		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(old.uav), old.uav, nullptr);
+
+		// Release COM objects to prevent memory leaks
+		if (old.shader)
+			old.shader->Release();
+		if (old.instance)
+			old.instance->Release();
+		for (auto& uav : old.uav) {
+			if (uav)
+				uav->Release();
+		}
+	}
+
+	bakeProgram->Release();
 }
 
 void TruePBR::SetupGlintsTexture()
@@ -815,13 +926,21 @@ struct BSLightingShaderProperty_PostLinkObject
 			return;
 		}
 
-		const auto* extra = property->GetExtraData("PBRThinSurface");
-		if (!extra) {
-			return;
-		}
-		const auto* parameters = netimmerse_cast<const RE::NiFloatsExtraData*>(extra);
-		if (!parameters || parameters->size != 4 || !parameters->value) {
-			logger::warn("[TruePBR] {} has invalid PBRThinSurface extra data, expected four floats", stream.inputFilePath);
+		const auto getFloats = [&](const char* name, std::uint32_t count) -> const RE::NiFloatsExtraData* {
+			const auto* extra = property->GetExtraData(name);
+			if (!extra) {
+				return nullptr;
+			}
+			const auto* parameters = netimmerse_cast<const RE::NiFloatsExtraData*>(extra);
+			if (!parameters || parameters->size != count || !parameters->value) {
+				logger::warn("[TruePBR] {} has invalid {} extra data, expected {} floats", stream.inputFilePath, name, count);
+				return nullptr;
+			}
+			return parameters;
+		};
+		const auto* thinSurfaceParameters = getFloats("PBRThinSurface", 4);
+		const auto* iceParameters = getFloats("PBRIce", 6);
+		if (!thinSurfaceParameters && !iceParameters) {
 			return;
 		}
 
@@ -833,8 +952,22 @@ struct BSLightingShaderProperty_PostLinkObject
 		// Per-NIF values must not modify a material shared by another shader property.
 		BSLightingShaderMaterialPBR source;
 		source.CopyMembers(material);
-		if (!source.ApplyNifThinSurfaceParameters({ parameters->value, parameters->size })) {
-			logger::warn("[TruePBR] {} has non-finite PBRThinSurface parameters", stream.inputFilePath);
+		bool applied = false;
+		if (thinSurfaceParameters) {
+			if (source.ApplyNifThinSurfaceParameters({ thinSurfaceParameters->value, thinSurfaceParameters->size })) {
+				applied = true;
+			} else {
+				logger::warn("[TruePBR] {} has non-finite PBRThinSurface parameters", stream.inputFilePath);
+			}
+		}
+		if (iceParameters) {
+			if (source.ApplyNifIceParameters({ iceParameters->value, iceParameters->size })) {
+				applied = true;
+			} else {
+				logger::warn("[TruePBR] {} has non-finite PBRIce parameters", stream.inputFilePath);
+			}
+		}
+		if (!applied) {
 			return;
 		}
 		if (const auto* textureSetData = BSLightingShaderMaterialPBR::All[&source].textureSetData) {
@@ -1078,7 +1211,20 @@ bool TruePBR::BSLightingShader_SetupMaterial(RE::BSLightingShader* shader, RE::B
 			} else if (pbrMaterial->pbrFlags.any(PBRFlags::HairMarschner)) {
 				shaderFlags.set(PBRShaderFlags::HairMarschner);
 			} else {
-				if (pbrMaterial->pbrFlags.any(PBRFlags::Subsurface)) {
+				if (pbrMaterial->pbrFlags.any(PBRFlags::Ice)) {
+					shaderFlags.set(PBRShaderFlags::Ice);
+
+					const auto& iceAbsorption = pbrMaterial->GetIceAbsorption();
+					std::array<float, 4> IceParams1;
+					IceParams1[0] = iceAbsorption[0];
+					IceParams1[1] = iceAbsorption[1];
+					IceParams1[2] = iceAbsorption[2];
+					IceParams1[3] = pbrMaterial->GetIceTransmissionWeight();
+					shadowState->SetPSConstant(IceParams1, RE::BSGraphics::ConstantGroupLevel::PerMaterial, lightingPSConstants.IceParams1);
+
+					const float IceParams2 = pbrMaterial->GetIceDepthScale() / Util::Units::GAME_UNIT_TO_M;
+					shadowState->SetPSConstant(IceParams2, RE::BSGraphics::ConstantGroupLevel::PerMaterial, lightingPSConstants.IceParams2);
+				} else if (pbrMaterial->pbrFlags.any(PBRFlags::Subsurface)) {
 					shaderFlags.set(PBRShaderFlags::Subsurface);
 
 					std::array<float, 4> PBRParams2;

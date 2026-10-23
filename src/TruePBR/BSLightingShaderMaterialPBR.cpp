@@ -16,6 +16,14 @@ static void DiscardMislinkedTextureSet(RE::NiPointer<RE::BSTextureSet>& textureS
 	}
 }
 
+/** @brief Beer-Lambert absorption per game unit, from the color left after the absorption distance in meters. */
+static std::array<float, 3> GetIceAbsorptionCoefficients(const RE::NiColor& color, float absorptionDistance)
+{
+	const float distance = std::clamp(absorptionDistance, 0.05f, 50.f) / Util::Units::GAME_UNIT_TO_M;
+	const auto toIceAbsorption = [distance](float channel) { return -std::log(std::clamp(channel, 0.01f, 1.f)) / distance; };
+	return { toIceAbsorption(color.red), toIceAbsorption(color.green), toIceAbsorption(color.blue) };
+}
+
 BSLightingShaderMaterialPBR::~BSLightingShaderMaterialPBR()
 {
 	All.erase(this);
@@ -49,8 +57,12 @@ void BSLightingShaderMaterialPBR::CopyMembers(RE::BSShaderMaterial* that)
 	loadedWithFeature = pbrThat->loadedWithFeature;
 	pbrFlags = pbrThat->pbrFlags;
 	nifThinSurfaceFlags = pbrThat->nifThinSurfaceFlags;
+	nifIce = pbrThat->nifIce;
 	subsurfaceBalance = pbrThat->subsurfaceBalance;
 	thinSurfaceParameters = pbrThat->thinSurfaceParameters;
+	iceAbsorption = pbrThat->iceAbsorption;
+	iceTransmissionWeight = pbrThat->iceTransmissionWeight;
+	iceDepthScale = pbrThat->iceDepthScale;
 	coatRoughness = pbrThat->coatRoughness;
 	coatSpecularLevel = pbrThat->coatSpecularLevel;
 	fuzzColor = pbrThat->fuzzColor;
@@ -76,8 +88,12 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 	{
 		uint32_t pbrFlags = 0;
 		uint32_t nifThinSurfaceFlags = 0;
+		uint32_t nifIce = 0;
 		float subsurfaceBalance = 0.75f;
 		std::array<float, 3> thinSurfaceParameters = { 0.5f, 0.5f, 1.f };
+		std::array<float, 3> iceAbsorption = { 0.f, 0.f, 0.f };
+		float iceTransmissionWeight = 1.f;
+		float iceDepthScale = 1.f;
 		float coatRoughness = 0.f;
 		float coatSpecularLevel = 0.f;
 		std::array<float, 3> fuzzColor = { 0.f, 0.f, 0.f };
@@ -103,8 +119,12 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 
 	hashes.pbrFlags = pbrFlags.underlying();
 	hashes.nifThinSurfaceFlags = nifThinSurfaceFlags.underlying();
+	hashes.nifIce = nifIce;
 	hashes.subsurfaceBalance = subsurfaceBalance;
 	hashes.thinSurfaceParameters = thinSurfaceParameters;
+	hashes.iceAbsorption = iceAbsorption;
+	hashes.iceTransmissionWeight = iceTransmissionWeight;
+	hashes.iceDepthScale = iceDepthScale;
 	hashes.coatRoughness = coatRoughness * 100.f;
 	hashes.coatSpecularLevel = coatSpecularLevel * 100.f;
 	hashes.fuzzColor[0] = fuzzColor[0] * 100.f;
@@ -150,17 +170,27 @@ void BSLightingShaderMaterialPBR::ApplyTextureSetData(const TruePBR::PBRTextureS
 	specularPower = textureSetData.specularLevel;
 	rimLightPower = textureSetData.displacementScale;
 	subsurfaceBalance = std::clamp(textureSetData.subsurfaceBalance, 0.f, 1.f);
-	pbrFlags.reset(PBRFlags::ThinSurface, PBRFlags::Foliage);
+	pbrFlags.reset(PBRFlags::ThinSurface, PBRFlags::Foliage, PBRFlags::Ice);
 	pbrFlags.set(nifThinSurfaceFlags.get());
+	if (nifIce) {
+		pbrFlags.set(PBRFlags::Ice);
+	}
 	if (textureSetData.thinSurface) {
 		pbrFlags.set(PBRFlags::ThinSurface);
 	}
 	if (textureSetData.foliage) {
 		pbrFlags.set(PBRFlags::Foliage);
 	}
+	if (textureSetData.ice) {
+		pbrFlags.set(PBRFlags::Ice);
+	}
 	thinSurfaceParameters = { std::clamp(textureSetData.thinSurfaceSpecularWeight, 0.f, 1.f),
 		std::clamp(textureSetData.thinSurfaceBackSpecularWeight, 0.f, 1.f),
 		std::clamp(textureSetData.thinSurfaceBackRoughnessScale, 0.f, 3.f) };
+
+	iceAbsorption = GetIceAbsorptionCoefficients(textureSetData.iceAbsorptionColor, textureSetData.iceAbsorptionDistance);
+	iceTransmissionWeight = std::clamp(textureSetData.iceTransmissionWeight, 0.f, 1.f);
+	iceDepthScale = std::clamp(textureSetData.iceDepthScale, 0.f, 10.f);
 
 	if (pbrFlags.any(PBRFlags::TwoLayer)) {
 		specularColor = textureSetData.coatColor;
@@ -192,6 +222,20 @@ bool BSLightingShaderMaterialPBR::ApplyNifThinSurfaceParameters(std::span<const 
 	thinSurfaceParameters = { std::clamp(parameters[1], 0.f, 1.f),
 		std::clamp(parameters[2], 0.f, 1.f),
 		std::clamp(parameters[3], 0.f, 3.f) };
+	return true;
+}
+
+bool BSLightingShaderMaterialPBR::ApplyNifIceParameters(std::span<const float> parameters)
+{
+	if (parameters.size() != 6 || std::ranges::any_of(parameters, [](float value) { return !std::isfinite(value); })) {
+		return false;
+	}
+
+	nifIce = true;
+	pbrFlags.set(PBRFlags::Ice);
+	iceAbsorption = GetIceAbsorptionCoefficients(RE::NiColor(parameters[0], parameters[1], parameters[2]), parameters[3]);
+	iceTransmissionWeight = std::clamp(parameters[4], 0.f, 1.f);
+	iceDepthScale = std::clamp(parameters[5], 0.f, 10.f);
 	return true;
 }
 
@@ -380,6 +424,21 @@ float BSLightingShaderMaterialPBR::GetSubsurfaceBalance() const
 const std::array<float, 3>& BSLightingShaderMaterialPBR::GetThinSurfaceParameters() const
 {
 	return thinSurfaceParameters;
+}
+
+const std::array<float, 3>& BSLightingShaderMaterialPBR::GetIceAbsorption() const
+{
+	return iceAbsorption;
+}
+
+float BSLightingShaderMaterialPBR::GetIceTransmissionWeight() const
+{
+	return iceTransmissionWeight;
+}
+
+float BSLightingShaderMaterialPBR::GetIceDepthScale() const
+{
+	return iceDepthScale;
 }
 
 const RE::NiColor& BSLightingShaderMaterialPBR::GetCoatColor() const

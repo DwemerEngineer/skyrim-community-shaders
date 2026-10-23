@@ -118,6 +118,19 @@ namespace BRDF
 		return saturate(F0 + Fc * ((1 - F0) - b * (VdotH - VdotH * VdotH)));
 	}
 
+	// Exact unpolarized Fresnel for a dielectric interface, eta = n_transmitted / n_incident
+	// Branchless port of fresnel_dielectric_cos from Blender Cycles, which adapts it from Open Shading Language
+	// Clamping g^2 at 0 makes total internal reflection return 1, and clamping c avoids 0 / 0 at grazing angles
+	// [Walter et al. 2007, "Microfacet models for refraction through rough surfaces", eq. 22]
+	float F_DielectricCos(float eta, float VdotH)
+	{
+		float c = max(abs(VdotH), 1e-5);
+		float g = sqrt(max(eta * eta - 1.0 + c * c, 0.0));
+		float a = (g - c) / (g + c);
+		float b = (c * (g + c) - 1.0) / (c * (g - c) + 1.0);
+		return 0.5 * a * a * (1.0 + b * b);
+	}
+
 	// [Beckmann 1963, "The scattering of electromagnetic waves from rough surfaces"]
 	float D_Beckmann(float roughness, float NdotH)
 	{

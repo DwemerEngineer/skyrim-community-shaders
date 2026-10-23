@@ -161,6 +161,11 @@ public:
 	void SetupGlintsTexture();
 	eastl::unique_ptr<Texture2D> glintsNoiseTexture = nullptr;
 
+	/** @brief Creates and populates the 32x32 ice energy compensation LUT via a compute shader dispatch. */
+	void SetupIceEnergyLUT();
+	eastl::unique_ptr<Texture2D> iceEnergyLUT = nullptr;
+	bool iceEnergyLUTAttempted = false;
+
 	std::unordered_map<uint32_t, std::string> editorIDs;
 
 	struct PBRTextureSetData
@@ -177,6 +182,12 @@ public:
 		float thinSurfaceSpecularWeight = 0.5f;
 		float thinSurfaceBackSpecularWeight = 0.5f;
 		float thinSurfaceBackRoughnessScale = 1.f;
+
+		bool ice = false;
+		RE::NiColor iceAbsorptionColor = { 0.61f, 0.9f, 0.9f };
+		float iceAbsorptionDistance = 1.f;
+		float iceTransmissionWeight = 1.f;
+		float iceDepthScale = 1.f;
 
 		RE::NiColor coatColor = { 1.f, 1.f, 1.f };
 		float coatStrength = 1.f;

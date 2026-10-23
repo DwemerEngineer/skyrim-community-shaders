@@ -17,6 +17,9 @@ namespace PBR
 		static const float MaxGlintRoughness = 0.3f;
 		static const float MinGlintDensityRandomization = 0.0f;
 		static const float MaxGlintDensityRandomization = 5.0f;
+		static const float IceIOR = 1.31f;
+		static const float IceF0 = 0.018f;               // IORToF0(IceIOR)
+		static const float IceDepthBlur = 4.0f / 70.0f;  // Inner layer mip bias growth per game unit of depth at roughness 1, about 4 per meter
 	}
 
 	namespace Flags
@@ -36,6 +39,7 @@ namespace PBR
 		static const uint ProjectedGlint = (1 << 12);
 		static const uint Foliage = (1 << 13);
 		static const uint ThinSurface = (1 << 14);
+		static const uint Ice = (1 << 15);
 	}
 
 	bool IsFoliageMaterial(uint flags)
@@ -125,6 +129,93 @@ namespace PBR
 	{
 		float2 specularBRDF = BRDF::EnvBRDF(roughness, NdotV);
 		return F0 * specularBRDF.x + specularBRDF.y;
+	}
+
+#if defined(TRUE_PBR) && defined(LIGHTING) && !defined(LANDSCAPE) && !defined(LODLANDSCAPE)
+	Texture2D<float2> TexIceEnergyLUT : register(t21);
+
+	/// @brief Energy compensation for the ice lobes (Turquin 2019), baked at IOR 1.31 by IceEnergyLUTCS.hlsl
+	/// @param roughness Perceptual roughness [0,1]
+	/// @param NdotV Dot product of normal and view direction
+	/// @return Scale for the reflected and transmitted lobes, x entering the ice and y leaving it
+	/// @note Bilinear Loads need no sampler slot. An unbound table reads 0 and clamps to 1.
+	float2 IceEnergyCompensation(float roughness, float NdotV)
+	{
+		static const int size = 32;
+		float2 coord = saturate(float2(NdotV, roughness)) * (size - 1);
+		int2 p = min(int2(coord), size - 2);
+		float2 f = coord - p;
+		float2 c00 = TexIceEnergyLUT.Load(int3(p, 0));
+		float2 c10 = TexIceEnergyLUT.Load(int3(p + int2(1, 0), 0));
+		float2 c01 = TexIceEnergyLUT.Load(int3(p + int2(0, 1), 0));
+		float2 c11 = TexIceEnergyLUT.Load(int3(p + int2(1, 1), 0));
+		return max(lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y), 1.0f);
+	}
+#endif
+
+	/// @brief Share of light crossing the ice surface, which is what the compensated reflection lobe does not reflect
+	/// @param roughness Perceptual roughness [0,1]
+	/// @param NdotX Dot product of normal and the outside direction
+	/// @param compensation Energy compensation of the crossing
+	float IceInterfaceTransmittance(float roughness, float NdotX, float compensation)
+	{
+		return saturate(1.0f - compensation * SpecularDirectionalAlbedo(Constants::IceF0, roughness, NdotX).x);
+	}
+
+	/// @brief Length of the path to a given depth inside the ice for light refracted from an outside direction
+	/// @param depth Depth below the surface in game units
+	/// @param NdotX Dot product of normal and the outside direction
+	/// @note The refracted cosine never drops below cos(49.8) at IOR 1.31, so the division is safe.
+	float IcePathLength(float depth, float NdotX)
+	{
+		float cosThetaT = sqrt(1.0f - (1.0f - NdotX * NdotX) / (Constants::IceIOR * Constants::IceIOR));
+		return max(depth, 0.0f) / cosThetaT;
+	}
+
+	/// @brief Beer-Lambert transmittance through ice
+	/// @param absorption Absorption coefficient per game unit
+	/// @param pathLength Path length in game units
+	float3 IceAbsorption(float3 absorption, float pathLength)
+	{
+		return exp(-absorption * pathLength);
+	}
+
+	/// @brief Dominant direction of the rough transmission lobe for the view ray entering the ice
+	/// @param N Surface normal, facing the viewer
+	/// @param V View direction
+	/// @param roughness Perceptual roughness [0,1]
+	/// @note Fit to the GGX BTDF at IOR 1.31, off by 0.8 degrees on average and 2.5 at most. The peak leans toward -V as roughness grows.
+	float3 GetIceTransmissionDirection(float3 N, float3 V, float roughness)
+	{
+		float NdotV = saturate(dot(N, V));
+		float3 T = refract(-V, N, 1.0f / Constants::IceIOR);
+		float a = roughness * roughness;
+		float s = a / (a + 0.67f * sqrt(NdotV) + 0.17f);
+		return normalize(lerp(T, -V, s));
+	}
+
+	/// @brief Rough dielectric transmission for light leaving the ice toward the viewer
+	/// @param roughness Perceptual roughness [0,1]
+	/// @param N Surface normal, facing the viewer
+	/// @param V View direction
+	/// @param L Light direction, below the surface
+	/// @return Transmission BTDF times the cosine on the light side
+	/// @note [Walter et al. 2007, "Microfacet models for refraction through rough surfaces"], eq. 21 with the light inside the ice.
+	float IceTransmissionLobe(float roughness, float3 N, float3 V, float3 L)
+	{
+		const float eta = Constants::IceIOR;
+		float3 H = normalize(-(eta * L + V));
+		H = dot(N, H) < 0.0f ? -H : H;
+		float VdotH = dot(V, H);
+		float LdotH = dot(L, H);
+		float NdotV = clamp(dot(N, V), EPSILON_DOT_CLAMP, 1.0f);
+		float NdotL = clamp(-dot(N, L), EPSILON_DOT_CLAMP, 1.0f);
+		float D = BRDF::D_GGX(roughness, saturate(dot(N, H)));
+		float visibility = BRDF::Vis_SmithJoint(roughness, NdotV, NdotL);
+		float F = BRDF::F_DielectricCos(1.0f / eta, LdotH);
+		float denominator = eta * LdotH + VdotH;
+		float lobe = 4.0f * visibility * D * (1.0f - F) * abs(VdotH * LdotH) / max(denominator * denominator, EPSILON_DIVISION) * NdotL;
+		return VdotH * LdotH < 0.0f ? lobe : 0.0f;
 	}
 
 	float3 GetThinSurfaceNormal(float3 N, float3 V)
