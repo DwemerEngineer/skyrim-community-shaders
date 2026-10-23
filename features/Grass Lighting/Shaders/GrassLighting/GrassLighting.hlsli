@@ -26,11 +26,11 @@ namespace GrassLighting
 		return 1.0 - SharedData::grassLightingSettings.CanopyOcclusion * (1.0 - saturate(canopyHeight));
 	}
 
-	// Align two-sided blade normals before blending so opposing normals cannot cancel.
+	// Bend within the normal's tangent plane to avoid hemisphere flips and cancellation.
 	float3 GetClumpBlendedNormal(float3 bladeNormal, float3 clumpNormal)
 	{
-		bladeNormal = dot(bladeNormal, clumpNormal) < 0.0 ? -bladeNormal : bladeNormal;
-		return normalize(lerp(bladeNormal, clumpNormal, SharedData::grassLightingSettings.ClumpShading));
+		float3 bend = clumpNormal - bladeNormal * dot(bladeNormal, clumpNormal);
+		return normalize(bladeNormal + bend * saturate(SharedData::grassLightingSettings.ClumpShading));
 	}
 
 	// Clump occlusion must not depend on which side of a blade faces the light.

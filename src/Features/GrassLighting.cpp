@@ -63,7 +63,7 @@ void GrassLighting::DrawSettings()
 		}
 		ImGui::SliderFloat(T(TKEY("clump_shading"), "Clump Shading"), &settings.ClumpShading, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextWrapped("%s", T(TKEY("clump_shading_tooltip"), "Shades each plant as a rounded volume: blade normals bend toward the plant's dome shape, and the side of the plant facing away from a light is dimmed because that light must pass through the plant to reach it. Zero keeps flat per-blade shading. Applies to PBR and non-PBR grass."));
+			ImGui::TextWrapped("%s", T(TKEY("clump_shading_tooltip"), "Rounds grass lighting toward the plant's dome shape. Basic and PBR grass also receive extra shadowing on the side facing away from a light. Complex grass keeps its normal-map detail without that extra shadowing. Does not affect meshes with authored sphere normals. Zero disables it."));
 		}
 
 		ImGui::Spacing();

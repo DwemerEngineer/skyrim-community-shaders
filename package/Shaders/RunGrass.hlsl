@@ -501,11 +501,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 vertexNormal = normalize(input.VertexNormal.xyz);
 	float3 clumpNormal = normalize(input.ClumpNormal);
 	float3 faceNormal = PBR::GetThinSurfaceFaceNormal(input.WorldPosition.xyz, viewDirection, vertexNormal);
-	// Bent normals may face away from the camera on visible cards. Orient by the geometric face instead.
-	if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal)) {
-		vertexNormal = GrassLighting::GetClumpBlendedNormal(vertexNormal, clumpNormal);
-		vertexNormal = dot(vertexNormal, faceNormal) < 0.0f ? -vertexNormal : vertexNormal;
-	}
+	const bool sphereNormal = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal) != 0;
+	// Winding keeps sidedness constant across interpolated blade normals.
+	if (!sphereNormal && !frontFace)
+		vertexNormal = -vertexNormal;
 
 #				ifdef GRASS_OPTIMIZATIONS
 	const bool pbrDetail = input.IsFar <= 0.5;
@@ -525,6 +524,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		normal = normalize(mul(GrassLighting::TransformNormal(normalSample.xyz), tbn));
 		rawRMAOS = TexRMAOSSampler.SampleBias(SampRMAOSSampler, input.TexCoord.xy, SharedData::MipBias) *
 		           float4(PBRParams1.x, 1, 1, PBRParams1.y);
+	}
+	// Preserve the authored normal-map basis before rounding the shading normal.
+	if (!sphereNormal) {
+		normal = GrassLighting::GetClumpBlendedNormal(normal, clumpNormal);
 	}
 	MaterialProperties material = (MaterialProperties)0;
 	material.ThinSurfaceSpecularWeight = saturate(frontFace ? PBRParams4.y : PBRParams4.z);
@@ -599,7 +602,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #				endif  // SCREEN_SPACE_SHADOWS
 
 	float canopyVisibility = GrassLighting::GetCanopyVisibility(input.VertexNormal.w);
-	float dirClumpVisibility = canopyVisibility * GrassLighting::GetClumpLightVisibility(clumpNormal, SharedData::DirLightDirection.xyz);
+	float dirClumpVisibility = canopyVisibility * (sphereNormal ? 1.0 : GrassLighting::GetClumpLightVisibility(clumpNormal, SharedData::DirLightDirection.xyz));
 	dirDetailedShadow *= dirClumpVisibility;
 	dirSoftShadow *= dirClumpVisibility;
 
@@ -635,7 +638,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				else if (light.lightFlags & LightLimitFix::LightFlags::Shadow)
 					lightShadow = shadowColor[light.shadowLightIndex];
 				float3 lightDirection = lightVector / max(lightDist, EPSILON_DIVISION);
-				lightShadow *= canopyVisibility * GrassLighting::GetClumpLightVisibility(clumpNormal, lightDirection);
+				lightShadow *= canopyVisibility * (sphereNormal ? 1.0 : GrassLighting::GetClumpLightVisibility(clumpNormal, lightDirection));
 				DirectContext pointContext = CreateDirectLightingContext(normal, normal, vertexNormal, viewDirection, viewDirection,
 					lightDirection, lightDirection, lightColor, lightShadow, lightShadow);
 				DirectLightingOutput pointOutput;
@@ -719,7 +722,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #				endif
 
-	float3 normalVS = normalize(FrameBuffer::WorldToView(PBR::GetThinSurfaceNormal(normal, viewDirection), false));
+	// Deferred diffuse and GI must keep the same hemisphere as forward diffuse.
+	float3 normalVS = normalize(FrameBuffer::WorldToView(normal, false));
 	psout.Diffuse = float4(outputColor, 1);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(normalVS), 1 - material.Roughness, 1);
 	psout.Albedo = float4(outputAlbedo, 1);
@@ -806,11 +810,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float3 clumpNormal = normalize(input.ClumpNormal);
 	float3 faceNormal = PBR::GetThinSurfaceFaceNormal(input.WorldPosition.xyz, viewDirection, normal);
-	// Bent normals may face away from the camera on visible cards. Orient by the geometric face instead.
-	if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal)) {
-		normal = GrassLighting::GetClumpBlendedNormal(normal, clumpNormal);
-		normal = dot(normal, faceNormal) < 0.0f ? -normal : normal;
-	}
+	const bool sphereNormal = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal) != 0;
+	const bool useClumpOcclusion = !sphereNormal && !complex;
+	// Winding keeps sidedness constant across interpolated blade normals.
+	if (!sphereNormal && !frontFace)
+		normal = -normal;
 
 	float3x3 tbn = 0;
 
@@ -827,8 +831,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		normal = normalize(mul(normalColor, tbn));
 	}
 
+	// Preserve the authored normal-map basis before rounding the shading normal.
+	if (!sphereNormal) {
+		normal = GrassLighting::GetClumpBlendedNormal(normal, clumpNormal);
+	}
 	float3 specularNormal = normal;
-	if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::GrassSphereNormal))
+	if (!sphereNormal)
 		specularNormal = PBR::GetThinSurfaceNormal(normal, viewDirection);
 
 	if (!complex || SharedData::grassLightingSettings.OverrideComplexGrassSettings)
@@ -908,7 +916,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	dirTransmissionShadow = min(dirTransmissionShadow, dirShadow);
 
 	float canopyVisibility = GrassLighting::GetCanopyVisibility(input.VertexNormal.w);
-	float dirClumpVisibility = canopyVisibility * GrassLighting::GetClumpLightVisibility(clumpNormal, SharedData::DirLightDirection.xyz);
+	float dirClumpVisibility = canopyVisibility * (useClumpOcclusion ? GrassLighting::GetClumpLightVisibility(clumpNormal, SharedData::DirLightDirection.xyz) : 1.0);
 	dirDetailedShadow *= dirClumpVisibility;
 	dirTransmissionShadow *= dirClumpVisibility;
 
@@ -966,7 +974,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 				float3 normalizedLightDirection = normalize(lightDirection);
 
-				lightColor *= lightShadow * canopyVisibility * GrassLighting::GetClumpLightVisibility(clumpNormal, normalizedLightDirection);
+				lightColor *= lightShadow * canopyVisibility * (useClumpOcclusion ? GrassLighting::GetClumpLightVisibility(clumpNormal, normalizedLightDirection) : 1.0);
 
 				float NdotL = dot(normal, normalizedLightDirection);
 				float3 lightDiffuseColor, lightTransmissionColor;
@@ -1043,7 +1051,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	psout.Diffuse.xyz = FogNearColor.w * diffuseColor;
 #				endif
 
-	float3 normalVS = normalize(FrameBuffer::WorldToView(specularNormal, false));
+	// Deferred diffuse and GI must keep the same hemisphere as forward diffuse.
+	float3 normalVS = normalize(FrameBuffer::WorldToView(normal, false));
 	psout.Albedo = float4(reflectionAlbedo, 1);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(normalVS), specColor.w, 1);
 
