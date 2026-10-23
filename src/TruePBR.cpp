@@ -170,12 +170,12 @@ void TruePBR::DrawSettings()
 					wasEdited = true;
 				}
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("%s", T(TKEY("thin_surface_enabled_tooltip"), "Lights the material as a thin two-sided sheet, such as leaves, paper or cloth. Each side is shaded from its own face, and subsurface light passes through to the side facing away from a light. Does not apply to landscape, coat or hair materials."));
+					ImGui::Text("%s", T(TKEY("thin_surface_enabled_tooltip"), "Lights the material as a thin two-sided sheet, such as leaves, paper or cloth. Each side is shaded from its own face, and subsurface light passes through to the side facing away from a light. Does not apply to landscape, coat or hair materials. The NIF Anisotropic Lighting flag also enables this independently of this checkbox."));
 				if (ImGui::Checkbox(T(TKEY("foliage_enabled"), "Foliage"), &selectedPbrTextureSet->foliage)) {
 					wasEdited = true;
 				}
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("%s", T(TKEY("foliage_enabled_tooltip"), "Thin surface lighting with foliage approximations: shadows and sky occlusion assume nearby occluders are leaves that pass some light, and normal-map roughness is filtered for leaf cards. Implies Thin Surface. Grass and trees with subsurface use it automatically."));
+					ImGui::Text("%s", T(TKEY("foliage_enabled_tooltip"), "Thin surface lighting with foliage approximations: shadows and sky occlusion assume nearby occluders are leaves that pass some light, and normal-map roughness is filtered for leaf cards. Implies Thin Surface. Grass and trees with subsurface use it automatically. The NIF Effect Lighting flag also enables this independently of this checkbox, except on coat or hair materials."));
 				wasEdited |= ImGui::SliderFloat(T(TKEY("thin_surface_specular_weight"), "Front Specular Weight"), &selectedPbrTextureSet->thinSurfaceSpecularWeight, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 				wasEdited |= ImGui::SliderFloat(T(TKEY("thin_surface_back_specular_weight"), "Back Specular Weight"), &selectedPbrTextureSet->thinSurfaceBackSpecularWeight, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 				wasEdited |= ImGui::SliderFloat(T(TKEY("thin_surface_back_roughness_scale"), "Back Roughness Scale"), &selectedPbrTextureSet->thinSurfaceBackRoughnessScale, 0.f, 3.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
@@ -768,6 +768,15 @@ struct BSLightingShaderProperty_LoadBinary
 			} else if (property->flags.any(kBackLighting)) {
 				pbrMaterial->pbrFlags.set(PBRFlags::HairMarschner);
 			} else {
+				// These NIF flags select thin-surface behavior only outside coat and hair materials.
+				if (property->flags.any(kAnisotropicLighting)) {
+					pbrMaterial->nifThinSurfaceFlags.set(PBRFlags::ThinSurface);
+				}
+				if (property->flags.any(kEffectLighting)) {
+					pbrMaterial->nifThinSurfaceFlags.set(PBRFlags::Foliage);
+				}
+				pbrMaterial->pbrFlags.set(pbrMaterial->nifThinSurfaceFlags.get());
+
 				if (property->flags.any(kRimLighting)) {
 					pbrMaterial->pbrFlags.set(PBRFlags::Subsurface);
 				}
@@ -796,6 +805,45 @@ static bool IsPBRShaderProperty(const RE::BSShaderProperty* property)
 {
 	return property->material != nullptr && property->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kVertexLighting) && (property->material->GetFeature() == RE::BSShaderMaterial::Feature::kDefault || property->material->GetFeature() == RE::BSShaderMaterial::Feature::kMultiTexLandLODBlend);
 }
+
+struct BSLightingShaderProperty_PostLinkObject
+{
+	static void thunk(RE::BSLightingShaderProperty* property, RE::NiStream& stream)
+	{
+		func(property, stream);
+		if (!IsPBRShaderProperty(property)) {
+			return;
+		}
+
+		const auto* extra = property->GetExtraData("PBRThinSurface");
+		if (!extra) {
+			return;
+		}
+		const auto* parameters = netimmerse_cast<const RE::NiFloatsExtraData*>(extra);
+		if (!parameters || parameters->size != 4 || !parameters->value) {
+			logger::warn("[TruePBR] {} has invalid PBRThinSurface extra data, expected four floats", stream.inputFilePath);
+			return;
+		}
+
+		auto* material = static_cast<BSLightingShaderMaterialPBR*>(property->material);
+		if (material->pbrFlags.any(PBRFlags::TwoLayer, PBRFlags::HairMarschner)) {
+			return;
+		}
+
+		// Per-NIF values must not modify a material shared by another shader property.
+		BSLightingShaderMaterialPBR source;
+		source.CopyMembers(material);
+		if (!source.ApplyNifThinSurfaceParameters({ parameters->value, parameters->size })) {
+			logger::warn("[TruePBR] {} has non-finite PBRThinSurface parameters", stream.inputFilePath);
+			return;
+		}
+		if (const auto* textureSetData = BSLightingShaderMaterialPBR::All[&source].textureSetData) {
+			source.ApplyTextureSetData(*textureSetData);
+		}
+		property->SetMaterial(&source, true);
+	}
+	static inline REL::Relocation<decltype(thunk)> func;
+};
 
 struct BSLightingShaderProperty_GetRenderPasses
 {
@@ -1821,6 +1869,7 @@ void TruePBR::PostPostLoad()
 
 	logger::info("[TruePBR] Hooking BSLightingShaderProperty");
 	stl::write_vfunc<0x18, BSLightingShaderProperty_LoadBinary>(RE::VTABLE_BSLightingShaderProperty[0]);
+	stl::write_vfunc<0x1E, BSLightingShaderProperty_PostLinkObject>(RE::VTABLE_BSLightingShaderProperty[0]);
 	stl::write_vfunc<0x2A, BSLightingShaderProperty_GetRenderPasses>(RE::VTABLE_BSLightingShaderProperty[0]);
 	stl::write_vfunc<0x2C, BSLightingShaderProperty_GetRenderPasses_LocalMap>(RE::VTABLE_BSLightingShaderProperty[0]);
 	stl::detour_thunk<BSLightingShaderProperty_OnLoadTextureSet>(REL::RelocationID(99865, 106510));

@@ -143,6 +143,8 @@ public:
 	 * @param textureSetData The texture set configuration to apply.
 	 */
 	void ApplyTextureSetData(const TruePBR::PBRTextureSetData& textureSetData);
+	/** @brief Applies the four finite values in the NIF PBRThinSurface extra-data block. */
+	bool ApplyNifThinSurfaceParameters(std::span<const float> parameters);
 	/**
 	 * @brief Applies projected material object parameters (base color scale, roughness, specular, glint) to this material.
 	 * @param materialObjectData The material object configuration to apply.
@@ -205,6 +207,8 @@ public:
 	RE::BSShaderMaterial::Feature loadedWithFeature = RE::BSShaderMaterial::Feature::kDefault;
 
 	stl::enumeration<PBRFlags> pbrFlags;
+	// Retain NIF defaults when texture-set parameters are reapplied.
+	stl::enumeration<PBRFlags> nifThinSurfaceFlags;
 	float subsurfaceBalance = 0.75f;
 	std::array<float, 3> thinSurfaceParameters = { 0.5f, 0.5f, 1.f };
 
