@@ -339,7 +339,8 @@ namespace SharedData
 
 		float MasserBillboardTan;
 		float SecundaBillboardTan;
-		float2 SkyScatteringPad0;
+		float SkyScaleMultiplier;
+		float SkyScatteringPad0;
 
 		uint EnableWater;
 		float WaterWavesAmplitude;
