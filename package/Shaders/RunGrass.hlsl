@@ -112,6 +112,7 @@ cbuffer GrassBucket : register(b13)
 	uint GrassBucketGroupCount : packoffset(c0.x);
 	uint GrassOutputOffset : packoffset(c1.y);
 	float GrassComplexThreshold : packoffset(c3.z);
+	float3 GrassCanopyHeights : packoffset(c5);
 };
 #	endif
 
@@ -137,15 +138,15 @@ float3 CalculateWindDisplacement(VS_INPUT input, float windTimer)
 
 #	ifdef GRASS_LIGHTING
 // Grass meshes are rooted at the model origin.
-float GetCanopyHeight(VS_INPUT input)
+float GetCanopyHeight(VS_INPUT input, float canopyHeight)
 {
-	return saturate(input.Position.z / max(Permutation::GrassCanopyHeight, 1.0));
+	return saturate(input.Position.z / max(canopyHeight, 1.0));
 }
 
 // A pivot below the root gives the clump a dome-shaped normal field.
-float3 GetClumpNormal(VS_INPUT input, float3x3 world3x3)
+float3 GetClumpNormal(VS_INPUT input, float3x3 world3x3, float canopyHeight)
 {
-	return mul(world3x3, input.Position.xyz + float3(0, 0, 0.5 * max(Permutation::GrassCanopyHeight, 1.0)));
+	return mul(world3x3, input.Position.xyz + float3(0, 0, 0.5 * max(canopyHeight, 1.0)));
 }
 
 float4 GetMSPosition(VS_INPUT input, float3x3 world3x3)
@@ -233,8 +234,8 @@ VS_OUTPUT VanillaVertex(VS_INPUT input)
 #		ifdef GRASS_LIGHTING
 	// Vertex normal needs to be transformed to world-space for lighting calculations.
 	vsout.VertexNormal.xyz = mul(world3x3, input.Normal.xyz * 2.0 - 1.0);
-	vsout.VertexNormal.w = GetCanopyHeight(input);
-	vsout.ClumpNormal = GetClumpNormal(input, world3x3);
+	vsout.VertexNormal.w = GetCanopyHeight(input, Permutation::GrassCanopyHeight);
+	vsout.ClumpNormal = GetClumpNormal(input, world3x3, Permutation::GrassCanopyHeight);
 #		else
 	float3 instanceNormal = float3(input.InstanceData2.z, input.InstanceData3.zw);
 	vsout.DirLightAngle = saturate(dot(DirLightDirection.xyz, instanceNormal));
@@ -321,8 +322,9 @@ VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
 	vsout.LodTier = (float)(flags >> GrassInstance::FlagTierShift);
 #			ifdef GRASS_LIGHTING
 	vsout.VertexNormal.xyz = mul(world3x3, input.Normal.xyz * 2.0 - 1.0);
-	vsout.VertexNormal.w = GetCanopyHeight(input);
-	vsout.ClumpNormal = GetClumpNormal(input, world3x3);
+	const float canopyHeight = GrassCanopyHeights[flags >> GrassInstance::FlagTierShift];
+	vsout.VertexNormal.w = GetCanopyHeight(input, canopyHeight);
+	vsout.ClumpNormal = GetClumpNormal(input, world3x3, canopyHeight);
 #			endif
 #		endif
 

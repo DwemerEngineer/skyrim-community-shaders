@@ -833,12 +833,12 @@ struct BSLightingShaderProperty_PostLinkObject
 		// Per-NIF values must not modify a material shared by another shader property.
 		BSLightingShaderMaterialPBR source;
 		source.CopyMembers(material);
+		if (const auto* textureSetData = BSLightingShaderMaterialPBR::All[&source].textureSetData) {
+			source.ApplyTextureSetData(*textureSetData);
+		}
 		if (!source.ApplyNifThinSurfaceParameters({ parameters->value, parameters->size })) {
 			logger::warn("[TruePBR] {} has non-finite PBRThinSurface parameters", stream.inputFilePath);
 			return;
-		}
-		if (const auto* textureSetData = BSLightingShaderMaterialPBR::All[&source].textureSetData) {
-			source.ApplyTextureSetData(*textureSetData);
 		}
 		property->SetMaterial(&source, true);
 	}

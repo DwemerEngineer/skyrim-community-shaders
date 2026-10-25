@@ -2404,10 +2404,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		if (thinSurfaceNormals) {
 			float faceLightAngle = dot(thinSurfaceFaceNormal, DirLightDirection);
 			dirDetailedShadow *= ScreenSpaceShadows::GetThinSurfaceScreenSpaceShadow(input.Position.xyz, screenUV, screenNoise, faceLightAngle);
-			if ((PBRFlags & PBR::Flags::Subsurface) == 0) {
-				float2 screenSpaceShadows = ScreenSpaceShadows::GetScreenSpaceShadows(input.Position.xyz, screenUV, screenNoise);
-				dirTransmissionContactShadow = faceLightAngle >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
-			}
+			float2 screenSpaceShadows = ScreenSpaceShadows::GetScreenSpaceShadows(input.Position.xyz, screenUV, screenNoise);
+			dirTransmissionContactShadow = faceLightAngle >= 0.0 ? screenSpaceShadows.x : screenSpaceShadows.y;
 		} else
 #		endif
 		{

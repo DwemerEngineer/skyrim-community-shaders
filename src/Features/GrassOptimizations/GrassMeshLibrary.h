@@ -43,6 +43,7 @@ public:
 		ID3D11Buffer* indexBuffer = nullptr;
 		uint32_t indexCount = 0;
 		float boundExtent = 0.0f;
+		float canopyHeight = 1.0f;
 		// The LOD .nif is authored separately, so its vertex format need not match the source mesh's.
 		uint32_t meshStride = 0;
 		uint64_t descVal = 0;

@@ -287,6 +287,7 @@ void GrassMeshLibrary::LoadLODMesh(LODMesh& entry, const std::string& stem, LODT
 				entry.indexCount = 3u * ts->GetTrishapeRuntimeData().triangleCount;
 				const auto& bound = ts->GetModelData().modelBound;
 				entry.boundExtent = bound.center.Length() + bound.radius;
+				entry.canopyHeight = bound.center.z > 1.0f ? 2.0f * bound.center.z : std::max(bound.center.z + bound.radius, 1.0f);
 
 				if (entry.meshStride != 0 && entry.indexCount != 0)
 					entry.state = LoadState::kReady;
