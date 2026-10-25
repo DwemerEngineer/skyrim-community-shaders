@@ -38,25 +38,25 @@ void BSLightingShaderMaterialPBRLandscape::CopyMembers(RE::BSShaderMaterial* tha
 
 	auto* pbrThat = static_cast<BSLightingShaderMaterialPBRLandscape*>(that);
 
-	numLandscapeTextures = pbrThat->numLandscapeTextures;
+	pbrThat->numLandscapeTextures = numLandscapeTextures;
 
 	for (uint32_t textureIndex = 0; textureIndex < NumTiles; ++textureIndex) {
-		landscapeBaseColorTextures[textureIndex] = pbrThat->landscapeBaseColorTextures[textureIndex];
-		landscapeNormalTextures[textureIndex] = pbrThat->landscapeNormalTextures[textureIndex];
-		landscapeDisplacementTextures[textureIndex] = pbrThat->landscapeDisplacementTextures[textureIndex];
-		landscapeRMAOSTextures[textureIndex] = pbrThat->landscapeRMAOSTextures[textureIndex];
+		pbrThat->landscapeBaseColorTextures[textureIndex] = landscapeBaseColorTextures[textureIndex];
+		pbrThat->landscapeNormalTextures[textureIndex] = landscapeNormalTextures[textureIndex];
+		pbrThat->landscapeDisplacementTextures[textureIndex] = landscapeDisplacementTextures[textureIndex];
+		pbrThat->landscapeRMAOSTextures[textureIndex] = landscapeRMAOSTextures[textureIndex];
 	}
-	terrainOverlayTexture = pbrThat->terrainOverlayTexture;
-	terrainNoiseTexture = pbrThat->terrainNoiseTexture;
-	landBlendParams = pbrThat->landBlendParams;
-	isPbr = pbrThat->isPbr;
-	roughnessScales = pbrThat->roughnessScales;
-	displacementScales = pbrThat->displacementScales;
-	specularLevels = pbrThat->specularLevels;
-	terrainTexOffsetX = pbrThat->terrainTexOffsetX;
-	terrainTexOffsetY = pbrThat->terrainTexOffsetY;
-	terrainTexFade = pbrThat->terrainTexFade;
-	glintParameters = pbrThat->glintParameters;
+	pbrThat->terrainOverlayTexture = terrainOverlayTexture;
+	pbrThat->terrainNoiseTexture = terrainNoiseTexture;
+	pbrThat->landBlendParams = landBlendParams;
+	pbrThat->isPbr = isPbr;
+	pbrThat->roughnessScales = roughnessScales;
+	pbrThat->displacementScales = displacementScales;
+	pbrThat->specularLevels = specularLevels;
+	pbrThat->terrainTexOffsetX = terrainTexOffsetX;
+	pbrThat->terrainTexOffsetY = terrainTexOffsetY;
+	pbrThat->terrainTexFade = terrainTexFade;
+	pbrThat->glintParameters = glintParameters;
 
 	All[this] = All[pbrThat];
 }
