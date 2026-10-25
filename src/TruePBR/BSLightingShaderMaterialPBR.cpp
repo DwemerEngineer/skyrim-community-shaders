@@ -252,6 +252,9 @@ void BSLightingShaderMaterialPBR::OnLoadTextureSet(std::uint64_t arg1, RE::BSTex
 				if (auto* textureSetData = globals::features::truePBR.GetPBRTextureSetData(bgsTextureSet)) {
 					ApplyTextureSetData(*textureSetData);
 					All[this].textureSetData = textureSetData;
+				} else if (const auto it = All.find(this); it != All.end()) {
+					it->second.textureSetData = nullptr;
+					it->second.nifThinSurfaceParameters.reset();
 				}
 			}
 		}
