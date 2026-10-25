@@ -49,6 +49,7 @@ public:
 	{
 		TruePBR::PBRTextureSetData* textureSetData = nullptr;
 		TruePBR::PBRMaterialObjectData* materialObjectData = nullptr;
+		std::optional<std::array<float, 4>> nifThinSurfaceParameters;
 		/**
 		 * FormID of the TESObjectREFR whose Clone3D call last wrote MATO data to this
 		 * material.  Used by the fork-before-write check to detect when a pooled material

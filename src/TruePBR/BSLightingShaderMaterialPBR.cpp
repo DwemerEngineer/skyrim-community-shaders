@@ -76,6 +76,7 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 	{
 		uint32_t pbrFlags = 0;
 		uint32_t nifThinSurfaceFlags = 0;
+		uint32_t hasNifThinSurfaceParameters = 0;
 		float subsurfaceBalance = 0.75f;
 		std::array<float, 3> thinSurfaceParameters = { 0.5f, 0.5f, 1.f };
 		float coatRoughness = 0.f;
@@ -103,6 +104,9 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 
 	hashes.pbrFlags = pbrFlags.underlying();
 	hashes.nifThinSurfaceFlags = nifThinSurfaceFlags.underlying();
+	if (const auto it = All.find(this); it != All.end()) {
+		hashes.hasNifThinSurfaceParameters = it->second.nifThinSurfaceParameters.has_value();
+	}
 	hashes.subsurfaceBalance = subsurfaceBalance;
 	hashes.thinSurfaceParameters = thinSurfaceParameters;
 	hashes.coatRoughness = coatRoughness * 100.f;
@@ -180,6 +184,10 @@ void BSLightingShaderMaterialPBR::ApplyTextureSetData(const TruePBR::PBRTextureS
 	}
 
 	glintParameters = textureSetData.glintParameters;
+
+	if (const auto it = All.find(this); it != All.end() && it->second.nifThinSurfaceParameters) {
+		ApplyNifThinSurfaceParameters(*it->second.nifThinSurfaceParameters);
+	}
 }
 
 bool BSLightingShaderMaterialPBR::ApplyNifThinSurfaceParameters(std::span<const float> parameters)
@@ -192,6 +200,7 @@ bool BSLightingShaderMaterialPBR::ApplyNifThinSurfaceParameters(std::span<const 
 	thinSurfaceParameters = { std::clamp(parameters[1], 0.f, 1.f),
 		std::clamp(parameters[2], 0.f, 1.f),
 		std::clamp(parameters[3], 0.f, 3.f) };
+	All[this].nifThinSurfaceParameters = std::array{ subsurfaceBalance, thinSurfaceParameters[0], thinSurfaceParameters[1], thinSurfaceParameters[2] };
 	return true;
 }
 
