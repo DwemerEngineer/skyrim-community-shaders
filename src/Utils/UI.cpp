@@ -174,6 +174,29 @@ namespace Util
 		return !debugSectionsHidden;
 	}
 
+	void StepFade(float& fade, bool visible, float deltaTime)
+	{
+		const float step = deltaTime / ThemeManager::Constants::UI_FADE_SECONDS;
+		fade = std::clamp(fade + (visible ? step : -step), 0.0f, 1.0f);
+	}
+
+	FadeScope::FadeScope(float fade) :
+		context(*ImGui::GetCurrentContext()),
+		hoveredWindow(context.HoveredWindow),
+		hoveredWindowUnderMoving(context.HoveredWindowUnderMovingWindow)
+	{
+		ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * fade);
+		if (fade < 1.0f)
+			context.HoveredWindow = context.HoveredWindowUnderMovingWindow = nullptr;
+	}
+
+	FadeScope::~FadeScope()
+	{
+		context.HoveredWindow = hoveredWindow;
+		context.HoveredWindowUnderMovingWindow = hoveredWindowUnderMoving;
+		ImGui::PopStyleVar();
+	}
+
 	void TextUnformattedDisabled(const char* a_text, const char* a_textEnd)
 	{
 		ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
@@ -1924,13 +1947,12 @@ namespace Util
 			IM_COL32(0, 0, 0, alpha));
 	}
 
-	void DrawBreathingText(const char* text, float speed, float minAlpha, float maxAlpha)
+	void DrawBreathingText(const char* text, std::optional<ImVec4> color, float speed, float minAlpha, float maxAlpha)
 	{
 		float alphaRange = maxAlpha - minAlpha;
 		float breathe = minAlpha + alphaRange * 0.5f * (1.0f + sinf((float)ImGui::GetTime() * speed));
-		auto& theme = globals::menu->GetTheme().Palette;
-		ImVec4 color = ImVec4(theme.Text.x, theme.Text.y, theme.Text.z, breathe);
-		ImGui::TextColored(color, "%s", text);
+		const ImVec4 base = color.value_or(globals::menu->GetTheme().Palette.Text);
+		ImGui::TextColored(ImVec4(base.x, base.y, base.z, breathe), "%s", text);
 	}
 
 	ImVec4 GetPulsingColor(const ImVec4& baseColor, float speed, float minBrightness, float maxBrightness)

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <functional>
 #include <imgui.h>
+#include <optional>
 #include <string>
 #include <vector>
 #include <windows.h>  // For WPARAM and virtual key constants
@@ -16,6 +17,8 @@
 // Forward declarations
 struct ID3D11Device;
 struct ID3D11ShaderResourceView;
+struct ImGuiContext;
+struct ImGuiWindow;
 struct ImRect;
 struct ImVec2;
 class Menu;
@@ -170,6 +173,25 @@ namespace Util
 
 	/** @brief False while a HideDebugSectionsGuard hides them; gate each feature's Debug header on this. */
 	bool ShowDebugSections();
+
+	/** @brief Eases fade toward 1 (visible) or 0 (hidden) over ThemeManager::Constants::UI_FADE_SECONDS. */
+	void StepFade(float& fade, bool visible, float deltaTime);
+
+	/** @brief Scales ImGui alpha by fade while alive; below 1 it also hides the mouse from windows drawn in scope. */
+	class FadeScope
+	{
+	public:
+		explicit FadeScope(float fade);
+		~FadeScope();
+
+		FadeScope(const FadeScope&) = delete;
+		FadeScope& operator=(const FadeScope&) = delete;
+
+	private:
+		ImGuiContext& context;
+		ImGuiWindow* hoveredWindow;
+		ImGuiWindow* hoveredWindowUnderMoving;
+	};
 
 	/**
 	 * Renders text using the disabled text color.
@@ -1140,13 +1162,14 @@ namespace Util
 	void DrawModalBackground(uint8_t alpha = 160);
 
 	/**
-	 * @brief Draws text with a breathing/pulsing alpha animation using theme text color.
+	 * @brief Draws text with a breathing/pulsing alpha animation.
 	 * @param text The text to display
+	 * @param color Base color (default: theme text color)
 	 * @param speed Animation speed multiplier (default: 2.5f)
 	 * @param minAlpha Minimum alpha value (default: 0.7f)
 	 * @param maxAlpha Maximum alpha value (default: 1.0f)
 	 */
-	void DrawBreathingText(const char* text, float speed = 2.5f, float minAlpha = 0.7f, float maxAlpha = 1.0f);
+	void DrawBreathingText(const char* text, std::optional<ImVec4> color = std::nullopt, float speed = 2.5f, float minAlpha = 0.7f, float maxAlpha = 1.0f);
 
 	/**
 	 * @brief Returns a color with pulsing brightness animation applied.
