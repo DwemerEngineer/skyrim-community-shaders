@@ -201,7 +201,7 @@ struct GrassBucket
 	bool sliceBlocksUseful = false;      // Scattered run order can make parent bounds too broad.
 	uint64_t lastRunCell = 0;            // The cell of the newest run, which appended slices may extend.
 	uint32_t appendedRuns = 0;           // Runs added in arrival order since the last spatially ordered rebuild.
-	bool spatialRebuildPending = false;  // Appended runs are valid but scattered; the cull reorders one bucket per frame.
+	bool spatialRebuildPending = false;  // Appended runs are valid but scattered, and the cull reorders one bucket per frame.
 
 	// Keep the resolved LOD selection for all draws in this frame.
 	std::array<const GrassMeshLibrary::LODMesh*, kTierCount - 1> lodMeshes{};

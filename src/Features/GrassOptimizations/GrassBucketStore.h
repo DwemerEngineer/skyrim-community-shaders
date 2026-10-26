@@ -35,7 +35,7 @@ public:
 		{
 			std::shared_ptr<GrassShape> registration;
 			bool direct = false;
-			// Render thread only. Setup and draw both ask per pass; a group the engine adds mid-frame invalidates the answer.
+			// Render thread only. Setup and draw both ask per pass, and a group the engine adds mid-frame invalidates the answer.
 			mutable uint32_t optimizedFrame = UINT32_MAX;
 			mutable uint32_t optimizedGroups = 0;
 			mutable bool optimized = false;

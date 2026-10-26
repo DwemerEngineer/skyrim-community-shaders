@@ -554,7 +554,7 @@ void GrassBucketStore::MergeSlicesIntoRuns(GrassBucket& bucket)
 	const uint32_t uploadedSliceCount = bucket.uploadedSlices;
 
 	// Rebuilds visit slices in Morton order so each cull block covers a compact area.
-	std::vector<uint32_t> order(uploadedSliceCount - bucket.clusteredSlices);
+	std::vector<uint32_t> order(std::max(uploadedSliceCount, bucket.clusteredSlices) - bucket.clusteredSlices);
 	std::iota(order.begin(), order.end(), bucket.clusteredSlices);
 
 	if (rebuild) {
