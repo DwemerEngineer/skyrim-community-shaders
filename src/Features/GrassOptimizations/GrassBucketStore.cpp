@@ -648,14 +648,19 @@ std::shared_ptr<GrassShape> GrassBucketStore::FindShape(RE::BSMultiStreamInstanc
 bool GrassBucketStore::IsShapeOptimized(const CullSnapshot::NativeShape& native, uint32_t frame)
 {
 	// An unregistered shape's native geometry may already be released, so it is never read.
-	if (!native.registration->registered.load(std::memory_order_acquire))
+	const auto& shape = *native.registration;
+	if (!shape.registered.load(std::memory_order_acquire))
 		return false;
 
-	const uint32_t groups = native.registration->native->GetMultiStreamTrishapeRuntimeData().activeGroupCount;
+	// A group replaced mid-frame keeps the group count, so staged changes are checked on every call.
+	if (shape.pendingChanges.load(std::memory_order_acquire))
+		return false;
+
+	const uint32_t groups = shape.native->GetMultiStreamTrishapeRuntimeData().activeGroupCount;
 	if (native.optimizedFrame != frame || native.optimizedGroups != groups) {
 		native.optimizedFrame = frame;
 		native.optimizedGroups = groups;
-		native.optimized = IsShapeOptimized(*native.registration);
+		native.optimized = IsShapeOptimized(shape);
 	}
 	return native.optimized;
 }
