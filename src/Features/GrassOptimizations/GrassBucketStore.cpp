@@ -18,7 +18,9 @@ GrassBucketStore::~GrassBucketStore()
 
 	preparation.reset();
 	allocator.reset();
-	cullSnapshot.store(nullptr, std::memory_order_release);
+	publishedSnapshot.store(nullptr, std::memory_order_release);
+	cullSnapshot.reset();
+	retiredSnapshot.reset();
 	retiredProxies.clear();
 	buckets.clear();
 	activeShapes.clear();
@@ -643,17 +645,15 @@ std::shared_ptr<GrassShape> GrassBucketStore::FindShape(RE::BSMultiStreamInstanc
 	return entry == shapes.end() ? nullptr : entry->second;
 }
 
-std::shared_ptr<GrassShape> GrassBucketStore::FindRenderedShape(RE::BSMultiStreamInstanceTriShape* shape) const
+bool GrassBucketStore::IsShapeOptimized(const CullSnapshot::NativeShape& native, uint32_t frame)
 {
-	const auto snapshot = AcquireCullSnapshot();
-	if (!snapshot)
-		return nullptr;
-
-	const auto entry = snapshot->nativeShapes.find(shape);
-	if (entry != snapshot->nativeShapes.end() && entry->second.registration->registered.load(std::memory_order_acquire))
-		return entry->second.registration;
-
-	return nullptr;
+	const uint32_t groups = native.registration->native->GetMultiStreamTrishapeRuntimeData().activeGroupCount;
+	if (native.optimizedFrame != frame || native.optimizedGroups != groups) {
+		native.optimizedFrame = frame;
+		native.optimizedGroups = groups;
+		native.optimized = native.registration->registered.load(std::memory_order_acquire) && IsShapeOptimized(*native.registration);
+	}
+	return native.optimized;
 }
 
 bool GrassBucketStore::IsShapeOptimized(const GrassShape& shape)
@@ -699,7 +699,7 @@ void GrassBucketStore::PublishCullSnapshot()
 	if (!snapshotDirty)
 		return;
 
-	auto snapshot = std::make_shared<CullSnapshot>();
+	auto snapshot = std::make_unique<CullSnapshot>();
 	for (const auto& shape : activeShapes) {
 		const bool direct = shape->residentInstances && shape->current && shape->current->optimizedReady;
 		snapshot->nativeShapes.emplace(shape->native, CullSnapshot::NativeShape{ shape, direct });
@@ -710,7 +710,9 @@ void GrassBucketStore::PublishCullSnapshot()
 			snapshot->proxies.push_back(bucket.asset.proxy);
 	}
 
-	cullSnapshot.store(std::move(snapshot), std::memory_order_release);
+	retiredSnapshot = std::move(cullSnapshot);
+	cullSnapshot = std::move(snapshot);
+	publishedSnapshot.store(cullSnapshot.get(), std::memory_order_release);
 	snapshotDirty = false;
 }
 
