@@ -32,6 +32,7 @@ enum class PBRShaderFlags : uint32_t
 	ProjectedGlint = 1 << 12,
 	Foliage = 1 << 13,
 	ThinSurface = 1 << 14,
+	HasFuzzRoughnessTexture = 1 << 15,
 };
 
 /**
@@ -79,23 +80,23 @@ public:
 	 *
 	 * @return A new heap-allocated BSLightingShaderMaterialPBR instance.
 	 */
-	RE::BSShaderMaterial* Create() override;                                                                                      // 01
+	RE::BSShaderMaterial* Create() override;  // 01
 	/**
 	 * @brief Copies all PBR-specific members from another material, including textures and extensions.
 	 * @param that Source material to copy from (must be BSLightingShaderMaterialPBR).
 	 */
-	void CopyMembers(RE::BSShaderMaterial* that) override;                                                                        // 02
+	void CopyMembers(RE::BSShaderMaterial* that) override;  // 02
 	/**
 	 * @brief Computes a CRC32 hash incorporating all PBR-specific fields and texture paths.
 	 * @param srcHash Initial hash seed.
 	 * @return Combined CRC32 hash for material deduplication.
 	 */
-	std::uint32_t ComputeCRC32(uint32_t srcHash) override;                                                                        // 04
+	std::uint32_t ComputeCRC32(uint32_t srcHash) override;  // 04
 	/**
 	 * @brief Returns the material feature type.
 	 * @return Always returns kDefault to integrate with the vanilla shader dispatch.
 	 */
-	Feature GetFeature() const override;                                                                                          // 06
+	Feature GetFeature() const override;  // 06
 	/**
 	 * @brief Loads PBR textures (RMAOS, emissive, displacement, features) from a texture set.
 	 *
@@ -104,9 +105,9 @@ public:
 	 * @param arg1 Unused argument passed through from the base class.
 	 * @param inTextureSet The texture set to load PBR textures from.
 	 */
-	void OnLoadTextureSet(std::uint64_t arg1, RE::BSTextureSet* inTextureSet) override;                                           // 08
+	void OnLoadTextureSet(std::uint64_t arg1, RE::BSTextureSet* inTextureSet) override;  // 08
 	/** @brief Releases all PBR texture references in addition to base class textures. */
-	void ClearTextures() override;                                                                                                // 09
+	void ClearTextures() override;  // 09
 	/**
 	 * @brief Assigns default textures to any PBR texture slots that are still null.
 	 * @param skinned Whether the mesh is skinned.
@@ -121,12 +122,12 @@ public:
 	 * @param textures Output array to fill with texture pointers.
 	 * @return The number of textures written.
 	 */
-	uint32_t GetTextures(RE::NiSourceTexture** textures) override;                                                                // 0B
+	uint32_t GetTextures(RE::NiSourceTexture** textures) override;  // 0B
 	/**
 	 * @brief Deserializes PBR-specific parameters (coat, fuzz, glint) from a NiStream.
 	 * @param stream The binary stream to read from.
 	 */
-	void LoadBinary(RE::NiStream& stream) override;                                                                               // 0D
+	void LoadBinary(RE::NiStream& stream) override;  // 0D
 
 	/**
 	 * @brief Allocates a scrap-heap temporary for use during BSLightingShaderProperty::LoadBinary.
@@ -198,6 +199,8 @@ public:
 	const RE::NiColor& GetFuzzColor() const;
 	/** @brief Returns the fuzz layer weight/intensity. */
 	float GetFuzzWeight() const;
+	/** @brief Returns fuzz roughness clamped to [0, 1], or a negative value to use base roughness. */
+	float GetFuzzRoughness() const;
 
 	/** @brief Returns the glint rendering parameters for this material's base surface. */
 	const GlintParameters& GetGlintParameters() const;
@@ -218,13 +221,14 @@ public:
 
 	RE::NiColor fuzzColor;
 	float fuzzWeight = 0.f;
+	float fuzzRoughness = -1.f;
 
 	GlintParameters glintParameters;
 
 	// Roughness in r, metallic in g, AO in b, nonmetal reflectance in a
 	RE::NiPointer<RE::NiSourceTexture> rmaosTexture;
 
-	// Emission color in rgb
+	// Emission color in rgb, fuzz roughness in a
 	RE::NiPointer<RE::NiSourceTexture> emissiveTexture;
 
 	// Displacement in r
