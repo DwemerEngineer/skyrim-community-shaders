@@ -20,6 +20,7 @@ Texture2D<float4> NormalTex : register(t0);
 Texture2D<float4> ColorTex : register(t1);
 Texture2D<float4> DepthTex : register(t2);
 Texture2D<float4> AlphaTex : register(t3);
+TextureCube<float4> SkyReflectionTex : register(t4);
 
 cbuffer PerGeometry : register(b2)
 {
@@ -31,6 +32,12 @@ static const int iterations = 64.0;
 static const int binaryIterations = ceil(log2(iterations));
 
 static const float rayLength = 1.0;
+static const float skyDepth = 1.0 - 1e-6;
+#	ifdef UNIFIED_WATER
+static const float maxValidDepth = skyDepth;
+#	else
+static const float maxValidDepth = 0.9999;
+#	endif
 
 float2 ConvertRaySample(float2 raySample)
 {
@@ -44,7 +51,8 @@ float2 ConvertRaySamplePrevious(float2 raySample)
 
 float4 GetReflectionColor(
 	float3 projReflectionDirection,
-	float3 projPosition)
+	float3 projPosition,
+	float3 reflectionDirection)
 {
 	float3 prevRaySample;
 	float3 raySample = projPosition;
@@ -59,6 +67,8 @@ float4 GetReflectionColor(
 			return 0.0;
 
 		float iterationDepth = DepthTex.SampleLevel(DepthSampler, ConvertRaySample(sampleUV), 0).x;
+		if (iterationDepth > maxValidDepth && iterationDepth <= skyDepth)
+			continue;
 
 		if (saturate((raySample.z - iterationDepth) / SSRParams.y) > 0.0) {
 			float3 binaryMinRaySample = prevRaySample;
@@ -71,6 +81,14 @@ float4 GetReflectionColor(
 
 				sampleUV = binaryRaySample.xy;
 				iterationDepth = DepthTex.SampleLevel(DepthSampler, ConvertRaySample(sampleUV), 0).x;
+				if (iterationDepth > maxValidDepth && iterationDepth <= skyDepth) {
+					if (iterationDepth < binaryRaySample.z)
+						binaryMaxRaySample = binaryRaySample;
+					else
+						binaryMinRaySample = binaryRaySample;
+					depthThicknessFactor = 0.0;
+					continue;
+				}
 
 				// Compute expected depth vs actual depth
 				depthThicknessFactor = 1.0 - saturate(abs(binaryRaySample.z - iterationDepth) / SSRParams.y);
@@ -95,6 +113,13 @@ float4 GetReflectionColor(
 			float fadeFactor = depthThicknessFactor * ssrMarchingRadiusFadeFactor * centerDistanceFadeFactorX * centerDistanceFadeFactorY;
 
 			if (fadeFactor > 0.0) {
+				if (iterationDepth > skyDepth) {
+					if (SharedData::InInterior || SharedData::HideSky)
+						return 0.0;
+					float3 reflectionDirectionWS = FrameBuffer::ViewToWorld(reflectionDirection, false);
+					return float4(SkyReflectionTex.SampleLevel(ColorSampler, reflectionDirectionWS, 0).xyz, fadeFactor);
+				}
+
 				float2 finalSampleUV = binaryRaySample.xy;
 
 				float3 color = ColorTex.SampleLevel(ColorSampler, ConvertRaySample(finalSampleUV), 0).xyz;
@@ -148,6 +173,10 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 viewNormal = DefaultNormal;
 
 	float depth = DepthTex.SampleLevel(DepthSampler, screenPosition, 0).x;
+	[branch] if (depth > maxValidDepth)
+	{
+		return psout;
+	}
 
 	float4 positionVS = float4(float2(uv.x, 1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
 	positionVS = mul(FrameBuffer::CameraProjInverse, positionVS);
@@ -163,15 +192,18 @@ PS_OUTPUT main(PS_INPUT input)
 		return psout;
 	}
 
-	float4 reflectionPosition = float4(viewPosition + reflectionDirection, 1.0);
-	float4 projReflectionPosition = mul(FrameBuffer::CameraProj, reflectionPosition);
-	projReflectionPosition /= projReflectionPosition.w;
-	projReflectionPosition.xy = projReflectionPosition.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
+	float4 clipReflectionDirection = mul(FrameBuffer::CameraProj, float4(reflectionDirection, 0.0));
+	float3 ndcPosition = float3(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), depth);
+	float3 projReflectionDirection = clipReflectionDirection.xyz - ndcPosition * clipReflectionDirection.w;
+	projReflectionDirection.xy *= float2(0.5, -0.5);
+	float directionLengthSquared = dot(projReflectionDirection, projReflectionDirection);
+	if (directionLengthSquared <= 0.0)
+		return psout;
+	projReflectionDirection *= rsqrt(directionLengthSquared) * rayLength;
 
 	float3 projPosition = float3(uv, depth);
-	float3 projReflectionDirection = normalize(projReflectionPosition.xyz - projPosition) * rayLength;
 
-	psout.Color = GetReflectionColor(projReflectionDirection, projPosition);
+	psout.Color = GetReflectionColor(projReflectionDirection, projPosition, reflectionDirection);
 
 	return psout;
 }

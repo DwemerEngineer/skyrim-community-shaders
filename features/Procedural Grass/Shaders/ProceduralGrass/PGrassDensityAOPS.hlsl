@@ -2,7 +2,7 @@
 // grass-map, edge and object tests, so the darkening matches the grass it sits under.
 
 #define FRAMEBUFFER
-#include "Common/Color.hlsli"
+#include "Common/ColorManagement.hlsli"
 #include "Common/FrameBuffer.hlsli"
 #include "Common/Random.hlsli"
 
@@ -205,8 +205,8 @@ float GetTerrainDarkeningWeight(float2 position)
 
 float4 DarkenSceneLighting(float4 scene, float weight)
 {
-	float3 lighting = Color::IrradianceToLinear(scene.rgb);
-	scene.rgb = Color::IrradianceToGamma(ApplyGrassTerrainDarkening(lighting, weight));
+	float3 lighting = ColorManagement::SceneToLinear(scene.rgb);
+	scene.rgb = ColorManagement::LinearToScene(ApplyGrassTerrainDarkening(lighting, weight));
 	return scene;
 }
 

@@ -317,7 +317,7 @@ private:
 	bool grassTypesDirty = true;
 	uint64_t resolvedSlopeLimitsHash = 0;  // Slope limits the terrain-darkening maps were built with.
 	bool resolvedTypeColorsLinear = false;
-	float resolvedTypeColorGamma = 1.0f;
+	bool resolvedTypeColorsACEScg = false;
 	Buffer* vertexIndicesHighBuffer = nullptr;
 	Buffer* vertexIndicesHighOuterBuffer = nullptr;
 	Buffer* vertexIndicesMidBuffer = nullptr;       // 9-index, five-vertex Mid blade
@@ -506,7 +506,7 @@ private:
 	void PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer);
 
 	/** @brief Rebuilds the per-type render and generator tables and the culling bounds derived from them. */
-	void ResolveGrassTypes(bool prelinearizeTypeColors, float typeColorGamma);
+	void ResolveGrassTypes(bool prelinearizeTypeColors);
 
 	/** @brief Inverts the terrain-blend opacity curve into the High depth pass's base cutoff when blend settings change. */
 	void UpdateDepthBaseCutoff();

@@ -16,7 +16,7 @@ struct LightLimitFix;
 struct LinearLighting;
 struct LODBlending;
 struct InteriorSun;
-struct InverseSquareLighting;
+struct RainRefraction;
 struct ScreenSpaceGI;
 struct ScreenSpaceShadows;
 struct Skylighting;
@@ -38,17 +38,19 @@ struct CSEditor;
 struct Effects11;
 struct ExponentialHeightFog;
 struct HDRDisplay;
+struct PostProcessing;
 struct ScreenshotFeature;
 struct Skin;
 struct ProceduralGrass;
+struct SceneManager;
 
 class State;
 class Deferred;
 struct TruePBR;
+struct DeveloperTools;
 class RenderDoc;
 class RemoteControl;
 class Menu;
-class WeatherManager;
 class SceneSettingsManager;
 class TerrainHeightMap;
 class TopDownOcclusion;
@@ -110,7 +112,7 @@ namespace globals
 		extern LinearLighting linearLighting;
 		extern LODBlending lodBlending;
 		extern InteriorSun interiorSun;
-		extern InverseSquareLighting inverseSquareLighting;
+		extern RainRefraction rainRefraction;
 		extern ScreenSpaceGI screenSpaceGI;
 		extern ScreenSpaceShadows screenSpaceShadows;
 		extern Skylighting skylighting;
@@ -129,6 +131,8 @@ namespace globals
 		extern Upscaling upscaling;
 		extern HDRDisplay hdrDisplay;
 		extern Effects11 effects11;
+		extern DeveloperTools developerTools;
+		// Developer Tools components, not features: driven by developerTools.
 		extern RenderDoc renderDoc;
 		extern RemoteControl remoteControl;
 		extern ScreenshotFeature screenshotFeature;
@@ -137,6 +141,8 @@ namespace globals
 		extern TruePBR truePBR;
 		extern Skin skin;
 		extern ProceduralGrass proceduralGrass;
+		extern SceneManager sceneManager;
+		extern PostProcessing postProcessing;
 
 	}
 
@@ -257,7 +263,6 @@ namespace globals
 	extern TerrainHeightMap* terrainHeightMap;
 	extern TopDownOcclusion* topDownOcclusion;
 	extern HiZPyramid* hiZPyramid;
-	extern WeatherManager* weatherManager;
 	extern SceneSettingsManager* sceneSettingsManager;
 
 	/** @brief Initializes core singletons (ShaderCache, State, Menu, Deferred). Called once at plugin load. */

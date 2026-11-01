@@ -1,5 +1,6 @@
 #include "Features/ProceduralGrass.h"
 
+#include "Features/LinearLighting.h"
 #include "Utils/Math.h"
 
 #include <algorithm>
@@ -277,7 +278,7 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 	}
 }
 
-void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors, const float typeColorGamma)
+void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors)
 {
 	// Slot 0 is bare, slot 1 is base grass, and later slots are texture variants.
 	resolvedGrassTypes = {};
@@ -289,10 +290,8 @@ void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors, const
 		resolvedGrassTypes.grassType[i + 2] = ResolveGrassType(settings.textureTypes[key][defIndex].overrides);
 	}
 
-	const auto convertTint = [typeColorGamma](float4& tint) {
-		tint.x = std::pow(std::abs(tint.x), typeColorGamma);
-		tint.y = std::pow(std::abs(tint.y), typeColorGamma);
-		tint.z = std::pow(std::abs(tint.z), typeColorGamma);
+	const auto convertTint = [](float4& tint) {
+		globals::features::linearLighting.SRGBToWorking(&tint.x);
 	};
 
 	const uint32_t activeTypeCount = std::min<uint32_t>(static_cast<uint32_t>(typeAllocation.size()) + 2u, MaxGrassTypes);

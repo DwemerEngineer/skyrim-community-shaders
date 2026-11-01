@@ -1,4 +1,4 @@
-#include "Common/Color.hlsli"
+#include "Common/ColorManagement.hlsli"
 #include "Common/DummyVSTexCoord.hlsl"
 #include "Common/FrameBuffer.hlsli"
 #include "Common/SharedData.hlsli"
@@ -167,9 +167,10 @@ PS_OUTPUT main(PS_INPUT input)
 	if (EyePosition.w != 0 && 1e-5 < snowMask) {
 		ao = min(1, SparklesParameters3.x + ao);
 	}
-	composedColor.xyz = Color::IrradianceToLinear(composedColor.xyz);
-	composedColor.xyz *= Color::IrradianceToLinear(ao);
-	composedColor.xyz = Color::IrradianceToGamma(composedColor.xyz);
+	composedColor.xyz *= ao;
+#		if !defined(ENABLE_LL)
+	composedColor.xyz = abs(composedColor.xyz);
+#		endif
 #	endif
 
 	float depth = depthTex.SampleLevel(depthSampler, screenPosition, 0).x;
@@ -179,7 +180,8 @@ PS_OUTPUT main(PS_INPUT input)
 #	if defined(APPLY_FOG)
 	float fogDistanceFactor = (2 * CameraNearFar.x * CameraNearFar.y) / ((CameraNearFar.y + CameraNearFar.x) - (2 * (1.01 * depth - 0.01) - 1) * (CameraNearFar.y - CameraNearFar.x));
 	float fogFactor = min(FogParam.w, pow(saturate(fogDistanceFactor * FogParam.y - FogParam.x), FogParam.z));
-	float3 fogColor = Color::Fog(lerp(FogNearColor.xyz, FogFarColor.xyz, fogFactor));
+	// The engine writes these constants straight into the buffer, bypassing any C++ conversion hook.
+	float3 fogColor = lerp(ColorManagement::SRGBToWorking(FogNearColor.xyz), ColorManagement::SRGBToWorking(FogFarColor.xyz), fogFactor);
 #		if defined(IBL)
 	if (SharedData::iblSettings.EnableIBL) {
 		fogColor = ImageBasedLighting::GetFogIBLColor(fogColor);
@@ -193,26 +195,35 @@ PS_OUTPUT main(PS_INPUT input)
 	positionWS.xyz = positionWS.xyz / positionWS.w;
 	float4 exponentialHeightFog = (float4)0;
 	if (exponentialHeightFogEnabled) {
+#			if defined(HORIZON_FIX)
+		// The HorizonFix plugin's far water meets the sky at its own horizon, far beyond the far
+		// plane, so the sky is fogged out to that distance to match the water it sits on.
+		if (!isGeometryDepth) {
+			float skyRayLength = length(positionWS.xyz);
+			positionWS.xyz *= max(skyRayLength, SharedData::horizonFixSettings.farWaterDistance) / max(skyRayLength, 1e-4);
+		}
+#			endif
 		float4 fogScreenPosition = float4(monoUV * SharedData::BufferDim.xy, depth, 1.0f);
 		exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(positionWS.xyz, FrameBuffer::CameraPosAdjust.xyz, fogColor, fogScreenPosition);
 	}
 	if (isGeometryDepth || exponentialHeightFogEnabled) {
 		float fogFade = exponentialHeightFogEnabled ? ExponentialHeightFog::GetVanillaFogFade(FogNearColor.w) : FogNearColor.w;
 		float3 fogSource = exponentialHeightFogEnabled && !isGeometryDepth ? composedColor.xyz : fogFade * composedColor.xyz;
-		if (exponentialHeightFogEnabled && !ExponentialHeightFog::ShouldDisableVanillaFog()) {
+		// Vanilla fog only ever applies to geometry; sky pixels take height fog alone.
+		if (exponentialHeightFogEnabled && isGeometryDepth && !ExponentialHeightFog::ShouldDisableVanillaFog()) {
 			// Apply vanilla fog first, then exp fog on top
-			composedColor.xyz = lerp(fogSource, fogFade * fogColor, Color::FogAlpha(fogFactor));
+			composedColor.xyz = lerp(fogSource, fogFade * fogColor, fogFactor);
 			composedColor.xyz = lerp(composedColor.xyz, fogFade * exponentialHeightFog.xyz, exponentialHeightFog.w);
 		} else if (exponentialHeightFogEnabled) {
 			// Disable vanilla fog, only apply exp height fog
 			composedColor.xyz = lerp(fogSource, fogFade * exponentialHeightFog.xyz, exponentialHeightFog.w);
 		} else {
-			composedColor.xyz = lerp(fogSource, fogFade * fogColor, Color::FogAlpha(fogFactor));
+			composedColor.xyz = lerp(fogSource, fogFade * fogColor, fogFactor);
 		}
 	}
 #		else
 	if (isGeometryDepth) {
-		composedColor.xyz = FogNearColor.w * lerp(composedColor.xyz, fogColor, Color::FogAlpha(fogFactor));
+		composedColor.xyz = FogNearColor.w * lerp(composedColor.xyz, fogColor, fogFactor);
 	}
 #		endif
 #	endif

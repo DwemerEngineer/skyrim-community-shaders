@@ -14,7 +14,7 @@
 
 static const uint PBRFlags = PBR::Flags::Subsurface;
 
-#include "Common/Color.hlsli"
+#include "Common/ColorManagement.hlsli"
 #include "Common/FrameBuffer.hlsli"
 #include "Common/GBuffer.hlsli"
 #include "Common/LightingEval.hlsli"
@@ -43,9 +43,6 @@ Texture2D<uint> GrassDensityTexture : register(t71);
 #	include "LightLimitFix/LightLimitFix.hlsli"
 #endif
 
-#if defined(ISL) && defined(LIGHT_LIMIT_FIX)
-#	include "InverseSquareLighting/InverseSquareLighting.hlsli"
-#endif
 
 #if defined(WETNESS_EFFECTS)
 #	include "WetnessEffects/WetnessEffects.hlsli"
@@ -482,7 +479,7 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 #endif
 
 	// Determine the authored color in display space, then convert it once for Linear Lighting.
-	baseColor.rgb = Color::ColorToLinear(baseColor.rgb);
+	baseColor.rgb = ColorManagement::SRGBToWorking(baseColor.rgb);
 
 	float canopyHeight01 = saturate(sideAndBladeT.z / max(bladeType.height, 1.0));
 	// The sky the canopy hides depends on which way the surface faces, so GetCanopySkyVisibility applies it below.
@@ -683,9 +680,16 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	[branch] if (wetnessGlossinessAlbedo > 0.0)
 	{
 		float wetnessDarkeningAmount = wetnessGlossinessAlbedo;
-		float3 wetBaseColor = Color::LLLinearToGamma(baseColor.xyz);
+		float3 wetBaseColor = baseColor.xyz;
+#	if defined(ENABLE_LL)
+		wetBaseColor = TransferFunctions::LinearToGameGamma(wetBaseColor);
+#	endif
 		wetBaseColor = lerp(wetBaseColor, pow(abs(wetBaseColor), 1.0 + wetnessDarkeningAmount), 0.8);
-		baseColor.xyz = Color::LLGammaToLinear(wetBaseColor);
+#	if defined(ENABLE_LL)
+		baseColor.xyz = TransferFunctions::GameGammaToLinear(wetBaseColor);
+#	else
+		baseColor.xyz = wetBaseColor;
+#	endif
 	}
 #endif
 
@@ -815,7 +819,7 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 
 	float screenAO = 1.0f - saturate(GrassScreenAO[uint2(shadowPixel)]);
 
-	psout.Diffuse = float4(Color::IrradianceToGamma(ResolveFarGrassLighting(farLighting, screenAO)), grassOpacity);
+	psout.Diffuse = float4(ColorManagement::LinearToScene(ResolveFarGrassLighting(farLighting, screenAO)), grassOpacity);
 	// Far draws after the deferred pass, so its pixels still hold the motion of the surface behind them. Against distant
 	// terrain or sky that parallax differs from the blade's, and TAA would reproject the blade from the wrong place.
 	psout.MotionVectors = float4(MotionBlur::GetSSMotionVector(float4(cameraRelativePosition, 1.0f), float4(previousCameraRelativePosition, 1.0f)), 0.0f, 1.0f);
@@ -932,22 +936,13 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 			float3 lightDirection = light.positionWS.xyz - cameraRelativePosition;
 			float distSq = dot(lightDirection, lightDirection);
 
-#		if defined(ISL)
 			float lightDist = sqrt(distSq);
-			float intensityMultiplier = InverseSquareLighting::GetAttenuation(lightDist, light);
+			float intensityMultiplier = LightLimitFix::GetAttenuation(lightDist, light);
 			if (intensityMultiplier < 1e-5)
 				continue;
 			float3 normalizedLightDirection = lightDirection * rcp(max(lightDist, 1e-5));
-#		else
-			float radiusSq = light.radius * light.radius;
-			if (distSq >= radiusSq)
-				continue;
-			float intensityMultiplier = 1 - distSq / radiusSq;
-			float3 normalizedLightDirection = lightDirection * rsqrt(max(distSq, 1e-10));
-#		endif
 
-			const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
-			float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * light.fade;
+			float3 lightColor = Color::PointLight(light.color.xyz) * intensityMultiplier * light.fade;
 			float lightShadow = 1.0;
 			if (light.lightFlags & LightLimitFix::LightFlags::Shadow)
 				lightShadow = shadowColor[light.shadowLightIndex];
@@ -1056,8 +1051,8 @@ PS_OUTPUT main(GrassTierIO input, bool frontFace : SV_IsFrontFace)
 	float canopyReflectionPath = canopyOverhead / max(specularReflectDirection.z, CanopyReflectionMinElevation);
 	float canopyReflectionVisibility = exp2(-canopyReflectionPath * CanopyReflectionExtinction) *
 	                                   smoothstep(-CanopyReflectionMinElevation, CanopyReflectionMinElevation, specularReflectDirection.z) * curveSkyView;
-	float3 canopyReflection = lerp(Color::IrradianceToLinear(ambientDiffuseColor),
-		Color::IrradianceToLinear(specularSky * Color::ReflectionNormalisationScale), canopyReflectionVisibility);
+	float3 canopyReflection = lerp(ColorManagement::SceneToLinear(ambientDiffuseColor),
+		ColorManagement::SceneToLinear(specularSky * Color::ReflectionNormalisationScale), canopyReflectionVisibility);
 	specularColorPBR += canopyReflection * specularAlbedo * fuzzThroughput * specularSkyOcclusion;
 	specularColorPBR *= grassLightingScale;
 

@@ -6,8 +6,8 @@
 
 **For comprehensive development guidance, architecture details, and complete build instructions, see:**
 
--   **`.claude/CLAUDE.md`** - Complete 400+ line guide covering all aspects of development
--   **`AI-INSTRUCTIONS.md`** - Quick reference that also points to .claude/CLAUDE.md
+- **`.claude/CLAUDE.md`** - Concise guide to build tooling, project conventions, and release rules
+- **`AI-INSTRUCTIONS.md`** - Quick reference that also points to .claude/CLAUDE.md
 
 This file provides Copilot-specific guidance while avoiding duplication of the comprehensive documentation above.
 
@@ -19,21 +19,20 @@ SKSE64 plugin providing modular DirectX 11 graphics enhancements for Skyrim SE/A
 
 ### Windows-Only Requirements
 
--   Visual Studio Community 2022 with "Desktop development with C++" workload
--   CMake 3.21+, Git, vcpkg with VCPKG_ROOT environment variable, Windows SDK
--   **NEVER CANCEL BUILDS**: 45-60 minutes build time, 15-30 minutes shader validation
+- Visual Studio Community 2026 with "Desktop development with C++" workload (VS 2022 via the `ALL-VS2022` preset)
+- CMake 4.2+, Git, vcpkg with VCPKG_ROOT environment variable, Windows SDK
+- **NEVER CANCEL BUILDS**: 45-60 minutes build time, 15-30 minutes shader validation
 
 ### Linux/WSL Limitations
 
--   **Cannot build or validate shaders** - requires Windows fxc.exe compiler
--   **Limited to**: Code review, documentation, Python tooling only
+- **Cannot build or validate shaders** - requires Windows fxc.exe compiler
+- **Limited to**: Code review, documentation, Python tooling only
 
 ### Primary Build Command (Windows)
 
 ```powershell
-# ALL preset is primary - other presets (SE, AE) are legacy
-./BuildRelease.bat ALL    # Universal binary (recommended)
-./BuildRelease.bat        # Same as ALL (default)
+./BuildRelease.bat        # Shipping build, ALL preset (universal SE/AE binary)
+./BuildDevFast.bat        # Fastest iteration: DLL only
 ```
 
 ### Essential Repository Setup
@@ -50,26 +49,26 @@ git submodule update --init --recursive  # If not cloned with --recursive
 
 **Graphics programming and Skyrim modding expert** with deep knowledge of:
 
--   DirectX 11/12 rendering pipelines and performance optimization
--   SKSE plugin development and CommonLibSSE-NG runtime targeting
--   HLSL shader development and GPU compute programming
--   ImGui interface design and Skyrim engine integration
+- DirectX 11/12 rendering pipelines and performance optimization
+- SKSE plugin development and CommonLibSSE-NG runtime targeting
+- HLSL shader development and GPU compute programming
+- ImGui interface design and Skyrim engine integration
 
 ### Proactive Issue Identification
 
 **Flag potential problems before they occur:**
 
--   **Performance Impact**: Graphics features affect rendering performance - suggest user toggles
--   **Runtime Compatibility**: Warn about SE/AE compatibility issues, suggest `REL::RelocateMember()` patterns
--   **Buffer Conflicts**: Highlight GPU register conflicts, recommend hlslkit buffer scanning
--   **Security Risks**: Validate user input, prevent DirectX crashes from malformed configurations
+- **Performance Impact**: Graphics features affect rendering performance - suggest user toggles
+- **Runtime Compatibility**: Warn about SE/AE compatibility issues, suggest `REL::RelocateMember()` patterns
+- **Buffer Conflicts**: Highlight GPU register conflicts, recommend hlslkit buffer scanning
+- **Security Risks**: Validate user input, prevent DirectX crashes from malformed configurations
 
 ### Code Quality Standards
 
--   **Complete Solutions**: No TODO/FIXME placeholders - provide fully functional code
--   **Performance Conscious**: Always consider GPU workload and user experience
--   **Cross-Platform**: Ensure changes work across SE/AE variants using runtime detection
--   **Error Handling**: Include proper resource management and graceful degradation
+- **Complete Solutions**: No TODO/FIXME placeholders - provide fully functional code
+- **Performance Conscious**: Always consider GPU workload and user experience
+- **Cross-Platform**: Ensure changes work across SE/AE variants using runtime detection
+- **Error Handling**: Include proper resource management and graceful degradation
 
 ## Architecture Quick Reference
 
@@ -94,7 +93,7 @@ globals::d3d::*       // DirectX 11 device/context access
 2. Implement `DrawSettings()`, `LoadSettings()`, `SaveSettings()`
 3. Add shaders to `features/YourFeature/Shaders/`
 4. Register in `globals::features` namespace
-5. Use template in `template/` directory as starting point
+5. Use template in `docs/new-feature-template/` as starting point
 
 ### Common Development Commands
 
@@ -115,10 +114,9 @@ pre-commit run --all-files
 
 This file focuses on Copilot-specific guidance while `.claude/CLAUDE.md` provides:
 
--   Complete architecture documentation (Feature system, DirectX hooking, shader architecture)
--   Comprehensive build setup and shader validation workflows
--   Detailed CommonLibSSE-NG runtime targeting patterns
--   Performance considerations and testing strategies
--   Complete troubleshooting guide and development best practices
+- Build wrappers and shader refactor verification (`tools/verify-shader-refactor.ps1`)
+- Feature release stages (Alpha / Beta / Unreleased) and versioning rules
+- D3D11 resource naming, UI constant, and i18n conventions
+- Commit types and release branch rules
 
-Refer to `.claude/CLAUDE.md` for detailed technical information not covered in this Copilot-specific summary.
+Refer to `.claude/CLAUDE.md` for project rules not covered in this Copilot-specific summary.

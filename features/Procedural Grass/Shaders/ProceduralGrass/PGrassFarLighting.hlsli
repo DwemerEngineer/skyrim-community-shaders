@@ -70,7 +70,7 @@ FarGrassLighting GetFarGrassLighting(FarGrassSurface surface, MaterialProperties
 	// Ambient fuzz reflects in its colour; the broad reflection reuses the same filtered sky hemisphere.
 	lighting.ambient += frontIrradiance * frontSkyLight * material.AO * fuzzAlbedo * surface.fuzzColor;
 	lighting.diffuse += lighting.ambient;
-	lighting.specular += Color::IrradianceToLinear(frontIrradiance * frontSkyLight * Color::ReflectionNormalisationScale) *
+	lighting.specular += ColorManagement::SceneToLinear(frontIrradiance * frontSkyLight * Color::ReflectionNormalisationScale) *
 	                     material.AO * specularAlbedo * (1.0f - fuzzAlbedo);
 
 	lighting.diffuse *= grassFrameLight.w;
@@ -86,14 +86,14 @@ float3 ResolveFarGrassLighting(FarGrassLighting lighting, float screenAO)
 	float3 diffuse = lighting.diffuse;
 	[branch] if (screenAO < 1.0f)
 	{
-		float3 albedo = Color::IrradianceToLinear(lighting.diffuseAlbedo / Color::PBRLightingScale);
+		float3 albedo = ColorManagement::SceneToLinear(lighting.diffuseAlbedo / Color::PBRLightingScale);
 		// Move the AO weights into irradiance space to avoid converting each light component twice.
-		float3 ambientAO = Color::IrradianceToGamma(MultiBounceAO(albedo, screenAO));
+		float3 ambientAO = ColorManagement::LinearToScene(MultiBounceAO(albedo, screenAO));
 		float3 ambient = min(lighting.ambient, lighting.diffuse);
 		diffuse = (lighting.diffuse - ambient) * sqrt(ambientAO) + ambient * ambientAO;
 	}
 	// Canopy and contact occlusion are already included above; terrain darkness belongs to the ground.
-	return Color::IrradianceToLinear(diffuse) + lighting.specular;
+	return ColorManagement::SceneToLinear(diffuse) + lighting.specular;
 }
 
 #endif

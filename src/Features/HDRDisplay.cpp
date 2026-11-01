@@ -8,6 +8,8 @@
 #include "I18n/I18n.h"
 #include "LinearLighting.h"
 #include "Menu.h"
+#include "PostProcessing.h"
+#include "ScreenshotFeature.h"
 #include "ShaderCache.h"
 #include "State.h"
 #include "Upscaling.h"
@@ -242,6 +244,25 @@ namespace
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
+
+	// Bink movies draw into kFRAMEBUFFER outside both redirects, so ApplyHDR would overwrite them.
+	// Route the draw into the UI buffer like the interface; the Present path undoes it.
+	struct HDR_Movie_Draw
+	{
+		static void thunk(void* a_movie)
+		{
+			auto& hdr = globals::features::hdrDisplay;
+			if (hdr.settings.enableHDR && !hdr.framebufferRedirected && hdr.hdrTexture && hdr.hdrTexture->rtv) {
+				const float clearColor[4]{};
+				globals::d3d::context->ClearRenderTargetView(hdr.hdrTexture->rtv.get(), clearColor);
+				hdr.movieDrawnFrame = globals::state->frameCount;
+				hdr.SetUIBuffer();
+			}
+
+			func(a_movie);
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
 }
 
 bool HDRDisplay::isHDRMonitor = false;
@@ -350,7 +371,7 @@ void HDRDisplay::DrawSettings()
 	// Advanced override button — shown when HDR is neither active nor auto-detected
 	if (!isHDRMonitor && !oldEnableHDR) {
 		ImGui::SameLine();
-		if (ImGui::Button(T(TKEY("advanced"), "Advanced"))) {
+		if (Util::Button(T(TKEY("advanced"), "Advanced"))) {
 			bool dontShowWarning;
 			{
 				std::lock_guard<std::mutex> lock(settingsMutex);
@@ -408,13 +429,11 @@ void HDRDisplay::DrawSettings()
 		};
 		const char* forceEnableLabel = T(TKEY("force_enable_hdr"), "Force Enable HDR");
 		const char* cancelLabel = T(TKEY("cancel"), "Cancel");
-		const float buttonWidth = std::max({
-			ThemeManager::Constants::POPUP_BUTTON_WIDTH * Util::GetUIScale(),
+		const float buttonWidth = std::max({ ThemeManager::Constants::POPUP_BUTTON_WIDTH * Util::GetUIScale(),
 			buttonWidthForLabel(forceEnableLabel),
-			buttonWidthForLabel(cancelLabel)
-		});
+			buttonWidthForLabel(cancelLabel) });
 
-		if (ImGui::Button(forceEnableLabel, ImVec2(buttonWidth, 0))) {
+		if (Util::Button(forceEnableLabel, ImVec2(buttonWidth, 0))) {
 			{
 				std::lock_guard<std::mutex> lock(settingsMutex);
 				settings.enableHDR = true;
@@ -427,7 +446,7 @@ void HDRDisplay::DrawSettings()
 			ImGui::CloseCurrentPopup();
 		}
 		ImGui::SameLine();
-		if (ImGui::Button(cancelLabel, ImVec2(buttonWidth, 0))) {
+		if (Util::Button(cancelLabel, ImVec2(buttonWidth, 0))) {
 			{
 				std::lock_guard<std::mutex> lock(settingsMutex);
 				settings.enableHDR = false;
@@ -495,7 +514,14 @@ void HDRDisplay::DrawSettings()
 			ImGui::TextUnformatted(T(TKEY("paper_white_tooltip_1"), "203 nits is the ITU BT.2408 reference. Increase for a brighter image."));
 		}
 
-		ImGui::SliderInt(T(TKEY("peak_brightness_nits"), "Peak Brightness (nits)"), reinterpret_cast<int*>(&currentPeakNits), 400, 10000);
+		// Under AutoHDR, show the capped range without overwriting the stored native peak unless edited
+		const bool autoHDRActive = globals::features::effects11.ReplacedTonemapperThisFrame();
+		const uint peakSliderMax = autoHDRActive ? kAutoHDRMaxNits : kHdrPeakNitsMax;
+		int displayedPeakNits = static_cast<int>(std::min(currentPeakNits, peakSliderMax));
+		// Logarithmic spreads the common 600-1000 nit range across more of the native slider
+		if (ImGui::SliderInt(T(TKEY("peak_brightness_nits"), "Peak Brightness (nits)"), &displayedPeakNits, kHdrPeakNitsMin, peakSliderMax, "%d",
+				autoHDRActive ? ImGuiSliderFlags_None : ImGuiSliderFlags_Logarithmic))
+			currentPeakNits = static_cast<uint>(displayedPeakNits);
 		{
 			std::lock_guard<std::mutex> lock(settingsMutex);
 			if (currentPeakNits <= settings.hdrPaperWhite) {
@@ -510,6 +536,9 @@ void HDRDisplay::DrawSettings()
 			ImGui::TextUnformatted(T(TKEY("peak_brightness_tooltip_0"), "Maximum brightness your display can produce."));
 			ImGui::TextUnformatted(T(TKEY("peak_brightness_tooltip_1"), "Set to match your display's actual peak brightness."));
 		}
+
+		if (autoHDRActive)
+			Util::Text::WrappedWarning(T(TKEY("auto_hdr_peak_cap"), "Effects11 AutoHDR is active: peak brightness is capped at %u nits."), kAutoHDRMaxNits);
 
 		ImGui::TextDisabled(T(TKEY("display_reports_max_nits"), "Display reports: %.0f nits max"), cachedDisplayMaxLuminance);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -556,6 +585,10 @@ void HDRDisplay::LoadSettings(json& o_json)
 	bool oldEnableHDR = settings.enableHDR;
 
 	settings = o_json;
+	settings.hdrPeakNits = std::clamp(settings.hdrPeakNits, kHdrPeakNitsMin, kHdrPeakNitsMax);
+	settings.hdrPaperWhite = std::clamp(settings.hdrPaperWhite, 80u, settings.hdrPeakNits - 1);
+	if (!std::isfinite(settings.hdrUIBrightness))
+		settings.hdrUIBrightness = 1.0f;
 
 	// Defer auto-detection to SetupResources where the swap chain is available.
 	// DetectHDR() needs globals::d3d::swapChain which isn't valid during early plugin init.
@@ -604,6 +637,8 @@ void HDRDisplay::PostPostLoad()
 		stl::detour_thunk<HDR_MenuManagerDrawInterfaceStartHook>(REL::RelocationID(79947, 82084));
 		stl::write_thunk_call<HDR_Main_PostProcessing>(REL::RelocationID(100430, 107148).address() + REL::Relocate(0x1F0, 0x1E7));
 	}
+
+	stl::detour_thunk<HDR_Movie_Draw>(REL::RelocationID(87907, 90279));
 }
 
 void HDRDisplay::SetupResources()
@@ -921,7 +956,24 @@ namespace
 			if (globals::features::hdrDisplay.IsPresentSuppressed())
 				return S_OK;
 
-			return func(This, SyncInterval, Flags);
+			if (!globals::features::upscaling.d3d12SwapChainActive)
+				globals::features::screenshotFeature.ProcessCaptureRequest();
+
+			return TimedPresent(This, SyncInterval, Flags);
+		}
+
+		/** @brief Calls the real Present and folds its CPU wait into State::smoothPresentTimeMs. */
+		static HRESULT TimedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
+		{
+			LARGE_INTEGER frequency, presentStart, presentEnd;
+			QueryPerformanceFrequency(&frequency);
+			QueryPerformanceCounter(&presentStart);
+			const HRESULT presentResult = func(swapChain, syncInterval, flags);
+			QueryPerformanceCounter(&presentEnd);
+			const float presentMs = static_cast<float>(static_cast<double>(presentEnd.QuadPart - presentStart.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart));
+			auto& smoothPresentTimeMs = globals::state->smoothPresentTimeMs;
+			smoothPresentTimeMs = smoothPresentTimeMs * 0.95f + presentMs * 0.05f;
+			return presentResult;
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
@@ -946,9 +998,9 @@ namespace
 	};
 }
 
-void HDRDisplay::InstallSwapChainPresentHooks(IDXGISwapChain* swapChain)
+void HDRDisplay::InstallSwapChainPresentHooks(IDXGISwapChain* swapChain, std::uintptr_t originalPresent)
 {
-	stl::detour_vfunc<8, SwapChainPresentBottom>(swapChain);
+	stl::detour_vfunc<8, SwapChainPresentBottom>(swapChain, originalPresent);
 	stl::detour_vfunc<35, ID3D11DeviceContext_OMSetBlendState>(globals::d3d::context);
 }
 
@@ -956,7 +1008,10 @@ ID3D11BlendState* HDRDisplay::GetPatchedAlphaBlendState(ID3D11BlendState* origin
 {
 	auto it = patchedBlendStateCache.find(original);
 	if (it != patchedBlendStateCache.end())
-		return it->second ? it->second.get() : original;
+		return it->second.patched ? it->second.patched.get() : original;
+
+	auto& entry = patchedBlendStateCache[original];
+	entry.original.copy_from(original);
 
 	D3D11_BLEND_DESC desc{};
 	original->GetDesc(&desc);
@@ -975,7 +1030,6 @@ ID3D11BlendState* HDRDisplay::GetPatchedAlphaBlendState(ID3D11BlendState* origin
 	}
 
 	if (!needsPatch) {
-		patchedBlendStateCache[original] = nullptr;
 		return original;
 	}
 
@@ -994,18 +1048,18 @@ ID3D11BlendState* HDRDisplay::GetPatchedAlphaBlendState(ID3D11BlendState* origin
 
 	winrt::com_ptr<ID3D11BlendState> patched;
 	if (FAILED(globals::d3d::device->CreateBlendState(&desc, patched.put()))) {
-		patchedBlendStateCache[original] = nullptr;
 		return original;
 	}
 
 	auto* raw = patched.get();
-	patchedBlendStateCache[original] = std::move(patched);
+	entry.patched = std::move(patched);
 	return raw;
 }
 
 HRESULT HDRDisplay::PresentToSwapChain(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
 {
-	return SwapChainPresentBottom::func(swapChain, syncInterval, flags);
+	globals::features::screenshotFeature.ProcessCaptureRequest();
+	return SwapChainPresentBottom::TimedPresent(swapChain, syncInterval, flags);
 }
 
 void HDRDisplay::DrawImGuiForPresent(bool frameGenActive, bool hdrReady)
@@ -1472,6 +1526,7 @@ void HDRDisplay::RestoreLDRRenderTargets()
 
 void HDRDisplay::ClearShaderCache()
 {
+	patchedBlendStateCache.clear();
 	if (hdrOutputCS) {
 		hdrOutputCS->Release();
 		hdrOutputCS = nullptr;
@@ -1600,16 +1655,16 @@ float4 HDRDisplay::GetSharedDataHDR() const
 
 HDRDisplay::HDRDataCB HDRDisplay::BuildHDRData() const
 {
-	bool isMainOrLoadingMenu = globals::state->IsMainOrLoadingMenuOpen();
+	bool isMainOrLoadingMenu = globals::state->IsMainOrLoadingMenuOpen() || movieDrawnFrame == globals::state->frameCount;
 	auto* ui = globals::game::ui;
 	bool skipUIComposite = IsFGCompositingThisFrame();
 
 	// Linear Lighting keeps the pipeline linear throughout.
 	// Without it, ISHDR gamma-encodes its output even in HDR mode.
-	bool isSceneLinear = globals::features::linearLighting.settings.enableLinearLighting;
+	bool isSceneLinear = globals::features::linearLighting.IsLinearLightingActive() && !isMainOrLoadingMenu && !globals::state->IsFlatWorldMapOpen();
 
-	// Use user-specified peak brightness for highlights compression
-	float effectivePeakNits = static_cast<float>(settings.hdrPeakNits);
+	const bool applyAutoHDR = globals::features::effects11.ReplacedTonemapperThisFrame();
+	float effectivePeakNits = static_cast<float>(applyAutoHDR ? std::min(settings.hdrPeakNits, kAutoHDRMaxNits) : settings.hdrPeakNits);
 
 	HDRDataCB data{};
 	data.enableHDR = settings.enableHDR ? 1.f : 0.f;
@@ -1622,7 +1677,8 @@ HDRDisplay::HDRDataCB HDRDisplay::BuildHDRData() const
 	// TweenMenu = pause UI. ScaleUIBrightnessForFG skips while GameIsPaused(), so HDROutputCS applies the same mid-alpha boost when compositing gamma UI.
 	data.fgTweenMenuMidAlphaBoost = (ui && ui->IsMenuOpen(RE::TweenMenu::MENU_NAME)) ? 1.f : 0.f;
 	data.previewSDR = 0.f;
-	data.applyAutoHDR = globals::features::effects11.ReplacedTonemapperThisFrame() ? 1.f : 0.f;
+	// Effects11 ENB presets are SDR; Jiaye SDR-only tonemappers opt in via Color Grading AutoHDR.
+	data.applyAutoHDR = (applyAutoHDR || globals::features::postProcessing.WantsAutoHDR()) ? 1.f : 0.f;
 	return data;
 }
 

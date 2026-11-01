@@ -77,8 +77,11 @@ private:
 	winrt::com_ptr<ID3D11ShaderResourceView> mip0SRV;
 	std::unique_ptr<ConstantBuffer> paramsCB;
 
-	ID3D11ComputeShader* baseCS = nullptr;
-	ID3D11ComputeShader* spdCS = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> baseCS;
+	winrt::com_ptr<ID3D11ComputeShader> spdCS;
+	// Retry failed compiles only after an explicit shader-cache clear.
+	bool baseCSFailed = false;
+	bool spdCSFailed = false;
 
 	uint32_t width = 0;
 	uint32_t height = 0;

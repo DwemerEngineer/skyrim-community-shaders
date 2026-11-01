@@ -206,7 +206,9 @@ void TerrainBlending::ResetDepth()
 	auto context = globals::d3d::context;
 
 	auto dsv = terrainDepth.views[0];
+	globals::profiler->BeginPass("TerrainBlending::ClearDepth");
 	context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0u);
+	globals::profiler->EndPass();
 }
 
 void TerrainBlending::ResetTerrainDepth()
@@ -270,7 +272,9 @@ void TerrainBlending::BlendPrepassDepths()
 	auto renderer = globals::game::renderer;
 	auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 
+	globals::profiler->BeginPass("TerrainBlending::CopyDepth");
 	context->CopyResource(terrainDepth.texture, mainDepth.texture);
+	globals::profiler->EndPass();
 
 	if (globals::state->frameAnnotations)
 		globals::state->EndPerfEvent();
@@ -365,7 +369,9 @@ void TerrainBlending::Hooks::BSBatchRenderer__RenderPassImmediately::thunk(RE::B
 			}
 
 			if (inTerrain) {
+				globals::profiler->BeginPass("TerrainBlending::TerrainDepth");
 				func(a_pass, a_technique, a_alphaTest, a_renderFlags);  // Run terrain twice
+				globals::profiler->EndPass();
 			}
 		} else if (globals::state->inWorld) {
 			if (auto shaderProperty = a_pass->shaderProperty) {
@@ -434,8 +440,10 @@ void TerrainBlending::RenderTerrainBlendingPasses()
 		// Enable rendering for depth below the surface
 		context->OMSetDepthStencilState(terrainDepthStencilState, 0xFF);
 
+		globals::profiler->BeginPass("TerrainBlending::TerrainPasses");
 		for (auto& renderPass : terrainRenderPasses)
 			Hooks::BSBatchRenderer__RenderPassImmediately::func(renderPass.a_pass, renderPass.a_technique, renderPass.a_alphaTest, renderPass.a_renderFlags);
+		globals::profiler->EndPass();
 
 		// Reset alpha blending
 		alphaBlendMode = 0;
@@ -445,8 +453,10 @@ void TerrainBlending::RenderTerrainBlendingPasses()
 		depthStencilDepthMode = RE::BSGraphics::DepthStencilDepthMode::kTestEqual;
 		stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_DEPTH_MODE);
 
+		globals::profiler->BeginPass("TerrainBlending::NoBlendPasses");
 		for (auto& renderPass : renderPasses)
 			Hooks::BSBatchRenderer__RenderPassImmediately::func(renderPass.a_pass, renderPass.a_technique, renderPass.a_alphaTest, renderPass.a_renderFlags);
+		globals::profiler->EndPass();
 
 		terrainRenderPasses.clear();
 		renderPasses.clear();
@@ -457,5 +467,9 @@ void TerrainBlending::RenderTerrainBlendingPasses()
 
 	auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 	mainDepth.depthSRV = depthSRVBackup;
+	// Point the prepass copy back at its own texture: Deferred copies the final depth into it,
+	// and everything after this pass (water included) should read that rather than blended prepass depth.
+	auto& zPrepassCopy = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+	zPrepassCopy.depthSRV = prepassSRVBackup;
 }
 #undef I18N_KEY_PREFIX

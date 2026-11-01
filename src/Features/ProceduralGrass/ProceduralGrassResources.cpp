@@ -245,7 +245,7 @@ void ProceduralGrass::CompileSupportShaders()
 		std::vector<std::pair<const char*, const char*>> defines;
 		for (auto* feature : Feature::GetFeatureList()) {
 			const auto name = feature->GetShaderDefineName();
-			if (feature->loaded && (name == "LINEAR_LIGHTING" || name == "TERRAIN_SHADOWS" || name == "CLOUD_SHADOWS" || name == "SCREEN_SPACE_SHADOWS"))
+			if (feature->loaded && (name == "ENABLE_LL" || name == "TERRAIN_SHADOWS" || name == "CLOUD_SHADOWS" || name == "SCREEN_SPACE_SHADOWS"))
 				defines.push_back({ name.data(), nullptr });
 		}
 		terrainCanopyCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\ProceduralGrass\\PGrassTerrainCanopyCS.hlsl", defines, "cs_5_0"));

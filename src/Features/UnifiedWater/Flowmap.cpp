@@ -1,5 +1,6 @@
 ﻿#include "Flowmap.h"
 
+#include "Utils/D3D.h"
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
 #include <charconv>
@@ -177,29 +178,11 @@ bool Flowmap::GenerateFlowmap(bool useMips)
 		return false;
 	}
 
-	static winrt::com_ptr<REX::W32::ID3D11Multithread> multithread;
-	if (SUCCEEDED(ctx->QueryInterface(multithread.put()))) {
-		multithread->SetMultithreadProtected(TRUE);
-	} else {
+	Util::MultithreadScope guard(ctx);
+	if (!guard) {
 		logger::error("[Unified Water] [Flowmap] ID3D11Multithread not available");
 		return false;
 	}
-
-	multithread->Enter();
-
-	struct MultithreadGuard
-	{
-		winrt::com_ptr<REX::W32::ID3D11Multithread> mt;
-		MultithreadGuard(winrt::com_ptr<REX::W32::ID3D11Multithread> m) :
-			mt(m) {}
-		~MultithreadGuard()
-		{
-			if (mt) {
-				mt->Leave();
-				mt->SetMultithreadProtected(FALSE);
-			}
-		}
-	} guard(multithread);
 
 	const auto tamriel = RE::TESForm::LookupByEditorID<RE::TESWorldSpace>("Tamriel");
 	if (!tamriel) {
@@ -325,6 +308,7 @@ bool Flowmap::GenerateFlowmap(bool useMips)
 		logger::error("[Unified Water] [Flowmap] Failed to create texture");
 		return false;
 	}
+	Util::SetResourceName(flowmap.get(), "UnifiedWater::Flowmap");
 
 	for (const auto& [x, y, flowTex] : cells) {
 		D3D11_TEXTURE2D_DESC srcDesc{};

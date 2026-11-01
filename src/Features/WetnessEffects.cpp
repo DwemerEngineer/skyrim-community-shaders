@@ -1,5 +1,5 @@
 #include "WetnessEffects.h"
-#include "CSEditor.h"
+#include "CSEditor/SceneManager/SceneWidgetInterceptor.h"
 #include "I18n/I18n.h"
 #include "Menu.h"
 
@@ -618,20 +618,12 @@ void WetnessEffects::DrawSettings()
 		ImGui::TreePop();
 	}
 
-	ImGui::Spacing();
-	ImGui::Spacing();
-	auto& csEditor = globals::features::csEditor;
-	if (csEditor.loaded) {
-		if (ImGui::SmallButton(T(TKEY("open_weather_picker"), "Open Weather Picker"))) {
-			// Navigate to the replacement feature in the menu
-			Menu::GetSingleton()->SelectFeatureMenu(csEditor.GetShortName());
-		}
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("%s", T(TKEY("open_weather_picker_tooltip"), "Open the Weather Picker in CS Utility"));
-		}
-	}
+	// The debug overrides have no scene-context meaning, so hide them while a Scene Manager replica is
+	// borrowing this panel to author overrides.
+	if (SceneWidgetInterceptor::IsArmed())
+		return;
 
-	if (ImGui::TreeNodeEx(T(TKEY("debug"), "Debug"), ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (Util::ShowDebugSections() && ImGui::TreeNodeEx(T(TKEY("debug"), "Debug"), ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox(T(TKEY("enable_wetness_override"), "Enable Wetness Override"), &debugSettings.EnableWetnessOverride);
 		ImGui::Checkbox(T(TKEY("enable_puddle_override"), "Enable Puddle Override"), &debugSettings.EnablePuddleOverride);
 		ImGui::Checkbox(T(TKEY("enable_rain_override"), "Enable Rain Override"), &debugSettings.EnableRainOverride);
@@ -841,6 +833,13 @@ void WetnessEffects::ApplyClimatePreset(ClimatePreset preset)
 	// Removed clamping for all settings to allow full preset range
 }
 
+void WetnessEffects::Reset()
+{
+	// Not in GetCommonBufferData: the feature buffer is rebuilt several times per frame (see Deferred).
+	if (globals::game::ui && !globals::game::ui->GameIsPaused())
+		rainTimer += (size_t)(RE::GetSecondsSinceLastFrame() * 1000000);  // BSTimer::delta is always 0 for some reason
+}
+
 WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 {
 	PerFrame data{};
@@ -858,10 +857,8 @@ WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 						if (!precipObject) {
 							precipObject = precip->lastPrecip;
 						}
-						if (precipObject) {
-							auto& effect = precipObject->GetGeometryRuntimeData().shaderProperty;
-							auto shaderProp = effect.get();
-							auto particleShaderProperty = netimmerse_cast<RE::BSParticleShaderProperty*>(shaderProp);
+						auto particleShaderProperty = precipObject ? netimmerse_cast<RE::BSParticleShaderProperty*>(precipObject->GetGeometryRuntimeData().shaderProperty.get()) : nullptr;
+						if (particleShaderProperty && particleShaderProperty->particleEmitter) {
 							auto rain = (RE::BSParticleShaderRainEmitter*)(particleShaderProperty->particleEmitter);
 							data.OcclusionViewProj = rain->occlusionProjection;
 						}
@@ -927,10 +924,7 @@ WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 		}
 	}
 
-	static size_t rainTimer = 0;  // size_t for precision
-	if (!globals::game::ui->GameIsPaused())
-		rainTimer += (size_t)(RE::GetSecondsSinceLastFrame() * 1000);  // BSTimer::delta is always 0 for some reason
-	data.Time = rainTimer / 1000.f;
+	data.Time = static_cast<float>(static_cast<double>(rainTimer) / 1000000.0);
 
 	data.settings = settings;
 	data.settings.MaxShoreWetness = settings.EnableWetnessEffects ? settings.MaxShoreWetness : 0.0f;

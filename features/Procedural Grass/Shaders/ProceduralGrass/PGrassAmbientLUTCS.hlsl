@@ -1,6 +1,6 @@
 #define CSHADER
 
-#include "Common/Color.hlsli"
+#include "Common/ColorManagement.hlsli"
 #include "Common/GBuffer.hlsli"
 #include "Common/SharedData.hlsli"
 #include "IBL/IBL.hlsli"

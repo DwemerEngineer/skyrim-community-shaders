@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Utils/Game.h"
+
 struct CloudShadows : Feature
 {
 private:
@@ -35,18 +37,20 @@ public:
 	virtual inline bool HasShaderDefine(RE::BSShader::Type) override { return true; }
 
 	bool overrideSky = false;
+	/** @brief Set for a cloud layer drawn outside the reflections capture, which binds that layer's occlusion at t26. */
+	bool bindLayerSelfShadow = false;
 	/**
 	 * @brief Applies sky shader render state overrides for cloud shadow capture.
 	 *
 	 * When overrideSky is set, redirects rendering to the cloud occlusion cubemap
-	 * and configures the appropriate blend state and depth resources.
+	 * and configures the appropriate blend state and depth resources. For every
+	 * cloud layer it also binds the cloud occlusion read by cloud self shadowing (t26).
 	 */
 	void SkyShaderHacks();
 
 	Texture2D* texCloudShadowLayers[kMaxCloudLayers] = {};
 	ID3D11RenderTargetView* cloudShadowLayerRTVs[kMaxCloudLayers][6] = {};
 	Texture2D* texCubemapCloudOccCopy = nullptr;
-	Texture2D* texSelfShadowCopy = nullptr;
 
 	UINT cubemapMipLevels = 1;
 	int currentLayerForDraw = 0;
@@ -54,9 +58,16 @@ public:
 	uint32_t renderedLayersMask[6] = {};
 	uint32_t globalRenderedMask = 0;
 	int previouslyRenderedSide = -1;
+	/** @brief Set once the occlusion has been cleared for a weather without cloud layers. */
+	bool occlusionClearedWithoutClouds = false;
 
 	ID3D11BlendState* cloudShadowBlendState = nullptr;
 
+private:
+	Util::FrameChecker frameChecker;
+	Util::FrameChecker frame_checker[6];
+
+public:
 	/** @brief Creates cubemap textures, SRVs, RTVs, and blend state for cloud shadow rendering. */
 	virtual void SetupResources() override;
 

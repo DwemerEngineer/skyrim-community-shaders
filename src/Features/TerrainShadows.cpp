@@ -19,10 +19,10 @@ namespace
 	}
 
 	class TimeJumpEventHandler :
-		public RE::BSTEventSink<RE::TESWaitStopEvent>,
-		public RE::BSTEventSink<RE::TESSleepStopEvent>,
-		public RE::BSTEventSink<RE::TESFastTravelEndEvent>,
-		public RE::BSTEventSink<RE::BGSActorCellEvent>
+	    public RE::BSTEventSink<RE::TESWaitStopEvent>,
+	    public RE::BSTEventSink<RE::TESSleepStopEvent>,
+	    public RE::BSTEventSink<RE::TESFastTravelEndEvent>,
+	    public RE::BSTEventSink<RE::BGSActorCellEvent>
 	{
 	public:
 		RE::BSEventNotifyControl ProcessEvent(const RE::TESWaitStopEvent*, RE::BSTEventSource<RE::TESWaitStopEvent>*) override
@@ -129,6 +129,16 @@ namespace
 
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
+
+	// Heightmaps are keyed by the worldspace that provides the land data.
+	RE::TESWorldSpace* GetLandWorldspace()
+	{
+		auto tes = globals::game::tes;
+		auto worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+		while (worldspace && worldspace->parentWorld && worldspace->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData))
+			worldspace = worldspace->parentWorld;
+		return worldspace;
+	}
 }
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -182,7 +192,7 @@ void TerrainShadows::DrawSettings()
 {
 	ImGui::Checkbox(T(TKEY("enable_terrain_shadow"), "Enable Terrain Shadow"), &settings.EnableTerrainShadow);
 
-	if (ImGui::CollapsingHeader(T(TKEY("debug"), "Debug"))) {
+	if (Util::ShowDebugSections() && ImGui::CollapsingHeader(T(TKEY("debug"), "Debug"))) {
 		std::string curr_worldspace = "N/A";
 		std::string curr_worldspace_name = "N/A";
 		auto tes = RE::TES::GetSingleton();
@@ -193,18 +203,18 @@ void TerrainShadows::DrawSettings()
 				curr_worldspace_name = worldspace->GetName();
 			}
 		}
-		ImGui::Text(fmt::format("Current worldspace: {} ({})", curr_worldspace, curr_worldspace_name).c_str());
-		ImGui::Text(fmt::format("Has height map: {}", globals::terrainHeightMap->Contains(curr_worldspace)).c_str());
+		ImGui::TextUnformatted(fmt::format("Current worldspace: {} ({})", curr_worldspace, curr_worldspace_name).c_str());
+		ImGui::TextUnformatted(fmt::format("Has height map: {}", globals::terrainHeightMap->Contains(curr_worldspace)).c_str());
 
 		ImGui::Separator();
 
 		ImGui::BulletText("shadowUpdateCBData");
 		ImGui::Indent();
 		{
-			ImGui::Text(fmt::format("LightPxDir: ({}, {})", shadowUpdateCBData.LightPxDir.x, shadowUpdateCBData.LightPxDir.y).c_str());
-			ImGui::Text(fmt::format("LightDeltaZ: ({}, {})", shadowUpdateCBData.LightDeltaZ.x, shadowUpdateCBData.LightDeltaZ.y).c_str());
-			ImGui::Text(fmt::format("StartPxCoord: {}", shadowUpdateCBData.StartPxCoord).c_str());
-			ImGui::Text(fmt::format("PxSize: ({}, {})", shadowUpdateCBData.PxSize.x, shadowUpdateCBData.PxSize.y).c_str());
+			ImGui::TextUnformatted(fmt::format("LightPxDir: ({}, {})", shadowUpdateCBData.LightPxDir.x, shadowUpdateCBData.LightPxDir.y).c_str());
+			ImGui::TextUnformatted(fmt::format("LightDeltaZ: ({}, {})", shadowUpdateCBData.LightDeltaZ.x, shadowUpdateCBData.LightDeltaZ.y).c_str());
+			ImGui::TextUnformatted(fmt::format("StartPxCoord: {}", shadowUpdateCBData.StartPxCoord).c_str());
+			ImGui::TextUnformatted(fmt::format("PxSize: ({}, {})", shadowUpdateCBData.PxSize.x, shadowUpdateCBData.PxSize.y).c_str());
 		}
 		ImGui::Unindent();
 
@@ -222,10 +232,7 @@ void TerrainShadows::DrawSettings()
 
 void TerrainShadows::ClearShaderCache()
 {
-	if (shadowUpdateProgram) {
-		shadowUpdateProgram->Release();
-		shadowUpdateProgram = nullptr;
-	}
+	shadowUpdateProgram = nullptr;
 
 	CompileComputeShaders();
 }
@@ -294,7 +301,7 @@ void TerrainShadows::Precompute()
 			context->CSSetShaderResources(60, (uint)srvs.size(), srvs.data());
 		}
 
-		texShadowHeight.release();
+		texShadowHeight.reset();
 
 		auto texHeightMap = globals::terrainHeightMap->GetTexture();
 
@@ -349,8 +356,8 @@ bool TerrainShadows::UpdateShadow(bool a_refreshImmediately)
 		context->CSSetShaderResources(60, (uint)srvs.size(), srvs.data());
 	}
 
-	auto accumulator = *globals::game::currentAccumulator.get();
-	auto shadowSceneNode = accumulator->GetRuntimeData().activeShadowSceneNode;
+	// Runs before the world accumulator is current, which can still be a freed menu (e.g. local map) accumulator.
+	auto shadowSceneNode = globals::game::smState->shadowSceneNode[0];
 	if (!shadowSceneNode)
 		return false;
 	auto sunLight = skyrim_cast<RE::NiDirectionalLight*>(shadowSceneNode->GetRuntimeData().sunLight->light.get());
@@ -383,7 +390,7 @@ bool TerrainShadows::UpdateShadow(bool a_refreshImmediately)
 		invScale.z = cachedHeightmap->zRange.y - cachedHeightmap->zRange.x;
 		float2 dirLightPxDir = { dirLightDir.x / invScale.x * width, dirLightDir.y / invScale.y * height };
 		if (dirLightPxDir.x == 0.f && dirLightPxDir.y == 0.f)
-			dirLightPxDir = { 1.f, 0.f };
+			dirLightPxDir = float2(1.f, 0.f);
 
 		if (abs(dirLightPxDir.x) >= abs(dirLightPxDir.y)) {
 			edgePxCoord = dirLightPxDir.x > 0 ? 0 : (width - 1);

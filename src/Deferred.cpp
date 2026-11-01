@@ -5,6 +5,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "Utils/D3D.h"
+#include "VanillaBinding.h"
 
 #include "Features/CSEditor.h"
 #include "Features/DynamicCubemaps.h"
@@ -35,7 +36,7 @@ struct BlendStates
 	}
 };
 
-void SetupRenderTarget(RE::RENDER_TARGET target, D3D11_TEXTURE2D_DESC texDesc, D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc, D3D11_RENDER_TARGET_VIEW_DESC rtvDesc, D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc, DXGI_FORMAT format, uint bindFlags)
+void SetupRenderTarget(RE::RENDER_TARGET target, D3D11_TEXTURE2D_DESC texDesc, D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc, D3D11_RENDER_TARGET_VIEW_DESC rtvDesc, D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc, DXGI_FORMAT format, uint bindFlags, const char* name)
 {
 	auto renderer = globals::game::renderer;
 	auto device = globals::d3d::device;
@@ -83,6 +84,11 @@ void SetupRenderTarget(RE::RENDER_TARGET target, D3D11_TEXTURE2D_DESC texDesc, D
 
 	if (texDesc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
 		DX::ThrowIfFailed(device->CreateUnorderedAccessView(data.texture, &uavDesc, &data.UAV));
+
+	Util::SetResourceName(data.texture, "%s", name);
+	Util::SetResourceName(data.SRV, "%s SRV", name);
+	Util::SetResourceName(data.RTV, "%s RTV", name);
+	Util::SetResourceName(data.UAV, "%s UAV", name);
 }
 
 void Deferred::SetupResources()
@@ -127,22 +133,22 @@ void Deferred::SetupResources()
 		// TEMPORAL_AA_WATER_2
 
 		// Albedo
-		SetupRenderTarget(ALBEDO, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R10G10B10A2_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+		SetupRenderTarget(ALBEDO, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R10G10B10A2_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, "Deferred::Albedo");
 		// Specular
-		SetupRenderTarget(SPECULAR, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R11G11B10_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+		SetupRenderTarget(SPECULAR, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R11G11B10_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, "Deferred::Specular");
 		// Reflectance
-		SetupRenderTarget(REFLECTANCE, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R11G11B10_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+		SetupRenderTarget(REFLECTANCE, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R11G11B10_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, "Deferred::Reflectance");
 		// Normal + Roughness
-		SetupRenderTarget(NORMALROUGHNESS, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R10G10B10A2_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+		SetupRenderTarget(NORMALROUGHNESS, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R10G10B10A2_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, "Deferred::NormalRoughness");
 		// Masks
-		SetupRenderTarget(MASKS, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R11G11B10_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+		SetupRenderTarget(MASKS, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R11G11B10_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, "Deferred::Masks");
 		// Vertex AO and, for procedural grass, visible landscape classification. UNORM permits blending.
 		const auto masks2Format = globals::features::proceduralGrass.loaded ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R16_UNORM;
-		SetupRenderTarget(MASKS2, texDesc, srvDesc, rtvDesc, uavDesc, masks2Format, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+		SetupRenderTarget(MASKS2, texDesc, srvDesc, rtvDesc, uavDesc, masks2Format, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, "Deferred::Masks2");
 
 		// TAA water history buffers need RGBA16: alpha stores premultiplied coverage for ISWaterBlend
-		SetupRenderTarget(RE::RENDER_TARGETS::kWATER_1, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
-		SetupRenderTarget(RE::RENDER_TARGETS::kWATER_2, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+		SetupRenderTarget(RE::RENDER_TARGETS::kWATER_1, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, "Deferred::Water1");
+		SetupRenderTarget(RE::RENDER_TARGETS::kWATER_2, texDesc, srvDesc, rtvDesc, uavDesc, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, "Deferred::Water2");
 	}
 
 	{
@@ -215,6 +221,8 @@ void Deferred::EarlyPrepasses()
 	ZoneScoped;
 	TracyD3D11Zone(globals::state->tracyCtx, "Early Prepass");
 
+	sceneDepthFinal = false;
+
 	auto shaderCache = globals::shaderCache;
 
 	if (!shaderCache->IsEnabled())
@@ -251,6 +259,7 @@ void Deferred::PrepassPasses()
 
 void Deferred::StartDeferred()
 {
+	sceneDepthFinal = false;
 	if (!globals::state->inWorld)
 		return;
 	globals::state->UpdateSharedData(true, false);
@@ -319,6 +328,13 @@ void Deferred::DeferredPasses()
 	auto main = renderer->GetRuntimeData().renderTargets[forwardRenderTargets[0]];
 	auto normals = renderer->GetRuntimeData().renderTargets[forwardRenderTargets[2]];
 	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
+	// Publish the finished opaque depth before any post-geometry pass reads it. The z-prepass
+	// depth omits alpha-tested geometry (rocks, cliffs, road edges), so SSGI, SSS and the
+	// composite would otherwise see the background where those objects stand. Water also
+	// samples this copy for edge fade and refraction.
+	auto finalDepthCopy = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+	context->CopyResource(finalDepthCopy.texture, depth.texture);
+	sceneDepthFinal = true;
 	auto reflectance = renderer->GetRuntimeData().renderTargets[REFLECTANCE];
 
 	auto motionVectors = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
@@ -352,23 +368,24 @@ void Deferred::DeferredPasses()
 	{
 		TracyD3D11Zone(globals::state->tracyCtx, "Deferred Composite");
 
+		ID3D11ShaderResourceView* skylightingProbes = skylighting.loaded && skylighting.texProbeArray ? skylighting.texProbeArray->srv.get() : nullptr;
 		ID3D11ShaderResourceView* srvs[16]{
-			specular.SRV,                                                                                   // t0  SpecularTexture
-			albedo.SRV,                                                                                     // t1  AlbedoTexture
-			normalRoughness.SRV,                                                                            // t2  NormalRoughnessTexture
-			masks.SRV,                                                                                      // t3  MasksTexture
-			dynamicCubemaps.loaded ? Util::GetCurrentSceneDepthSRV(false) : nullptr,                        // t4  DepthTexture (24/32-bit; HLSL type baked at compile via TERRAIN_BLENDING)
-			dynamicCubemaps.loaded ? reflectance.SRV : nullptr,                                             // t5  ReflectanceTexture
-			dynamicCubemaps.loaded ? dynamicCubemaps.envTexture->srv.get() : nullptr,                       // t6  EnvTexture
-			dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr,            // t7  EnvReflectionsTexture
-			dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr,  // t8  SkylightingProbeArray
-			masks2.SRV,                                                                                     // t9  Masks2Texture (vertexAO in .x)
-			ssgi_ao,                                                                                        // t10 SsgiAoTexture
-			ssgi_hq_spec ? nullptr : ssgi_y,                                                                // t11 SsgiYTexture
-			ssgi_hq_spec ? nullptr : ssgi_cocg,                                                             // t12 SsgiCoCgTexture
-			ssgi_hq_spec ? ssgi_gi_spec : nullptr,                                                          // t13 SsgiSpecularTexture
-			ibl.loaded ? ibl.envIBLTexture->srv.get() : nullptr,                                            // t14 EnvIBLTexture
-			ibl.loaded ? ibl.skyIBLTexture->srv.get() : nullptr,                                            // t15 SkyIBLTexture
+			specular.SRV,                                                                         // t0  SpecularTexture
+			albedo.SRV,                                                                           // t1  AlbedoTexture
+			normalRoughness.SRV,                                                                  // t2  NormalRoughnessTexture
+			masks.SRV,                                                                            // t3  MasksTexture
+			dynamicCubemaps.loaded ? Util::GetCurrentSceneDepthSRV(false) : nullptr,              // t4  DepthTexture (24/32-bit; HLSL type baked at compile via TERRAIN_BLENDING)
+			dynamicCubemaps.loaded ? reflectance.SRV : nullptr,                                   // t5  ReflectanceTexture
+			dynamicCubemaps.loaded ? dynamicCubemaps.envTexture->srv.get() : nullptr,             // t6  EnvTexture
+			dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr,  // t7  EnvReflectionsTexture
+			dynamicCubemaps.loaded ? skylightingProbes : nullptr,                                 // t8  SkylightingProbeArray
+			masks2.SRV,                                                                           // t9  Masks2Texture (vertexAO in .x)
+			ssgi_ao,                                                                              // t10 SsgiAoTexture
+			ssgi_hq_spec ? nullptr : ssgi_y,                                                      // t11 SsgiYTexture
+			ssgi_hq_spec ? nullptr : ssgi_cocg,                                                   // t12 SsgiCoCgTexture
+			ssgi_hq_spec ? ssgi_gi_spec : nullptr,                                                // t13 SsgiSpecularTexture
+			ibl.loaded ? ibl.envIBLTexture->srv.get() : nullptr,                                  // t14 EnvIBLTexture
+			ibl.loaded ? ibl.skyIBLTexture->srv.get() : nullptr,                                  // t15 SkyIBLTexture
 		};
 
 		if (dynamicCubemaps.loaded)
@@ -413,8 +430,10 @@ void Deferred::DeferredPasses()
 	if (dynamicCubemaps.loaded)
 		dynamicCubemaps.PostDeferred();
 
-	if (globals::features::effects11.loaded)
+	if (globals::features::effects11.loaded) {
 		globals::features::effects11.DrawVolumetricRays();
+		globals::features::effects11.DrawSunRays();
+	}
 }
 
 void Deferred::EndDeferred()
@@ -695,14 +714,16 @@ void Deferred::Hooks::Main_RenderWorld_BlendedDecals::thunk(RE::BSShaderAccumula
 
 	deferred->EndDeferred();
 
-	// Copy depth from before water
-	auto renderer = globals::game::renderer;
-	auto context = globals::d3d::context;
+	// Copy depth from before water, unless DeferredPasses already did
+	if (!deferred->sceneDepthFinal) {
+		auto renderer = globals::game::renderer;
+		auto context = globals::d3d::context;
 
-	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
-	auto depthCopy = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+		auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
+		auto depthCopy = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 
-	context->CopyResource(depthCopy.texture, depth.texture);
+		context->CopyResource(depthCopy.texture, depth.texture);
+	}
 
 	// After this point, water starts rendering
 };
@@ -729,11 +750,5 @@ void Deferred::Hooks::Main_RenderFirstPersonView::thunk(bool a1, bool a2)
 void Deferred::Hooks::Renderer_ResetState::thunk(void* This)
 {
 	func(This);
-
-	auto* const state = globals::state;
-	auto* const context = globals::d3d::context;
-
-	ID3D11Buffer* buffers[3] = { state->permutationCB->CB(), state->sharedDataCB->CB(), state->featureDataCB->CB() };
-	context->PSSetConstantBuffers(4, 3, buffers);
-	context->CSSetConstantBuffers(5, 2, buffers + 1);
+	VanillaBinding::BindSharedConstantBuffers();
 }

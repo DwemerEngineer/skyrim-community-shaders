@@ -7,7 +7,7 @@
 #include "Common/PBRMath.hlsli"
 static const uint PBRFlags = PBR::Flags::Subsurface;
 
-#include "Common/Color.hlsli"
+#include "Common/ColorManagement.hlsli"
 #include "Common/FrameBuffer.hlsli"
 #include "Common/GBuffer.hlsli"
 #include "Common/LightingEval.hlsli"
@@ -56,7 +56,7 @@ void AddCanopyMaterial(inout CanopyMaterial material, uint typeIndex, float weig
 	// A tapered triangle's area-weighted blade position is one third of its height.
 	static const float Along = 1.0f / 3.0f;
 	float3 meanClumpColor = lerp(1.0f, (type.grassColorCool.rgb + type.grassColorWarm.rgb) * 0.5f, type.clumpColorStrength);
-	float3 color = saturate(Color::ColorToLinear(GetDistantBladeColor(type, meanClumpColor, Along)));
+	float3 color = saturate(ColorManagement::SRGBToWorking(GetDistantBladeColor(type, meanClumpColor, Along)));
 	float3 surface = GetDistantAOThicknessRoughness(type, 1.0f / 3.0f, 0.5f, Along);
 	float3 scatteringColor = saturate(color * type.grassSubsurfaceColor.rgb);
 	float3 reflection, transmission;
@@ -184,6 +184,6 @@ float3 ShadeTerrainCanopy(CanopyMaterial canopy, float3 position, int2 pixel, fl
 
 	float3 grassLighting = ShadeTerrainCanopy(canopy, position, pixel, farCoverage.x, groundSunFacing);
 	float4 scene = MainLighting[pixel];
-	scene.rgb = Color::IrradianceToGamma(lerp(Color::IrradianceToLinear(scene.rgb), grassLighting, opacity));
+	scene.rgb = ColorManagement::LinearToScene(lerp(ColorManagement::SceneToLinear(scene.rgb), grassLighting, opacity));
 	MainLighting[pixel] = scene;
 }

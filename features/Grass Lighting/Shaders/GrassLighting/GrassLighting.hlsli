@@ -1,12 +1,42 @@
+#include "Common/PBRMath.hlsli"
+
 namespace GrassLighting
 {
+	void GetSubsurfaceAlbedos(float3 albedo, float amount, float balance,
+		out float3 reflectionAlbedo, out float3 frontTransmissionAlbedo, out float3 backTransmissionAlbedo)
+	{
+		float reflectionWeight;
+		PBR::GetThinSurfaceSubsurfaceAlbedos(albedo, albedo, 1.0 - 0.5 * saturate(amount), balance,
+			reflectionWeight, frontTransmissionAlbedo, backTransmissionAlbedo);
+		reflectionAlbedo = albedo * reflectionWeight;
+	}
+
 	float3 GetLightSpecularInput(float3 L, float3 V, float3 N, float3 lightColor, float shininess)
 	{
 		float3 H = normalize(V + L);
-		float HdotN = saturate(dot(H, N));
+		// log2(0) times a zero shininess is NaN
+		float HdotN = max(saturate(dot(H, N)), 1e-6);
 
 		float lightColorMultiplier = exp2(shininess * log2(HdotN));
 		return lightColor * lightColorMultiplier.xxx;
+	}
+
+	float GetCanopyVisibility(float canopyHeight)
+	{
+		return 1.0 - SharedData::grassLightingSettings.CanopyOcclusion * (1.0 - saturate(canopyHeight));
+	}
+
+	// Bend within the normal's tangent plane to avoid hemisphere flips and cancellation.
+	float3 GetClumpBlendedNormal(float3 bladeNormal, float3 clumpNormal)
+	{
+		float3 bend = clumpNormal - bladeNormal * dot(bladeNormal, clumpNormal);
+		return normalize(bladeNormal + bend * saturate(SharedData::grassLightingSettings.ClumpShading));
+	}
+
+	// Clump occlusion must not depend on which side of a blade faces the light.
+	float GetClumpLightVisibility(float3 clumpNormal, float3 L)
+	{
+		return lerp(1.0, saturate(dot(clumpNormal, L) * 0.5 + 0.5), SharedData::grassLightingSettings.ClumpShading);
 	}
 
 	float3 TransformNormal(float3 normal)

@@ -199,12 +199,12 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	if (grassCollision.loaded)
 		grassCollision.Update();
 
-	const auto linearLightingData = globals::features::linearLighting.GetCommonBufferData();
-	const bool prelinearizeTypeColors = linearLightingData.enableLinearLighting != 0;
-	const float typeColorGamma = prelinearizeTypeColors ? linearLightingData.colorGamma : 1.0f;
-	if (resolvedTypeColorsLinear != prelinearizeTypeColors || resolvedTypeColorGamma != typeColorGamma) {
+	const auto& linearLighting = globals::features::linearLighting;
+	const bool prelinearizeTypeColors = linearLighting.IsLinearLightingActive();
+	const bool typeColorsACEScg = linearLighting.IsACEScgActive();
+	if (resolvedTypeColorsLinear != prelinearizeTypeColors || resolvedTypeColorsACEScg != typeColorsACEScg) {
 		resolvedTypeColorsLinear = prelinearizeTypeColors;
-		resolvedTypeColorGamma = typeColorGamma;
+		resolvedTypeColorsACEScg = typeColorsACEScg;
 		grassTypesDirty = true;
 		distantAmbientLUTFrame = UINT32_MAX;
 	}
@@ -219,7 +219,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 
 	// Resolve frame-uniform TRUE_PBR lighting conversions once.
 	constexpr float vanillaPBRLightingScale = 0.65f;
-	const float grassLightingScale = prelinearizeTypeColors ? std::pow(vanillaPBRLightingScale, typeColorGamma) : vanillaPBRLightingScale;
+	const float grassLightingScale = prelinearizeTypeColors ? 1.0f : vanillaPBRLightingScale;
 	float3 resolvedDirLightColor = float3::Zero;
 
 	if (const auto shaderManager = globals::game::smState) {
@@ -232,22 +232,10 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 					if (const auto imageSpaceManager = globals::game::imageSpaceManager)
 						sunlightScale = imageSpaceManager->GetRuntimeData().data.baseData.hdr.sunlightScale;
 
-					const float rawLightScale = lightData.fade * sunlightScale;
-					const float3 rawDirLightColor = float3(lightData.diffuse.red, lightData.diffuse.green, lightData.diffuse.blue) * rawLightScale;
-
-					if (!prelinearizeTypeColors) {
-						resolvedDirLightColor = rawDirLightColor * std::numbers::pi_v<float>;
-					} else if (linearLightingData.isDirLightLinear) {
-						resolvedDirLightColor = rawDirLightColor;
-					} else {
-						const float dirLightMult = linearLightingData.dirLightMult;
-						const float invDirLightMult = 1.0f / std::max(dirLightMult, 1.0e-5f);
-						const auto convertLight = [&](const float channel) {
-							return std::pow(std::abs(channel * invDirLightMult), linearLightingData.lightGamma);
-						};
-						resolvedDirLightColor = float3(convertLight(rawDirLightColor.x), convertLight(rawDirLightColor.y), convertLight(rawDirLightColor.z));
-						resolvedDirLightColor *= std::numbers::pi_v<float> * linearLightingData.directionalLightMult * dirLightMult;
-					}
+					const auto lightColor = linearLighting.LightColorToWorking(dirLight);
+					const float lightScale = lightData.fade * sunlightScale *
+					                         (prelinearizeTypeColors ? linearLighting.settings.directionalLightMult : std::numbers::pi_v<float>);
+					resolvedDirLightColor = float3(lightColor.red, lightColor.green, lightColor.blue) * lightScale;
 				}
 			}
 		}
@@ -395,7 +383,7 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	grassGlobals.grassLodOrigin = grassLodOrigin;
 
 	if (grassTypesDirty)
-		ResolveGrassTypes(prelinearizeTypeColors, typeColorGamma);
+		ResolveGrassTypes(prelinearizeTypeColors);
 
 	const float canopyStart = std::max(24576.0f, farStart + 4096.0f);
 	const float canopyEnd = std::min(canopyStart + 8192.0f, farEnd);

@@ -8,7 +8,7 @@
 #include <array>
 #include <optional>
 
-#define I18N_KEY_PREFIX "native_menu.ssgi."
+#define I18N_KEY_PREFIX "feature.screen_space_gi."
 
 namespace
 {
@@ -52,28 +52,38 @@ namespace
 	std::vector<std::string> SSGIQualityOptions()
 	{
 		return {
-			T(TKEY("preset_ao_only"), "AO Only"),
-			T(TKEY("preset_low"), "Low"),
-			T(TKEY("preset_standard"), "Standard"),
-			T(TKEY("preset_extreme"), "Extreme"),
-			T(TKEY("preset_reference"), "Reference"),
-			T(TKEY("preset_custom"), "Custom"),
+			T("menu.features.disabled", "Disabled"),
+			T(TKEY("ao_only"), "AO only"),
+			T(TKEY("low"), "Low"),
+			T(TKEY("standard"), "Standard"),
+			T(TKEY("extreme"), "Extreme"),
+			T(TKEY("reference"), "Reference"),
+			T(TKEY("custom"), "Custom"),
 		};
+	}
+
+	// Option 0 is Disabled, so the presets and Custom sit one past their index.
+	float SSGIOption(const Settings& s)
+	{
+		return s.Enabled ? static_cast<float>(FindSSGIPresetIndex(s) + 1) : 0.0f;
 	}
 
 	float __stdcall GetSSGIQuality()
 	{
-		return static_cast<float>(FindSSGIPresetIndex(SSGIRoot::Live()));
+		return SSGIOption(SSGIRoot::Live());
 	}
 
 	void __stdcall SetSSGIQuality(float v)
 	{
-		const auto idx = static_cast<size_t>(std::clamp<float>(v, 0.0f, static_cast<float>(kSSGICustomIndex)));
-		if (idx >= kSSGIPresets.size())
+		const auto option = static_cast<size_t>(std::clamp<float>(v, 0.0f, static_cast<float>(kSSGICustomIndex + 1)));
+		auto& s = SSGIRoot::Live();
+		s.Enabled = option != 0;
+
+		// Custom keeps the current values, so it re-enables without losing tuning.
+		if (option == 0 || option - 1 >= kSSGIPresets.size())
 			return;
 
-		const auto& preset = kSSGIPresets[idx];
-		auto& s = SSGIRoot::Live();
+		const auto& preset = kSSGIPresets[option - 1];
 		s.NumSlices = preset.numSlices;
 		s.NumSteps = preset.numSteps;
 		if (preset.resolutionMode)
@@ -81,6 +91,11 @@ namespace
 		s.EnableBlur = preset.enableBlur;
 		s.EnableGI = preset.enableGI;
 		globals::features::screenSpaceGI.recompileFlag = true;
+	}
+
+	bool __stdcall IsSSGIEditable()
+	{
+		return NativeMenu::IsFeatureEditable(globals::features::screenSpaceGI.GetShortName());
 	}
 }
 
@@ -91,19 +106,12 @@ namespace NativeMenu
 		if (!globals::features::screenSpaceGI.loaded)
 			return {};
 
-		using Enabled = Bind<SSGIRoot, &Settings::Enabled>;
-
 		return {
-			Checkbox<SSGIRoot, &Settings::Enabled>(T(TKEY("enable"), "Enable Screen Space GI"),
-				T(TKEY("enable_desc"),
-					"Toggles Screen Space GI. When disabled, the quality preset below is greyed out.")),
-
-			Dropdown(T(TKEY("quality"), "Screen Space GI Quality"), SSGIQualityOptions(), &GetSSGIQuality,
-				&SetSSGIQuality, static_cast<float>(FindSSGIPresetIndex(Settings{})),
-				T(TKEY("quality_desc"),
-					"Trades render resolution and sample count for visual quality. Matches the presets in the Screen "
-					"Space GI panel's Quality/Performance section."),
-				&Enabled::IsFlagOn),
+			Dropdown(T(TKEY("name"), "Screen Space GI"), SSGIQualityOptions(), &GetSSGIQuality, &SetSSGIQuality,
+				SSGIOption(Settings{}),
+				T(TKEY("description"),
+					"Screen Space Global Illumination adds realistic indirect lighting and ambient occlusion to the game. This technique simulates how light bounces off surfaces to illuminate other objects naturally."),
+				&IsSSGIEditable),
 		};
 	}
 }

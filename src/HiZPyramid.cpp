@@ -11,12 +11,10 @@ void HiZPyramid::SetupResources()
 
 void HiZPyramid::ClearShaderCache()
 {
-	if (baseCS)
-		baseCS->Release();
 	baseCS = nullptr;
-	if (spdCS)
-		spdCS->Release();
 	spdCS = nullptr;
+	baseCSFailed = false;
+	spdCSFailed = false;
 	valid = false;
 	builtFrame = UINT32_MAX;
 }
@@ -47,6 +45,11 @@ ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
 
 ID3D11ShaderResourceView* HiZPyramid::GetLiveDepthSRV()
 {
+	// Terrain Blending keeps the live UNORM view here while its replacement is active.
+	auto& terrainBlending = globals::features::terrainBlending;
+	if (terrainBlending.loaded && terrainBlending.depthSRVBackup)
+		return terrainBlending.depthSRVBackup;
+
 	auto* renderer = globals::game::renderer;
 	if (!renderer)
 		return nullptr;
@@ -169,19 +172,25 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx, bool forc
 
 	// One variant only: both depth sources are R24_UNORM_X8_TYPELESS views.
 	if (!baseCS) {
-		baseCS = static_cast<ID3D11ComputeShader*>(
-			Util::CompileShader(L"Data\\Shaders\\Common\\HiZ\\GrassHiZCS.hlsl", {}, "cs_5_0"));
+		if (baseCSFailed)
+			return false;
+
+		baseCS.attach(static_cast<ID3D11ComputeShader*>(
+			Util::CompileShader(L"Data\\Shaders\\Common\\HiZ\\GrassHiZCS.hlsl", {}, "cs_5_0")));
 		if (!baseCS) {
+			baseCSFailed = true;
 			logger::error("[HiZ Pyramid] HiZ CS load failed — occlusion culling disabled");
 			return false;
 		}
 	}
 
-	if (!spdCS) {
-		spdCS = static_cast<ID3D11ComputeShader*>(
-			Util::CompileShader(L"Data\\Shaders\\Common\\HiZ\\SPD.hlsl", {}, "cs_5_0"));
-		if (!spdCS)
+	if (!spdCS && !spdCSFailed) {
+		spdCS.attach(static_cast<ID3D11ComputeShader*>(
+			Util::CompileShader(L"Data\\Shaders\\Common\\HiZ\\SPD.hlsl", {}, "cs_5_0")));
+		if (!spdCS) {
+			spdCSFailed = true;
 			logger::error("[HiZ Pyramid] SPD load failed — large instances will not be occlusion culled");
+		}
 	}
 
 	// Threads past the rendered sub-rect read beyond it, so the base pass's out-of-bounds guard writes 1.0 there and neither the padding nor the unrendered margin can cull.
@@ -201,7 +210,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx, bool forc
 
 	ID3D11Buffer* cb = paramsCB->CB();
 	ID3D11UnorderedAccessView* baseUAV = mipUAVs[0].get();
-	ctx->CSSetShader(baseCS, nullptr, 0);
+	ctx->CSSetShader(baseCS.get(), nullptr, 0);
 	ctx->CSSetConstantBuffers(0, 1, &cb);
 	ctx->CSSetShaderResources(0, 1, &srcSRV);
 	ctx->CSSetUnorderedAccessViews(0, 1, &baseUAV, nullptr);
@@ -237,7 +246,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx, bool forc
 			spdUAVs[i] = mipUAVs[i + 1].get();
 		ID3D11ShaderResourceView* spdSourceSRV = mip0SRV.get();
 
-		ctx->CSSetShader(spdCS, nullptr, 0);
+		ctx->CSSetShader(spdCS.get(), nullptr, 0);
 		ctx->CSSetShaderResources(0, 1, &spdSourceSRV);
 		ctx->CSSetUnorderedAccessViews(0, 6, spdUAVs, nullptr);
 		ctx->Dispatch(groupsX, groupsY, 1);

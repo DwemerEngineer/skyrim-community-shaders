@@ -38,7 +38,7 @@ float GaussianWeight(float r)
 // http://marc-b-reynolds.github.io/quaternions/2016/07/06/Orthonormal.html
 float3x3 getBasis(float3 N)
 {
-	float sz = sign(N.z);
+	const float sz = N.z >= 0.0 ? 1.0 : -1.0;
 	float a = 1.0 / (sz + N.z);
 	float ya = N.y * a;
 	float b = N.x * ya;
@@ -101,7 +101,7 @@ float2x2 getRotationMatrix(float noise)
 
 	float depth = READ_DEPTH(srcDepth, dtid);
 	float3 pos = ScreenToViewPosition(screenPos, depth);
-	float3 normal = GBuffer::DecodeNormal(FULLRES_LOAD(srcNormalRoughness, dtid, uv, samplerLinearClamp).xy);
+	float3 normal = GBuffer::DecodeNormal(FULLRES_LOAD(srcNormalRoughness, dtid, uv * frameScale, samplerLinearClamp).xy);
 
 	const float2 pixelDirRBViewspaceSizeAtCenterZ = depth.xx * NDCToViewMul.xy * RCP_OUT_FRAME_DIM;
 	const float worldRadius = radius * pixelDirRBViewspaceSizeAtCenterZ.x;
@@ -111,7 +111,7 @@ float2x2 getRotationMatrix(float noise)
 	TvBv[0] *= worldRadius;
 	TvBv[1] *= worldRadius;
 #ifdef TEMPORAL_DENOISER
-	halfAngle *= 1 - lerp(0, 0.8, sqrt(accumFrames / (float)MaxAccumFrames));
+	halfAngle *= 1 - lerp(0, 0.8, sqrt(saturate(accumFrames * 255 / (float)MaxAccumFrames)));
 #endif
 
 	const float4 ilY = srcIlY[dtid];
@@ -132,7 +132,7 @@ float2x2 getRotationMatrix(float noise)
 		float2 screenPosSample = FrameBuffer::ViewToUV(viewSamplePos);
 
 		if (any(screenPosSample < 0) || any(screenPosSample > 1)) {
-				continue;
+			continue;
 		}
 
 		float2 uvSample = screenPosSample;

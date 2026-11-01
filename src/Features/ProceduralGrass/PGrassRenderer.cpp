@@ -1227,7 +1227,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::AppendFeatureDefines(Shader
 
 		// Simple lighting keeps only the colour-space and shadowing features it evaluates.
 		// Far evaluates screen-space shadows only as Low's statistical stand-in, so it needs the define but not skylighting.
-		if (simpleLighting && featureName != "LINEAR_LIGHTING" && featureName != "TERRAIN_SHADOWS" && featureName != "CLOUD_SHADOWS" &&
+		if (simpleLighting && featureName != "ENABLE_LL" && featureName != "TERRAIN_SHADOWS" && featureName != "CLOUD_SHADOWS" &&
 			featureName != "SCREEN_SPACE_SHADOWS" && (extraDefine || featureName != "SKYLIGHTING"))
 			continue;
 		defines.push_back({ featureName.data(), nullptr });

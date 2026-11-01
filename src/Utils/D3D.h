@@ -2,6 +2,9 @@
 #include <array>
 #include <cstdint>
 #include <d3d11.h>
+#include <d3dcompiler.h>
+#include <filesystem>
+#include <fstream>
 #include <winrt/base.h>
 
 class Texture2D;
@@ -21,6 +24,46 @@ namespace Util
 	/** @brief Creates an owned single-mip square texture with an SRV and optional UAV. */
 	Texture2D* CreateSquareTexture(uint32_t dim, DXGI_FORMAT format, bool unorderedAccess, const char* name);
 
+	/**
+	 * @brief ID3DInclude handler resolving #include paths under Data\Shaders,
+	 *        shared by every HLSL compile call site in this codebase.
+	 */
+	struct CustomInclude : public ID3DInclude
+	{
+		HRESULT Open([[maybe_unused]] D3D_INCLUDE_TYPE IncludeType, LPCSTR pFileName, [[maybe_unused]] LPCVOID pParentData, LPCVOID* ppData, UINT* pBytes) override
+		{
+			std::filesystem::path filePath = pFileName;
+			filePath = L"Data\\Shaders" / filePath;
+
+			std::ifstream file(filePath, std::ios::binary);
+			if (!file.is_open()) {
+				*ppData = NULL;
+				*pBytes = 0;
+				return E_FAIL;
+			}
+
+			file.seekg(0, std::ios::end);
+			UINT size = static_cast<UINT>(file.tellg());
+			file.seekg(0, std::ios::beg);
+
+			char* data = new char[size];
+			if (!file.read(data, size)) {
+				delete[] data;
+				*ppData = NULL;
+				*pBytes = 0;
+				return E_FAIL;
+			}
+			*ppData = data;
+			*pBytes = size;
+			return S_OK;
+		}
+
+		HRESULT Close(LPCVOID pData) override
+		{
+			delete[] static_cast<const char*>(pData);
+			return S_OK;
+		}
+	};
 	/**
 	 * @brief Look up the matching SRV for a given render target view.
 	 * @param a_rtv The render target view to look up.
@@ -57,14 +100,38 @@ namespace Util
 	void SetResourceName(ID3D11DeviceChild* Resource, const char* Format, ...);
 
 	/**
+	 * @brief Enables D3D11 multithread protection and holds the immediate context's lock for the scope.
+	 * Scopes are reference counted, and the protection state from before the first scope is restored when the last one ends.
+	 */
+	class MultithreadScope
+	{
+	public:
+		explicit MultithreadScope(ID3D11DeviceContext* context);
+		~MultithreadScope();
+		MultithreadScope(const MultithreadScope&) = delete;
+		MultithreadScope& operator=(const MultithreadScope&) = delete;
+
+		/** @brief True when the lock is held; false when ID3D11Multithread is unavailable. */
+		explicit operator bool() const { return multithread != nullptr; }
+
+	private:
+		winrt::com_ptr<REX::W32::ID3D11Multithread> multithread;
+	};
+
+	/**
 	 * @brief Compile an HLSL shader from file and create the appropriate D3D11 shader object.
 	 * @param FilePath Path to the HLSL source file.
 	 * @param Defines Preprocessor macro name/value pairs to pass to the compiler.
 	 * @param ProgramType Shader model target (e.g. "ps_5_0", "vs_5_0", "cs_5_0").
 	 * @param Program Entry point function name (defaults to "main").
-	 * @return The compiled shader object, or nullptr on failure.
+	 * @return The compiled shader object, or nullptr on failure. A failed compile is not retried until ClearShaderCompileFailures().
 	 */
 	ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program = "main");
+
+	/**
+	 * @brief Allow previously failed CompileShader requests to compile again.
+	 */
+	void ClearShaderCompileFailures();
 
 	/**
 	 * @brief Apply an alpha-blended highlight tint to a texture via CPU staging copy.
@@ -110,9 +177,12 @@ namespace Util
 	 *
 	 * The caller does NOT own the returned pointer.
 	 *
-	 * @param prefer16bit When false (default) returns R32_FLOAT for compute shaders doing
-	 *        arithmetic on depth; when true returns R16_UNORM for pixel shaders via
-	 *        slot 17 / SharedData::GetDepth.
+	 * Returns prepass depth until Deferred::DeferredPasses copies the finished opaque
+	 * depth, and that final depth (R24_UNORM_X8) for the rest of the frame.
+	 *
+	 * @param prefer16bit Before the final depth is available: when false (default) returns
+	 *        R32_FLOAT for compute shaders doing arithmetic on depth; when true returns
+	 *        R16_UNORM for pixel shaders via slot 17 / SharedData::GetDepth. Ignored after.
 	 * @return The depth SRV, or nullptr if unavailable.
 	 */
 	ID3D11ShaderResourceView* GetCurrentSceneDepthSRV(bool prefer16bit = false);

@@ -26,8 +26,12 @@ public:
 
 	static TextureManager& GetSingleton();
 
+	/** @brief Creates a named texture with render-target and shader views. */
+	static Texture CreateTexture(uint32_t width, uint32_t height, DXGI_FORMAT format, const std::string& debugName);
+
 	void Initialize();
 	Texture* GetCommonTexture(const std::string& name);
+	Texture* FindCommonTexture(const std::string& name);
 
 	void SwapTextures(const std::string& name1, const std::string& name2);
 
@@ -41,9 +45,7 @@ public:
 	void IncrementTextureSwap() { textureSwap++; }
 
 private:
-	void CreateCommonTextures();
 	void CreateDownsampleResources();
-	static Texture CreateTexture(uint32_t width, uint32_t height, DXGI_FORMAT format, const std::string& debugName);
 	static DownsampleTexture CreateDownsampleTexture(DXGI_FORMAT format);
 	void DownsampleToFixed(ID3D11ShaderResourceView* source, DownsampleTexture& texture);
 

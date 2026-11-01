@@ -1,10 +1,12 @@
 #include "SettingManager.h"
 
+#include "IniSerialization.h"
 #include "PresetManager.h"
 #include "WeatherManager.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <string>
 #include <tuple>
@@ -40,7 +42,8 @@ static bool TryParseFloat(const std::string& a_value, float& a_out)
 				return false;
 			}
 		}
-		return true;
+		// stof accepts "nan"/"inf", and std::clamp lets NaN through
+		return std::isfinite(a_out);
 	} catch (...) {
 		return false;
 	}
@@ -90,6 +93,7 @@ void SettingManager::RegisterSettingInternal(Setting& setting)
 		uint32_t existingID = it->second;
 		const auto& existing = allSettings[existingID];
 		setting.id = existingID;
+		setting.legacyKeys = existing.legacyKeys;
 		// A type change would leave a mismatched variant, so the new default wins
 		if (existing.type == setting.type) {
 			setting.currentValue = existing.currentValue;
@@ -97,15 +101,103 @@ void SettingManager::RegisterSettingInternal(Setting& setting)
 		} else {
 			logger::warn("[SettingManager] Setting {}:{} re-registered with a different type, resetting to default", setting.category, setting.key);
 			setting.lastSavedValue = setting.currentValue;
+			// Cached weather buckets would otherwise keep the old-typed variant at this ID, and
+			// safeGet<T>() would silently return T{} instead of falling back to the new default.
+			for (auto& [weatherID, data] : weatherData) {
+				if (existingID < data.size())
+					data[existingID] = setting.currentValue;
+			}
+			for (auto& [weatherID, data] : lastSavedWeatherData) {
+				if (existingID < data.size())
+					data[existingID] = setting.currentValue;
+			}
 		}
 		allSettings[existingID] = setting;
 	}
+
+	if (setting.type == SettingType::Bool && setting.key == "EnableMultipleWeathers" && setting.category == "WEATHER")
+		multipleWeathersSettingID = setting.id;
 }
 
-void SettingManager::RegisterBoolSetting(const std::string& key, const std::string& category,
-	bool defaultValue, bool hasWeatherSupport)
+bool SettingManager::IsWeatherSystemEnabledInternal() const
 {
-	std::unique_lock lock(mutex);
+	if (multipleWeathersSettingID >= allSettings.size())
+		return false;
+	auto* enabled = std::get_if<bool>(&allSettings[multipleWeathersSettingID].currentValue);
+	return enabled && *enabled;
+}
+
+/** @brief The weather's defined-period mask for the setting, 0 if it has none. */
+static uint8_t DefinedMaskIn(const std::unordered_map<uint32_t, std::vector<uint8_t>>& a_defined, uint32_t weatherID, uint32_t settingID)
+{
+	auto definedIt = a_defined.find(weatherID);
+	return definedIt != a_defined.end() && settingID < definedIt->second.size() ? definedIt->second[settingID] : uint8_t{ 0 };
+}
+
+template <typename T>
+static constexpr bool isTimeOfDayType = std::is_same_v<T, TimeOfDayValue> || std::is_same_v<T, ColorTimeOfDayValue>;
+
+/** @brief Mask bit for one time-of-day period. */
+static constexpr uint8_t PeriodBit(int a_period)
+{
+	return static_cast<uint8_t>(1u << a_period);
+}
+
+/** @brief Bitmask of the periods where a_after differs from a_before; scalars report every period. */
+template <typename T>
+static uint8_t ChangedPeriods(const SettingValue& a_before, const T& a_after)
+{
+	if constexpr (isTimeOfDayType<T>) {
+		const auto* before = std::get_if<T>(&a_before);
+		uint8_t mask = 0;
+		for (int i = 0; i < T::Total; ++i) {
+			if (!before || !(before->values[i] == a_after.values[i]))
+				mask |= PeriodBit(i);
+		}
+		return mask;
+	} else {
+		return AllPeriodsMask;
+	}
+}
+
+uint8_t SettingManager::GetWeatherDefinedMask(uint32_t weatherID, uint32_t settingID) const
+{
+	return DefinedMaskIn(weatherDefined, weatherID, settingID);
+}
+
+SettingValue SettingManager::ResolveWeatherValue(uint32_t weatherID, uint32_t settingID) const
+{
+	assert(settingID < allSettings.size());
+	const SettingValue& base = allSettings[settingID].currentValue;
+	auto weatherIt = weatherData.find(weatherID);
+	const uint8_t definedMask = GetWeatherDefinedMask(weatherID, settingID);
+	if (weatherIt == weatherData.end() || settingID >= weatherIt->second.size() || !definedMask)
+		return base;
+
+	const SettingValue& weather = weatherIt->second[settingID];
+	if (definedMask == AllPeriodsMask || base.index() != weather.index())
+		return weather;
+
+	return std::visit([&](const auto& baseValue) -> SettingValue {
+		using T = std::decay_t<decltype(baseValue)>;
+		if constexpr (isTimeOfDayType<T>) {
+			T merged = baseValue;
+			const T& weatherValue = std::get<T>(weather);
+			for (int i = 0; i < T::Total; ++i) {
+				if (definedMask & PeriodBit(i))
+					merged.values[i] = weatherValue.values[i];
+			}
+			return merged;
+		} else {
+			return weather;
+		}
+	},
+		base);
+}
+
+/** @brief A bool setting ready for RegisterSettingInternal. */
+static Setting MakeBoolSetting(const std::string& key, const std::string& category, bool defaultValue, bool hasWeatherSupport)
+{
 	Setting setting;
 	setting.key = key;
 	setting.category = category;
@@ -113,7 +205,14 @@ void SettingManager::RegisterBoolSetting(const std::string& key, const std::stri
 	setting.hasWeatherSupport = hasWeatherSupport;
 	setting.defaultValue = defaultValue;
 	setting.currentValue = defaultValue;
+	return setting;
+}
 
+void SettingManager::RegisterBoolSetting(const std::string& key, const std::string& category,
+	bool defaultValue, bool hasWeatherSupport)
+{
+	std::unique_lock lock(mutex);
+	Setting setting = MakeBoolSetting(key, category, defaultValue, hasWeatherSupport);
 	RegisterSettingInternal(setting);
 }
 
@@ -176,10 +275,15 @@ void SettingManager::RegisterColorTimeOfDaySetting(const std::string& key, const
 	setting.currentValue = colorTimeOfDayDefault;
 
 	RegisterSettingInternal(setting);
+
+	// ENB gives every colour filter its own HDRWeighting switch
+	Setting hdrWeighting = MakeBoolSetting(key + "HDRWeighting", category, false, hasWeatherSupport);
+	RegisterSettingInternal(hdrWeighting);
+	allSettings[setting.id].hdrWeightingID = hdrWeighting.id;
 }
 
 template <typename T>
-T SettingManager::GetValue(const std::string& key, const std::string& category, bool rawValue)
+T SettingManager::GetValue(std::string_view key, std::string_view category, bool rawValue)
 {
 	std::shared_lock lock(mutex);
 	uint32_t id = GetSettingIDInternal(key, category);
@@ -197,14 +301,13 @@ T SettingManager::GetValue(uint32_t id, bool rawValue)
 }
 
 template <typename T>
-T SettingManager::GetValueInternal(uint32_t id, bool rawValue) const
+T SettingManager::GetValueInternal(uint32_t id, bool rawValue, float weatherBlendOverride) const
 {
 	if (id >= allSettings.size()) {
 		return T{};
 	}
 
 	const auto& setting = allSettings[id];
-	const auto& categorySettings = categories.at(setting.category);
 
 	auto safeGet = [](const SettingValue& v) -> T {
 		if (auto* p = std::get_if<T>(&v))
@@ -212,7 +315,8 @@ T SettingManager::GetValueInternal(uint32_t id, bool rawValue) const
 		return T{};
 	};
 
-	if (setting.hasWeatherSupport) {
+	if (setting.hasWeatherSupport && IsWeatherSystemEnabledInternal()) {
+		const auto& categorySettings = categories.at(setting.category);
 		bool isInterior = (timeOfDay2[2] + timeOfDay2[3]) > 0.5f;
 		bool shouldIgnoreWeather = isInterior ?
 		                               categorySettings.ignoreWeatherSystemInterior :
@@ -226,22 +330,16 @@ T SettingManager::GetValueInternal(uint32_t id, bool rawValue) const
 		auto lastIt = weatherData.find(lastWeatherID);
 
 		if (currentIt != weatherData.end() || lastIt != weatherData.end()) {
-			SettingValue currentValue = setting.currentValue;
-			SettingValue lastValue = setting.currentValue;
+			SettingValue currentValue = ResolveWeatherValue(currentWeatherID, id);
+			SettingValue lastValue = ResolveWeatherValue(lastWeatherID, id);
 
-			if (currentIt != weatherData.end() && id < currentIt->second.size()) {
-				currentValue = currentIt->second[id];
-			}
-
-			if (lastIt != weatherData.end() && id < lastIt->second.size()) {
-				lastValue = lastIt->second[id];
-			}
-
+			const float liveBlend = threadWeatherBlend >= 0.0f ? threadWeatherBlend : weatherBlendFactor;
+			const float blend = weatherBlendOverride >= 0.0f ? weatherBlendOverride : liveBlend;
 			if (rawValue) {
-				return safeGet(weatherBlendFactor > 0.5f ? currentValue : lastValue);
+				return safeGet(blend > 0.5f ? currentValue : lastValue);
 			}
 
-			SettingValue blendedValue = InterpolateValues(lastValue, currentValue, weatherBlendFactor);
+			SettingValue blendedValue = InterpolateValues(lastValue, currentValue, blend);
 			return safeGet(blendedValue);
 		}
 	}
@@ -264,9 +362,9 @@ void SettingManager::SetValueInternal(uint32_t id, const T& value)
 	}
 
 	auto& setting = allSettings[id];
-	const auto& categorySettings = categories.at(setting.category);
 
-	if (setting.hasWeatherSupport) {
+	if (setting.hasWeatherSupport && IsWeatherSystemEnabledInternal()) {
+		const auto& categorySettings = categories.at(setting.category);
 		bool isInterior = (timeOfDay2[2] + timeOfDay2[3]) > 0.5f;
 		bool shouldIgnoreWeather = isInterior ?
 		                               categorySettings.ignoreWeatherSystemInterior :
@@ -282,22 +380,15 @@ void SettingManager::SetValueInternal(uint32_t id, const T& value)
 		// Update all weather IDs sharing the same file
 		auto& weatherManager = WeatherManager::GetSingleton();
 		auto* entry = weatherManager.FindWeatherEntry(targetWeatherID);
+		if (!entry) {
+			setting.currentValue = value;
+			return;
+		}
 
-		if (entry) {
-			for (uint32_t linkedID : entry->weatherIDs) {
-				auto& data = weatherData[linkedID];
-				if (data.size() < allSettings.size()) {
-					auto oldSize = data.size();
-					data.resize(allSettings.size());
-					for (size_t i = oldSize; i < allSettings.size(); ++i) {
-						data[i] = allSettings[i].currentValue;
-					}
-				}
-				data[id] = value;
-			}
-		} else {
-			// Fallback: update target ID only
-			auto& data = weatherData[targetWeatherID];
+		// Only the periods the edit changed become weather-defined; the rest keep following enbseries.ini
+		const uint8_t editedPeriods = ChangedPeriods(ResolveWeatherValue(targetWeatherID, id), value);
+		for (uint32_t linkedID : entry->weatherIDs) {
+			auto& data = weatherData[linkedID];
 			if (data.size() < allSettings.size()) {
 				auto oldSize = data.size();
 				data.resize(allSettings.size());
@@ -306,6 +397,11 @@ void SettingManager::SetValueInternal(uint32_t id, const T& value)
 				}
 			}
 			data[id] = value;
+
+			auto& defined = weatherDefined[linkedID];
+			if (defined.size() < allSettings.size())
+				defined.resize(allSettings.size(), 0);
+			defined[id] |= editedPeriods;
 		}
 		return;
 	}
@@ -313,13 +409,13 @@ void SettingManager::SetValueInternal(uint32_t id, const T& value)
 	setting.currentValue = value;
 }
 
-uint32_t SettingManager::GetSettingID(const std::string& key, const std::string& category) const
+uint32_t SettingManager::GetSettingID(std::string_view key, std::string_view category) const
 {
 	std::shared_lock lock(mutex);
 	return GetSettingIDInternal(key, category);
 }
 
-uint32_t SettingManager::GetSettingIDInternal(const std::string& key, const std::string& category) const
+uint32_t SettingManager::GetSettingIDInternal(std::string_view key, std::string_view category) const
 {
 	auto catIt = categories.find(category);
 	if (catIt != categories.end()) {
@@ -331,7 +427,7 @@ uint32_t SettingManager::GetSettingIDInternal(const std::string& key, const std:
 	return 0xFFFFFFFF;
 }
 
-float SettingManager::GetInterpolatedTimeOfDayValue(const std::string& key, const std::string& category)
+float SettingManager::GetInterpolatedTimeOfDayValue(std::string_view key, std::string_view category)
 {
 	std::shared_lock lock(mutex);
 	uint32_t id = GetSettingIDInternal(key, category);
@@ -341,17 +437,17 @@ float SettingManager::GetInterpolatedTimeOfDayValue(const std::string& key, cons
 	return ComputeTimeOfDayInterpolation(timeOfDayValue);
 }
 
-float3 SettingManager::GetInterpolatedColorTimeOfDayValue(const std::string& key, const std::string& category)
+float3 SettingManager::GetInterpolatedColorTimeOfDayValue(std::string_view key, std::string_view category)
 {
 	std::shared_lock lock(mutex);
 	uint32_t id = GetSettingIDInternal(key, category);
 	if (id == 0xFFFFFFFF)
 		return {};
 	ColorTimeOfDayValue colorTimeOfDayValue = GetValueInternal<ColorTimeOfDayValue>(id);
-	return ComputeColorTimeOfDayInterpolation(colorTimeOfDayValue);
+	return ComputeColorTimeOfDayInterpolation(colorTimeOfDayValue, GetValueInternal<bool>(allSettings[id].hdrWeightingID));
 }
 
-const Setting* SettingManager::GetSettingInfo(const std::string& key, const std::string& category) const
+const Setting* SettingManager::GetSettingInfo(std::string_view key, std::string_view category) const
 {
 	std::shared_lock lock(mutex);
 	uint32_t id = GetSettingIDInternal(key, category);
@@ -402,41 +498,10 @@ bool SettingManager::IsCategoryExteriorOnly(const std::string& category) const
 	return it->second.exteriorOnly;
 }
 
-std::map<std::string, std::vector<std::string>> SettingManager::GetCategorizedSettings() const
+std::vector<std::string> SettingManager::GetCategories() const
 {
 	std::shared_lock lock(mutex);
-	std::map<std::string, std::vector<std::string>> result;
-	result["Main"] = {};
-	result["Weather"] = {};
-	result["Debug"] = {};
-
-	for (const auto& catName : categoryOrder) {
-		auto it = categories.find(catName);
-		if (it == categories.end())
-			continue;
-
-		if (it->second.tab == "Debug") {
-			result["Debug"].push_back(catName);
-			continue;
-		}
-
-		bool hasNonTod = false;
-		bool hasTod = false;
-		for (const auto& [key, id] : it->second.settings) {
-			auto type = allSettings[id].type;
-			if (type == SettingType::TimeOfDay || type == SettingType::ColorTimeOfDay)
-				hasTod = true;
-			else
-				hasNonTod = true;
-		}
-
-		if (hasNonTod)
-			result["Main"].push_back(catName);
-		if (hasTod)
-			result["Weather"].push_back(catName);
-	}
-
-	return result;
+	return categoryOrder;
 }
 
 void SettingManager::SetCategoryDependency(const std::string& category, const std::string& dependsOnKey, const std::string& dependsOnCategory)
@@ -447,6 +512,15 @@ void SettingManager::SetCategoryDependency(const std::string& category, const st
 		it->second.dependsOnKey = dependsOnKey;
 		it->second.dependsOnCategory = dependsOnCategory;
 	}
+}
+
+std::pair<std::string, std::string> SettingManager::GetCategoryDependency(const std::string& category) const
+{
+	std::shared_lock lock(mutex);
+	auto it = categories.find(category);
+	if (it == categories.end())
+		return {};
+	return { it->second.dependsOnKey, it->second.dependsOnCategory };
 }
 
 void SettingManager::SetSettingDependency(const std::string& key, const std::string& category, const std::string& dependsOnKey, const std::string& dependsOnCategory)
@@ -491,6 +565,23 @@ bool SettingManager::IsSettingEnabled(const std::string& key, const std::string&
 	return GetValue<bool>(depKey, depCategory);
 }
 
+void SettingManager::SetSettingLegacyKey(const std::string& key, const std::string& category, const std::string& legacyKey)
+{
+	std::unique_lock lock(mutex);
+	uint32_t id = GetSettingIDInternal(key, category);
+	if (id == 0xFFFFFFFF)
+		return;
+	auto& legacyKeys = allSettings[id].legacyKeys;
+	if (std::find(legacyKeys.begin(), legacyKeys.end(), legacyKey) == legacyKeys.end())
+		legacyKeys.push_back(legacyKey);
+}
+
+bool SettingManager::IsWeatherSystemEnabled() const
+{
+	std::shared_lock lock(mutex);
+	return IsWeatherSystemEnabledInternal();
+}
+
 void SettingManager::SetWeatherBlendFactors(uint32_t newCurrentWeatherID, uint32_t newLastWeatherID, float blendFactor)
 {
 	std::unique_lock lock(mutex);
@@ -519,12 +610,14 @@ void SettingManager::LoadWeatherSettings(const std::vector<uint32_t>& weatherIDs
 
 	// Do all file I/O without holding any lock
 	std::vector<SettingValue> loadedValues(settingsCopy.size());
+	std::vector<uint8_t> definedValues(settingsCopy.size(), 0);
 	for (size_t i = 0; i < settingsCopy.size(); ++i) {
 		loadedValues[i] = settingsCopy[i].currentValue;
 	}
 	for (auto& setting : settingsCopy) {
 		if (setting.hasWeatherSupport) {
-			LoadSettingFromFile(filePath, setting.category, setting.key, setting);
+			setting.defaultValue = setting.currentValue;
+			definedValues[setting.id] = LoadSettingFromFile(filePath, setting.category, setting.key, setting);
 			loadedValues[setting.id] = setting.currentValue;
 		}
 	}
@@ -535,6 +628,8 @@ void SettingManager::LoadWeatherSettings(const std::vector<uint32_t>& weatherIDs
 		for (uint32_t weatherID : weatherIDs) {
 			weatherData[weatherID] = loadedValues;
 			lastSavedWeatherData[weatherID] = loadedValues;
+			weatherDefined[weatherID] = definedValues;
+			lastSavedWeatherDefined[weatherID] = definedValues;
 		}
 	}
 }
@@ -550,7 +645,7 @@ void SettingManager::SaveWeatherSettings(const std::string& weatherKey, const st
 	std::filesystem::path absPath = std::filesystem::absolute(filePath);
 	std::string absPathStr = absPath.string();
 
-	std::vector<std::tuple<std::string, std::string, Setting>> settingsToWrite;
+	std::vector<std::tuple<std::string, std::string, Setting, uint8_t>> settingsToWrite;
 
 	{
 		std::unique_lock lock(mutex);
@@ -563,9 +658,13 @@ void SettingManager::SaveWeatherSettings(const std::string& weatherKey, const st
 		const auto& weatherValues = weatherIt->second;
 
 		for (const auto& setting : allSettings) {
-			if (setting.hasWeatherSupport && setting.id < weatherValues.size()) {
+			// Only write what the weather defines; the rest belongs to enbseries.ini
+			const uint8_t definedMask = GetWeatherDefinedMask(weatherID, setting.id);
+			if (setting.hasWeatherSupport && definedMask && setting.id < weatherValues.size()) {
 				bool changed = true;
-				if (lastIt != lastSavedWeatherData.end() && setting.id < lastIt->second.size()) {
+				// Newly defined periods must be written even if they match the snapshot, which held the enbseries.ini value
+				const bool newlyDefined = (definedMask & ~DefinedMaskIn(lastSavedWeatherDefined, weatherID, setting.id)) != 0;
+				if (!newlyDefined && lastIt != lastSavedWeatherData.end() && setting.id < lastIt->second.size()) {
 					if (weatherValues[setting.id] == lastIt->second[setting.id]) {
 						changed = false;
 					}
@@ -574,13 +673,14 @@ void SettingManager::SaveWeatherSettings(const std::string& weatherKey, const st
 				if (changed) {
 					Setting tempSetting = setting;
 					tempSetting.currentValue = weatherValues[setting.id];
-					settingsToWrite.emplace_back(setting.category, setting.key, tempSetting);
+					settingsToWrite.emplace_back(setting.category, setting.key, tempSetting, definedMask);
 				}
 			}
 		}
 
 		// Update last saved state
 		lastSavedWeatherData[weatherID] = weatherValues;
+		lastSavedWeatherDefined[weatherID] = weatherDefined[weatherID];
 	}
 
 	if (settingsToWrite.empty()) {
@@ -588,8 +688,8 @@ void SettingManager::SaveWeatherSettings(const std::string& weatherKey, const st
 	}
 
 	// Perform IO outside of lock to prevent deadlocks
-	for (const auto& [category, key, setting] : settingsToWrite) {
-		SaveSettingToFile(absPathStr, category, key, setting);
+	for (const auto& [category, key, setting, definedMask] : settingsToWrite) {
+		SaveSettingToFile(absPathStr, category, key, setting, definedMask);
 	}
 
 	// Flush Windows .ini cache to disk
@@ -619,6 +719,7 @@ void SettingManager::ReloadAllWeatherSettings()
 	{
 		std::unique_lock lock(mutex);
 		weatherData.clear();
+		weatherDefined.clear();
 	}
 	auto& weatherManager = WeatherManager::GetSingleton();
 	weatherManager.Initialize();
@@ -711,6 +812,7 @@ void SettingManager::LoadFromFile(const std::string& filePath)
 		}
 
 		lastSavedWeatherData = weatherData;
+		lastSavedWeatherDefined = weatherDefined;
 	}
 }
 
@@ -816,59 +918,109 @@ float SettingManager::ComputeTimeOfDayInterpolation(const TimeOfDayValue& value)
 	       timeOfDay2[3] * value.values[TimeOfDayValue::InteriorNight];
 }
 
-float3 SettingManager::ComputeColorTimeOfDayInterpolation(const ColorTimeOfDayValue& value) const
+float3 SettingManager::ComputeColorTimeOfDayInterpolation(const ColorTimeOfDayValue& value, bool hdrWeighting) const
 {
-	return timeOfDay1[0] * value.values[ColorTimeOfDayValue::Dawn] +
-	       timeOfDay1[1] * value.values[ColorTimeOfDayValue::Sunrise] +
-	       timeOfDay1[2] * value.values[ColorTimeOfDayValue::Day] +
-	       timeOfDay1[3] * value.values[ColorTimeOfDayValue::Sunset] +
-	       timeOfDay2[0] * value.values[ColorTimeOfDayValue::Dusk] +
-	       timeOfDay2[1] * value.values[ColorTimeOfDayValue::Night] +
-	       timeOfDay2[2] * value.values[ColorTimeOfDayValue::InteriorDay] +
-	       timeOfDay2[3] * value.values[ColorTimeOfDayValue::InteriorNight];
+	static const float3 rec709Luminance{ 0.2126f, 0.7152f, 0.0722f };
+	const float periodWeights[ColorTimeOfDayValue::Total] = { timeOfDay1[0], timeOfDay1[1], timeOfDay1[2], timeOfDay1[3],
+		timeOfDay2[0], timeOfDay2[1], timeOfDay2[2], timeOfDay2[3] };
+
+	float3 blended{};
+	float weightSum = 0.0f;
+	for (int i = 0; i < ColorTimeOfDayValue::Total; ++i) {
+		const float weight = periodWeights[i] * (hdrWeighting ? value.values[i].Dot(rec709Luminance) : 1.0f);
+		blended += value.values[i] * weight;
+		weightSum += weight;
+	}
+	// Brighter filters take a larger share of the transition, so a dim tinted period fades out sooner
+	return hdrWeighting && weightSum > 0.0f ? blended / weightSum : blended;
 }
 
-void SettingManager::LoadSettingFromFile(const std::string& filePath, const std::string& section, const std::string& key, Setting& setting)
+/** @brief Reads a raw ini value; returns false if the key is missing or empty. */
+static bool ReadIniValue(const std::string& filePath, const std::string& section, const std::string& key, std::string& a_out)
 {
+	char buffer[256];
+	DWORD length = GetPrivateProfileStringA(section.c_str(), key.c_str(), "", buffer, sizeof(buffer), filePath.c_str());
+	if (length == 0)
+		return false;
+	a_out.assign(buffer, length);
+	return true;
+}
+
+/** @brief Parses exactly three comma-separated floats, clamping each to [a_min, a_max]. */
+static bool TryParseColor(const std::string& a_value, float a_min, float a_max, float3& a_out)
+{
+	std::stringstream ss(a_value);
+	std::string item;
+	float components[3];
+	int count = 0;
+
+	while (std::getline(ss, item, ',')) {
+		float parsed;
+		if (count >= 3 || !TryParseFloat(item, parsed))
+			return false;
+		components[count++] = std::clamp(parsed, a_min, a_max);
+	}
+
+	if (count != 3)
+		return false;
+
+	a_out = { components[0], components[1], components[2] };
+	return true;
+}
+
+uint8_t SettingManager::LoadSettingFromFile(const std::string& filePath, const std::string& section, const std::string& key, Setting& setting)
+{
+	// Later keys override earlier ones, so the canonical key goes last to win over legacy names
+	std::vector<std::string> keys{ setting.legacyKeys };
+	keys.push_back(key);
+	uint8_t foundMask = 0;
+
 	switch (setting.type) {
 	case SettingType::Bool:
 		{
-			bool defaultVal = std::get<bool>(setting.defaultValue);
-			char buffer[256];
-			GetPrivateProfileStringA(section.c_str(), key.c_str(), defaultVal ? "true" : "false", buffer, sizeof(buffer), filePath.c_str());
-			bool parsed;
-			if (TryParseBool(buffer, parsed)) {
-				setting.currentValue = parsed;
-			} else {
-				setting.currentValue = defaultVal;
+			bool value = std::get<bool>(setting.defaultValue);
+			for (const auto& k : keys) {
+				std::string str;
+				bool parsed;
+				if (ReadIniValue(filePath, section, k, str) && TryParseBool(str, parsed)) {
+					value = parsed;
+					foundMask = AllPeriodsMask;
+				}
 			}
+			setting.currentValue = value;
 			break;
 		}
 	case SettingType::Float:
 		{
-			float defaultVal = std::get<float>(setting.defaultValue);
-			char buffer[256];
-			GetPrivateProfileStringA(section.c_str(), key.c_str(), std::to_string(defaultVal).c_str(), buffer, sizeof(buffer), filePath.c_str());
-			float parsed;
-			if (TryParseFloat(buffer, parsed)) {
-				setting.currentValue = std::clamp(parsed, setting.minValue, setting.maxValue);
-			} else {
-				setting.currentValue = defaultVal;
+			float value = std::get<float>(setting.defaultValue);
+			for (const auto& k : keys) {
+				std::string str;
+				float parsed;
+				if (ReadIniValue(filePath, section, k, str) && TryParseFloat(str, parsed)) {
+					value = std::clamp(parsed, setting.minValue, setting.maxValue);
+					foundMask = AllPeriodsMask;
+				}
 			}
+			setting.currentValue = value;
 			break;
 		}
 	case SettingType::TimeOfDay:
 		{
 			TimeOfDayValue timeOfDayValue = std::get<TimeOfDayValue>(setting.defaultValue);
 
-			for (int i = 0; i < 8; ++i) {
-				std::string fullKey = key + timeOfDayNames[i];
-				char buffer[256];
-				std::string defaultStr = std::to_string(timeOfDayValue.values[i]);
-				GetPrivateProfileStringA(section.c_str(), fullKey.c_str(), defaultStr.c_str(), buffer, sizeof(buffer), filePath.c_str());
+			for (const auto& k : keys) {
+				std::string str;
 				float parsed;
-				if (TryParseFloat(buffer, parsed)) {
-					timeOfDayValue.values[i] = std::clamp(parsed, setting.minValue, setting.maxValue);
+				if (ReadIniValue(filePath, section, k, str) && TryParseFloat(str, parsed)) {
+					std::fill(std::begin(timeOfDayValue.values), std::end(timeOfDayValue.values), std::clamp(parsed, setting.minValue, setting.maxValue));
+					foundMask = AllPeriodsMask;
+				}
+
+				for (int i = 0; i < 8; ++i) {
+					if (ReadIniValue(filePath, section, k + timeOfDayNames[i], str) && TryParseFloat(str, parsed)) {
+						timeOfDayValue.values[i] = std::clamp(parsed, setting.minValue, setting.maxValue);
+						foundMask |= PeriodBit(i);
+					}
 				}
 			}
 
@@ -879,38 +1031,19 @@ void SettingManager::LoadSettingFromFile(const std::string& filePath, const std:
 		{
 			ColorTimeOfDayValue colorTimeOfDayValue = std::get<ColorTimeOfDayValue>(setting.defaultValue);
 
-			for (int i = 0; i < 8; ++i) {
-				std::string fullKey = key + timeOfDayNames[i];
-				char buffer[256];
-				float3 defaultColor = colorTimeOfDayValue.values[i];
-				std::string defaultStr = std::to_string(defaultColor.x) + ", " +
-				                         std::to_string(defaultColor.y) + ", " +
-				                         std::to_string(defaultColor.z);
-
-				GetPrivateProfileStringA(section.c_str(), fullKey.c_str(), defaultStr.c_str(), buffer, sizeof(buffer), filePath.c_str());
-				std::string valueStr = buffer;
-
-				// Parse comma-separated float3 values
-				std::stringstream ss(valueStr);
-				std::string item;
-				std::vector<float> components;
-				bool success = true;
-
-				while (std::getline(ss, item, ',')) {
-					float parsed;
-					if (TryParseFloat(item, parsed)) {
-						components.push_back(std::clamp(parsed, setting.minValue, setting.maxValue));
-					} else {
-						success = false;
-						break;
-					}
+			for (const auto& k : keys) {
+				std::string str;
+				float3 parsed;
+				if (ReadIniValue(filePath, section, k, str) && TryParseColor(str, setting.minValue, setting.maxValue, parsed)) {
+					std::fill(std::begin(colorTimeOfDayValue.values), std::end(colorTimeOfDayValue.values), parsed);
+					foundMask = AllPeriodsMask;
 				}
 
-				// Ensure we have exactly 3 components and parsing was successful
-				if (success && components.size() == 3) {
-					colorTimeOfDayValue.values[i].x = components[0];
-					colorTimeOfDayValue.values[i].y = components[1];
-					colorTimeOfDayValue.values[i].z = components[2];
+				for (int i = 0; i < 8; ++i) {
+					if (ReadIniValue(filePath, section, k + timeOfDayNames[i], str) && TryParseColor(str, setting.minValue, setting.maxValue, parsed)) {
+						colorTimeOfDayValue.values[i] = parsed;
+						foundMask |= PeriodBit(i);
+					}
 				}
 			}
 
@@ -918,28 +1051,11 @@ void SettingManager::LoadSettingFromFile(const std::string& filePath, const std:
 			break;
 		}
 	}
+	return foundMask;
 }
 
-void SettingManager::SaveSettingToFile(const std::string& filePath, const std::string& section, const std::string& key, const Setting& setting)
+void SettingManager::SaveSettingToFile(const std::string& filePath, const std::string& section, const std::string& key, const Setting& setting, uint8_t periodMask)
 {
-	auto formatFloat = [](float value) -> std::string {
-		char temp[32];
-		sprintf_s(temp, "%.3f", value);
-		std::string result = temp;
-
-		// Remove trailing zeros
-		while (result.length() > 1 && result.back() == '0') {
-			result.pop_back();
-		}
-
-		// Ensure at least one decimal place (add .0 if needed)
-		if (result.back() == '.') {
-			result += '0';
-		}
-
-		return result;
-	};
-
 	switch (setting.type) {
 	case SettingType::Bool:
 		{
@@ -950,7 +1066,7 @@ void SettingManager::SaveSettingToFile(const std::string& filePath, const std::s
 	case SettingType::Float:
 		{
 			float value = std::get<float>(setting.currentValue);
-			std::string formatted = formatFloat(value);
+			std::string formatted = Effects11Util::Ini::FormatFloat(value);
 			WritePrivateProfileStringA(section.c_str(), key.c_str(), formatted.c_str(), filePath.c_str());
 			break;
 		}
@@ -959,8 +1075,10 @@ void SettingManager::SaveSettingToFile(const std::string& filePath, const std::s
 			const TimeOfDayValue& timeOfDayValue = std::get<TimeOfDayValue>(setting.currentValue);
 
 			for (int i = 0; i < 8; ++i) {
+				if (!(periodMask & PeriodBit(i)))
+					continue;
 				std::string fullKey = key + timeOfDayNames[i];
-				std::string formatted = formatFloat(timeOfDayValue.values[i]);
+				std::string formatted = Effects11Util::Ini::FormatFloat(timeOfDayValue.values[i]);
 				WritePrivateProfileStringA(section.c_str(), fullKey.c_str(), formatted.c_str(), filePath.c_str());
 			}
 			break;
@@ -970,12 +1088,24 @@ void SettingManager::SaveSettingToFile(const std::string& filePath, const std::s
 			const ColorTimeOfDayValue& colorTimeOfDayValue = std::get<ColorTimeOfDayValue>(setting.currentValue);
 
 			for (int i = 0; i < 8; ++i) {
+				if (!(periodMask & PeriodBit(i)))
+					continue;
 				std::string fullKey = key + timeOfDayNames[i];
 				const auto& color = colorTimeOfDayValue.values[i];
-				std::string formatted = formatFloat(color.x) + ", " + formatFloat(color.y) + ", " + formatFloat(color.z);
+				const float rgb[3] = { color.x, color.y, color.z };
+				std::string formatted = Effects11Util::Ini::FormatFloatList(rgb);
 				WritePrivateProfileStringA(section.c_str(), fullKey.c_str(), formatted.c_str(), filePath.c_str());
 			}
 			break;
+		}
+	}
+
+	const bool isTimeOfDay = setting.type == SettingType::TimeOfDay || setting.type == SettingType::ColorTimeOfDay;
+	for (const auto& legacyKey : setting.legacyKeys) {
+		WritePrivateProfileStringA(section.c_str(), legacyKey.c_str(), nullptr, filePath.c_str());
+		if (isTimeOfDay) {
+			for (const char* suffix : timeOfDayNames)
+				WritePrivateProfileStringA(section.c_str(), (legacyKey + suffix).c_str(), nullptr, filePath.c_str());
 		}
 	}
 }
@@ -1051,10 +1181,10 @@ void SettingManager::Save()
 }
 
 // Explicit template instantiations
-template bool SettingManager::GetValue<bool>(const std::string& key, const std::string& category, bool rawValue);
-template float SettingManager::GetValue<float>(const std::string& key, const std::string& category, bool rawValue);
-template TimeOfDayValue SettingManager::GetValue<TimeOfDayValue>(const std::string& key, const std::string& category, bool rawValue);
-template ColorTimeOfDayValue SettingManager::GetValue<ColorTimeOfDayValue>(const std::string& key, const std::string& category, bool rawValue);
+template bool SettingManager::GetValue<bool>(std::string_view key, std::string_view category, bool rawValue);
+template float SettingManager::GetValue<float>(std::string_view key, std::string_view category, bool rawValue);
+template TimeOfDayValue SettingManager::GetValue<TimeOfDayValue>(std::string_view key, std::string_view category, bool rawValue);
+template ColorTimeOfDayValue SettingManager::GetValue<ColorTimeOfDayValue>(std::string_view key, std::string_view category, bool rawValue);
 
 template bool SettingManager::GetValue<bool>(uint32_t id, bool rawValue);
 template float SettingManager::GetValue<float>(uint32_t id, bool rawValue);
@@ -1066,10 +1196,10 @@ template void SettingManager::SetValue<float>(uint32_t id, const float& value);
 template void SettingManager::SetValue<TimeOfDayValue>(uint32_t id, const TimeOfDayValue& value);
 template void SettingManager::SetValue<ColorTimeOfDayValue>(uint32_t id, const ColorTimeOfDayValue& value);
 
-template bool SettingManager::GetValueInternal<bool>(uint32_t id, bool rawValue) const;
-template float SettingManager::GetValueInternal<float>(uint32_t id, bool rawValue) const;
-template TimeOfDayValue SettingManager::GetValueInternal<TimeOfDayValue>(uint32_t id, bool rawValue) const;
-template ColorTimeOfDayValue SettingManager::GetValueInternal<ColorTimeOfDayValue>(uint32_t id, bool rawValue) const;
+template bool SettingManager::GetValueInternal<bool>(uint32_t id, bool rawValue, float weatherBlendOverride) const;
+template float SettingManager::GetValueInternal<float>(uint32_t id, bool rawValue, float weatherBlendOverride) const;
+template TimeOfDayValue SettingManager::GetValueInternal<TimeOfDayValue>(uint32_t id, bool rawValue, float weatherBlendOverride) const;
+template ColorTimeOfDayValue SettingManager::GetValueInternal<ColorTimeOfDayValue>(uint32_t id, bool rawValue, float weatherBlendOverride) const;
 
 template void SettingManager::SetValueInternal<bool>(uint32_t id, const bool& value);
 template void SettingManager::SetValueInternal<float>(uint32_t id, const float& value);

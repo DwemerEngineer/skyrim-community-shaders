@@ -2,7 +2,9 @@
 
 #include "NativeMenu/Vendor/SystemMenuHook.h"
 
+#include "CSEditor/SceneManager/SceneSettingsManager.h"
 #include "Globals.h"
+#include "I18n/I18n.h"
 #include "State.h"
 
 namespace NativeMenu
@@ -10,7 +12,13 @@ namespace NativeMenu
 	void __stdcall CommitAndSave(float)
 	{
 		if (auto* state = globals::state)
-			state->Save(State::ConfigMode::USER);
+			state->Save();
+	}
+
+	bool IsFeatureEditable(const std::string& featureShortName)
+	{
+		auto* sceneSettingsManager = globals::sceneSettingsManager;
+		return !sceneSettingsManager || !sceneSettingsManager->IsFeatureSceneControlled(featureShortName);
 	}
 
 	void RegisterRows(const char* tab, const std::vector<Row>& rows)
@@ -44,6 +52,6 @@ namespace NativeMenu
 	void Register()
 	{
 		Vendor::SystemMenuHook::Install();
-		RegisterRows("Graphics", GraphicsRows());
+		RegisterRows(T("native_menu.graphics.tab", "Graphics"), GraphicsRows());
 	}
 }

@@ -10,10 +10,12 @@
 #include "Features/ExtendedTranslucency.h"
 #include "Features/GrassLighting.h"
 #include "Features/HairSpecular.h"
+#include "Features/HorizonFix.h"
 #include "Features/IBL.h"
 #include "Features/LODBlending.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
+#include "Features/RainRefraction.h"
 #include "Features/Skin.h"
 #include "Features/Skylighting.h"
 #include "Features/TerrainBlending.h"
@@ -46,7 +48,7 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 	return _GetFeatureBufferData(
 		globals::features::grassLighting.settings,
 		globals::features::extendedMaterials.settings,
-		globals::features::dynamicCubemaps.settings,
+		globals::features::dynamicCubemaps.GetCommonBufferData(),
 		globals::features::terrainShadows.GetCommonBufferData(),
 		globals::features::lightLimitFix.GetCommonBufferData(),
 		globals::features::wetnessEffects.GetCommonBufferData(),
@@ -62,5 +64,7 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::terrainBlending.settings,
 		globals::features::exponentialHeightFog.GetCommonBufferData(),
 		globals::features::truePBR.settings,
-		globals::features::skin.GetCommonBufferData());
+		globals::features::skin.GetCommonBufferData(),
+		globals::features::horizonFix.GetCommonBufferData(),
+		globals::features::rainRefraction.GetCommonBufferData());
 }

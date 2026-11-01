@@ -2,6 +2,7 @@
 #define __PBR_MATH_HLSL__
 
 #include "Common/BRDF.hlsli"
+#include "Common/ColorManagement.hlsli"
 #include "Common/Math.hlsli"
 
 namespace PBR
@@ -33,6 +34,29 @@ namespace PBR
 		static const uint HairMarschner = (1 << 10);
 		static const uint Glint = (1 << 11);
 		static const uint ProjectedGlint = (1 << 12);
+		static const uint Foliage = (1 << 13);
+		static const uint ThinSurface = (1 << 14);
+	}
+
+	bool IsFoliageMaterial(uint flags)
+	{
+#if defined(LANDSCAPE) || defined(LODLANDSCAPE)
+		return false;
+#elif defined(TREE_ANIM)
+		return (flags & (Flags::Foliage | Flags::Subsurface)) != 0;
+#else
+		return (flags & Flags::Foliage) != 0;
+#endif
+	}
+
+	// Foliage is a thin surface with canopy-specific approximations on top.
+	bool IsThinSurfaceMaterial(uint flags)
+	{
+#if defined(LANDSCAPE) || defined(LODLANDSCAPE)
+		return false;
+#else
+		return IsFoliageMaterial(flags) || (flags & Flags::ThinSurface) != 0;
+#endif
 	}
 
 	namespace TerrainFlags
@@ -165,6 +189,100 @@ namespace PBR
 	float SpecularAntiAliasingVariance(float3 dNdx, float3 dNdy, float pixelVariance, float maxVariance)
 	{
 		return min(2.0 * pixelVariance * (dot(dNdx, dNdx) + dot(dNdy, dNdy)), maxVariance);
+	}
+
+	float3 GetThinSurfaceNormal(float3 N, float3 V)
+	{
+		return dot(N, V) < 0.0f ? -N : N;
+	}
+
+	// Bent vertex normals do not identify the visible face. Derivatives require uniform control flow.
+	float3 GetThinSurfaceFaceNormal(float3 worldPosition, float3 V, float3 fallbackNormal)
+	{
+		float3 faceNormal = cross(ddx(worldPosition), ddy(worldPosition));
+		float lengthSq = dot(faceNormal, faceNormal);
+		faceNormal = lengthSq > 1e-12f ? faceNormal * rsqrt(lengthSq) : fallbackNormal;
+		return GetThinSurfaceNormal(faceNormal, V);
+	}
+
+	void GetThinSurfaceSubsurfaceAlbedos(float3 baseColor, float3 scatteringColor, float opacity, float balance,
+		out float reflectionWeight, out float3 frontTransmissionAlbedo, out float3 backTransmissionAlbedo)
+	{
+		float subsurfaceShare = 1.0f - saturate(opacity);
+		float backShare = saturate(balance);
+		// Light scattered inside the sheet is no longer available for surface reflection.
+		float3 weights = float3(subsurfaceShare * (1.0f - backShare), subsurfaceShare * backShare, 1.0f - subsurfaceShare);
+		float3 litFaceAlbedo = weights.z * baseColor + weights.x * scatteringColor;
+#if defined(TRUE_PBR) && (defined(TREE_ANIM) || defined(LIGHTING) || defined(GRASS_LIGHTING))
+		// Subsurface share and balance are linear energy shares, not gamma-encoded material colors.
+#	if !defined(GRASS_LIGHTING)
+		if (IsThinSurfaceMaterial(PBRFlags))
+#	endif
+		{
+			// Both lit-face lobes leave the same side, so they must sum before encoding.
+			litFaceAlbedo = Color::LinearToPBRMaterial(weights.z * Color::PBRMaterialToLinear(baseColor) + weights.x * Color::PBRMaterialToLinear(scatteringColor));
+			weights = Color::LinearToPBRMaterial(weights);
+		}
+#endif
+		reflectionWeight = weights.z;
+		frontTransmissionAlbedo = saturate(litFaceAlbedo - baseColor * weights.z);
+		backTransmissionAlbedo = saturate(scatteringColor * weights.y);
+	}
+
+	// Light crossing a sheet exits away from a face turned toward the light, whatever its bent normal says.
+	float GetThinSurfaceBackTransmissionVisibility(float3 faceNormal, float3 L)
+	{
+		return 1.0f - saturate(4.0f * dot(faceNormal, L));
+	}
+
+	// The squared denominator preserves lobe energy as wrap broadens the terminator.
+	float2 GetThinSurfaceDiffuseCosines(float NdotL, float wrap)
+	{
+		float normalization = 1.0f / ((1.0f + wrap) * (1.0f + wrap));
+		return float2(saturate((NdotL + wrap) * normalization), saturate((wrap - NdotL) * normalization));
+	}
+
+	/** @brief Evaluates thin-surface diffuse lobes with separate reflection and transmission shadows. */
+	void GetThinSurfaceDirectScattering(float3 reflectionAlbedo, float3 transmissionAlbedo, float3 irradiance,
+		float NdotL, float wrap, float reflectionShadow, float transmissionShadow,
+		out float3 reflection, out float3 transmission)
+	{
+		float2 diffuseCosines = GetThinSurfaceDiffuseCosines(NdotL, wrap);
+		reflection = reflectionAlbedo * diffuseCosines.x * irradiance * reflectionShadow;
+		transmission = transmissionAlbedo * diffuseCosines.y * irradiance * transmissionShadow;
+	}
+
+	void GetThinSurfaceDirectScattering(float3 reflectionAlbedo, float3 frontTransmissionAlbedo, float3 backTransmissionAlbedo,
+		float3 shineThroughAlbedo, float opacity, float3 irradiance, float NdotL, float wrap, float reflectionShadow, float2 transmissionShadows,
+		out float3 reflection, out float3 transmission)
+	{
+		float3 transmittance = (1.0f - saturate(opacity)).xxx;
+#if defined(TRUE_PBR) && (defined(TREE_ANIM) || defined(LIGHTING) || defined(GRASS_LIGHTING))
+#	if !defined(GRASS_LIGHTING)
+		if (IsThinSurfaceMaterial(PBRFlags))
+#	endif
+			transmittance = Color::LinearToPBRMaterial(transmittance);
+#endif
+		// Share the wrapped shading response so flat sheet boundaries do not split the transmission lobe.
+		float3 transmissionAlbedo = saturate(shineThroughAlbedo * transmittance + backTransmissionAlbedo);
+		GetThinSurfaceDirectScattering(reflectionAlbedo, transmissionAlbedo, irradiance,
+			NdotL, wrap, reflectionShadow, transmissionShadows.y, reflection, transmission);
+		transmission += frontTransmissionAlbedo * saturate(NdotL) * irradiance * transmissionShadows.x;
+	}
+
+	// Normal-variance filtering from Tokuyoshi and Kaplanyan (2019).
+	float FilterFoliageRoughness(float roughness, float3 normalDx, float3 normalDy)
+	{
+		float variance = 0.25f * (dot(normalDx, normalDx) + dot(normalDy, normalDy));
+		float kernelRoughnessSq = min(2.0f * variance, 0.18f);
+		float roughnessSq = roughness * roughness;
+		return sqrt(sqrt(saturate(roughnessSq * roughnessSq + kernelRoughnessSq)));
+	}
+
+	// Approximate canopy transmission using receiver opacity when occluder material is unavailable.
+	float GetFoliageShadowVisibility(float shadow, float opacity)
+	{
+		return lerp(1.0f - saturate(opacity), 1.0f, saturate(shadow));
 	}
 
 	/// @brief Directional albedo of the OpenPBR fuzz layer (Zeltner et al. 2022 sheen)

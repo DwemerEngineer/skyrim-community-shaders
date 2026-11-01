@@ -1,6 +1,7 @@
 #include "Game.h"
 
 #include <atomic>
+#include <limits>
 
 #include "Globals.h"
 #include "State.h"
@@ -11,6 +12,23 @@ namespace
 	std::atomic_bool timeJumpTransitionRequested{ false };
 	std::atomic_bool gameLoadTransitionRequested{ false };
 	std::atomic_uint32_t completedCelestialTransitionGeneration{ 0 };
+
+	void ResetModelHandle(RE::ModelDBHandle& a_handle)
+	{
+		if (!a_handle)
+			return;
+
+		if (REL::Module::IsAE()) {
+			auto* entry = a_handle.get();
+			a_handle = {};
+			static REL::Relocation<void (*)(RE::ModelDBHandle::U_Entry*)> release{ REL::ID(15443) };
+			release(entry);
+		} else {
+			using Reset = RE::ModelDBHandle* (*)(RE::ModelDBHandle*, RE::ModelDBHandle::U_Entry*);
+			static REL::Relocation<Reset> reset{ REL::ID(25746) };
+			reset(&a_handle, nullptr);
+		}
+	}
 
 	void MarkCelestialTransitionComplete()
 	{
@@ -29,6 +47,30 @@ namespace
 
 namespace Util
 {
+	void ForceWeather(RE::Sky* a_sky, RE::TESWeather* a_weather, bool a_override)
+	{
+		if (!a_sky)
+			return;
+
+		a_sky->ForceWeather(a_weather, a_override);
+		if (a_sky->auroraRoot) {
+			if (a_sky->root)
+				a_sky->root->DetachChild(a_sky->auroraRoot.get());
+			a_sky->auroraRoot.reset();
+		}
+		ResetModelHandle(a_sky->auroraModel);
+
+		// Defer cloud-pass rebuilding until accumulation; render queues may still hold the current passes.
+		if (a_sky->clouds) {
+			for (const auto& cloud : a_sky->clouds->clouds) {
+				if (cloud) {
+					if (auto* property = skyrim_cast<RE::BSSkyShaderProperty*>(cloud->GetGeometryRuntimeData().shaderProperty.get()))
+						property->lastRenderPassState = (std::numeric_limits<std::int32_t>::max)();
+				}
+			}
+		}
+	}
+
 	void SetCelestialTransitionHandlerAvailable(bool a_available)
 	{
 		celestialTransitionHandlerAvailable.store(a_available, std::memory_order_release);
@@ -186,7 +228,7 @@ namespace Util
 	{
 		static float& cameraFOVDeg = (*(float*)(REL::RelocationID(513786, 388785).address()));  // FOV degrees
 		float hFOVRad = cameraFOVDeg * (3.14159265359f / 180.0f);
-		float unitHalfWidth = tan(hFOVRad / 2);                                                                // This is same as camera frustum RL
+		float unitHalfWidth = tan(hFOVRad / 2);                                                                                                         // This is same as camera frustum RL
 		float unitHalfHeight = unitHalfWidth / ((float)globals::game::graphicsState->screenWidth / (float)globals::game::graphicsState->screenHeight);  // frustum TB
 		float vFOVRad = 2.0f * atan(unitHalfHeight);
 		return vFOVRad;
@@ -329,6 +371,11 @@ namespace Util
 		return IsNewFrame(globals::state->frameCount);
 	}
 
+	bool GraphSampleGate::ShouldSample()
+	{
+		return ShouldSample(globals::state->frameCount);
+	}
+
 	RE::BGSTextureSet* GetSeasonalSwap(RE::BGSTextureSet* textureSet)
 	{
 		if (textureSet == nullptr) {
@@ -342,6 +389,17 @@ namespace Util
 		}
 
 		return textureSet;
+	}
+
+	float GetSunVisibility(const RE::Sun* a_sun)
+	{
+		if (!a_sun || !a_sun->root || !a_sun->sunBaseNode || !a_sun->sunBase)
+			return 0.0f;
+		if (a_sun->root->GetFlags().any(RE::NiAVObject::Flag::kHidden) || a_sun->sunBaseNode->GetFlags().any(RE::NiAVObject::Flag::kHidden))
+			return 0.0f;
+
+		const auto property = skyrim_cast<RE::BSSkyShaderProperty*>(a_sun->sunBase->GetGeometryRuntimeData().shaderProperty.get());
+		return property ? std::clamp(property->kBlendColor.alpha, 0.0f, 1.0f) : 0.0f;
 	}
 
 	bool IsInterior()
@@ -373,5 +431,60 @@ namespace Util
 	void WorldToCell(const RE::NiPoint3& worldPos, int32_t& x, int32_t& y)
 	{
 		WorldToCell(RE::NiPoint2(worldPos.x, worldPos.y), x, y);
+	}
+
+	void ComputeFrustumPlanes(RE::NiFrustumPlanes& out, const RE::NiFrustum& viewFrustum, const RE::NiTransform& transform, float edgePadding)
+	{
+		const __m128 forward = _mm_set_ps(0.0f, transform.rotate.entry[2][0], transform.rotate.entry[1][0], transform.rotate.entry[0][0]);
+		const __m128 up = _mm_set_ps(0.0f, transform.rotate.entry[2][1], transform.rotate.entry[1][1], transform.rotate.entry[0][1]);
+		const __m128 right = _mm_set_ps(0.0f, transform.rotate.entry[2][2], transform.rotate.entry[1][2], transform.rotate.entry[0][2]);
+		const __m128 translation = _mm_set_ps(0.0f, transform.translate.z, transform.translate.y, transform.translate.x);
+
+		const __m128 nearPoint = _mm_add_ps(translation, _mm_mul_ps(forward, _mm_set1_ps(viewFrustum.fNear)));
+		const __m128 farPoint = _mm_add_ps(translation, _mm_mul_ps(forward, _mm_set1_ps(viewFrustum.fFar)));
+
+		auto setPlane = [&](int planeIndex, __m128 normal, __m128 point) {
+			alignas(16) float components[4];
+			_mm_store_ps(components, normal);
+			out.cullingPlanes[planeIndex].normal = { components[0], components[1], components[2] };
+			out.cullingPlanes[planeIndex].constant = _mm_cvtss_f32(_mm_dp_ps(normal, point, 0x71));
+		};
+
+		setPlane(0, forward, nearPoint);
+		const __m128 backward = _mm_xor_ps(forward, _mm_set1_ps(-0.0f));
+		setPlane(1, backward, farPoint);
+
+		if (viewFrustum.bOrtho) {
+			setPlane(2, right, _mm_add_ps(translation, _mm_mul_ps(right, _mm_set1_ps(viewFrustum.fLeft))));
+			setPlane(3, _mm_xor_ps(right, _mm_set1_ps(-0.0f)), _mm_add_ps(translation, _mm_mul_ps(right, _mm_set1_ps(viewFrustum.fRight))));
+			setPlane(4, _mm_xor_ps(up, _mm_set1_ps(-0.0f)), _mm_add_ps(translation, _mm_mul_ps(up, _mm_set1_ps(viewFrustum.fTop))));
+			setPlane(5, up, _mm_add_ps(translation, _mm_mul_ps(up, _mm_set1_ps(viewFrustum.fBottom))));
+		} else {
+			// Normalize each side plane from the camera axis and frustum slope.
+			auto setSidePlane = [&](int planeIndex, __m128 axis, float slope, float forwardSign, float axisSign) {
+				const float inverseLength = 1.0f / std::sqrt(slope * slope + 1.0f);
+				const __m128 normal = _mm_add_ps(
+					_mm_mul_ps(forward, _mm_set1_ps(forwardSign * slope * inverseLength)),
+					_mm_mul_ps(axis, _mm_set1_ps(axisSign * inverseLength)));
+				setPlane(planeIndex, normal, translation);
+			};
+
+			setSidePlane(2, right, viewFrustum.fLeft, -1.0f, +1.0f);
+			setSidePlane(3, right, viewFrustum.fRight, +1.0f, -1.0f);
+			setSidePlane(4, up, viewFrustum.fTop, +1.0f, -1.0f);
+			setSidePlane(5, up, viewFrustum.fBottom, -1.0f, +1.0f);
+		}
+
+		out.activePlanes = RE::NiFrustumPlanes::ActivePlane(0x3F);
+
+		for (int planeIndex = RE::NiFrustumPlanes::Planes::kLeft; planeIndex <= RE::NiFrustumPlanes::Planes::kBottom; planeIndex++)
+			out.cullingPlanes[planeIndex].constant -= edgePadding;
+	}
+
+	bool IsSphereInFrustum(const RE::NiFrustumPlanes& frustum, const RE::NiPoint3& center, float radius)
+	{
+		return std::ranges::all_of(frustum.cullingPlanes, [&](const RE::NiPlane& plane) {
+			return plane.normal.Dot(center) - plane.constant >= -radius;
+		});
 	}
 }  // namespace Util
