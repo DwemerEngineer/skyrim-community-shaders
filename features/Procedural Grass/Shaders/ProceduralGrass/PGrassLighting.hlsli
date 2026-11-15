@@ -28,14 +28,14 @@ float2 GetDistantShadowPixel(float2 rootPixel, float3 rootPosition, out float co
 
 #if defined(SCREEN_SPACE_SHADOWS) && defined(LOW_LOD)
 /** @brief Filters contact shadows at projected roots so sub-pixel movement does not switch whole blades. */
-float SampleGrassRootContactShadow(Texture2D<unorm float> shadowTexture, SamplerState linearSampler, float2 rootPixel)
+float SampleGrassRootContactShadow(Texture2D<unorm float2> shadowTexture, SamplerState linearSampler, float2 rootPixel)
 {
 	uint2 shadowExtent;
 	shadowTexture.GetDimensions(shadowExtent.x, shadowExtent.y);
 	// Pixel coordinates refer to the active viewport; UVs refer to the allocated texture.
 	float2 validExtent = min(rcp(dynamicResolutionInverted), float2(shadowExtent));
 	float2 rootUV = clamp(rootPixel, 0.5f, validExtent - 0.5f) / float2(shadowExtent);
-	return shadowTexture.SampleLevel(linearSampler, rootUV, 0.0f);
+	return shadowTexture.SampleLevel(linearSampler, rootUV, 0.0f).x;
 }
 
 /** @brief Fades root contact shadows across the loaded-grid handoff and unreliable terrain LOD seams. */
@@ -238,9 +238,10 @@ void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, Direc
 	// OpenPBR fuzz sits over both faces of the blade: it reflects fuzzAlbedo of the light in its colour and passes the
 	// rest untinted. Light from behind reaches the viewer-side fuzz through the blade, tinted by its transmission.
 	float fuzzThroughput = 1.0f - fuzzAlbedo;
+	PBR::FuzzLTC fuzzLTC = PBR::CreateFuzzLTC(V, fuzzNormal, fuzzNdotV, fuzzRoughness);
 	float3 fuzzReflection = fuzzAlbedo * fuzzColor *
-	                        (PBR::FuzzLobe(L, V, fuzzNormal, fuzzNdotV, fuzzRoughness) +
-								transmissionAlbedo * PBR::FuzzLobeTransmitted(L, V, fuzzNormal, fuzzNdotV, fuzzRoughness));
+	                        (PBR::FuzzLobe(L, fuzzLTC) +
+								transmissionAlbedo * PBR::FuzzLobeTransmitted(L, fuzzLTC));
 
 	GetDiffuseLightInputProcGrass(lightingOutput, context, diffuseNdotL, reflectionAlbedo, transmissionAlbedo,
 		(1.0f - specularAlbedo) * fuzzThroughput);

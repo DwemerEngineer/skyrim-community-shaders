@@ -16,6 +16,7 @@ struct LightLimitFix;
 struct LinearLighting;
 struct LODBlending;
 struct InteriorSun;
+struct ProceduralSun;
 struct RainRefraction;
 struct ScreenSpaceGI;
 struct ScreenSpaceShadows;
@@ -26,6 +27,7 @@ struct SubsurfaceScattering;
 struct TerrainBlending;
 struct TerrainHelper;
 struct TerrainShadows;
+struct TreeWind;
 struct UnifiedWater;
 struct VolumetricLighting;
 struct WaterEffects;
@@ -43,6 +45,7 @@ struct ScreenshotFeature;
 struct Skin;
 struct ProceduralGrass;
 struct SceneManager;
+struct ProceduralAurora;
 
 class State;
 class Deferred;
@@ -112,6 +115,7 @@ namespace globals
 		extern LinearLighting linearLighting;
 		extern LODBlending lodBlending;
 		extern InteriorSun interiorSun;
+		extern ProceduralSun proceduralSun;
 		extern RainRefraction rainRefraction;
 		extern ScreenSpaceGI screenSpaceGI;
 		extern ScreenSpaceShadows screenSpaceShadows;
@@ -122,6 +126,7 @@ namespace globals
 		extern TerrainBlending terrainBlending;
 		extern TerrainHelper terrainHelper;
 		extern TerrainShadows terrainShadows;
+		extern TreeWind treeWind;
 		extern UnifiedWater unifiedWater;
 		extern VolumetricLighting volumetricLighting;
 		extern WaterEffects waterEffects;
@@ -143,6 +148,7 @@ namespace globals
 		extern ProceduralGrass proceduralGrass;
 		extern SceneManager sceneManager;
 		extern PostProcessing postProcessing;
+		extern ProceduralAurora proceduralAurora;
 
 	}
 

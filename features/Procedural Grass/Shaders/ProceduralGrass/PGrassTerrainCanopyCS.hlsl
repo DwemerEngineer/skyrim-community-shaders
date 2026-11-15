@@ -21,7 +21,7 @@ SamplerState ShadowSampler : register(s14);
 Texture2D<float2> LandscapeMasks : register(t2);
 Texture2D<float> GrassHiZ : register(t8);
 Texture2D<float4> ShadowMask : register(t14);
-Texture2D<unorm float> GrassScreenShadow : register(t45);
+Texture2D<unorm float2> GrassScreenShadow : register(t45);
 Texture2D<float4> DistantAmbientLUT : register(t73);
 Texture2D<float> GrassSceneDepth : register(t74);
 Texture2D<float> GrassScreenAO : register(t76);

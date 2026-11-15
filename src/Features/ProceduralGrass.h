@@ -160,11 +160,12 @@ public:
 	const Settings::ObjectGrassRule* GetObjectGrassRule(std::string_view texturePath) const;
 
 	virtual void DrawSettings() override;
+	virtual bool HasDebugSection() const override { return true; }
 
 	/** @brief Draws the per-type overrides and landscape-texture mix editor. */
 	void DrawGrassTypeEditor();
 	/** @brief Draws debug toggles and diagnostic readouts. The blade counts stall on GPU readback. */
-	void DrawDebugSettings();
+	virtual void DrawDebugSection() override;
 
 	/** @brief Draws the per-field override editor for one grass type variant. */
 	void DrawTypeOverrides(nlohmann::json& ov) const;

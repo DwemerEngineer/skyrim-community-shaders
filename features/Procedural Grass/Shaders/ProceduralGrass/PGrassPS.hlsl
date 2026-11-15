@@ -17,6 +17,14 @@ static const uint PBRFlags = PBR::Flags::Subsurface;
 #include "Common/ColorManagement.hlsli"
 #include "Common/FrameBuffer.hlsli"
 #include "Common/GBuffer.hlsli"
+#if defined(IBL)
+#	include "IBL/IBL.hlsli"
+#endif
+
+#if defined(SKYLIGHTING) && !defined(FAR_LOD)
+#	include "Skylighting/Skylighting.hlsli"
+#endif
+
 #include "Common/LightingEval.hlsli"
 #include "Common/Math.hlsli"
 #include "Common/MotionBlur.hlsli"
@@ -46,10 +54,6 @@ Texture2D<uint> GrassDensityTexture : register(t71);
 
 #if defined(WETNESS_EFFECTS)
 #	include "WetnessEffects/WetnessEffects.hlsli"
-#endif
-
-#if defined(SKYLIGHTING) && !defined(FAR_LOD)
-#	include "Skylighting/Skylighting.hlsli"
 #endif
 
 #if defined(__INTELLISENSE__)

@@ -2,6 +2,7 @@
 
 #include "TerrainHeightMap.h"
 #include "TopDownOcclusion.h"
+#include "Utils/DebugSection.h"
 #include "Utils/FileSystem.h"
 #include "Utils/Serialize.h"
 
@@ -559,15 +560,12 @@ void ProceduralGrass::DrawSettings()
 	ImGui::Separator();
 
 	DrawGrassTypeEditor();
-
-	ImGui::Separator();
-
-	DrawDebugSettings();
 }
 
-void ProceduralGrass::DrawDebugSettings()
+void ProceduralGrass::DrawDebugSection()
 {
-	if (!ImGui::CollapsingHeader(T("feature.procedural_grass.debug", "Debug")))
+	Util::DebugSection section;
+	if (!section)
 		return;
 
 	bool invalidate = false;
@@ -748,7 +746,7 @@ void ProceduralGrass::DrawGrassTypeEditor()
 				const auto overridesLabel = std::vformat(
 					T("feature.procedural_grass.overrides_count", "Overrides ({} set)"),
 					std::make_format_args(overrideCount));
-				if (ImGui::TreeNode("Overrides", "%s", overridesLabel.c_str())) {
+				if (ImGui::TreeNode("Overrides", "%s", overridesLabel.c_str())) {  // i18n-ignore: stable tree ID; display label is translated
 					DrawTypeOverrides(def.overrides);
 					ImGui::TreePop();
 				}

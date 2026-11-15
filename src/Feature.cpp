@@ -24,7 +24,9 @@
 #include "Features/LinearLighting.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/PostProcessing.h"
+#include "Features/ProceduralAurora.h"
 #include "Features/ProceduralGrass.h"
+#include "Features/ProceduralSun.h"
 #include "Features/RainRefraction.h"
 #include "Features/RemoteControl.h"
 #include "Features/RenderDoc.h"
@@ -39,6 +41,7 @@
 #include "Features/TerrainHelper.h"
 #include "Features/TerrainShadows.h"
 #include "Features/TerrainVariation.h"
+#include "Features/TreeWind.h"
 #include "Features/UnifiedWater.h"
 #include "Features/Upscaling.h"
 #include "Features/VolumetricLighting.h"
@@ -265,6 +268,7 @@ const std::vector<Feature*>& Feature::GetFeatureList()
 		&globals::features::lodBlending,
 		&globals::features::hairSpecular,
 		&globals::features::interiorSun,
+		&globals::features::proceduralSun,
 		&globals::features::terrainVariation,
 		&globals::features::ibl,
 		&globals::features::extendedTranslucency,
@@ -278,11 +282,13 @@ const std::vector<Feature*>& Feature::GetFeatureList()
 		&globals::features::rainRefraction,
 		&globals::features::unifiedWater,
 		&globals::features::horizonFix,
+		&globals::features::treeWind,
 		&globals::features::exponentialHeightFog,
 		&globals::features::hdrDisplay,
 		&globals::features::skin,
 		&globals::features::proceduralGrass,
-		&globals::features::postProcessing
+		&globals::features::postProcessing,
+		&globals::features::proceduralAurora
 	};
 
 	return features;
