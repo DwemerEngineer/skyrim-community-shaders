@@ -218,7 +218,7 @@ namespace Skylighting
 #	if defined(SKYLIGHTING_COVERAGE)
 					// An open probe above the occluder covering the receiver sees sky through that roof; open probes below it are beside the receiver
 					[branch] if (receiverCovered && SkylightingProbeCoverage[cellTexID] == COVERAGE_OPEN &&
-								 ZenithProject(cellCentreMS + SharedData::skylightingSettings.PosOffset.xyz).z < receiverOccluderDepth)
+								 ZenithProject(cellCentreMS + positionOffset).z < receiverOccluderDepth)
 						tangentWeight = MIN_TANGENT_WEIGHT;
 #	endif
 					float shW = triW * tangentWeight;
