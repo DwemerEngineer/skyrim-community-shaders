@@ -364,24 +364,19 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	}
 	grassGlobals.loadedLandBounds = loadedLandBounds;
 
+	auto heightMap = globals::terrainHeightMap;
+	heightMap->LoadForCurrentWorldspace();
+
 	// Centre the terrain lift window on the camera. A new heightmap means a new worldspace, whose cells share
 	// coordinates with the old one, so restart from an origin that maps every texel to a different cell.
 	const int32_t liftOriginX = static_cast<int32_t>(std::floor(cameraPosAdjust.x / PGrassCommon::TerrainLiftCellSize)) - PGrassCommon::TerrainLiftDim / 2;
 	const int32_t liftOriginY = static_cast<int32_t>(std::floor(cameraPosAdjust.y / PGrassCommon::TerrainLiftCellSize)) - PGrassCommon::TerrainLiftDim / 2;
-	const uint32_t heightMapGeneration = globals::terrainHeightMap->GetLoadGeneration();
-	if (!terrainLiftOriginValid || terrainLiftHeightMapGeneration != heightMapGeneration) {
-		terrainLiftOriginCell[0] = liftOriginX + PGrassCommon::TerrainLiftDim * 8;
-		terrainLiftOriginCell[1] = liftOriginY + PGrassCommon::TerrainLiftDim * 8;
-		terrainLiftHeightMapGeneration = heightMapGeneration;
-		terrainLiftOriginValid = true;
-	}
+	const bool reuseTerrainLift = terrainLiftOriginValid && terrainLiftHeightMapGeneration == heightMap->GetLoadGeneration();
 	grassGlobals.terrainLiftOrigin[0] = liftOriginX;
 	grassGlobals.terrainLiftOrigin[1] = liftOriginY;
-	grassGlobals.terrainLiftOrigin[2] = terrainLiftOriginCell[0];
-	grassGlobals.terrainLiftOrigin[3] = terrainLiftOriginCell[1];
+	grassGlobals.terrainLiftOrigin[2] = reuseTerrainLift ? terrainLiftOriginCell[0] : liftOriginX + PGrassCommon::TerrainLiftDim * 8;
+	grassGlobals.terrainLiftOrigin[3] = reuseTerrainLift ? terrainLiftOriginCell[1] : liftOriginY + PGrassCommon::TerrainLiftDim * 8;
 	grassGlobals.terrainLiftPhase = globals::state->frameCount & 3u;
-	terrainLiftOriginCell[0] = liftOriginX;
-	terrainLiftOriginCell[1] = liftOriginY;
 
 	previousShaderTimer = shaderTimer;
 	previousWindDirection = windDirection;
@@ -389,9 +384,6 @@ void ProceduralGrass::PostDepthRenderPrep(ID3D11DeviceContext* ctx, RE::BSGraphi
 	grassGlobals.miscParams = float4(settings.grassMapEdgeNoise, topDown->GetGrassSurfaceSRV() ? 1.0f : 0.0f, settings.grassViewThicken, timerDelta);
 	grassGlobals.grassTerrainBlend = float4(settings.grassTerrainBlendStrength, settings.grassTerrainBlendHeight, settings.grassTerrainBlendNormal, settings.grassTerrainBlendRough);
 	UpdateDepthBaseCutoff();
-
-	auto heightMap = globals::terrainHeightMap;
-	heightMap->LoadForCurrentWorldspace();
 
 	const auto heightMapScale = heightMap->GetScale();
 	grassGlobals.heightMapScale = float2(heightMapScale.x, heightMapScale.y);
@@ -565,7 +557,7 @@ void ProceduralGrass::GenerateBlades(ID3D11DeviceContext* ctx, const bool nearTi
 	}
 
 	// An unbound map reads zero, leaving roots on LAND where there is no heightmap to measure against.
-	const bool terrainLiftReady = terrainLiftTexture && terrainLiftSurfaceTexture && globals::terrainHeightMap->IsReady();
+	const bool terrainLiftReady = terrainLiftOriginValid && terrainLiftTexture && terrainLiftSurfaceTexture && globals::terrainHeightMap->IsReady();
 	ID3D11ShaderResourceView* terrainLiftSRVs[2] = {
 		terrainLiftReady ? terrainLiftTexture->srv.get() : nullptr,
 		terrainLiftReady ? terrainLiftSurfaceTexture->srv.get() : nullptr
@@ -916,8 +908,9 @@ void ProceduralGrass::UpdateDistantAmbientLUT(ID3D11DeviceContext* ctx) const
 	distantAmbientLUTFrame = globals::state->frameCount;
 }
 
-void ProceduralGrass::UpdateTerrainLift(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const
+void ProceduralGrass::UpdateTerrainLift(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer)
 {
+	terrainLiftOriginValid = false;
 	if (!terrainLiftTexture || !terrainLiftMeasuredTexture || !terrainLiftSurfaceTexture || !terrainLiftCS || !globals::terrainHeightMap->IsReady())
 		return;
 
@@ -938,6 +931,10 @@ void ProceduralGrass::UpdateTerrainLift(ID3D11DeviceContext* ctx, RE::BSGraphics
 	ctx->CSSetUnorderedAccessViews(0, ARRAYSIZE(liftUAVs), liftUAVs, nullptr);
 	ctx->CSSetShader(terrainLiftCS, nullptr, 0);
 	ctx->Dispatch((PGrassCommon::TerrainLiftDim + 7) / 8, (PGrassCommon::TerrainLiftDim + 7) / 8, 1);
+	terrainLiftOriginCell[0] = grassGlobalsStaging->terrainLiftOrigin[0];
+	terrainLiftOriginCell[1] = grassGlobalsStaging->terrainLiftOrigin[1];
+	terrainLiftHeightMapGeneration = globals::terrainHeightMap->GetLoadGeneration();
+	terrainLiftOriginValid = true;
 
 	ID3D11UnorderedAccessView* nullUAVs[3]{};
 	ctx->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUAVs), nullUAVs, nullptr);

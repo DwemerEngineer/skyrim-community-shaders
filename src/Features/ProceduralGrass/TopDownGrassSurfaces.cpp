@@ -178,40 +178,45 @@ ID3D11SamplerState* TopDownOcclusion::GetGrassAlphaSampler(uint8_t mode)
 
 void TopDownOcclusion::CreateGrassSurfaceResources()
 {
-	if (grassSurfaceMap)
-		return;
-
 	D3D11_TEXTURE2D_DESC desc{};
 	desc.Width = desc.Height = mapDim;
 	desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
 	desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
 	desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-	grassSurfaceMap = new Texture2D(desc, "PGrass::ObjectSurfaces");
+	if (!grassSurfaceMap) {
+		auto texture = std::make_unique<Texture2D>(desc, "PGrass::ObjectSurfaces");
 
-	D3D11_RENDER_TARGET_VIEW_DESC rtv{};
-	rtv.Format = desc.Format;
-	rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-	grassSurfaceMap->CreateRTV(rtv);
-	D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
-	srv.Format = desc.Format;
-	srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-	srv.Texture2D.MipLevels = 1;
-	grassSurfaceMap->CreateSRV(srv);
+		D3D11_RENDER_TARGET_VIEW_DESC rtv{};
+		rtv.Format = desc.Format;
+		rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		texture->CreateRTV(rtv);
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
+		srv.Format = desc.Format;
+		srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srv.Texture2D.MipLevels = 1;
+		texture->CreateSRV(srv);
+		grassSurfaceMap = texture.release();
+	}
 
 	desc.Format = DXGI_FORMAT_D32_FLOAT;
 	desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-	grassSurfaceDepth = new Texture2D(desc, "PGrass::ObjectSurfaceDepth");
-	D3D11_DEPTH_STENCIL_VIEW_DESC dsv{};
-	dsv.Format = desc.Format;
-	dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-	grassSurfaceDepth->CreateDSV(dsv);
+	if (!grassSurfaceDepth) {
+		auto texture = std::make_unique<Texture2D>(desc, "PGrass::ObjectSurfaceDepth");
+		D3D11_DEPTH_STENCIL_VIEW_DESC dsv{};
+		dsv.Format = desc.Format;
+		dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+		texture->CreateDSV(dsv);
+		grassSurfaceDepth = texture.release();
+	}
 
-	D3D11_DEPTH_STENCIL_DESC depthState{};
-	depthState.DepthEnable = TRUE;
-	depthState.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-	depthState.DepthFunc = D3D11_COMPARISON_LESS;
-	if (SUCCEEDED(globals::d3d::device->CreateDepthStencilState(&depthState, grassSurfaceDSS.put())))
-		Util::SetResourceName(grassSurfaceDSS.get(), "PGrass::ObjectSurfaceDSS");
+	if (!grassSurfaceDSS) {
+		D3D11_DEPTH_STENCIL_DESC depthState{};
+		depthState.DepthEnable = TRUE;
+		depthState.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+		depthState.DepthFunc = D3D11_COMPARISON_LESS;
+		if (SUCCEEDED(globals::d3d::device->CreateDepthStencilState(&depthState, grassSurfaceDSS.put())))
+			Util::SetResourceName(grassSurfaceDSS.get(), "PGrass::ObjectSurfaceDSS");
+	}
 }
 
 void TopDownOcclusion::RenderGrassSurfaces(ID3D11DeviceContext* context)

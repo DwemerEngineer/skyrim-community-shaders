@@ -61,7 +61,7 @@ namespace
 	template <class T>
 	std::unique_ptr<StructuredBuffer> CreateRangeUpdatedBuffer(const uint32_t count, const char* name)
 	{
-		auto buffer = std::make_unique<StructuredBuffer>(StructuredBufferDesc<T>(count, false), count, name);
+		auto buffer = std::make_unique<StructuredBuffer>(StructuredBufferDesc<T>(count, false, false), count, name);
 		buffer->CreateSRV();
 		return buffer;
 	}
@@ -278,7 +278,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::SetDensity(const uint32_t g
 		const float densityRatio = lowDensity * lowDensity / std::max(static_cast<float>(grassDensity * grassDensity), 1.0f);
 		// Each handoff extra record draws a double blade.
 		const float extraRecords = (2.0f * densityRatio - 1.0f) * (outerVertexIndicesBuffer ? 0.5f : 1.0f);
-		const uint32_t extraSlots = static_cast<uint32_t>(std::clamp(std::ceil(extraRecords), 1.0f, 15.0f));
+		const uint32_t extraSlots = static_cast<uint32_t>(std::max(std::ceil(extraRecords), 1.0f));
 		if (extraSlots != handoffExtraBlades) {
 			handoffExtraBlades = extraSlots;
 			handoffGeneratorCS = nullptr;
@@ -360,7 +360,7 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::EnsureBladeCapacity(uint64_
 	targetCapacity = std::clamp(targetCapacity, requiredBladeCount, maximumCapacity);
 
 	const auto newCapacity = static_cast<uint32_t>(targetCapacity);
-	auto bladesDesc = StructuredBufferDesc<Blade>(newCapacity, false);
+	auto bladesDesc = StructuredBufferDesc<Blade>(newCapacity, true, false);
 	bladesDesc.StructureByteStride = bladeStrideBytes;
 	bladesDesc.ByteWidth = bladeStrideBytes * newCapacity;
 
@@ -476,6 +476,10 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::UploadQuadrantInputs(const 
 					if (const auto it = slotByWorldQuadrant.find(GrassQuadrantKey(quadrant.WorldX() + dx, quadrant.WorldY() + dy)); it != slotByWorldQuadrant.end())
 						slotDirty[it->second] = 1u;
 		};
+
+		for (uint32_t i = static_cast<uint32_t>(quadrants.size()); i < lastQuadrantCount; ++i)
+			if (stagedQuadrants[i].inUse)
+				markNeighbours(stagedQuadrants[i]);
 
 		for (uint32_t i = 0; i < quadrants.size(); ++i) {
 			const bool changed = restageAll || !(quadrants[i] == stagedQuadrants[i]);

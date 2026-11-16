@@ -146,8 +146,8 @@ namespace PGrassCommon
 		return 0;
 	}
 
-	/** @brief Fills bare samples within one LAND quadrant, without extending grass across its borders. */
-	inline std::array<uint8_t, QuadrantGrassSamples> FillQuadrantGrassIds(const uint8_t* ids, int32_t quadrantX, int32_t quadrantY)
+	/** @brief Fills texture gaps within one LAND quadrant, preserving explicit bare selections. */
+	inline std::array<uint8_t, QuadrantGrassSamples> FillQuadrantGrassIds(const uint8_t* ids, int32_t quadrantX, int32_t quadrantY, const bool* bare = nullptr)
 	{
 		std::array<uint8_t, QuadrantGrassSamples> filled{};
 		if (!ids)
@@ -159,7 +159,7 @@ namespace PGrassCommon
 			for (uint32_t x = 0; x < QuadrantGrassPitch; ++x) {
 				const uint32_t sample = y * QuadrantGrassPitch + x;
 				filled[sample] = ids[sample];
-				if (filled[sample] == 0u)
+				if (filled[sample] == 0u && (!bare || !bare[sample]))
 					filled[sample] = FindAdjacentGrassId(ids, QuadrantGrassPitch, QuadrantGrassPitch, x, y,
 						worldSampleBaseX + static_cast<int32_t>(x), worldSampleBaseY + static_cast<int32_t>(y));
 			}
@@ -185,8 +185,8 @@ namespace PGrassCommon
 
 	/**
 	 * @brief Builds one quadrant's filled grass ids from its texture blend.
-	 * Each sample takes the strongest grass-growing texture whose share passes fTexturePctThreshold:Grass, then that
-	 * texture's weighted variant; bare samples then take one neighbouring id (FillQuadrantGrassIds). Loaded and streamed
+	 * Each sample takes the strongest configured or grass-growing texture whose share passes fTexturePctThreshold:Grass,
+	 * then that texture's weighted variant. Texture gaps take one neighbouring id. Loaded and streamed
 	 * LAND both go through here, so the near and far tiers agree on every sample.
 	 * @param percents Per-sample overlay opacity in 0-255 units with @p percentStride bytes per sample, as the engine
 	 *                 stores TESObjectLAND::LoadedLandData::percents (opacity * 255, truncated).
@@ -214,7 +214,7 @@ namespace PGrassCommon
 		};
 		const auto describe = [&](const RE::TESLandTexture* texture) {
 			const GrassTextureSelection* selection = texture ? getSelection(texture) : nullptr;
-			const bool grows = texture && (selection && selection->total > 0.0f ? selection->HasWeightedGrass() : !texture->textureGrassList.empty());
+			const bool grows = texture && ((selection && selection->total > 0.0f) || !texture->textureGrassList.empty());
 			return Candidate{ texture, selection, grows };
 		};
 		const Candidate base = describe(baseTexture);
@@ -224,6 +224,7 @@ namespace PGrassCommon
 			layers[layer] = describe(texture && texture->formID == 0 ? defaultTexture : texture);
 		}
 
+		std::array<bool, QuadrantGrassSamples> bare{};
 		for (uint32_t v = 0; v < QuadrantGrassSamples; ++v) {
 			const uint8_t* samplePercents = percents + static_cast<size_t>(v) * percentStride;
 			int32_t overlayTotal = 0;
@@ -243,11 +244,13 @@ namespace PGrassCommon
 			for (uint32_t layer = 0; layer < LandscapeOverlayCount; ++layer)
 				consider(layers[layer], samplePercents[layer]);
 
-			if (best)
+			if (best) {
 				ids[v] = best->selection && best->selection->total > 0.0f ? best->selection->Select(QuadrantSampleHash(cellX, cellY, quadrant, v)) : uint8_t{ 1 };
+				bare[v] = ids[v] == 0u;
+			}
 		}
 
-		return FillQuadrantGrassIds(ids.data(), cellX * 2 + static_cast<int32_t>(quadrant % 2), cellY * 2 + static_cast<int32_t>(quadrant / 2));
+		return FillQuadrantGrassIds(ids.data(), cellX * 2 + static_cast<int32_t>(quadrant % 2), cellY * 2 + static_cast<int32_t>(quadrant / 2), bare.data());
 	}
 
 	inline constexpr int32_t HighTierQuadrantRadius = 2;

@@ -402,7 +402,7 @@ private:
 	/** @brief Returns geometric-mean Far patch density so Low and Far meet at the seam. */
 	uint32_t FarPatchDensity() const
 	{
-		return std::max(8u, static_cast<uint32_t>(std::lround(std::sqrt(static_cast<double>(settings.lowGrassDensity) * settings.farGrassDensity))));
+		return std::max(8u, static_cast<uint32_t>(std::sqrt(static_cast<double>(settings.lowGrassDensity) * settings.farGrassDensity)) & ~1u);
 	}
 
 	/** @brief Builds a GPU GrassType from base settings and sparse JSON overrides. */
@@ -533,7 +533,7 @@ private:
 	void UpdateDistantAmbientLUT(ID3D11DeviceContext* ctx) const;
 
 	/** @brief Refreshes a quarter of the terrain lift map from the copied scene depth. */
-	void UpdateTerrainLift(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer) const;
+	void UpdateTerrainLift(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer);
 	void RenderGrass(ID3D11DeviceContext* ctx) const;
 
 public:

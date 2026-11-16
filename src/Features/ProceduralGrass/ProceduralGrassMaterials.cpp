@@ -150,6 +150,11 @@ void ProceduralGrass::RebuildTypeAllocation()
 PGrassCommon::GrassType ProceduralGrass::BuildGrassType(const GrassTypeFields& s)
 {
 	const auto packColor = [](const float3& c) { return float4(c.x, c.y, c.z, 0.0f); };
+	const auto detailScale = [](float value) {
+		// Keep grain coordinates within int32_t after frequency and texture-size scaling.
+		constexpr float maxScale = static_cast<float>(INT32_MAX / (32u * GrassMaterialDetailDim));
+		return std::isfinite(value) ? std::clamp(value, 0.0f, maxScale) : 0.0f;
+	};
 	constexpr float degreesToRadians = std::numbers::pi_v<float> / 180.0f;
 
 	PGrassCommon::GrassType t{};
@@ -199,7 +204,7 @@ PGrassCommon::GrassType ProceduralGrass::BuildGrassType(const GrassTypeFields& s
 	t.grassColorCool = packColor(s.grassColorCool);
 	t.grassColorWarm = packColor(s.grassColorWarm);
 	t.grassBounceColor = packColor(s.grassBounceColor);
-	t.grassTextureParams = float4(s.grassBlotchStrength, s.grassBlotchScale, s.grassSpeckleStrength, s.grassSpeckleScale);
+	t.grassTextureParams = float4(s.grassBlotchStrength, detailScale(s.grassBlotchScale), s.grassSpeckleStrength, detailScale(s.grassSpeckleScale));
 	t.grassVeinParams = float4(s.grassVeinTint.x, s.grassVeinTint.y, s.grassVeinTint.z, s.grassVeinAlbedoStrength);
 	t.grassVeinParams2 = float4(s.grassVeinNormalStrength, s.grassVeinRippleDepth, s.grassVeinWiggleAmount, s.curvedNormalStrength);
 

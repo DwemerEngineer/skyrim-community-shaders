@@ -471,9 +471,9 @@ void TopDownOcclusion::Render()
 	ID3D11DepthStencilView* previousDSV = nullptr;
 	context->OMGetRenderTargets(8, previousRTVs, &previousDSV);
 
-	uint32_t previousViewportCount = 1;
-	D3D11_VIEWPORT previousViewport{};
-	context->RSGetViewports(&previousViewportCount, &previousViewport);
+	uint32_t previousViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+	D3D11_VIEWPORT previousViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+	context->RSGetViewports(&previousViewportCount, previousViewports);
 
 	const float clearHigh[4] = { EmptyHigh, EmptyHigh, EmptyHigh, EmptyHigh };
 	const float clearLow[4] = { EmptyLow, EmptyLow, EmptyLow, EmptyLow };
@@ -533,8 +533,7 @@ void TopDownOcclusion::Render()
 	if (previousDSV)
 		previousDSV->Release();
 
-	if (previousViewportCount)
-		context->RSSetViewports(previousViewportCount, &previousViewport);
+	context->RSSetViewports(previousViewportCount, previousViewports);
 
 	if (paddingComplete)
 		CommitRenderedMaps();

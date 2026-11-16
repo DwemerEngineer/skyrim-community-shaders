@@ -453,34 +453,39 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float2 farRootOffset = packedRoot.xy + FrameBuffer::CameraPosAdjust.xy - grassLodOrigin;
 	float farHeight = generatorType.height * float(packedHeight) * (1.0f / 255.0f) * GetFarHeightScale(farRootOffset, FrameBuffer::CameraProj._m00);
 	float2 farTip = packedDirectionValues.zw * farHeight;
-	float3 packedTip = packedRoot + float3(packedDirectionValues.xy * farTip.x, farTip.y);
 	float2 farCoverage = GetFarCoverage(farRootOffset, FrameBuffer::CameraProj._m00);
-	float farWidth = generatorType.width * 2.5f * lerp(0.45f, 1.3f, float(packedWidth) * (1.0f / 255.0f)) *
-	                 GetFarWidthScale(farRootOffset) * farCoverage.y;
-	// The test widens perpendicular to the direction it is given; Far's width lies across the view.
+	float baseFarWidth = generatorType.width * 2.5f * lerp(0.45f, 1.3f, float(packedWidth) * (1.0f / 255.0f));
+	float farWidth = baseFarWidth * GetFarWidthScale(farRootOffset) * farCoverage.y;
+	float2 firstFacing = packedDirectionValues.xy;
+#	if defined(FAR_DOUBLE_GEOMETRY)
+	outerGeometry = !baseCandidate;
+	float3 secondRoot = packedRoot + float3(GetFarDoubleRootOffset(b.seedAndType, b.posZWidthHeight), 0.0f);
+	if (outerGeometry && objectSurface) {
+		float secondHeight, secondDensity;
+		float2 secondSlope;
+		uint secondType;
+		float2 secondWorld = secondRoot.xy + FrameBuffer::CameraPosAdjust.xy;
+		outerGeometry = LoadGrassObjectSurface(secondWorld, secondHeight, secondSlope, secondType, secondDensity) && secondType == type &&
+		                IsGrassObjectInterior(secondWorld, secondHeight, secondSlope, secondType);
+		float secondNormalZ = rsqrt(dot(secondSlope, secondSlope) + 1.0f);
+		outerGeometry = outerGeometry && objectDensityRandom < secondDensity && secondNormalZ >= generatorType.maxSlope && secondNormalZ <= generatorType.minSlope;
+		secondRoot.z = secondHeight - FrameBuffer::CameraPosAdjust.z;
+	}
+	if (outerGeometry)
+		firstFacing = float2(dot(firstFacing, float2(0.8660254f, -0.5f)), dot(firstFacing, float2(0.5f, 0.8660254f)));
+#	endif
+	float3 packedTip = packedRoot + float3(firstFacing * farTip.x, farTip.y);
 	float2 farViewDirection = packedRoot.xy * rsqrt(max(dot(packedRoot.xy, packedRoot.xy), 1.0f));
 	bool farOccluded = IsFarTriangleOccluded(packedRoot, packedTip, farViewDirection, farWidth, cullsDisabled);
 #	if defined(FAR_DOUBLE_GEOMETRY)
-	// Handoff extras draw a second blade on a nearby root, turned 30 degrees; keep the pair while either blade shows.
-	outerGeometry = !baseCandidate;
-	if (outerGeometry && (farOccluded || objectSurface)) {
-		float3 secondRoot = packedRoot + float3(GetFarDoubleRootOffset(b.seedAndType, b.posZWidthHeight), 0.0f);
-		if (objectSurface) {
-			float secondHeight, secondDensity;
-			float2 secondSlope;
-			uint secondType;
-			float2 secondWorld = secondRoot.xy + FrameBuffer::CameraPosAdjust.xy;
-			outerGeometry = LoadGrassObjectSurface(secondWorld, secondHeight, secondSlope, secondType, secondDensity) && secondType == type &&
-			                IsGrassObjectInterior(secondWorld, secondHeight, secondSlope, secondType);
-			float secondNormalZ = rsqrt(dot(secondSlope, secondSlope) + 1.0f);
-			outerGeometry = outerGeometry && objectDensityRandom < secondDensity && secondNormalZ >= generatorType.maxSlope && secondNormalZ <= generatorType.minSlope;
-			secondRoot.z = secondHeight - FrameBuffer::CameraPosAdjust.z;
-		}
-		if (farOccluded && outerGeometry) {
-			float2 turnedFacing = float2(dot(packedDirectionValues.xy, float2(0.8660254f, -0.5f)), dot(packedDirectionValues.xy, float2(0.5f, 0.8660254f)));
-			float3 turnedTip = secondRoot + float3(turnedFacing * farTip.x, farTip.y);
-			farOccluded = IsFarTriangleOccluded(secondRoot, turnedTip, farViewDirection, farWidth, cullsDisabled);
-		}
+	if (farOccluded && outerGeometry) {
+		float2 secondOffset = secondRoot.xy + FrameBuffer::CameraPosAdjust.xy - grassLodOrigin;
+		float secondHeight = generatorType.height * float(packedHeight) * (1.0f / 255.0f) * GetFarHeightScale(secondOffset, FrameBuffer::CameraProj._m00);
+		float2 secondTip = packedDirectionValues.zw * secondHeight;
+		float3 secondPackedTip = secondRoot + float3(packedDirectionValues.xy * secondTip.x, secondTip.y);
+		float secondWidth = baseFarWidth * GetFarWidthScale(secondOffset) * GetFarCoverage(secondOffset, FrameBuffer::CameraProj._m00).y;
+		float2 secondViewDirection = secondRoot.xy * rsqrt(max(dot(secondRoot.xy, secondRoot.xy), 1.0f));
+		farOccluded = IsFarTriangleOccluded(secondRoot, secondPackedTip, secondViewDirection, secondWidth, cullsDisabled);
 	}
 #	endif
 	if (farOccluded)
@@ -536,8 +541,14 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	// Test the geometry the VS will draw: packed root, tip along the facing, and view-thickened width.
 	float3 packedTip = packedRoot + float3(packedFacingValue * lowTip.x, lowTip.y);
 	float bladeRadius = packedWidthValue * (1.0f + miscParams.z) + 1.0f;
-	if (IsBladeOccluded(packedRoot, packedTip, bladeRadius, cullsDisabled))
-		return false;
+	if (IsBladeOccluded(packedRoot, packedTip, bladeRadius, cullsDisabled)) {
+		if (storedHeight == 0u)
+			return false;
+		float2 turnedFacing = float2(dot(packedFacingValue, float2(0.8660254f, -0.5f)), dot(packedFacingValue, float2(0.5f, 0.8660254f)));
+		float3 turnedTip = packedRoot + float3(turnedFacing * lowTip.x, lowTip.y);
+		if (IsBladeOccluded(packedRoot, turnedTip, bladeRadius, cullsDisabled))
+			return false;
+	}
 #	endif
 
 #	if defined(HIGH_LOD)
