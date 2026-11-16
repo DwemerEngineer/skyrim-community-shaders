@@ -70,7 +70,7 @@ ID3D11ComputeShader* TerrainBlending::GetMergeDepthShader()
 
 void TerrainBlending::MergeSceneDepthIntoBlend()
 {
-	if (!settings.Enabled || !blendedDepthTexture || !depthSRVBackup)
+	if (!globals::shaderCache->IsEnabled() || !settings.Enabled || !blendedDepthTexture || !depthSRVBackup)
 		return;
 
 	auto context = globals::d3d::context;

@@ -344,8 +344,10 @@ void Deferred::DeferredPasses()
 
 	auto& skylighting = globals::features::skylighting;
 	auto& proceduralGrass = globals::features::proceduralGrass;
-	if (proceduralGrass.loaded)
+	if (proceduralGrass.loaded) {
 		proceduralGrass.DeferredRendering();
+		context->CopyResource(finalDepthCopy.texture, depth.texture);
+	}
 
 	auto& ssgi = globals::features::screenSpaceGI;
 	if (ssgi.loaded)
