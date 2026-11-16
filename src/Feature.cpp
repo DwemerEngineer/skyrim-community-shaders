@@ -28,8 +28,6 @@
 #include "Features/ProceduralGrass.h"
 #include "Features/ProceduralSun.h"
 #include "Features/RainRefraction.h"
-#include "Features/RemoteControl.h"
-#include "Features/RenderDoc.h"
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpaceShadows.h"
 #include "Features/ScreenshotFeature.h"

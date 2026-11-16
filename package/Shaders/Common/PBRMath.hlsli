@@ -142,23 +142,6 @@ namespace PBR
 		return D * G * F;
 	}
 
-	/// @brief Evaluate Charlie microflake specular BRDF for sheen/fabric (D * Vis * F)
-	/// @param roughness Perceptual roughness [0,1]
-	/// @param F0 Reflectance at normal incidence
-	/// @param NdotL Dot product of normal and light direction
-	/// @param NdotV Dot product of normal and view direction
-	/// @param NdotH Dot product of normal and half vector
-	/// @param VdotH Dot product of view and half vector
-	/// @return Specular BRDF value (D * Vis * F)
-	float3 SpecularMicroflakes(float roughness, float3 F0, float NdotL, float NdotV, float NdotH, float VdotH)
-	{
-		float D = BRDF::D_Charlie(roughness, NdotH);
-		float G = BRDF::Vis_Neubelt(NdotV, NdotL);
-		float3 F = BRDF::F_Schlick(F0, VdotH);
-
-		return D * G * F;
-	}
-
 	/// @brief Directional albedo of a GGX specular lobe from the split-sum environment BRDF
 	/// @param F0 Reflectance at normal incidence
 	/// @param roughness Perceptual roughness [0,1]
@@ -274,10 +257,7 @@ namespace PBR
 	// Normal-variance filtering from Tokuyoshi and Kaplanyan (2019).
 	float FilterFoliageRoughness(float roughness, float3 normalDx, float3 normalDy)
 	{
-		float variance = 0.25f * (dot(normalDx, normalDx) + dot(normalDy, normalDy));
-		float kernelRoughnessSq = min(2.0f * variance, 0.18f);
-		float roughnessSq = roughness * roughness;
-		return sqrt(sqrt(saturate(roughnessSq * roughnessSq + kernelRoughnessSq)));
+		return AddRoughnessVariance(roughness, SpecularAntiAliasingVariance(normalDx, normalDy, 0.25f, 0.18f));
 	}
 
 	// Approximate canopy transmission using receiver opacity when occluder material is unavailable.
@@ -286,26 +266,33 @@ namespace PBR
 		return lerp(1.0f - saturate(opacity), 1.0f, saturate(shadow));
 	}
 
-	/// @brief Directional albedo of the OpenPBR fuzz layer (Zeltner et al. 2022 sheen)
-	/// @param NdotV Dot product of normal and view direction
+	/// @brief Roughness-dependent parameters of the OpenPBR fuzz directional-albedo fit (Zeltner et al. 2022 sheen)
 	/// @param roughness Fuzz roughness [0.01,1]: low is fibre-like, high is dusty
-	/// @return Fraction of light the fuzz reflects; the layers below receive the rest
+	/// @return Inverse Gaussian width, centre, amplitude and baseline, in that order; ProceduralGrass mirrors this on the CPU
 	/// @note Rational fits from the MaterialX reference implementation (mx_microfacet_sheen.glsl).
-	float FuzzDirectionalAlbedo(float NdotV, float roughness)
+	float4 FuzzDirectionalAlbedoParameters(float roughness)
 	{
 		float s = roughness * (0.0206607 + 1.58491 * roughness) / (0.0379424 + roughness * (1.32227 + roughness));
 		float m = roughness * (-0.193854 + roughness * (-1.14885 + roughness * (1.7932 - 0.95943 * roughness * roughness))) / (0.046391 + roughness);
 		float o = roughness * (0.000654023 + (-0.0207818 + 0.119681 * roughness) * roughness) / (1.26264 + roughness * (-1.92021 + roughness));
-		float d = (NdotV - m) / s;
-		return exp(-0.5 * d * d) / (s * sqrt(Math::TAU)) + o;
+		return float4(1.0 / s, m, 1.0 / (s * sqrt(Math::TAU)), o);
 	}
 
-	/// @brief Evaluate the same fuzz fit with roughness-dependent parameters prepared once per material
-	/// @param parameters Inverse Gaussian width, centre, amplitude and baseline, in that order
+	/// @brief Evaluate the fuzz fit with parameters prepared once per material
+	/// @param parameters Output of FuzzDirectionalAlbedoParameters
 	float FuzzDirectionalAlbedoWithParameters(float NdotV, float4 parameters)
 	{
 		float d = (NdotV - parameters.y) * parameters.x;
 		return exp(-0.5 * d * d) * parameters.z + parameters.w;
+	}
+
+	/// @brief Directional albedo of the OpenPBR fuzz layer
+	/// @param NdotV Dot product of normal and view direction
+	/// @param roughness Fuzz roughness [0.01,1]
+	/// @return Fraction of light the fuzz reflects; the layers below receive the rest
+	float FuzzDirectionalAlbedo(float NdotV, float roughness)
+	{
+		return FuzzDirectionalAlbedoWithParameters(NdotV, FuzzDirectionalAlbedoParameters(roughness));
 	}
 
 	/// @brief View-dependent basis and inverse LTC coefficients of the OpenPBR fuzz lobe

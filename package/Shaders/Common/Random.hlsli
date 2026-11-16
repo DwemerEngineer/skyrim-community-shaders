@@ -285,9 +285,9 @@ namespace Random
 		int2 cell = int2(floor(p));
 		float2 fr = p - cell;
 		fr = fr * fr * (3.0 - 2.0 * fr);
-		float2 lower = float2(iqint3(asuint(cell)), iqint3(asuint(cell + int2(1, 0)))) * (1.0f / 4294967296.0f);
-		float2 upper = float2(iqint3(asuint(cell + int2(0, 1))), iqint3(asuint(cell + int2(1, 1)))) * (1.0f / 4294967296.0f);
-		return lerp(lerp(lower.x, lower.y, fr.x), lerp(upper.x, upper.y, fr.x), fr.y);
+		float lower = lerp(CellNoise2D(cell), CellNoise2D(cell + int2(1, 0)), fr.x);
+		float upper = lerp(CellNoise2D(cell + int2(0, 1)), CellNoise2D(cell + int2(1, 1)), fr.x);
+		return lerp(lower, upper, fr.y);
 	}
 
 	// Keep the nearest Voronoi feature, skipping cells whose closest point cannot beat the current best.

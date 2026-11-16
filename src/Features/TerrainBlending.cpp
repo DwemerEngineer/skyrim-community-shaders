@@ -95,8 +95,7 @@ void TerrainBlending::MergeSceneDepthIntoBlend()
 	context->CSSetShaderResources(0, 1, nullViews);
 	ID3D11UnorderedAccessView* nullUavs[2] = { nullptr, nullptr };
 	context->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
-	ID3D11ComputeShader* nullShader = nullptr;
-	context->CSSetShader(nullShader, nullptr, 0);
+	context->CSSetShader(nullptr, nullptr, 0);
 }
 
 void TerrainBlending::SetupResources()
@@ -294,10 +293,7 @@ void TerrainBlending::ClearShaderCache()
 		depthBlendShader->Release();
 		depthBlendShader = nullptr;
 	}
-	if (mergeDepthShader) {
-		mergeDepthShader->Release();
-		mergeDepthShader = nullptr;
-	}
+	Util::ReleaseAndNull(mergeDepthShader);
 }
 
 void TerrainBlending::Hooks::Main_RenderDepth::thunk(bool a1, bool a2)

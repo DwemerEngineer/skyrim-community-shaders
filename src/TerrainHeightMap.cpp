@@ -1,4 +1,4 @@
-﻿#include "TerrainHeightMap.h"
+#include "TerrainHeightMap.h"
 
 #include <DirectXTex.h>
 #include <pystring/pystring.h>

@@ -29,10 +29,9 @@ namespace GrassCollision
 		x /= fadeRate;
 		x /= distanceFromCenter;
 		x *= 100;
-		x = max(x, 0.0);
 
 		if (smoothRecovery) {
-			float recovery = exp(-x * recoveryRate);
+			float recovery = exp(-max(x, 0.0) * recoveryRate);
 			return recovery * recovery * (3.0 - 2.0 * recovery);
 		}
 
@@ -157,11 +156,9 @@ namespace GrassCollision
 #endif
 	}
 
-	void GetDisplacedPosition(float3 worldPosition, float3 worldPositionCentre, float alpha, float maximumDistance, bool smoothRecovery, float recoveryRate, out float3 displacement, out float3 previousDisplacement)
+	/** @param nearFactor Fade of the collision response with camera distance. */
+	void GetDisplacedPosition(float3 worldPosition, float3 worldPositionCentre, float alpha, float nearFactor, bool smoothRecovery, float recoveryRate, out float3 displacement, out float3 previousDisplacement)
 	{
-		float nearFactor = maximumDistance > 0.0 ? saturate(1.0 - length(worldPosition.xy) / maximumDistance) : 0.0;
-		nearFactor = nearFactor * nearFactor * (3.0 - 2.0 * nearFactor);
-
 		if (alpha > 0.0 && nearFactor > 0.0) {
 			// Limit stretching
 			float3 remappedWorldPosition = lerp(worldPosition, worldPositionCentre, float3(0.95, 0.95, 0.0));
@@ -196,14 +193,14 @@ namespace GrassCollision
 	// Positions arrive camera-relative: instances are already in world space here, so applying World again would double the offset.
 	void GetDisplacedPosition(VS_INPUT input, float3 worldPosition, float3 worldPositionCentre, out float3 displacement, out float3 previousDisplacement)
 	{
-		GetDisplacedPosition(worldPosition, worldPositionCentre, input.Color.w, 2048.0, true, 1.5, displacement, previousDisplacement);
+		GetDisplacedPosition(worldPosition, worldPositionCentre, saturate(input.Color.w * 10.0), smoothstep(2048.0, 0.0, length(worldPosition)), false, 1.5, displacement, previousDisplacement);
 	}
 #	else
 	void GetDisplacedPosition(VS_INPUT input, float3 position, out float3 displacement, out float3 previousDisplacement)
 	{
 		float3 worldPosition = mul(World, float4(position.xyz, 1.0)).xyz;
 		float3 worldPositionCentre = mul(World, float4(input.InstanceData1.xyz, 1.0)).xyz;
-		GetDisplacedPosition(worldPosition, worldPositionCentre, saturate(input.Color.w * 10.0), 2048.0, false, 1.5, displacement, previousDisplacement);
+		GetDisplacedPosition(worldPosition, worldPositionCentre, saturate(input.Color.w * 10.0), smoothstep(2048.0, 0.0, length(worldPosition)), false, 1.5, displacement, previousDisplacement);
 	}
 #	endif
 #endif

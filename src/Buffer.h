@@ -216,6 +216,16 @@ public:
 		ctx->Unmap(resource.get(), 0);
 	}
 
+	/**
+	 * @brief Uploads @p byteSize bytes at @p byteOffset in place, leaving the rest of the buffer intact.
+	 * The buffer must use D3D11_USAGE_DEFAULT.
+	 */
+	void UpdateRange(void const* src_data, size_t byteOffset, size_t byteSize)
+	{
+		const D3D11_BOX box{ static_cast<UINT>(byteOffset), 0u, 0u, static_cast<UINT>(byteOffset + byteSize), 1u, 1u };
+		globals::d3d::context->UpdateSubresource(resource.get(), 0, &box, src_data, 0, 0);
+	}
+
 	/** @brief Uploads an array of elements to the structured buffer. */
 	template <typename T>
 	void UpdateList(T const& src_data, std::int64_t count)

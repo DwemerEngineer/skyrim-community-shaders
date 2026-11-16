@@ -20,10 +20,10 @@ namespace
 	}
 
 	class TimeJumpEventHandler :
-		public RE::BSTEventSink<RE::TESWaitStopEvent>,
-		public RE::BSTEventSink<RE::TESSleepStopEvent>,
-		public RE::BSTEventSink<RE::TESFastTravelEndEvent>,
-		public RE::BSTEventSink<RE::BGSActorCellEvent>
+	    public RE::BSTEventSink<RE::TESWaitStopEvent>,
+	    public RE::BSTEventSink<RE::TESSleepStopEvent>,
+	    public RE::BSTEventSink<RE::TESFastTravelEndEvent>,
+	    public RE::BSTEventSink<RE::BGSActorCellEvent>
 	{
 	public:
 		RE::BSEventNotifyControl ProcessEvent(const RE::TESWaitStopEvent*, RE::BSTEventSource<RE::TESWaitStopEvent>*) override
@@ -131,15 +131,6 @@ namespace
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
 
-	// Heightmaps are keyed by the worldspace that provides the land data.
-	RE::TESWorldSpace* GetLandWorldspace()
-	{
-		auto tes = globals::game::tes;
-		auto worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
-		while (worldspace && worldspace->parentWorld && worldspace->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData))
-			worldspace = worldspace->parentWorld;
-		return worldspace;
-	}
 }
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
