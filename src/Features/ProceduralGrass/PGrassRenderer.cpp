@@ -477,9 +477,11 @@ void PGrassRenderer<QuadrantCount, PatchBladeCount>::UploadQuadrantInputs(const 
 						slotDirty[it->second] = 1u;
 		};
 
-		for (uint32_t i = static_cast<uint32_t>(quadrants.size()); i < lastQuadrantCount; ++i)
+		for (uint32_t i = static_cast<uint32_t>(quadrants.size()); i < lastQuadrantCount; ++i) {
 			if (stagedQuadrants[i].inUse)
 				markNeighbours(stagedQuadrants[i]);
+			stagedQuadrants[i] = {};
+		}
 
 		for (uint32_t i = 0; i < quadrants.size(); ++i) {
 			const bool changed = restageAll || !(quadrants[i] == stagedQuadrants[i]);
