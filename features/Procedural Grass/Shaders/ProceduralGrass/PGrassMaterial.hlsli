@@ -73,6 +73,12 @@ float3 GetDistantBladeColor(GrassType bladeType, float3 clumpColor, float along)
 	return lerp(baseColor, tipColor, along) * clumpColor;
 }
 
+/** @brief Fade of per-pixel surface texture (grain and speckle) with view depth. */
+float GetSurfaceTextureFade(float viewDepth)
+{
+	return saturate(1.0f - viewDepth * (1.0f / 2500.0f));
+}
+
 void GetGrassScatteringAlbedos(float3 baseColor, float3 scatteringColor, float opaqueFraction, float transmissionStrength,
 	out float3 reflectionAlbedo, out float3 transmissionAlbedo)
 {

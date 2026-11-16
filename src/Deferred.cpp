@@ -344,7 +344,7 @@ void Deferred::DeferredPasses()
 
 	auto& skylighting = globals::features::skylighting;
 	auto& proceduralGrass = globals::features::proceduralGrass;
-	if (proceduralGrass.loaded && proceduralGrass.settings.Enabled && !globals::state->isMapMenuOpen)
+	if (proceduralGrass.loaded)
 		proceduralGrass.DeferredRendering();
 
 	auto& ssgi = globals::features::screenSpaceGI;

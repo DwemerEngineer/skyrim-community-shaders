@@ -177,8 +177,9 @@ float GetTerrainDarkeningWeight(float2 position)
 	if (weight <= 0.0f)
 		return 0.0f;
 
-	float terrainZ = lerp(heightMapZRange.x, heightMapZRange.y, TerrainHeightTexture.SampleLevel(LinearSampler, world.xy * heightMapScale + heightMapOffset, 0));
-	[branch] if (miscParams.y > 0.0f) {
+	float terrainZ = SampleTerrainHeight(TerrainHeightTexture, LinearSampler, world.xy);
+	[branch] if (miscParams.y > 0.0f)
+	{
 		float objectHeight, objectDensity;
 		float2 objectSlope;
 		uint objectType;

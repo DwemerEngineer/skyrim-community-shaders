@@ -32,21 +32,24 @@ void ProceduralGrass::UpdateTerrainCanopy(ID3D11DeviceContext* ctx)
 	if (!terrainCanopyTexture || !terrainCanopyCS)
 		return;
 
-	const auto* player = RE::PlayerCharacter::GetSingleton();
-	const auto& position = player->GetPosition();
-	const int32_t originX = static_cast<int32_t>(std::floor(position.x / 2048.0f)) - TerrainCanopyQuadrants / 2;
-	const int32_t originY = static_cast<int32_t>(std::floor(position.y / 2048.0f)) - TerrainCanopyQuadrants / 2;
+	const auto visibilityOrigin = GetVisibilityOrigin();
+	const int32_t originX = visibilityOrigin.quadrantX - TerrainCanopyQuadrants / 2;
+	const int32_t originY = visibilityOrigin.quadrantY - TerrainCanopyQuadrants / 2;
 	const bool moved = terrainCanopyOrigin[0] != originX || terrainCanopyOrigin[1] != originY;
 	bool reset = terrainCanopyNeedsClear || terrainCanopyWorldSpace != farRequestWorldSpace ||
 	             terrainCanopyPolicyVersion != grassMapCacheVersion ||
 	             std::abs(static_cast<int64_t>(originX) - terrainCanopyOrigin[0]) >= TerrainCanopyQuadrants ||
 	             std::abs(static_cast<int64_t>(originY) - terrainCanopyOrigin[1]) >= TerrainCanopyQuadrants;
+	static_assert(std::has_single_bit(static_cast<uint32_t>(TerrainCanopyQuadrants)), "Canopy slots wrap with a mask");
 	constexpr uint32_t slotMask = TerrainCanopyQuadrants - 1;
+	const auto slotOf = [](const int32_t x, const int32_t y) {
+		return (static_cast<uint32_t>(y) & slotMask) * TerrainCanopyQuadrants + (static_cast<uint32_t>(x) & slotMask);
+	};
 	// Long travel through unavailable LAND can leave a slot untouched for a complete coordinate-tag period.
 	if (moved && !reset) {
 		for (int32_t y = originY; y < originY + TerrainCanopyQuadrants && !reset; ++y) {
 			for (int32_t x = originX; x < originX + TerrainCanopyQuadrants; ++x) {
-				const auto& tile = terrainCanopyTiles[(static_cast<uint32_t>(y) & slotMask) * TerrainCanopyQuadrants + (static_cast<uint32_t>(x) & slotMask)];
+				const auto& tile = terrainCanopyTiles[slotOf(x, y)];
 				if (tile.version && (tile.x != x || tile.y != y) && ((tile.x ^ x) & 2047) == 0 && ((tile.y ^ y) & 2047) == 0) {
 					reset = true;
 					break;
@@ -70,12 +73,11 @@ void ProceduralGrass::UpdateTerrainCanopy(ID3D11DeviceContext* ctx)
 		terrainCanopyPending.clear();
 		terrainCanopyUploadCursor = 0;
 		for (const auto& quadrant : quadrantsFarLOD) {
-			const int32_t x = quadrant.cellX * 2 + static_cast<int32_t>(quadrant.x);
-			const int32_t y = quadrant.cellY * 2 + static_cast<int32_t>(quadrant.y);
+			const int32_t x = quadrant.WorldX();
+			const int32_t y = quadrant.WorldY();
 			if (!quadrant.grassIds || x < originX || y < originY || x >= originX + TerrainCanopyQuadrants || y >= originY + TerrainCanopyQuadrants)
 				continue;
-			const uint32_t slot = (static_cast<uint32_t>(y) & slotMask) * TerrainCanopyQuadrants + (static_cast<uint32_t>(x) & slotMask);
-			const auto& previous = terrainCanopyTiles[slot];
+			const auto& previous = terrainCanopyTiles[slotOf(x, y)];
 			if (previous.x == x && previous.y == y && previous.version == quadrant.cacheVersion)
 				continue;
 
@@ -83,10 +85,9 @@ void ProceduralGrass::UpdateTerrainCanopy(ID3D11DeviceContext* ctx)
 			upload.tile = { x, y, quadrant.cacheVersion };
 			// Coordinate tags distinguish stale wrapping slots; teleports clear the window before tags can alias.
 			const uint32_t tag = (1u << 30) | ((static_cast<uint32_t>(x) & 2047u) << 8) | ((static_cast<uint32_t>(y) & 2047u) << 19);
-			const auto grassIds = FillQuadrantGrassIds(quadrant.grassIds, x, y);
 			for (uint32_t row = 0; row < pitch; ++row) {
 				for (uint32_t column = 0; column < pitch; ++column) {
-					const uint8_t id = grassIds[row * QuadrantGrassPitch + column];
+					const uint8_t id = quadrant.grassIds[row * QuadrantGrassPitch + column];
 					upload.samples[row * pitch + column] = tag | LimitGrassIdToSlope(id, quadrant, column, row);
 				}
 			}
@@ -103,7 +104,7 @@ void ProceduralGrass::UpdateTerrainCanopy(ID3D11DeviceContext* ctx)
 		const uint32_t slotY = static_cast<uint32_t>(upload.tile.y) & slotMask;
 		const D3D11_BOX box{ slotX * pitch, slotY * pitch, 0, (slotX + 1) * pitch, (slotY + 1) * pitch, 1 };
 		ctx->UpdateSubresource(terrainCanopyTexture->resource.get(), 0, &box, upload.samples.data(), pitch * sizeof(uint32_t), 0);
-		terrainCanopyTiles[slotY * TerrainCanopyQuadrants + slotX] = upload.tile;
+		terrainCanopyTiles[slotOf(upload.tile.x, upload.tile.y)] = upload.tile;
 	}
 }
 

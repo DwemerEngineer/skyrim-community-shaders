@@ -19,7 +19,7 @@ static const float TerrainLodOverlapMargin = 4096.0f;
 
 float SampleLandHeight(float2 world2D)
 {
-	return lerp(heightMapZRange.x, heightMapZRange.y, TerrainHeightTexture.SampleLevel(LinearSampler, world2D * heightMapScale + heightMapOffset, 0));
+	return SampleTerrainHeight(TerrainHeightTexture, LinearSampler, world2D);
 }
 
 // LOD terrain vertices are LAND samples, so its surface cannot rise above the highest LAND around it.

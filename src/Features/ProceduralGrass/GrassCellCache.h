@@ -3,7 +3,6 @@
 #include "PGrassCommon.h"
 
 #include <array>
-#include <atomic>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -21,27 +20,21 @@
 struct CellGrass
 {
 	std::array<uint64_t, 4> quadrantCacheVersions{};
-	std::array<std::array<uint8_t, PGrassCommon::QuadrantGrassSamples>, 4> ids{};
-	std::array<PGrassCommon::QuadrantOccupancy, 4> occupancy{};
+	std::array<std::array<uint8_t, PGrassCommon::QuadrantGrassSamples>, 4> ids{};  // filled grass ids
 	std::array<std::array<float, PGrassCommon::QuadrantGrassSamples>, 4> heights{};
 	std::array<float, 4> minHeights{};
 	std::array<float, 4> maxHeights{};
 };
 
-struct GrassTexturePolicy
-{
-	std::vector<uint8_t> ids;
-	std::vector<float> cumulative;
-	float total = 0.0f;
-
-	bool operator==(const GrassTexturePolicy&) const = default;
-};
+using GrassTexturePolicyMap = std::unordered_map<const RE::TESLandTexture*, PGrassCommon::GrassTextureSelection>;
 
 /**
  * @brief Background reader + cache of per-cell grass data, mirroring the water cache's file-seeking.
  *
  * Reads run on a worker pool so first sight never hitches the render thread. Workers hand finished cells
- * to the main thread through a locked queue.
+ * to the main thread through a locked queue. Each worker reads through TESFile::Duplicate, which on a non-main thread
+ * returns that thread's copy of the file, created once and owned by the file's per-thread map; the copy is reused by
+ * later reads on the same thread and must not be closed or freed here.
  */
 class GrassCellCache
 {
@@ -52,7 +45,7 @@ public:
 	void BeginFrame(RE::TESWorldSpace* landWorldSpace);
 
 	/** @brief Updates LTEX grass overrides used by streamed LAND reads and invalidates stale cells. */
-	void SetGrassMapPolicy(std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy> textureOverrides, bool ignoreGrassMap);
+	void SetGrassMapPolicy(GrassTexturePolicyMap textureOverrides, bool ignoreGrassMap);
 
 	/** @brief Folds up to maxCount finished background reads into the readable map. Main thread only. */
 	void DrainCompleted(size_t maxCount);
@@ -65,20 +58,31 @@ public:
 
 	uint64_t GetReadyVersion() const { return readyVersion; }
 
-	/** @brief Drops cells not requested this frame. Call after gathering. Main thread only. */
-	void EvictUntouched();
+	/**
+	 * @brief Drops the least recently used cells over the cache limit. Main thread only.
+	 * Cells within @p keepRadius of the centre are kept: tier lists hold pointers into them between rebuilds.
+	 */
+	void EvictUntouched(int32_t centerX, int32_t centerY, int32_t keepRadius);
 
 	void Shutdown();
 
 private:
-	static std::unique_ptr<CellGrass> ReadCell(RE::TESWorldSpace* worldSpace, std::shared_ptr<const std::vector<RE::TESFile*>> files, int32_t cellX, int32_t cellY,
-		std::shared_ptr<const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>> textureOverrides, bool ignoreGrassMap);
-	static void ParseLandscape(RE::TESFile* file, CellGrass& out, int32_t cellX, int32_t cellY,
-		const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>& textureOverrides, bool ignoreGrassMap);
+	/** @brief Drops every cached, pending and completed cell. Main thread only. */
+	void ClearCells();
 
-	std::unordered_map<uint64_t, std::unique_ptr<CellGrass>> ready;  // main-thread only
-	std::unordered_map<uint64_t, uint64_t> lastTouched;              // key -> frame, main-thread only
-	std::unordered_set<uint64_t> pending;                            // enqueued keys, main-thread only
+	static std::unique_ptr<CellGrass> ReadCell(RE::TESWorldSpace* worldSpace, std::shared_ptr<const std::vector<RE::TESFile*>> files, int32_t cellX, int32_t cellY,
+		std::shared_ptr<const GrassTexturePolicyMap> textureOverrides, bool ignoreGrassMap);
+	static void ParseLandscape(RE::TESFile* file, CellGrass& out, int32_t cellX, int32_t cellY,
+		const GrassTexturePolicyMap& textureOverrides, bool ignoreGrassMap);
+
+	struct CachedCell
+	{
+		std::unique_ptr<CellGrass> data;
+		uint64_t lastTouched;
+	};
+
+	std::unordered_map<uint64_t, CachedCell> ready;  // main-thread only
+	std::unordered_set<uint64_t> pending;            // enqueued keys, main-thread only
 
 	std::mutex completedMutex;
 	std::deque<std::tuple<uint64_t, uint64_t, std::unique_ptr<CellGrass>>> completed;  // key, generation, data
@@ -86,10 +90,10 @@ private:
 	std::unique_ptr<BS::thread_pool<>> pool;
 	RE::TESWorldSpace* worldSpace = nullptr;
 	std::shared_ptr<const std::vector<RE::TESFile*>> files = std::make_shared<const std::vector<RE::TESFile*>>();
-	std::shared_ptr<const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>> textureOverrides =
-		std::make_shared<const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>>();
+	std::shared_ptr<const GrassTexturePolicyMap> textureOverrides =
+		std::make_shared<const GrassTexturePolicyMap>();
 	bool ignoreGrassMap = false;
-	std::atomic<uint64_t> generation{ 0 };  // bumped on worldspace change, stale results dropped
+	uint64_t generation = 0;  // Main-thread epoch captured by each request; stale completions are dropped.
 	uint64_t frame = 0;
 	uint64_t nextCacheVersion = 1;
 	uint64_t readyVersion = 1;

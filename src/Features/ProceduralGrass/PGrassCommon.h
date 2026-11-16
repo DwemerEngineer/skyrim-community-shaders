@@ -2,6 +2,15 @@
 
 namespace PGrassCommon
 {
+	/** @brief Grass level-of-detail tiers, nearest first. Far extends Low's shader paths. */
+	enum class Tier : uint8_t
+	{
+		High,
+		Mid,
+		Low,
+		Far,
+	};
+
 	inline constexpr uint32_t LowBladeBatchSize = 64;
 	inline constexpr uint32_t MidBladeBatchSize = 32;
 	inline constexpr uint32_t FarBladeBatchSize = 64;
@@ -40,26 +49,40 @@ namespace PGrassCommon
 		return mix(hash, sample);
 	}
 
-	inline bool HasWeightedGrass(const std::vector<uint8_t>& ids, const std::vector<float>& cumulative)
+	/** @brief Weighted grass-type variants assigned to one landscape texture. */
+	struct GrassTextureSelection
 	{
-		float previous = 0.0f;
-		for (size_t i = 0; i < ids.size(); ++i) {
-			if (ids[i] != 0u && cumulative[i] > previous)
-				return true;
-			previous = cumulative[i];
-		}
-		return false;
-	}
+		std::vector<uint8_t> ids;       // Global type id per variant; 0 is bare
+		std::vector<float> cumulative;  // Running weight sum
+		float total = 0.0f;
 
-	inline uint8_t SelectWeightedGrass(const std::vector<uint8_t>& ids, const std::vector<float>& cumulative, float total, uint32_t hash)
-	{
-		const float r = (hash * (1.0f / 4294967296.0f)) * total;
-		for (size_t i = 0; i < ids.size(); ++i) {
-			if (r < cumulative[i])
-				return ids[i];
+		bool operator==(const GrassTextureSelection&) const = default;
+
+		/** @brief True when any variant with a positive weight grows grass. */
+		bool HasWeightedGrass() const
+		{
+			if (total <= 0.0f)
+				return false;
+			float previous = 0.0f;
+			for (size_t i = 0; i < ids.size(); ++i) {
+				if (ids[i] != 0u && cumulative[i] > previous)
+					return true;
+				previous = cumulative[i];
+			}
+			return false;
 		}
-		return ids.back();
-	}
+
+		/** @brief Picks a variant by its weight from a uniform 32-bit hash. */
+		uint8_t Select(uint32_t hash) const
+		{
+			const float r = (hash * (1.0f / 4294967296.0f)) * total;
+			for (size_t i = 0; i < ids.size(); ++i) {
+				if (r < cumulative[i])
+					return ids[i];
+			}
+			return ids.back();
+		}
+	};
 
 	inline constexpr uint64_t GrassHashOffsetBasis = 14695981039346656037ull;
 	inline constexpr uint64_t GrassHashPrime = 1099511628211ull;
@@ -85,51 +108,19 @@ namespace PGrassCommon
 		       static_cast<uint32_t>(cellY);
 	}
 
-	constexpr uint64_t GrassQuadrantKey(uint32_t quadrantX, uint32_t quadrantY)
+	constexpr uint64_t GrassQuadrantKey(int32_t quadrantX, int32_t quadrantY)
 	{
-		return (static_cast<uint64_t>(quadrantX) << 32) | quadrantY;
+		return GrassCellKey(quadrantX, quadrantY);
 	}
 
 	// A LAND quadrant carries a 17x17 grid of texture-blend samples, so 128 world units apart.
-	static constexpr uint32_t QuadrantGrassPitch = 17;
-	static constexpr uint32_t QuadrantGrassSamples = QuadrantGrassPitch * QuadrantGrassPitch;
-	static constexpr uint32_t QuadrantCellPitch = QuadrantGrassPitch - 1;
+	inline constexpr uint32_t QuadrantGrassPitch = 17;
+	inline constexpr uint32_t QuadrantGrassSamples = QuadrantGrassPitch * QuadrantGrassPitch;
+	inline constexpr uint32_t QuadrantCellPitch = QuadrantGrassPitch - 1;
 
 	// The terrain material uses one base texture and five overlay slots.
-	static constexpr uint32_t LandscapeOverlayCount = 5;
+	inline constexpr uint32_t LandscapeOverlayCount = 5;
 	using QuadrantOccupancy = std::array<uint16_t, QuadrantCellPitch>;
-
-	/** @brief Builds a 16x16 occupied-cell mask after the generator's one-sample neighbour fill. */
-	inline QuadrantOccupancy BuildQuadrantOccupancy(const uint8_t* ids)
-	{
-		QuadrantOccupancy rows{};
-		if (!ids)
-			return rows;
-
-		for (uint32_t cellY = 0; cellY < QuadrantCellPitch; ++cellY) {
-			uint16_t row = 0;
-			for (uint32_t cellX = 0; cellX < QuadrantCellPitch; ++cellX) {
-				const uint32_t minX = cellX > 0 ? cellX - 1 : 0;
-				const uint32_t minY = cellY > 0 ? cellY - 1 : 0;
-				const uint32_t maxX = std::min(cellX + 2, QuadrantGrassPitch - 1);
-				const uint32_t maxY = std::min(cellY + 2, QuadrantGrassPitch - 1);
-
-				bool occupied = false;
-				for (uint32_t y = minY; y <= maxY && !occupied; ++y)
-					for (uint32_t x = minX; x <= maxX; ++x)
-						if (ids[y * QuadrantGrassPitch + x] != 0u) {
-							occupied = true;
-							break;
-						}
-
-				if (occupied)
-					row |= static_cast<uint16_t>(1u << cellX);
-			}
-			rows[cellY] = row;
-		}
-
-		return rows;
-	}
 
 	/** @brief Returns one neighbouring grass id for a bare sample; reads use the original map so the fill cannot spread farther. */
 	inline uint8_t FindAdjacentGrassId(const uint8_t* ids, uint32_t width, uint32_t height, uint32_t x, uint32_t y, int32_t worldSampleX, int32_t worldSampleY)
@@ -182,52 +173,134 @@ namespace PGrassCommon
 		return first == 0u ? second : (second == 0u ? first : std::min(first, second));
 	}
 
-	static constexpr int32_t HighTierQuadrantRadius = 2;
-	static constexpr int32_t MidTierQuadrantRadius = 4;  // Extend Mid this far to avoid popping when the player moves between Mid and Low tiers.
+	/**
+	 * @brief Landscape textures of one LAND quadrant, as TESObjectLAND::LoadedLandData stores them.
+	 * A layer whose record names form 0 already resolves to the default landscape texture.
+	 */
+	struct QuadrantLandTextures
+	{
+		const RE::TESLandTexture* base = nullptr;
+		std::array<const RE::TESLandTexture*, LandscapeOverlayCount> layers{};
+	};
+
+	/**
+	 * @brief Builds one quadrant's filled grass ids from its texture blend.
+	 * Each sample takes the strongest grass-growing texture whose share passes fTexturePctThreshold:Grass, then that
+	 * texture's weighted variant; bare samples then take one neighbouring id (FillQuadrantGrassIds). Loaded and streamed
+	 * LAND both go through here, so the near and far tiers agree on every sample.
+	 * @param percents Per-sample overlay opacity in 0-255 units with @p percentStride bytes per sample, as the engine
+	 *                 stores TESObjectLAND::LoadedLandData::percents (opacity * 255, truncated).
+	 * @param getSelection Returns the weighted selection overriding a texture, or null to use its own grass list.
+	 */
+	template <class GetSelection>
+	std::array<uint8_t, QuadrantGrassSamples> BuildQuadrantGrassIds(const QuadrantLandTextures& textures, const uint8_t* percents, uint32_t percentStride,
+		int32_t cellX, int32_t cellY, uint32_t quadrant, bool ignoreGrassMap, GetSelection&& getSelection)
+	{
+		std::array<uint8_t, QuadrantGrassSamples> ids{};
+		if (ignoreGrassMap) {
+			ids.fill(1u);
+			return ids;
+		}
+
+		const RE::TESLandTexture* defaultTexture = GetDefaultLandTexture();
+		const float thresholdPercent = GetGrassTexturePctThreshold() * 255.0f;
+		const RE::TESLandTexture* baseTexture = textures.base && textures.base->formID != 0 ? textures.base : defaultTexture;
+
+		struct Candidate
+		{
+			const RE::TESLandTexture* texture;
+			const GrassTextureSelection* selection;
+			bool growsGrass;
+		};
+		const auto describe = [&](const RE::TESLandTexture* texture) {
+			const GrassTextureSelection* selection = texture ? getSelection(texture) : nullptr;
+			const bool grows = texture && (selection && selection->total > 0.0f ? selection->HasWeightedGrass() : !texture->textureGrassList.empty());
+			return Candidate{ texture, selection, grows };
+		};
+		const Candidate base = describe(baseTexture);
+		std::array<Candidate, LandscapeOverlayCount> layers;
+		for (uint32_t layer = 0; layer < LandscapeOverlayCount; ++layer) {
+			const auto* texture = textures.layers[layer];
+			layers[layer] = describe(texture && texture->formID == 0 ? defaultTexture : texture);
+		}
+
+		for (uint32_t v = 0; v < QuadrantGrassSamples; ++v) {
+			const uint8_t* samplePercents = percents + static_cast<size_t>(v) * percentStride;
+			int32_t overlayTotal = 0;
+			for (uint32_t layer = 0; layer < LandscapeOverlayCount; ++layer)
+				if (layers[layer].texture)
+					overlayTotal += samplePercents[layer];
+
+			const Candidate* best = nullptr;
+			int32_t bestPercent = -1;
+			const auto consider = [&](const Candidate& candidate, const int32_t percent) {
+				if (candidate.growsGrass && percent > 0 && static_cast<float>(percent) >= thresholdPercent && percent > bestPercent) {
+					bestPercent = percent;
+					best = &candidate;
+				}
+			};
+			consider(base, std::max(255 - overlayTotal, 0));
+			for (uint32_t layer = 0; layer < LandscapeOverlayCount; ++layer)
+				consider(layers[layer], samplePercents[layer]);
+
+			if (best)
+				ids[v] = best->selection && best->selection->total > 0.0f ? best->selection->Select(QuadrantSampleHash(cellX, cellY, quadrant, v)) : uint8_t{ 1 };
+		}
+
+		return FillQuadrantGrassIds(ids.data(), cellX * 2 + static_cast<int32_t>(quadrant % 2), cellY * 2 + static_cast<int32_t>(quadrant / 2));
+	}
+
+	inline constexpr int32_t HighTierQuadrantRadius = 2;
+	inline constexpr int32_t MidTierQuadrantRadius = 4;  // Extend Mid this far to avoid popping when the player moves between Mid and Low tiers.
 	// Mid hands off to Low over this distance. Mid's blades are fully straightened by then and rarely cover a pixel, so
 	// the band is short. Keep in sync with PGrassCommon.hlsli.
-	static constexpr float MidLowHandoffBand = 1024.0f;
-	static constexpr int32_t LowTierQuadrantRadius = 5;  // Low overlaps Far across their radial transition band.
-	static constexpr int32_t FarCellRadiusCap = 15;      // Maximum total streamed cell radius that fits in the Far quadrant buffer.
-	static constexpr int32_t LowTierStreamGuardQuadrants = 1;
-	static constexpr int32_t FarStreamGuardCells = 1;
-	static constexpr float FarUnloadFadeWidth = 2048.0f;
+	inline constexpr float MidLowHandoffBand = 1024.0f;
+	inline constexpr int32_t LowTierQuadrantRadius = 5;  // Low overlaps Far across their radial transition band.
+	inline constexpr int32_t FarCellRadiusCap = 15;      // Maximum total streamed cell radius that fits in the Far quadrant buffer.
+	inline constexpr int32_t LowTierStreamGuardQuadrants = 1;
+	inline constexpr int32_t FarStreamGuardCells = 1;
+	inline constexpr float FarUnloadFadeWidth = 2048.0f;
 
 	// Terrain lift map; mirrors PGrassCommon.hlsli. The window spans the Far radius cap on every side of the camera.
-	static constexpr int32_t TerrainLiftDim = 512;
-	static constexpr float TerrainLiftCellSize = 256.0f;
-	static constexpr uint32_t TerrainCanopyDim = 1024;
-	static constexpr int32_t TerrainCanopyQuadrants = TerrainCanopyDim / QuadrantCellPitch;
+	inline constexpr int32_t TerrainLiftDim = 512;
+	inline constexpr float TerrainLiftCellSize = 256.0f;
+	inline constexpr uint32_t TerrainCanopyDim = 1024;
+	inline constexpr int32_t TerrainCanopyQuadrants = TerrainCanopyDim / QuadrantCellPitch;
 
 	// Quadrants in an md<=r square (r in each of x and y), one per tier's renderer buffer.
 	constexpr uint32_t QuadrantSquare(int32_t r) { return static_cast<uint32_t>((2 * r + 1) * (2 * r + 1)); }
 
-	static constexpr uint32_t HighTierQuadrantCap = QuadrantSquare(HighTierQuadrantRadius);
-	static constexpr uint32_t MidTierQuadrantCap = QuadrantSquare(MidTierQuadrantRadius);
-	static constexpr uint32_t LowTierQuadrantCap = QuadrantSquare(LowTierQuadrantRadius + LowTierStreamGuardQuadrants);
+	inline constexpr uint32_t HighTierQuadrantCap = QuadrantSquare(HighTierQuadrantRadius);
+	inline constexpr uint32_t MidTierQuadrantCap = QuadrantSquare(MidTierQuadrantRadius);
+	inline constexpr uint32_t LowTierQuadrantCap = QuadrantSquare(LowTierQuadrantRadius + LowTierStreamGuardQuadrants);
 
-	// Set near the 4,096 dx11 cbuffer size cap to be able to fit as many far-tier quadrants as possible in a single cbuffer, to avoid multiple dispatches for far cells.
-	static constexpr uint32_t FarQuadrantCount = 4000;
+	// Fills a 64 KiB constant buffer (4,096 registers) after its two fade registers, so Far needs one dispatch range.
+	inline constexpr uint32_t FarQuadrantCount = 4000;
 
+	inline constexpr float QuadrantNoHeight = -3.0e38f;
+
+	/** @brief One LAND quadrant slot of a tier's list. A default-constructed slot is empty. */
 	struct Quadrant
 	{
-		int cellX;
-		int cellY;
-		uint x;
-		uint y;
-		uint64_t cacheVersion;
-		bool nearCovered;  // a loaded near tier also renders this quadrant
-		const uint8_t* grassIds;
-		const uint16_t* occupancyRows;
-		const float* heights;  // null when the LAND is unloaded
-		float2 worldPos;       // cached lower-left world XY
-		float minHeight;       // QuadrantNoHeight when unavailable
-		float maxHeight;
+		int32_t cellX = 0;
+		int32_t cellY = 0;
+		uint32_t x = 0;
+		uint32_t y = 0;
+		uint64_t cacheVersion = 0;
+		bool inUse = false;
+		bool nearCovered = false;           // a loaded near tier also renders this quadrant
+		const uint8_t* grassIds = nullptr;  // filled grass ids; null for object-only quadrants
+		const float* heights = nullptr;     // null when the LAND is unloaded
+		float2 worldPos;                    // cached lower-left world XY
+		float minHeight = QuadrantNoHeight;
+		float maxHeight = QuadrantNoHeight;
+
+		int32_t WorldX() const { return cellX * 2 + static_cast<int32_t>(x); }
+		int32_t WorldY() const { return cellY * 2 + static_cast<int32_t>(y); }
+		bool HasLand() const { return maxHeight > QuadrantNoHeight && minHeight <= maxHeight; }
 
 		bool operator==(const Quadrant&) const = default;
 	};
-
-	static constexpr float QuadrantNoHeight = -3.0e38f;
 
 	struct alignas(16) QuadrantData
 	{
@@ -349,7 +422,7 @@ namespace PGrassCommon
 	static_assert(sizeof(GrassType) == 336);
 
 	// Slot 0 = bare, slot 1 = the base/default type, leaving 126 total slots for loaded per-texture variants.
-	static constexpr uint32_t MaxGrassTypes = 128;
+	inline constexpr uint32_t MaxGrassTypes = 128;
 
 	struct GrassTypesArray
 	{

@@ -26,12 +26,9 @@ public:
 	static constexpr float MinClumpGridSize = 16.0f;
 	static constexpr float MaxClumpGridSize = 512.0f;
 
-	struct Settings
+	/** @brief Fields a grass type can override per landscape-texture variant; Settings holds the base values. */
+	struct GrassTypeFields
 	{
-		bool Enabled = true;
-		int32_t Quality = 2;  // QualityDensities index
-
-		// Blade shape and material
 		float grassHeight = 100.0f;
 		float grassWidth = 0.6f;
 		float stiffness = 0.24f;
@@ -39,20 +36,18 @@ public:
 		float mid = 0.73f;
 		float rotationalStiffness = 1.0f;
 		float ao = 0.10f;                                          // Minimum blade AO
-		float specular = 0.08f;                                    // Specular reflectance at normal incidence
+		float specular = 0.04f;                                    // Specular reflectance at normal incidence
 		float specularAnisotropy = 0.6f;                           // OpenPBR specular anisotropy, stretched across the blade by its veins
-		float sheenStrength = 0.08f;                               // OpenPBR fuzz weight: coverage of the blade hairs and wax bloom
+		float sheenStrength = 0.16f;                               // OpenPBR fuzz weight: coverage of the blade hairs and wax bloom
 		float sheenRoughness = 0.5f;                               // OpenPBR fuzz roughness: low is fibre-like, high is dusty
 		float sheenTint = 0.5f;                                    // OpenPBR fuzz colour: 0 is white, 1 is the blade's hue
-		float curvedNormalStrength = 0.3f;                         // Edge tilt of the rolled cross-section as a fraction of 90 degrees
+		float curvedNormalStrength = 0.4f;                         // Edge tilt of the rolled cross-section as a fraction of 90 degrees
 		float2 subsurfaceOpacity = float2(0.5f, 0.30f);            // Opaque fraction of the base substrate, base to tip
 		float3 grassSubsurfaceTint = float3(0.50f, 0.54f, 0.38f);  // Scattering albedo at the stabilized blade colour
 		float grassTransmissionStrength = 1.5f;                    // Thin-subsurface anisotropy + 1; 0..2 splits scattering into reflection and transmission
 		float3 baseMinTipRoughness = float3(0.40f, 0.30f, 0.40f);
 		float tipRoughnessStart = 0.75f;
 		float clumpAOStrength = 0.5f;
-
-		// Colour
 		float3 baseColor = float3(0.115f, 0.135f, 0.080f);
 		float3 tipColor = float3(0.340f, 0.380f, 0.240f);
 		float grassColorHueVariation = 0.45f;                   // Per-blade hue variation
@@ -62,30 +57,38 @@ public:
 		float3 grassColorCool = float3(0.83f, 0.89f, 0.80f);    // Cool blade tint
 		float3 grassColorWarm = float3(1.02f, 1.00f, 0.84f);    // Warm blade tint
 		float3 grassColorTipDry = float3(1.04f, 1.02f, 0.88f);  // Dry tip tint
-
-		// Detail and lighting
-		float grassBaseAO = 0.35f;
 		float grassClumpColorStrength = 0.6f;
-
-		float grassCanopySkyOcclusion = 1.0f;
-		float grassDensityAO = 0.2f;
-
 		float grassBounceStrength = 0.35f;
 		float3 grassBounceColor = float3(0.55f, 0.42f, 0.24f);
 		float grassAmbientDesat = 0.5f;
-
-		// Surface texture
 		float grassBlotchStrength = 0.28f;
 		float grassBlotchScale = 1.0f;
 		float grassSpeckleStrength = 0.10f;
 		float grassSpeckleScale = 1.0f;
-
-		// Per-type vein detail
 		float3 grassVeinTint = float3(0.76f, 0.82f, 0.68f);  // albedo tint in the vein grooves
 		float grassVeinAlbedoStrength = 0.55f;               // how strongly the tint applies
 		float grassVeinNormalStrength = 0.60f;               // vein normal-tilt amount
 		float grassVeinRippleDepth = 0.28f;                  // along-blade ripple modulation of the veins
 		float grassVeinWiggleAmount = 0.09f;                 // fine micro-wiggle of the surface normal
+		float clumpGridSize = 64.0f;                         // Average spacing between Voronoi clump centres, in world units; about one tuft
+		float clumpDistanceFactor = 0.25f;                   // Pull toward the clump centre
+		float clumpFacingFactor = 0.25f;                     // Positive turns blades away from the clump centre, negative toward it
+		float clumpLeanFactor = 0.6f;                        // Turns a clump's blades toward one shared direction
+		float clumpHeightFactor = 0.5f;                      // Share of each blade's height taken from its clump
+		float grassMinSlope = 0.0f;
+		float grassMaxSlope = 40.0f;    // Degrees. 90 never culls grass.
+		float grassSlopeFacing = 0.2f;  // Downhill lean strength
+	};
+
+	struct Settings : GrassTypeFields
+	{
+		bool Enabled = true;
+		int32_t Quality = 2;  // QualityDensities index
+
+		float grassBaseAO = 0.35f;
+
+		float grassCanopySkyOcclusion = 1.0f;
+		float grassDensityAO = 0.2f;
 
 		// Terrain blend and shadow
 		float grassTerrainBlendStrength = 1.0f;
@@ -93,18 +96,6 @@ public:
 		float grassTerrainBlendNormal = 0.8f;
 		float grassTerrainBlendRough = 0.7f;
 		float grassAOStrength = 0.5f;  // Perceptual darkening of terrain under full grass. 0 disables it; 1 is black.
-
-		// Clump
-		float clumpGridSize = 64.0f;        // Average spacing between Voronoi clump centres, in world units; about one tuft
-		float clumpDistanceFactor = 0.25f;  // Pull toward the clump centre
-		float clumpFacingFactor = 0.25f;    // Positive turns blades away from the clump centre, negative toward it
-		float clumpLeanFactor = 0.6f;       // Turns a clump's blades toward one shared direction
-		float clumpHeightFactor = 0.5f;     // Share of each blade's height taken from its clump
-
-		// Slope
-		float grassMinSlope = 0.0f;
-		float grassMaxSlope = 40.0f;    // Degrees. 90 never culls grass.
-		float grassSlopeFacing = 0.2f;  // Downhill lean strength
 
 		// Wind / animation
 		float windAngle = 0.0f;
@@ -116,7 +107,7 @@ public:
 		float occlusionPadding = 12.0f;
 		float occlusionBias = 4.0f;  // Minimum occluder height above a blade
 		float grassMapEdgeNoise = 64.0f;
-		float grassViewThicken = 0.5f;  // Edge-on blade widening. 0 disables it.
+		float grassViewThicken = 0.4f;  // Edge-on blade widening. 0 disables it.
 
 		// Per-LOD densities and far tier
 		// Defaults match the High preset (see ApplyDensityPreset): Mid and Low use High's lattice.
@@ -164,11 +155,11 @@ public:
 
 	/** @brief Draws the per-type overrides and landscape-texture mix editor. */
 	void DrawGrassTypeEditor();
-	/** @brief Draws debug toggles and diagnostic readouts. The blade counts stall on GPU readback. */
+	/** @brief Draws debug toggles and the latest completed diagnostic readbacks. */
 	virtual void DrawDebugSection() override;
 
 	/** @brief Draws the per-field override editor for one grass type variant. */
-	void DrawTypeOverrides(nlohmann::json& ov) const;
+	bool DrawTypeOverrides(nlohmann::json& ov) const;
 
 	virtual void LoadSettings(json& o_json) override;
 	virtual void SaveSettings(json& o_json) override;
@@ -204,15 +195,17 @@ private:
 	const char* QualityNames[static_cast<uint8_t>(Quality::Count)] = { "160", "192", "256", "320" };
 	uint32_t QualityDensities[static_cast<uint8_t>(Quality::Count)] = { 160, 192, 256, 320 };
 
-	PGrassRenderer<PGrassCommon::HighTierQuadrantCap, 4>* grassRendererHighLOD = nullptr;
-	PGrassRenderer<PGrassCommon::MidTierQuadrantCap, PGrassCommon::MidPatchBladeCount>* grassRendererMidLOD = nullptr;
-	PGrassRenderer<PGrassCommon::LowTierQuadrantCap, 1>* grassRendererLowLOD = nullptr;
-	PGrassRenderer<PGrassCommon::FarQuadrantCount, 1>* grassRendererFarLOD = nullptr;
+	std::unique_ptr<PGrassRenderer<PGrassCommon::HighTierQuadrantCap, 4>> grassRendererHighLOD;
+	std::unique_ptr<PGrassRenderer<PGrassCommon::MidTierQuadrantCap, PGrassCommon::MidPatchBladeCount>> grassRendererMidLOD;
+	std::unique_ptr<PGrassRenderer<PGrassCommon::LowTierQuadrantCap, 1>> grassRendererLowLOD;
+	std::unique_ptr<PGrassRenderer<PGrassCommon::FarQuadrantCount, 1>> grassRendererFarLOD;
 
 	std::vector<PGrassCommon::Quadrant> quadrantsHighLOD;
 	std::vector<PGrassCommon::Quadrant> quadrantsMidLOD;
 	std::vector<PGrassCommon::Quadrant> quadrantsLowLOD;
-	std::vector<PGrassCommon::Quadrant> quadrantsFarLOD;
+	std::vector<PGrassCommon::Quadrant> quadrantsFarLOD;  // stable slots; empty slots are default-constructed
+	std::unordered_map<uint64_t, uint32_t> farSlotByQuadrant;
+	std::vector<PGrassCommon::Quadrant> farWanted;
 	std::vector<PGrassCommon::Quadrant> quadrantsPresence;
 	uint64_t quadrantsHighVersion = 1;
 	uint64_t quadrantsMidVersion = 1;
@@ -222,7 +215,7 @@ private:
 	uint64_t farVisibleStamp = (std::numeric_limits<uint64_t>::max)();
 	std::array<bool, PGrassCommon::LowTierQuadrantCap> nearCoveredQuadrants{};
 
-	bool vanillaToggled = false;
+	bool vanillaGrassSuppressed = false;  // This feature turned vanilla grass off and owes it back when disabled.
 
 	// Far reads LAND data on workers. Near tiers use loaded cell LAND data.
 	GrassCellCache grassCellCache;
@@ -245,6 +238,8 @@ private:
 	// Top-down grass density and the terrain-darkening pass.
 	Texture2D* grassDensityTexture = nullptr;
 	Texture2D* grassMaterialDetailTexture = nullptr;
+	std::array<uint64_t, PGrassCommon::MaxGrassTypes> grassMaterialDetailHashes{};
+	std::array<bool, PGrassCommon::MaxGrassTypes> grassMaterialDetailValid{};
 	Texture2D* distantAmbientLUT = nullptr;
 	mutable ID3D11ComputeShader* distantAmbientLUTCS = nullptr;
 
@@ -332,8 +327,7 @@ private:
 	struct QuadrantGrass
 	{
 		uint64_t cacheVersion = 0;
-		std::array<uint8_t, PGrassCommon::QuadrantGrassSamples> ids{};
-		PGrassCommon::QuadrantOccupancy occupancy{};
+		std::array<uint8_t, PGrassCommon::QuadrantGrassSamples> ids{};  // filled grass ids
 
 		/** @brief World Z per LAND vertex. All values are QuadrantNoHeight when unavailable. */
 		std::array<float, PGrassCommon::QuadrantGrassSamples> heights{};
@@ -371,16 +365,6 @@ private:
 	float farQuadrantFrustumPadding = 0.0f;
 	float lowFadeInPositionPadding = 1.0f;
 
-	/** @brief Raw LAND height inputs for the last resolved quadrant; debug panel only. */
-	struct LandHeightDebug
-	{
-		float rawFirst;
-		float rawMin;
-		float2 extents;
-		float anchor;
-		float meshWorldZ;
-	} landHeightDebug{};
-
 	/** @brief Per-stage counters for why quadrants are rejected; debug panel only. */
 	struct QuadrantReject
 	{
@@ -396,7 +380,7 @@ private:
 	 * @brief Returns all cached LAND grass ids and heights for a cell, rebuilding stale entries together.
 	 * @return The cache entry, stable until eviction.
 	 */
-	const LoadedCellGrass& GetCellCache(RE::TESObjectLAND* land, int32_t cellX, int32_t cellY, uint32_t debugQuadIndex);
+	const LoadedCellGrass& GetCellCache(RE::TESObjectLAND* land, int32_t cellX, int32_t cellY);
 	void SyncGrassCellCachePolicy();
 	void ClearGrassMapCache();
 
@@ -423,18 +407,14 @@ private:
 
 	/** @brief Builds a GPU GrassType from base settings and sparse JSON overrides. */
 	PGrassCommon::GrassType ResolveGrassType(const nlohmann::json& typeOverride) const;
+	/** @brief Packs resolved per-type fields into the GPU layout, clamping values the shaders rely on. */
+	static PGrassCommon::GrassType BuildGrassType(const GrassTypeFields& fields);
 	void UpdateGrassMaterialDetailTexture();
 
 	/** @brief Returns the stable settings key for a land texture. */
 	static std::string LandTextureKey(const RE::TESLandTexture* tex);
 
-	/** @brief Weighted type selection for one texture. */
-	struct TextureSelection
-	{
-		std::vector<uint8_t> ids;       // Global type id per variant
-		std::vector<float> cumulative;  // Running weight sum
-		float total = 0.0f;
-	};
+	using TextureSelection = PGrassCommon::GrassTextureSelection;
 
 	// Maps texture variants to global type ids and weighted selections. Rebuilt when variants or weights change.
 	std::vector<std::pair<std::string, uint32_t>> typeAllocation;
@@ -445,6 +425,8 @@ private:
 
 	/** @brief Rebuilds type ids and weighted selections from settings.textureTypes. */
 	void RebuildTypeAllocation();
+	/** @brief Bare, base and allocated texture-variant slots in use. */
+	uint32_t ActiveGrassTypeCount() const { return std::min<uint32_t>(static_cast<uint32_t>(typeAllocation.size()) + 2u, PGrassCommon::MaxGrassTypes); }
 	void LoadTextureTypes();
 	void SaveTextureTypes() const;
 
@@ -498,8 +480,32 @@ private:
 	/** @brief Clears a grass id whose type's slope limits reject the LAND slope at a quadrant sample, as the generator culls its blades. */
 	uint8_t LimitGrassIdToSlope(uint8_t id, const PGrassCommon::Quadrant& quadrant, uint32_t column, uint32_t row) const;
 
-	/** @brief Streams Far LAND cells and rebuilds the Far quadrant list when the cache changes. */
-	void UpdateFarQuadrants(RE::TESWorldSpace* landWorldSpace, const RE::GridCellArray* cells, const VisibilityOrigin& origin);
+	/** @brief Player position in quadrant and cell units; tier lists and streamed LAND follow the loaded grid around the player. */
+	static VisibilityOrigin GetVisibilityOrigin();
+
+	/** @brief Streams Far LAND cells and updates the Far quadrant slots when the cache changes. */
+	void UpdateFarQuadrants(RE::TESWorldSpace* landWorldSpace, const VisibilityOrigin& origin);
+
+	/** @brief Loaded-grid and Far distances shared by visibility, generation and terrain darkening. */
+	struct FarRange
+	{
+		int32_t loadedGridLength;
+		int32_t loadedCellRadius;
+		int32_t extraCells;    // Far cells beyond the loaded grid, as set by the user
+		int32_t streamRadius;  // Cell radius of streamed LAND, including the guard ring
+		float start;           // Loaded-grid half extent
+		float end;             // Outer edge of Far grass
+	};
+	FarRange GetFarRange() const;
+
+	/** @brief Largest Far radius setting that fits the Far quadrant buffer around a loaded grid of this radius. */
+	static int32_t MaxFarExtraCells(int32_t loadedCellRadius)
+	{
+		return std::max(0, PGrassCommon::FarCellRadiusCap - PGrassCommon::FarStreamGuardCells - loadedCellRadius);
+	}
+
+	/** @brief Binds the constant buffers, heightmap and sampler every generator dispatch reads. */
+	void BindGeneratorState(ID3D11DeviceContext* ctx) const;
 
 	/** @brief Index into nearCoveredQuadrants, or -1 outside the near coverage window. */
 	static int32_t NearCoverageIndex(int32_t worldQuadrantX, int32_t worldQuadrantY, const VisibilityOrigin& origin);

@@ -107,7 +107,7 @@ private:
 
 	Texture2D* grassSurfaceMap = nullptr;
 	Texture2D* grassSurfaceDepth = nullptr;
-	ID3D11PixelShader* grassSurfacePS = nullptr;
+	winrt::com_ptr<ID3D11PixelShader> grassSurfacePS;
 	winrt::com_ptr<ID3D11VertexShader> grassSurfaceAlphaVS;
 	winrt::com_ptr<ID3D11PixelShader> grassSurfaceAlphaPS;
 	winrt::com_ptr<ID3DBlob> grassSurfaceAlphaVSBlob;
@@ -175,6 +175,8 @@ private:
 	bool renderCacheValid = false;
 
 	void CompileShaders();
+	/** @brief Drops the captured geometry and surface records, forcing the maps to re-render. */
+	void ClearCapture();
 	void GatherGeometry();
 	void CollectFrom(RE::NiAVObject* a_object, bool allowGrass);
 	RenderCacheState GetRenderCacheState() const;

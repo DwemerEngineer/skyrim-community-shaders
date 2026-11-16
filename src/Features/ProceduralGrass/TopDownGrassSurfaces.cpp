@@ -114,8 +114,8 @@ void TopDownOcclusion::AddGrassSurfaceBounds(const CapturedGeometry& entry)
 	const auto bounds = GetSurfaceGridBounds(bound, windowCentre, halfExtent * 1.25f, 128.0f, 128.0f);
 	for (int32_t y = bounds.minY; y <= bounds.maxY; ++y) {
 		for (int32_t x = bounds.minX; x <= bounds.maxX; ++x) {
-			const int32_t qx = static_cast<int32_t>(std::floor(x / 16.0));
-			const int32_t qy = static_cast<int32_t>(std::floor(y / 16.0));
+			const int32_t qx = x >> 4;
+			const int32_t qy = y >> 4;
 			auto& quadrant = grassSurfaceQuadrants[PGrassCommon::GrassQuadrantKey(qx, qy)];
 			quadrant.x = qx;
 			quadrant.y = qy;
@@ -169,7 +169,9 @@ ID3D11SamplerState* TopDownOcclusion::GetGrassAlphaSampler(uint8_t mode)
 		desc.MaxAnisotropy = 1;
 		desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
 		desc.MaxLOD = D3D11_FLOAT32_MAX;
-		DX::ThrowIfFailed(globals::d3d::device->CreateSamplerState(&desc, sampler.put()));
+		if (FAILED(globals::d3d::device->CreateSamplerState(&desc, sampler.put())))
+			return nullptr;
+		Util::SetResourceName(sampler.get(), "PGrass::ObjectSurfaceAlphaSampler");
 	}
 	return sampler.get();
 }
@@ -208,7 +210,8 @@ void TopDownOcclusion::CreateGrassSurfaceResources()
 	depthState.DepthEnable = TRUE;
 	depthState.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
 	depthState.DepthFunc = D3D11_COMPARISON_LESS;
-	DX::ThrowIfFailed(globals::d3d::device->CreateDepthStencilState(&depthState, grassSurfaceDSS.put()));
+	if (SUCCEEDED(globals::d3d::device->CreateDepthStencilState(&depthState, grassSurfaceDSS.put())))
+		Util::SetResourceName(grassSurfaceDSS.get(), "PGrass::ObjectSurfaceDSS");
 }
 
 void TopDownOcclusion::RenderGrassSurfaces(ID3D11DeviceContext* context)
@@ -217,7 +220,7 @@ void TopDownOcclusion::RenderGrassSurfaces(ID3D11DeviceContext* context)
 	if (grassSurfaceQuadrants.empty())
 		return;
 	if (!grassSurfacePS)
-		grassSurfacePS = static_cast<ID3D11PixelShader*>(Util::CompileShader(L"Data\\Shaders\\TopDownOcclusion\\ObjectCapture.hlsl", { { "GRASS_SURFACE", "1" } }, "ps_5_0"));
+		grassSurfacePS.attach(static_cast<ID3D11PixelShader*>(Util::CompileShader(L"Data\\Shaders\\TopDownOcclusion\\ObjectCapture.hlsl", { { "GRASS_SURFACE", "1" } }, "ps_5_0")));
 	if (!grassSurfacePS)
 		return;
 
@@ -230,6 +233,8 @@ void TopDownOcclusion::RenderGrassSurfaces(ID3D11DeviceContext* context)
 		return;
 
 	CreateGrassSurfaceResources();
+	if (!grassSurfaceDSS)
+		return;
 
 	float minZ = FLT_MAX, maxZ = -FLT_MAX;
 	for (const auto& entry : captured) {
@@ -247,7 +252,7 @@ void TopDownOcclusion::RenderGrassSurfaces(ID3D11DeviceContext* context)
 	context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
 	context->OMSetDepthStencilState(grassSurfaceDSS.get(), 0);
 	context->VSSetShader(heightVS, nullptr, 0);
-	context->PSSetShader(grassSurfacePS, nullptr, 0);
+	context->PSSetShader(grassSurfacePS.get(), nullptr, 0);
 	auto* constants = heightCB->CB();
 	context->PSSetConstantBuffers(0, 1, &constants);
 
@@ -269,12 +274,14 @@ void TopDownOcclusion::RenderGrassSurfaces(ID3D11DeviceContext* context)
 
 		if (alpha != currentAlpha) {
 			context->VSSetShader(alpha ? grassSurfaceAlphaVS.get() : heightVS, nullptr, 0);
-			context->PSSetShader(alpha ? grassSurfaceAlphaPS.get() : grassSurfacePS, nullptr, 0);
+			context->PSSetShader(alpha ? grassSurfaceAlphaPS.get() : grassSurfacePS.get(), nullptr, 0);
 			currentAlpha = alpha;
 		}
+		auto* alphaSampler = alpha ? GetGrassAlphaSampler(entry.grassAlphaSampler) : nullptr;
+		if (alpha && !alphaSampler)
+			continue;
 		if (alpha) {
 			auto* texture = entry.grassAlphaTexture.get();
-			auto* alphaSampler = GetGrassAlphaSampler(entry.grassAlphaSampler);
 			context->PSSetShaderResources(0, 1, &texture);
 			context->PSSetSamplers(0, 1, &alphaSampler);
 		}

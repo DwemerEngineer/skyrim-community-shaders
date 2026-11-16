@@ -11,6 +11,12 @@
 #	define CSHADER
 #endif
 
+// Before the grass common header, which builds the camera-snapped probe frame on it.
+#if defined(SKYLIGHTING) && defined(HIGH_LOD)
+#	define SKYLIGHTING_PROBE_REGISTER t50
+#	include "Skylighting/Skylighting.hlsli"
+#endif
+
 #include "ProceduralGrass/PGrassCommon.hlsli"
 
 #if defined(PGRASS_CACHED_COLLISION)
@@ -19,11 +25,6 @@
 #		define GRASS_COLLISION_CURRENT_ONLY
 #	endif
 #	include "GrassCollision/GrassCollision.hlsli"
-#endif
-
-#if defined(SKYLIGHTING) && defined(HIGH_LOD)
-#	define SKYLIGHTING_PROBE_REGISTER t50
-#	include "Skylighting/Skylighting.hlsli"
 #endif
 
 #if defined(HIGH_LOD) && defined(TERRAIN_SHADOWS)
@@ -56,14 +57,16 @@
 #	define SLOPE_EXTRA_BLADES 0
 #endif
 
-// Match the constant-buffer array to the renderer's quadrant capacity.
+// Match the constant-buffer array to the renderer's quadrant capacity (PGrassCommon.h tier caps).
 #if !defined(QUADRANT_DATA_SIZE)
 #	if defined(HIGH_LOD)
-#		define QUADRANT_DATA_SIZE 9
+#		define QUADRANT_DATA_SIZE 25
 #	elif defined(MID_LOD)
-#		define QUADRANT_DATA_SIZE 16
-#	else  // LOW_LOD
-#		define QUADRANT_DATA_SIZE 75
+#		define QUADRANT_DATA_SIZE 81
+#	elif defined(FAR_LOD)
+#		define QUADRANT_DATA_SIZE 4000
+#	else
+#		define QUADRANT_DATA_SIZE 169
 #	endif
 #endif
 
@@ -121,18 +124,16 @@ static const uint MAX_BLADES_PER_THREAD = FAR_STAGED_CANDIDATES;
 static const uint MAX_BLADES_PER_THREAD = 1u + (SLOPE_EXTRA_BLADES + PATCH_BLADE_COUNT - 1u) / PATCH_BLADE_COUNT;
 #endif
 
-#if defined(HIGH_LOD) || defined(MID_LOD) || defined(LOW_LOD)
 // Adjacent lanes occupy adjacent slots for each emission, reducing shared-memory bank conflicts.
 groupshared Blade GroupBlades[THREADGROUP_SIZE * MAX_BLADES_PER_THREAD];
-#	if defined(PGRASS_OUTER_LIST)
+#if defined(PGRASS_OUTER_LIST)
 groupshared uint GroupBladeOuter[THREADGROUP_SIZE * MAX_BLADES_PER_THREAD];
 groupshared uint GroupOuterCount;
-#	endif
+#endif
 groupshared uint GroupInnerCount;
 groupshared uint2 GroupOutputBase;
-#	if defined(PGRASS_STAGED_ROUNDS)
+#if defined(PGRASS_STAGED_ROUNDS)
 groupshared uint GroupCandidateRounds;
-#	endif
 #endif
 
 Texture2D<float> TerrainHeightTexture : register(t0);
@@ -352,15 +353,14 @@ uint GetSharedPatchRank(SharedPatchDomain domain, uint patch)
 #include "ProceduralGrass/PGrassBladeConstruction.hlsli"
 #include "ProceduralGrass/PGrassGeneration.hlsli"
 
-#if defined(HIGH_LOD) || defined(MID_LOD) || defined(LOW_LOD)
 // Writes the group's staged blades with one output reservation per list. Every thread of the group must call it.
 void FlushGroupBlades(uint groupIndex, uint2 emittedBladeCounts)
 {
 	if (groupIndex == 0u) {
 		GroupInnerCount = 0u;
-#	if defined(PGRASS_OUTER_LIST)
+#if defined(PGRASS_OUTER_LIST)
 		GroupOuterCount = 0u;
-#	endif
+#endif
 		GroupOutputBase = uint2(0u, 0u);
 	}
 
@@ -369,48 +369,47 @@ void FlushGroupBlades(uint groupIndex, uint2 emittedBladeCounts)
 	uint2 threadOutputOffset = uint2(0u, 0u);
 	if (emittedBladeCounts.x != 0u)
 		InterlockedAdd(GroupInnerCount, emittedBladeCounts.x, threadOutputOffset.x);
-#	if defined(PGRASS_OUTER_LIST)
+#if defined(PGRASS_OUTER_LIST)
 	if (emittedBladeCounts.y != 0u)
 		InterlockedAdd(GroupOuterCount, emittedBladeCounts.y, threadOutputOffset.y);
-#	endif
+#endif
 
 	GroupMemoryBarrierWithGroupSync();
 
 	if (groupIndex == 0u) {
 		if (GroupInnerCount != 0u)
 			IndirectArgs.InterlockedAdd(4u, GroupInnerCount, GroupOutputBase.x);
-#	if defined(PGRASS_OUTER_LIST)
+#if defined(PGRASS_OUTER_LIST)
 		if (GroupOuterCount != 0u) {
 			uint oldOuterEnd;
 			IndirectArgs.InterlockedAdd(24u, GroupOuterCount, oldOuterEnd);
 			IndirectArgs.InterlockedAdd(36u, 0u - GroupOuterCount, oldOuterEnd);
 			GroupOutputBase.y = oldOuterEnd - GroupOuterCount;
 		}
-#	endif
+#endif
 	}
 
 	GroupMemoryBarrierWithGroupSync();
 
-#	if defined(PGRASS_OUTER_LIST)
+#if defined(PGRASS_OUTER_LIST)
 	uint2 categoryOffset = 0u;
-#	endif
+#endif
 	uint emittedBladeCount = emittedBladeCounts.x + emittedBladeCounts.y;
 	[loop] for (uint i = 0u; i < emittedBladeCount; ++i)
 	{
-#	if defined(PGRASS_OUTER_LIST)
+#if defined(PGRASS_OUTER_LIST)
 		uint outer = GroupBladeOuter[i * THREADGROUP_SIZE + groupIndex];
 		uint outputIndex;
 		if (outer != 0u)
 			outputIndex = GroupOutputBase.y + threadOutputOffset.y + categoryOffset.y++;
 		else
 			outputIndex = GroupOutputBase.x + threadOutputOffset.x + categoryOffset.x++;
-#	else
+#else
 		uint outputIndex = GroupOutputBase.x + threadOutputOffset.x + i;
-#	endif
+#endif
 		BladeOutput[outputIndex] = GroupBlades[i * THREADGROUP_SIZE + groupIndex];
 	}
 }
-#endif
 
 [numthreads(TG_DIM_X, TG_DIM_Y, 1)] void main(uint3 dispatch : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex) {
 	uint tileTask = LoadBladeTask(dispatch.z);
@@ -456,8 +455,6 @@ void FlushGroupBlades(uint groupIndex, uint2 emittedBladeCounts)
 #else
 	uint2 emittedBladeCounts;
 	GenerateThreadBlades(dispatch, groupIndex, emittedBladeCounts);
-#	if defined(HIGH_LOD) || defined(MID_LOD) || defined(LOW_LOD)
 	FlushGroupBlades(groupIndex, emittedBladeCounts);
-#	endif
 #endif
 }

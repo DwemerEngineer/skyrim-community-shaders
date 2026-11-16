@@ -15,8 +15,7 @@ struct FarGrassSurface
 	float3 transmissionAlbedo;
 	float3 bounceColor;
 	float ambientDesaturation;
-	float fuzzAlbedo;
-	float3 fuzzColor;
+	GrassFuzz fuzz;
 };
 
 /** @brief Approximates unresolved reflection layers with broad lobes, retaining thin-surface scattering. */
@@ -29,46 +28,36 @@ FarGrassLighting GetFarGrassLighting(FarGrassSurface surface, MaterialProperties
 	float normalDotView = clamp(dot(directNormal, viewDirection), EPSILON_DOT_CLAMP, 1.0f);
 	// Use the fully rough limit for the reflection energy of unresolved blades.
 	float3 specularAlbedo = saturate(PBR::SpecularDirectionalAlbedo(material.F0, 1.0f, normalDotView));
-	float fuzzAlbedo = surface.fuzzAlbedo;
+	float fuzzAlbedo = surface.fuzz.albedo;
 	float3 surfaceThroughput = (1.0f - specularAlbedo) * (1.0f - fuzzAlbedo);
-	float3 layerAlbedo = specularAlbedo * (1.0f - fuzzAlbedo) + fuzzAlbedo * surface.fuzzColor;
+	float3 layerAlbedo = specularAlbedo * (1.0f - fuzzAlbedo) + fuzzAlbedo * surface.fuzz.color;
 
 	float normalDotLight = dot(directNormal, lightDirection);
-	float2 diffuseCosines = max(float2(normalDotLight, -normalDotLight), 0.0f);
 	float3 sunIrradiance = lightColor * surfaceShadow * detailShadow * BRDF::Diffuse_Lambert();
-	lighting.diffuse = (surface.reflectionAlbedo * diffuseCosines.x + surface.transmissionAlbedo * diffuseCosines.y) *
-	                   sunIrradiance * surfaceThroughput;
+	lighting.diffuse = GetGrassThinDiffuse(surface.reflectionAlbedo, surface.transmissionAlbedo, sunIrradiance * surfaceThroughput, normalDotLight);
 
 	// Redistribute the surface layers' reflected energy over the visible hemisphere. The fuzz covers both faces, so light
 	// from behind reaches the viewer-side fuzz through the blade, tinted by its transmission.
-	float lightPath = canopyOverhead / max(lightDirection.z, CanopyReflectionMinElevation);
-	lighting.specular = (layerAlbedo * diffuseCosines.x + fuzzAlbedo * surface.fuzzColor * surface.transmissionAlbedo * diffuseCosines.y) * sunIrradiance *
-	                    exp2(-lightPath * CanopyReflectionExtinction);
+	float2 diffuseCosines = saturate(float2(normalDotLight, -normalDotLight));
+	lighting.specular = (layerAlbedo * diffuseCosines.x + fuzzAlbedo * surface.fuzz.color * surface.transmissionAlbedo * diffuseCosines.y) * sunIrradiance *
+	                    GetCanopyPathTransmittance(canopyOverhead, lightDirection.z);
 
-	float3 singleScatterAlbedo = saturate(surface.reflectionAlbedo + surface.transmissionAlbedo);
-	float3 canopyScatterAlbedo = CanopyScatterEscape * singleScatterAlbedo /
-	                             (1.0f - (1.0f - CanopyScatterEscape) * singleScatterAlbedo);
-	float blockedLight = saturate(1.0f - detailShadow) * surfaceShadow * saturate(lightDirection.z);
-	lighting.diffuse += lightColor * BRDF::Diffuse_Lambert() * blockedLight * canopyScatterAlbedo *
-	                    (surface.reflectionAlbedo + surface.transmissionAlbedo) * surfaceThroughput;
+	float3 canopyScatterAlbedo = GetCanopyScatterAlbedo(surface.reflectionAlbedo, surface.transmissionAlbedo);
+	lighting.diffuse += GetCanopyBlockedScatter(lightColor, detailShadow, surfaceShadow, lightDirection,
+		surface.reflectionAlbedo, surface.transmissionAlbedo, surfaceThroughput);
 
 	float3 frontIrradiance = DistantAmbientLUT.SampleLevel(LinearSampler, GBuffer::EncodeNormal(indirectNormal), 0).rgb;
-	float3 backIrradiance = DistantAmbientLUT.SampleLevel(LinearSampler, GBuffer::EncodeNormal(-indirectNormal), 0).rgb;
 	float3 frontSkyLight = canopyAO * GetCanopySkyLight(indirectNormal, canopyOverhead, canopyScatterAlbedo);
 	float3 backSkyLight = canopyAO * GetCanopySkyLight(-indirectNormal, canopyOverhead, canopyScatterAlbedo);
-	float3 frontAmbient = lerp(frontIrradiance, dot(frontIrradiance, float3(0.2126f, 0.7152f, 0.0722f)),
-							  surface.ambientDesaturation) *
-	                      frontSkyLight;
-	float3 backAmbient = lerp(backIrradiance, dot(backIrradiance, float3(0.2126f, 0.7152f, 0.0722f)),
-							 surface.ambientDesaturation) *
-	                     backSkyLight;
+	float3 frontAmbient = Color::Saturation(frontIrradiance, 1.0f - surface.ambientDesaturation) * frontSkyLight;
+	float3 backAmbient = SampleGrassAmbient(-indirectNormal, surface.ambientDesaturation) * backSkyLight;
 	float3 scatteringThroughput = MultiBounceAO(material.BaseColor, material.AO) * surfaceThroughput;
 	lighting.diffuseAlbedo = surface.reflectionAlbedo * scatteringThroughput;
 	lighting.ambient = frontAmbient * lighting.diffuseAlbedo + backAmbient * surface.transmissionAlbedo * scatteringThroughput;
 	lighting.ambient += frontAmbient * surface.bounceColor * (1.0f - canopyHeight) * surface.reflectionAlbedo * surfaceThroughput;
 
 	// Ambient fuzz reflects in its colour; the broad reflection reuses the same filtered sky hemisphere.
-	lighting.ambient += frontIrradiance * frontSkyLight * material.AO * fuzzAlbedo * surface.fuzzColor;
+	lighting.ambient += frontIrradiance * frontSkyLight * material.AO * fuzzAlbedo * surface.fuzz.color;
 	lighting.diffuse += lighting.ambient;
 	lighting.specular += ColorManagement::SceneToLinear(frontIrradiance * frontSkyLight * Color::ReflectionNormalisationScale) *
 	                     material.AO * specularAlbedo * (1.0f - fuzzAlbedo);

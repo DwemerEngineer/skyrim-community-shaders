@@ -141,21 +141,20 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	float objectDensity = 0.0f;
 	float objectDensityRandom = 0.0f;
 	if (objectSurface) {
-		if (!LoadGrassObjectSurface(bladeWorldPos2D, bladeWorldZ, terrainSlope, type, objectDensity))
-			return false;
 		uint densityHash = initialHash.x ^ 0xB5297A4Du;
 		objectDensityRandom = float(Random::pcg(densityHash)) * UINT_TO_FLOAT;
-		if (objectDensityRandom >= objectDensity)
-			return false;
+		// A missing or thinned surface reads as bare; any bare root is rejected below.
+		if (!LoadGrassObjectSurface(bladeWorldPos2D, bladeWorldZ, terrainSlope, type, objectDensity) || objectDensityRandom >= objectDensity)
+			type = 0u;
 		terrainNormalZ = rsqrt(dot(terrainSlope, terrainSlope) + 1.0f);
 #if defined(FAR_LOD)
-		if (!IsGrassObjectInterior(bladeWorldPos2D, bladeWorldZ, terrainSlope, type))
-			return false;
+		if (type != 0u && !IsGrassObjectInterior(bladeWorldPos2D, bladeWorldZ, terrainSlope, type))
+			type = 0u;
 #endif
 	} else {
-		ComputeGrassType(type, packedGrassCell, mapSamplePos, typeRandom, bladeWorldPos2D, float(hash.z & 0xFFFFu) * (1.0f / 65536.0f));
+		type = ComputeGrassType(packedGrassCell, mapSamplePos, typeRandom, bladeWorldPos2D, float(hash.z & 0xFFFFu) * (1.0f / 65536.0f));
 	}
-	if (type == 0u && !cullsDisabled)
+	if (type == 0u && (objectSurface || !cullsDisabled))
 		return false;
 	type = max(type, 1u);
 
@@ -472,7 +471,7 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 			uint secondType;
 			float2 secondWorld = secondRoot.xy + FrameBuffer::CameraPosAdjust.xy;
 			outerGeometry = LoadGrassObjectSurface(secondWorld, secondHeight, secondSlope, secondType, secondDensity) && secondType == type &&
-				IsGrassObjectInterior(secondWorld, secondHeight, secondSlope, secondType);
+			                IsGrassObjectInterior(secondWorld, secondHeight, secondSlope, secondType);
 			float secondNormalZ = rsqrt(dot(secondSlope, secondSlope) + 1.0f);
 			outerGeometry = outerGeometry && objectDensityRandom < secondDensity && secondNormalZ >= generatorType.maxSlope && secondNormalZ <= generatorType.minSlope;
 			secondRoot.z = secondHeight - FrameBuffer::CameraPosAdjust.z;
@@ -602,11 +601,8 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	b.skylightingRoot = viewPos;
 #	elif !defined(LOW_LOD)
 #		if defined(SKYLIGHTING)
-	float3 probeCell = round(FrameBuffer::CameraPosAdjust.xyz / Skylighting::CELL_SIZE);
-	float3 probeOffset = probeCell * Skylighting::CELL_SIZE - FrameBuffer::CameraPosAdjust.xyz;
-	uint3 probeArrayOrigin = (uint3)((int3)probeCell - (int3)(Skylighting::ARRAY_DIM / 2)) % Skylighting::ARRAY_DIM;
-	float3 skylightingPosition = viewPos;
-	sh2 skylightingSH = Skylighting::SampleWithOrigin(skylightingPosition, float3(0.0f, 0.0f, 1.0f), probeOffset, probeArrayOrigin);
+	SkylightingProbeFrame probes = GetSkylightingProbeFrame();
+	sh2 skylightingSH = Skylighting::SampleWithOrigin(viewPos, float3(0.0f, 0.0f, 1.0f), probes.offset, probes.arrayOrigin);
 
 	b.skylightingSH0 = f32tof16(skylightingSH.x) << 16 | f32tof16(skylightingSH.y);
 	b.skylightingSH1 = f32tof16(skylightingSH.z) << 16 | f32tof16(skylightingSH.w);
@@ -623,16 +619,17 @@ bool BuildBlade(uint3 initialHash, float2 mapSamplePos, float2 initialWorldPos2D
 	collisionTipViewPos.xy += windDir * windDisplacement;
 
 	float3 collisionDisplacement;
+	float collisionNearFactor = smoothstep(2048.0f, 0.0f, length(collisionTipViewPos.xy));
 
 #		if defined(MID_LOD)
 	float3 unusedPreviousCollisionDisplacement;
-	GrassCollision::GetDisplacedPosition(collisionTipViewPos, viewPos, 1.0f, 2048.0f, true, 0.75f,
+	GrassCollision::GetDisplacedPosition(collisionTipViewPos, viewPos, 1.0f, collisionNearFactor, true, 0.75f,
 		collisionDisplacement, unusedPreviousCollisionDisplacement);
 	b.collisionData = f32tof16(collisionDisplacement.x) << 16 | f32tof16(collisionDisplacement.y);
 	b.previousWind = packedBladeData << 16 | f32tof16(collisionDisplacement.z);
 #		else
 	float3 previousCollisionDisplacement;
-	GrassCollision::GetDisplacedPosition(collisionTipViewPos, viewPos, 1.0f, 2048.0f, true, 0.75f,
+	GrassCollision::GetDisplacedPosition(collisionTipViewPos, viewPos, 1.0f, collisionNearFactor, true, 0.75f,
 		collisionDisplacement, previousCollisionDisplacement);
 
 	b.collisionData.x = f32tof16(collisionDisplacement.x) << 16 | f32tof16(collisionDisplacement.y);

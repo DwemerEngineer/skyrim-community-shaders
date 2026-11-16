@@ -82,34 +82,32 @@ float3 ShadeTerrainCanopy(CanopyMaterial canopy, float3 position, int2 pixel, fl
 	float3 V = normalize(-position);
 	float3 L = SharedData::DirLightDirection.xyz;
 	// Average the view-facing blade orientations, then follow the blades' existing normal ramp.
-	float normalBlend = smoothstep(2048.0f, 24576.0f, length(position.xy));
+	float normalBlend = GetCanopyNormalBlend(length(position.xy));
 	float2 meanFacing = V.xy * rsqrt(max(dot(V.xy, V.xy), 1.0e-8f)) * (2.0f / Math::PI);
 	float3 N = normalize(float3(meanFacing * (1.0f - normalBlend), max(normalBlend, 1.0e-4f)));
 	float occlusionScale = lerp(1.0f, 0.8f, smoothstep(0.0f, 1.0f, farWidthT));
-	float contact = lerp(1.0f, lerp(0.62f, 0.9f, smoothstep(0.0f, 0.9f, 1.0f / 3.0f)), occlusionScale);
+	float contact = lerp(1.0f, GetLowContactOcclusion(1.0f / 3.0f), occlusionScale);
 
 	MaterialProperties material = (MaterialProperties)0;
 	material.BaseColor = canopy.baseColor;
 	material.AO = sqrt(saturate(canopy.ao * contact));
 	material.F0 = saturate(canopy.f0);
 	float fuzzNdotV = clamp(dot(N, V), EPSILON_DOT_CLAMP, 1.0f);
-	float fuzzRoughness = clamp(canopy.fuzzRoughness, 0.01f, 1.0f);
 	FarGrassSurface surface;
 	surface.reflectionAlbedo = canopy.reflection;
 	surface.transmissionAlbedo = canopy.transmission;
 	surface.bounceColor = canopy.bounce;
 	surface.ambientDesaturation = canopy.ambientDesaturation;
-	surface.fuzzAlbedo = saturate(canopy.fuzzWeight) * PBR::FuzzDirectionalAlbedo(fuzzNdotV, fuzzRoughness);
-	surface.fuzzColor = GetGrassFuzzColor(canopy.baseColor, canopy.fuzzTint);
+	// The canopy mixes several types, so the fit is prepared from their mean roughness here rather than on the CPU.
+	surface.fuzz = GetGrassFuzz(canopy.fuzzWeight, PBR::FuzzDirectionalAlbedoParameters(clamp(canopy.fuzzRoughness, 0.01f, 1.0f)), canopy.fuzzTint,
+		canopy.baseColor, fuzzNdotV);
 
 	float2 shadowUV = FrameBuffer::GetDynamicResolutionAdjustedScreenPosition((float2(pixel) + 0.5f) * dynamicResolutionInverted);
 	float surfaceShadow = ShadowMask.SampleLevel(ShadowSampler, shadowUV, 0).x *
 	                      lerp(1.0f, groundSunFacing, smoothstep(0.0f, 0.1f, farWidthT));
 	float detailShadow = 1.0f;
 #if defined(SCREEN_SPACE_SHADOWS)
-	float traceFade = GetFarGrassRootShadowFade(position);
-	[branch] if (traceFade > 0.0f)
-		detailShadow = lerp(1.0f, SampleGrassRootContactShadow(GrassScreenShadow, LinearSampler, float2(pixel) + 0.5f), traceFade);
+	detailShadow = GetGrassRootDetailShadow(GrassScreenShadow, LinearSampler, float2(pixel) + 0.5f, GetFarGrassRootShadowFade(position), 0.0f, 0.0f);
 	detailShadow *= GetBladeShadowPattern(V, L, 0u, 1.0f / 3.0f, 1.0f);
 #endif
 	detailShadow *= contact;

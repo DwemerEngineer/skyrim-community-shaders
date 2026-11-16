@@ -15,12 +15,12 @@ namespace PGrassRendererQuads
 	inline constexpr uint32_t WorkShareSteps = 8;         // Compact Far work generates a multiple of 1/8 of its patches.
 	inline constexpr uint32_t WorkOccupiedTile = 1u << 21;
 	inline constexpr uint32_t WorkTileShift = 22;
-	inline constexpr uint32_t WorkTileMask = 0xFFu;
 	inline constexpr uint32_t WorkFullGrass = 1u << 30;
 	inline constexpr uint32_t WorkFarHandoff = 1u << 31;  // Far work near Low, generated with the handoff fill.
 	inline constexpr float FarHandoffFillFade = 4096.0f;  // Keep in sync with PGrassGeneration.hlsli.
-	inline constexpr uint32_t OccupancyTilesPerAxis = PGrassCommon::QuadrantGrassPitch - 1;
+	inline constexpr uint32_t OccupancyTilesPerAxis = PGrassCommon::QuadrantCellPitch;
 	inline constexpr uint32_t OccupancyTileCount = OccupancyTilesPerAxis * OccupancyTilesPerAxis;
+	inline constexpr uint32_t ThreadGroupSize = 64;
 
 	/** Stable quadrant identity hash, generated once on the CPU for all patches in that quadrant. */
 	uint32_t QuadrantHash(uint32_t x, uint32_t y);
@@ -40,7 +40,25 @@ namespace PGrassRendererQuads
 	SideFrustum BuildSideFrustum(const float4x4& viewProj);
 
 	/** Conservative XY clip test for a padded quadrant LAND AABB. Near/far clipping intentionally matches the generator and stays disabled. */
-	QuadrantFrustumState ClassifyQuadrantFrustum(const PGrassCommon::Quadrant& quadrant, const SideFrustum& frustum, const float4& cameraPosAdjust, float xyPadding, bool& hasLand);
+	QuadrantFrustumState ClassifyQuadrantFrustum(const PGrassCommon::Quadrant& quadrant, const SideFrustum& frustum, const float4& cameraPosAdjust, float xyPadding);
+
+	/** @brief Per-frame inputs of one tier's blade generation. */
+	struct GenerateParams
+	{
+		uint64_t contentVersion = 0;
+		float2 lodOrigin;
+		float4 lodFadeIn;   // x: fade-in start, y: inverse range, z: unused, w: fade-out endpoint
+		float4 lodFadeOut;  // x: fade-out start, y: inverse range; Far: z edge keep, w inverse unload fade
+		float frustumPadding = 0.0f;
+		float fadeInPositionPadding = 0.0f;
+		/** Far only. x: start of Far's distance thinning, y: its inverse length, z: the keep at its end, w: the view-facing keep. */
+		float4 farKeepParams;
+		float edgeNoise = 0.0f;
+		std::array<int32_t, 2> objectOriginQuadrant{};  // Quadrant whose near ring treats object surfaces as near-covered.
+		bool disableCulls = false;
+
+		bool operator==(const GenerateParams&) const = default;
+	};
 }
 
 template <uint32_t QuadrantCount, uint32_t PatchBladeCount>
@@ -49,83 +67,93 @@ class PGrassRenderer
 public:
 	/**
 	 * @brief Creates a tier renderer with a lazily sized blade buffer.
-	 *
 	 * @param slopeExtraBlades Extra candidate blade slots per patch for filling sloped ground. Keep this small because it enlarges the
 	 *						   blade buffer and the base thread's candidate loop.
+	 * @param handoffSourceDensity Far only: Low's lattice density, which sizes the handoff fill.
 	 */
-	PGrassRenderer(uint32_t grassDensity, uint32_t tgSize, Buffer* vertexIndicesBuf, const char* lodDef, const char* vertCountDef, const char* extraDef = nullptr,
-		uint32_t slopeExtraBlades = 0, uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade), Buffer* outerVertexIndicesBuf = nullptr);
+	PGrassRenderer(PGrassCommon::Tier tier, uint32_t grassDensity, Buffer* vertexIndicesBuf, Buffer* outerVertexIndicesBuf,
+		uint32_t bladeStrideBytes, uint32_t slopeExtraBlades = 1, uint32_t handoffSourceDensity = 0);
 
-	void SetDensity(uint32_t grassDensity);
-	/** Discards the retained blade-buffer capacity. */
-	void ResetBladeCapacity();
-	void SetThreadGroupSize(uint32_t tgSize);
+	/**
+	 * @brief Sets the tier's lattice density.
+	 * @param handoffSourceDensity Far only: Low's lattice density, which sizes the handoff fill.
+	 */
+	void SetDensity(uint32_t grassDensity, uint32_t handoffSourceDensity = 0);
 
 	void ClearShaderCache();
 
-	/**
-	 * @brief Builds the visible work list when its inputs change and dispatches blade generation.
-	 * @param farKeepParams Far only. x: start of Far's distance thinning, y: its inverse length, z: the keep at its end,
-	 * w: the view-facing keep. Bounds each quadrant's keep so its work generates only the patches that keep can retain.
-	 */
-	void GenerateBlades(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion, int32_t cellXOffset, int32_t cellYOffset,
-		const float2& lodOrigin, const float4& lodFadeIn, const float4& lodFadeOut, float frustumPadding, bool disableGeneratorCulls,
-		float fadeInPositionPadding = 0.0f, const float4& farKeepParams = float4());
+	/** @brief Builds the visible work list when its inputs change and dispatches blade generation. */
+	void GenerateBlades(ID3D11DeviceContext* ctx, const std::vector<PGrassCommon::Quadrant>& quadrants, const PGrassRendererQuads::GenerateParams& params);
 	void RenderDepth(ID3D11DeviceContext* ctx, ID3D11PixelShader* depthClipPS = nullptr);
 	void RenderGrass(ID3D11DeviceContext* ctx);
 
-	/** @brief Reads back the instance count generated last frame. Debug only; stalls. */
-	uint32_t ReadBladeCount() const;
+	/** @brief Returns the latest completed debug readback without waiting for the GPU. */
+	uint32_t ReadBladeCount();
 
 private:
 	using ShaderDefines = std::vector<std::pair<const char*, const char*>>;
+	using Tier = PGrassCommon::Tier;
 
-	const char* lodDefine;
-	const char* vertCountDefine;
-	const char* extraDefine;
-	uint32_t density;
+	// Hash coordinates are offset so negative cells still produce distinct, stable seeds.
+	static constexpr int32_t QuadrantHashCellOffsetX = 61;
+	static constexpr int32_t QuadrantHashCellOffsetY = 60;
+
+	const Tier tier;
+	uint32_t density = 0;
 	uint32_t bladeStrideBytes = sizeof(PGrassCommon::Blade);  // High stores SH, Mid stores the probe root; either may include collision. Far is 16 bytes.
 	std::string densityString;
 	uint32_t slopeExtraBlades = 0;
 	uint32_t handoffExtraBlades = 0;  // Far's slope slot plus the fill slots that match Low's density in the handoff band.
 	std::string patchBladeCountString = std::to_string(PatchBladeCount);
 	std::string bladeBatchSizeString;
-	uint32_t patchesPerQuadrant;
+	uint32_t patchesPerQuadrant = 0;
+	uint32_t patchesPerRow = 0;
+	uint32_t patchRows = 0;
 	uint32_t bladeBufferCapacity = 0;
-	uint32_t threadGroupSize;
-	std::string threadGroupSizeString;
+	bool bladeCapacityClampLogged = false;
 	std::string quadrantCountString = std::to_string(QuadrantCount);
 
-	ID3D11ComputeShader* generatorCS = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> generatorCS;
 	bool generatorCompileAttempted = false;
-	ID3D11ComputeShader* handoffGeneratorCS = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> handoffGeneratorCS;
 	bool handoffGeneratorCompileAttempted = false;
-	ID3D11ComputeShader* batchArgsCS = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> batchArgsCS;
+
+	struct CachedGenerator
+	{
+		winrt::com_ptr<ID3D11ComputeShader> shader;
+		uint64_t lastUse = 0;
+	};
+
+	std::unordered_map<std::string, CachedGenerator> generatorVariants;
+	uint64_t generatorVariantUse = 0;
 
 	// Indexed by (depth ? 2 : 0) + (outer ? 1 : 0).
-	std::array<ID3D11VertexShader*, 4> vertexShaders{};
+	std::array<winrt::com_ptr<ID3D11VertexShader>, 4> vertexShaders;
 
 	// Feature variants for wetness and local-light availability.
-	std::array<ID3D11PixelShader*, 8> pixelShaders{};
+	std::array<winrt::com_ptr<ID3D11PixelShader>, 8> pixelShaders;
 
-	StructuredBuffer* bladesSB = nullptr;
+	std::unique_ptr<StructuredBuffer> bladesSB;
 
-	StructuredBuffer* quadrantGrassCellsSB = nullptr;
-	std::vector<std::array<uint8_t, PGrassCommon::QuadrantGrassSamples>> quadrantGrassIdsStaging;
+	// Per-slot generator inputs. A slot is restaged and uploaded only when its quadrant, a border neighbour, or a shared
+	// input changes, so streaming one Far cell does not rebuild the whole tier.
+	std::unique_ptr<StructuredBuffer> quadrantGrassCellsSB;
 	std::vector<uint32_t> quadrantGrassCellsStaging;  // one packed 2x2 LAND-id cell per 16x16 quadrant cell
-	StructuredBuffer* quadrantOccupancySB = nullptr;
+	std::unique_ptr<StructuredBuffer> quadrantOccupancySB;
 	std::vector<uint32_t> quadrantOccupancyStaging;
 	std::vector<uint64_t> quadrantOccupancyVersions;
-
-	StructuredBuffer* quadrantHeightSB = nullptr;
+	std::unique_ptr<StructuredBuffer> quadrantHeightSB;
 	std::vector<float> quadrantHeightStaging;
-
-	StructuredBuffer* tileHeightBoundsSB = nullptr;
+	std::unique_ptr<StructuredBuffer> tileHeightBoundsSB;
 	std::vector<float2> tileHeightBoundsStaging;
 	std::vector<PGrassCommon::QuadrantOccupancy> objectOccupancyRows;
 	std::vector<float2> objectHeightBounds;
+	std::vector<PGrassCommon::Quadrant> stagedQuadrants;
+	std::vector<uint8_t> slotDirty;
+	std::unordered_map<uint64_t, uint32_t> slotByWorldQuadrant;
 
-	StructuredBuffer* visibleWorkSB = nullptr;
+	std::unique_ptr<StructuredBuffer> visibleWorkSB;
 	std::vector<uint32_t> visibleWorkStaging;
 	uint32_t visibleTerrainWorkCount = 0;
 	uint32_t visibleObjectHandoffCount = 0;
@@ -170,24 +198,11 @@ private:
 
 	struct WorkListState
 	{
-		uint64_t contentVersion;
-		uint32_t density;
-		uint32_t threadGroupSize;
-		uint32_t quadrantCount;
-
+		PGrassRendererQuads::GenerateParams params;
+		uint32_t density = 0;
+		uint32_t quadrantCount = 0;
 		float4x4 viewProj;
 		float4 cameraPosAdjust;
-		float2 lodOrigin;
-
-		float4 lodFadeIn;
-		float4 lodFadeOut;
-
-		float frustumPadding;
-		float fadeInPositionPadding;
-		float4 farKeepParams;
-		float edgeNoise;
-
-		bool disableGeneratorCulls;
 
 		bool operator==(const WorkListState&) const = default;
 	};
@@ -198,35 +213,38 @@ private:
 	uint32_t cachedWorkPatchCount = 0;  // Patches a work item can span: one tile's, or the whole quadrant's.
 	bool hasCachedWorkList = false;
 
-	ConstantBuffer* quadrantsCB = nullptr;
+	std::unique_ptr<ConstantBuffer> quadrantsCB;
 	PGrassCommon::QuadrantDataArray<QuadrantCount> quadrantDataStaging{};
 
-	// Skip staging rebuilds and uploads while the tier content and fade constants are unchanged.
+	// Inputs every slot depends on; a change restages all of them.
 	uint64_t lastUploadVersion = 0;
-	float4 lastUploadLodFadeIn{};
-	float4 lastUploadLodFadeOut{};
 	float lastTileReach = -1.0f;
+	uint64_t lastSurfaceRevision = (std::numeric_limits<uint64_t>::max)();
+	size_t lastQuadrantCount = 0;
 	bool hasUploadedQuadrants = false;
 
-	Buffer* argsBuffer = nullptr;
-	Buffer* batchArgsBuffer = nullptr;
+	std::unique_ptr<Buffer> argsBuffer;
+	std::unique_ptr<Buffer> batchArgsBuffer;
 	winrt::com_ptr<ID3D11Buffer> argsStaging;
+	bool argsReadbackPending = false;
+	uint32_t lastBladeCount = 0;
 	Buffer* vertexIndicesBuffer = nullptr;
 	Buffer* outerVertexIndicesBuffer = nullptr;
 
-	void CreateArgsBuffer();
+	bool IsFar() const { return tier == Tier::Far; }
+	/** @brief Low and Far share the reduced lighting model and the LOW_LOD shader paths. */
+	bool UsesSimpleLighting() const { return tier == Tier::Low || tier == Tier::Far; }
+	bool UsesGrassCollision() const;
+	bool UsesBatchedDraws() const { return tier != Tier::High; }
+	bool HasDepthPrepass() const { return tier == Tier::High || tier == Tier::Mid; }
+	const char* LodDefine() const;
+	const char* VertexDefine() const;
+
+	void CreateBuffers();
+	/** @brief Draws the inner and outer blade lists when their required shaders are available. */
+	void DrawBlades(ID3D11DeviceContext* ctx, bool depth, ID3D11PixelShader* innerPS, ID3D11PixelShader* outerPS);
 	/** Grow the blade buffer for this frame's visible candidate work. */
 	void EnsureBladeCapacity(uint64_t requiredBladeCount);
-	bool UsesGrassCollision(bool grassCollisionLoaded) const
-	{
-		const auto lod = std::string_view(lodDefine);
-		return grassCollisionLoaded && (lod == "HIGH_LOD" || lod == "MID_LOD");
-	}
-	bool UsesSimpleLighting() const;
-	bool UsesBatchedLow() const { return std::string_view(vertCountDefine) == "LOW_VERTEX"; }
-	bool UsesBatchedMid() const { return std::string_view(vertCountDefine) == "MID_VERTEX"; }
-
-	bool UsesBatchedDraws() const { return UsesBatchedLow() || UsesBatchedMid() || extraDefine; }
 	void AppendVertexShaderDefines(ShaderDefines& defines) const;
 
 	ID3D11ComputeShader* GetBladeGeneratorCS(bool farHandoff = false);
@@ -241,14 +259,12 @@ private:
 
 	/** @brief Patches a work item spanning patchCount generates at a share of shareStep eighths. */
 	static uint32_t SharedPatchCount(uint32_t patchCount, uint32_t shareStep);
-	/** @brief Stages and uploads per-quadrant grass cells, heights, occupancy and tile bounds when their inputs change. */
-	void UploadQuadrantInputs(const std::vector<PGrassCommon::Quadrant>& quadrants, uint64_t contentVersion, int32_t cellXOffset, int32_t cellYOffset,
-		const float4& lodFadeIn, const float4& lodFadeOut, float tileReach);
-
-	/** @brief Fills one quadrant's bare grass samples from a neighbour. */
-	void StageQuadrantGrassIds(uint32_t index, const PGrassCommon::Quadrant& quadrant);
-	/** @brief Reconciles shared border samples before packing grass cells and their occupancy masks. */
-	void PackQuadrantGrassCells(const std::vector<PGrassCommon::Quadrant>& quadrants);
+	/** @brief Restages and uploads the slots whose quadrant, border neighbours or shared inputs changed. */
+	void UploadQuadrantInputs(const std::vector<PGrassCommon::Quadrant>& quadrants, const PGrassRendererQuads::GenerateParams& params, uint64_t surfaceRevision, float tileReach);
+	/** @brief Stages one slot's constant-buffer entry, heights, object surface and tile bounds. */
+	void StageQuadrant(uint32_t index, const PGrassCommon::Quadrant& quadrant, float tileReach);
+	/** @brief Packs one slot's grass cells, uniting its border samples with every neighbour sharing them. */
+	void PackQuadrantGrassCells(uint32_t index, const std::vector<PGrassCommon::Quadrant>& quadrants);
 	/** @brief Stages conservative per-tile LAND height bounds that cover jittered and clumped roots. */
 	void StageTileHeightBounds(uint32_t index, const PGrassCommon::Quadrant& quadrant, float tileReach);
 
@@ -259,6 +275,8 @@ private:
 
 	/** @brief Binds generator inputs, dispatches handoff and base work, and prepares batched draw arguments. */
 	void DispatchGeneration(ID3D11DeviceContext* ctx, ID3D11ComputeShader* bladeGenerator, ID3D11ComputeShader* batchArgsGenerator);
+	/** @brief Writes the indirect arguments for an empty frame, or the starting counts generation appends to. */
+	void ResetIndirectArgs(ID3D11DeviceContext* ctx, bool generating);
 
 	static std::string BuildDefineList(std::span<const std::pair<const char*, const char*>> defines);
 

@@ -133,12 +133,15 @@ void TopDownOcclusion::SetupResources()
 	blendDesc.RenderTarget[1].BlendOpAlpha = D3D11_BLEND_OP_MIN;
 	if (FAILED(device->CreateBlendState(&blendDesc, maxBlend.put())))
 		logger::error("[Top Down Occlusion] Failed to create the height-range blend state");
+	else
+		Util::SetResourceName(maxBlend.get(), "TopDownOcclusion::HeightRangeBlend");
 
 	D3D11_RASTERIZER_DESC rasterDesc{};
 	rasterDesc.FillMode = D3D11_FILL_SOLID;
 	rasterDesc.CullMode = D3D11_CULL_NONE;
 	rasterDesc.DepthClipEnable = FALSE;
-	device->CreateRasterizerState(&rasterDesc, noCull.put());
+	if (SUCCEEDED(device->CreateRasterizerState(&rasterDesc, noCull.put())))
+		Util::SetResourceName(noCull.get(), "TopDownOcclusion::NoCullRS");
 
 	heightCB = new ConstantBuffer(ConstantBufferDesc<HeightCB>(), "TopDownOcclusion::HeightCB");
 	padCB = new ConstantBuffer(ConstantBufferDesc<PadCB>(), "TopDownOcclusion::PadCB");
@@ -176,23 +179,11 @@ void TopDownOcclusion::CompileShaders()
 
 void TopDownOcclusion::ClearShaderCache()
 {
-	if (heightVS) {
-		heightVS->Release();
-		heightVS = nullptr;
-	}
-	if (heightPS) {
-		heightPS->Release();
-		heightPS = nullptr;
-	}
-	if (padCS) {
-		padCS->Release();
-		padCS = nullptr;
-	}
-	if (grassSurfacePS) {
-		grassSurfacePS->Release();
-		grassSurfacePS = nullptr;
-	}
+	Util::ReleaseAndNull(heightVS);
+	Util::ReleaseAndNull(heightPS);
+	Util::ReleaseAndNull(padCS);
 	heightVSBlob = nullptr;
+	grassSurfacePS = nullptr;
 	grassSurfaceAlphaVS = nullptr;
 	grassSurfaceAlphaPS = nullptr;
 	grassSurfaceAlphaVSBlob = nullptr;
@@ -205,13 +196,18 @@ void TopDownOcclusion::ClearShaderCache()
 
 void TopDownOcclusion::Invalidate()
 {
+	ClearCapture();
+	capturedWorldspace = nullptr;
+	capturedGeometryValid = false;
+}
+
+void TopDownOcclusion::ClearCapture()
+{
 	captured.clear();
 	grassSurfaceQuadrants.clear();
 	grassSurfaceValid = false;
-	++capturedGeometryRevision;
-	capturedWorldspace = nullptr;
-	capturedGeometryValid = false;
 	renderCacheValid = false;
+	++capturedGeometryRevision;
 }
 
 ID3D11ShaderResourceView* TopDownOcclusion::GetHighSRV() const
@@ -269,9 +265,8 @@ ID3D11InputLayout* TopDownOcclusion::GetGrassAlphaInputLayout(const RE::BSGraphi
 	if (!grassSurfaceAlphaVS) {
 		const D3D_SHADER_MACRO defines[] = { { "GRASS_SURFACE_ALPHA_TEST", "1" }, { nullptr, nullptr } };
 		grassSurfaceAlphaVSBlob.attach(CompileWithBlob(L"Data\\Shaders\\TopDownOcclusion\\ObjectCapture.hlsl", "vs_5_0", defines));
-		if (!grassSurfaceAlphaVSBlob)
+		if (!grassSurfaceAlphaVSBlob || FAILED(globals::d3d::device->CreateVertexShader(grassSurfaceAlphaVSBlob->GetBufferPointer(), grassSurfaceAlphaVSBlob->GetBufferSize(), nullptr, grassSurfaceAlphaVS.put())))
 			return nullptr;
-		DX::ThrowIfFailed(globals::d3d::device->CreateVertexShader(grassSurfaceAlphaVSBlob->GetBufferPointer(), grassSurfaceAlphaVSBlob->GetBufferSize(), nullptr, grassSurfaceAlphaVS.put()));
 	}
 
 	uint64_t key;
@@ -286,8 +281,10 @@ ID3D11InputLayout* TopDownOcclusion::GetGrassAlphaInputLayout(const RE::BSGraphi
 		{ "TEXCOORD", 0, DXGI_FORMAT_R16G16_FLOAT, 0, desc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_TEXCOORD0), D3D11_INPUT_PER_VERTEX_DATA, 0 },
 		{ "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, colorOffset, D3D11_INPUT_PER_VERTEX_DATA, 0 },
 	};
+	// A null entry stays cached, so an unsupported descriptor is only attempted once.
 	auto& layout = grassAlphaInputLayouts[key];
-	DX::ThrowIfFailed(globals::d3d::device->CreateInputLayout(elements, 3, grassSurfaceAlphaVSBlob->GetBufferPointer(), grassSurfaceAlphaVSBlob->GetBufferSize(), layout.put()));
+	if (FAILED(globals::d3d::device->CreateInputLayout(elements, 3, grassSurfaceAlphaVSBlob->GetBufferPointer(), grassSurfaceAlphaVSBlob->GetBufferSize(), layout.put())))
+		layout = nullptr;
 	return layout.get();
 }
 
@@ -373,11 +370,7 @@ void TopDownOcclusion::CollectFrom(RE::NiAVObject* a_object, bool allowGrass)
 
 void TopDownOcclusion::GatherGeometry()
 {
-	captured.clear();
-	grassSurfaceQuadrants.clear();
-	grassSurfaceValid = false;
-	renderCacheValid = false;
-	++capturedGeometryRevision;
+	ClearCapture();
 
 	const auto player = RE::PlayerCharacter::GetSingleton();
 	const auto tes = RE::TES::GetSingleton();
@@ -441,8 +434,7 @@ void TopDownOcclusion::Render()
 		capturedWorldspace = worldspace;
 	}
 
-	// Snap the window to the texel grid so it jumps in whole texels instead of sliding and re-quantising silhouette edges each frame.
-	// Snapping to the coarsest consumer (snapDim) keeps both maps stable.
+	// Snap to the coarsest consumer's texel grid so silhouettes do not re-quantise as the window slides.
 	const auto& eye = globals::game::frameBufferCached.GetCameraPosAdjust();
 	const float texel = halfExtent * 2.0f / snapDim;
 	windowCentre = {

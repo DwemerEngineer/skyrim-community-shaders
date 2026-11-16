@@ -46,6 +46,12 @@ cbuffer GrassGlobals : register(b8)
 	float4 terrainCanopyParams;  // x: transition start, y: inverse range, z: maximum blade height, w: Far density falloff.
 }
 
+/** @brief Decodes the terrain heightmap to world Z at a world position. */
+float SampleTerrainHeight(Texture2D<float> heightMap, SamplerState heightSampler, float2 world2D)
+{
+	return lerp(heightMapZRange.x, heightMapZRange.y, heightMap.SampleLevel(heightSampler, world2D * heightMapScale + heightMapOffset, 0));
+}
+
 // The terrain lift map stores the lift above LAND multiplied by its validity weight, alongside the weight.
 // It wraps a camera-centred window of world-aligned cells, so texels keep their values as the camera moves.
 static const float TerrainLiftMax = 160.0f;
@@ -302,6 +308,32 @@ struct Blade
 #		endif
 #	endif
 };
+#endif
+
+#if defined(__SKYLIGHTING_DEPENDENCY_HLSL__)
+/** @brief Wrapping origin and camera-relative offset of the skylighting probe array this frame. */
+struct SkylightingProbeFrame
+{
+	float3 offset;
+	uint3 arrayOrigin;
+	float3 extent;  // Half size minus one cell; samples clamp inside it
+};
+
+SkylightingProbeFrame GetSkylightingProbeFrame()
+{
+	SkylightingProbeFrame frame;
+	float3 probeCell = round(FrameBuffer::CameraPosAdjust.xyz / Skylighting::CELL_SIZE);
+	frame.offset = probeCell * Skylighting::CELL_SIZE - FrameBuffer::CameraPosAdjust.xyz;
+	frame.arrayOrigin = (uint3)((int3)probeCell - (int3)(Skylighting::ARRAY_DIM / 2)) % Skylighting::ARRAY_DIM;
+	frame.extent = Skylighting::ARRAY_SIZE * 0.5f - Skylighting::CELL_SIZE;
+	return frame;
+}
+
+/** @brief Clamps a camera-relative position into the probe volume. */
+float3 ClampToSkylightingProbes(SkylightingProbeFrame frame, float3 position)
+{
+	return clamp(position - frame.offset, -frame.extent, frame.extent) + frame.offset;
+}
 #endif
 
 // Object surfaces shared by generation, lighting and terrain darkening.

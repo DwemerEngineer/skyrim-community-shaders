@@ -68,6 +68,23 @@ float GetFarGrassRootShadowFade(float3 rootPosition)
 	return fade;
 }
 #	endif
+
+/**
+ * @brief Contact shadow cast onto a projected root, faded by @p fade.
+ * Covered roots skip the trace so overlapping nearer blades do not shadow them twice, and roots far behind a nearer
+ * surface keep their light.
+ */
+float GetGrassRootDetailShadow(Texture2D<unorm float2> shadowTexture, SamplerState linearSampler, float2 rootPixel, float fade,
+	float coverWeight, float distantForegroundWeight)
+{
+	float detailShadow = 1.0f;
+	[branch] if (fade > 0.0f && coverWeight < 1.0f && distantForegroundWeight < 1.0f)
+	{
+		float rootDetailShadow = lerp(SampleGrassRootContactShadow(shadowTexture, linearSampler, rootPixel), 1.0f, coverWeight);
+		detailShadow = lerp(1.0f, rootDetailShadow, fade * (1.0f - distantForegroundWeight));
+	}
+	return detailShadow;
+}
 #endif
 
 #if defined(FAR_LOD)
@@ -157,6 +174,78 @@ static const float CanopyReflectionExtinction = 4.0f;
 static const float CanopyReflectionMinElevation = 0.05f;
 static const float CanopyScatterEscape = 0.5f;  // Probability that scattered light escapes the canopy.
 
+// Unresolved blades turn their normals toward the canopy surface over this camera distance.
+static const float CanopyNormalBlendStart = 2048.0f;
+static const float CanopyNormalBlendEnd = 24576.0f;
+
+// Mid's darker lower blades and its tips standing in each other's screen-space shadows, as Low and Far shade them.
+static const float LowContactOcclusionBase = 0.62f;
+static const float LowContactOcclusionTip = 0.9f;
+
+/** @brief Weight of the canopy surface normal over the blade normal at a camera distance. */
+float GetCanopyNormalBlend(float horizontalDistance)
+{
+	return smoothstep(CanopyNormalBlendStart, CanopyNormalBlendEnd, horizontalDistance);
+}
+
+/** @brief Contact occlusion of a straight distant blade at a position along it. */
+float GetLowContactOcclusion(float along)
+{
+	return lerp(LowContactOcclusionBase, LowContactOcclusionTip, smoothstep(0.0f, 0.9f, along));
+}
+
+/** @brief Transmittance along a canopy path of the given overhead depth toward a direction of this elevation. */
+float GetCanopyPathTransmittance(float canopyOverhead, float elevation)
+{
+	return exp2(-canopyOverhead / max(elevation, CanopyReflectionMinElevation) * CanopyReflectionExtinction);
+}
+
+/** @brief Escaped canopy multiple scatter, e*a / (1 - (1-e)*a), bounded by the intercepted energy. */
+float3 GetCanopyScatterAlbedo(float3 reflectionAlbedo, float3 transmissionAlbedo)
+{
+	float3 singleScatterAlbedo = saturate(reflectionAlbedo + transmissionAlbedo);
+	return CanopyScatterEscape * singleScatterAlbedo / (1.0f - (1.0f - CanopyScatterEscape) * singleScatterAlbedo);
+}
+
+/**
+ * @brief Sunlight intercepted by surrounding blades and scattered on toward both sides of this one.
+ * @param lightColor Sun colour after world shadows
+ * @param detailShadow Visibility past neighbouring blades; the blocked share is what the canopy scatters
+ * @param surfaceThroughput Energy left after the specular and fuzz layers
+ */
+float3 GetCanopyBlockedScatter(float3 lightColor, float detailShadow, float surfaceShadow, float3 lightDirection,
+	float3 reflectionAlbedo, float3 transmissionAlbedo, float3 surfaceThroughput)
+{
+	float blockedLight = saturate(1.0f - detailShadow) * surfaceShadow * saturate(lightDirection.z);
+	return lightColor * BRDF::Diffuse_Lambert() * blockedLight * GetCanopyScatterAlbedo(reflectionAlbedo, transmissionAlbedo) *
+	       (reflectionAlbedo + transmissionAlbedo) * surfaceThroughput;
+}
+
+/**
+ * @brief Diffuse reflection and transmission of a thin blade, in Blender's zero-diffuse-roughness limit: Lambert lobes
+ * on opposite hemispheres.
+ */
+float3 GetGrassThinDiffuse(float3 reflectionAlbedo, float3 transmissionAlbedo, float3 irradiance, float normalDotLight)
+{
+	float3 reflection, transmission;
+	PBR::GetThinSurfaceDirectScattering(reflectionAlbedo, transmissionAlbedo, irradiance, normalDotLight, 0.0f, 1.0f, 1.0f, reflection, transmission);
+	return reflection + transmission;
+}
+
+/** @brief Returns the hemisphere irradiance around a normal, desaturated toward its luminance. */
+float3 SampleGrassAmbient(float3 normal, float desaturation)
+{
+	float3 irradiance = DistantAmbientLUT.SampleLevel(LinearSampler, GBuffer::EncodeNormal(normal), 0).rgb;
+	return Color::Saturation(irradiance, 1.0f - desaturation);
+}
+
+/** @brief The OpenPBR fuzz layer of a blade: its directional albedo and colour. */
+struct GrassFuzz
+{
+	float albedo;
+	float3 color;
+};
+
 /** @brief Filters distant blade normals toward the canopy surface normal: world up, or the terrain normal for Far. */
 float3 BlendGrassNormalToCanopy(float3 normal, float weight, float3 canopySurfaceNormal)
 {
@@ -188,6 +277,32 @@ float3 GetGrassFuzzColor(float3 bladeColor, float tint)
 	return lerp(1.0f, hue, saturate(tint));
 }
 
+/** @brief Evaluates a fuzz layer from its weight, prepared albedo fit and tint. */
+GrassFuzz GetGrassFuzz(float weight, float4 directionalAlbedoParams, float tint, float3 bladeColor, float normalDotView)
+{
+	GrassFuzz fuzz;
+	fuzz.albedo = saturate(weight) * PBR::FuzzDirectionalAlbedoWithParameters(normalDotView, directionalAlbedoParams);
+	fuzz.color = GetGrassFuzzColor(bladeColor, tint);
+	return fuzz;
+}
+
+/** @brief Evaluates a grass type's fuzz layer. */
+GrassFuzz GetGrassFuzz(GrassType type, float3 bladeColor, float normalDotView)
+{
+	return GetGrassFuzz(type.grassSurfParams.x, type.fuzzDirectionalAlbedoParams, type.grassSubsurfaceColor.w, bladeColor, normalDotView);
+}
+
+/**
+ * @brief Rebuilds a face normal from a curved normal: keeps the sheet component and scales the tilt across the blade.
+ * The sheet term stays nonzero so the face does not cancel at grazing views.
+ */
+float3 GetCurvedFaceNormal(float3 faceNormal, float3 curvedNormal, float3 planeNormal, float curvature)
+{
+	float sheet = dot(curvedNormal, planeNormal);
+	float3 tilt = curvedNormal - planeNormal * sheet;
+	return normalize(faceNormal * max(abs(sheet), 1e-4f) + tilt * curvature);
+}
+
 /**
  * @brief Returns cosine-weighted sky visibility on the concave face of a circular blade arc.
  * At side in [-1, 1], the two edges rise by curveHalfAngle * (1 -/+ side) / 2.
@@ -198,23 +313,20 @@ float GetCurvedBladeSkyView(float curveHalfAngle, float side)
 	return cos(0.5f * curveHalfAngle) * cos(0.5f * curveHalfAngle * side);
 }
 
+/** @brief Diffuse-only light from a local source; the scattered lobes combine so a wetness layer attenuates both together. */
 void GetDiffuseLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, float normalDotLight,
 	float3 reflectionAlbedo, float3 transmissionAlbedo, float3 surfaceThroughput)
 {
 	lightingOutput = (DirectLightingOutput)0;
-
-	// Use Blender's zero-diffuse-roughness limit: Lambert reflection and transmission on opposite hemispheres.
-	float2 diffuseCosines = max(float2(normalDotLight, -normalDotLight), 0.0f);
 	float3 irradiance = context.lightColor * context.detailedShadow * BRDF::Diffuse_Lambert() * surfaceThroughput;
-
-	// Combine the scattered lobes so the wetness layer attenuates both together.
-	lightingOutput.diffuse = (reflectionAlbedo * diffuseCosines.x + transmissionAlbedo * diffuseCosines.y) * irradiance;
+	lightingOutput.diffuse = GetGrassThinDiffuse(reflectionAlbedo, transmissionAlbedo, irradiance, normalDotLight);
 }
 
 #if !defined(FAR_LOD)
 void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, DirectContext context, MaterialProperties material, float diffuseNdotL,
 	float3 reflectionAlbedo, float3 transmissionAlbedo,
-	float3 specularNormal, float3 specularTangent, float specularRoughness, float specularAnisotropy, float specularSlopeVariance, float3 specularAlbedo, float3 fuzzNormal, float fuzzNdotV, float fuzzAlbedo, float3 fuzzColor, float fuzzRoughness)
+	float3 specularNormal, float3 specularTangent, float specularRoughness, float specularAnisotropy, float specularSlopeVariance, float3 specularAlbedo,
+	float3 fuzzNormal, float fuzzNdotV, GrassFuzz fuzz, float fuzzRoughness)
 {
 	const float3 detailedLightColor = context.lightColor * context.detailedShadow;
 	const float3 V = context.viewDir;
@@ -237,9 +349,9 @@ void GetDirectLightInputProcGrass(out DirectLightingOutput lightingOutput, Direc
 
 	// OpenPBR fuzz sits over both faces of the blade: it reflects fuzzAlbedo of the light in its colour and passes the
 	// rest untinted. Light from behind reaches the viewer-side fuzz through the blade, tinted by its transmission.
-	float fuzzThroughput = 1.0f - fuzzAlbedo;
+	float fuzzThroughput = 1.0f - fuzz.albedo;
 	PBR::FuzzLTC fuzzLTC = PBR::CreateFuzzLTC(V, fuzzNormal, fuzzNdotV, fuzzRoughness);
-	float3 fuzzReflection = fuzzAlbedo * fuzzColor *
+	float3 fuzzReflection = fuzz.albedo * fuzz.color *
 	                        (PBR::FuzzLobe(L, fuzzLTC) +
 								transmissionAlbedo * PBR::FuzzLobeTransmitted(L, fuzzLTC));
 

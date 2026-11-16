@@ -3,21 +3,16 @@
 
 #include "ProceduralGrass/PGrassCoverage.hlsli"
 
-float SampleTerrainHeightMap(float2 world2D)
-{
-	return lerp(heightMapZRange.x, heightMapZRange.y, TerrainHeightTexture.SampleLevel(LinearSampler, world2D * heightMapScale + heightMapOffset, 0));
-}
-
 float TerrainHeightSlopeAt(out float2 slope, float2 world2D, float2 quadWorldPos, uint quadrant, bool hasLand)
 {
 	float height;
 	if (SampleLandHeightSlope(height, slope, world2D - quadWorldPos, quadrant, hasLand))
 		return height;
 
-	float coarseHeight = SampleTerrainHeightMap(world2D);
+	float coarseHeight = SampleTerrainHeight(TerrainHeightTexture, LinearSampler, world2D);
 	float eps = QUADRANT_GRASS_SPACING;
-	float hR = SampleTerrainHeightMap(world2D + float2(eps, 0.0f));
-	float hU = SampleTerrainHeightMap(world2D + float2(0.0f, eps));
+	float hR = SampleTerrainHeight(TerrainHeightTexture, LinearSampler, world2D + float2(eps, 0.0f));
+	float hU = SampleTerrainHeight(TerrainHeightTexture, LinearSampler, world2D + float2(0.0f, eps));
 	slope = float2(hR - coarseHeight, hU - coarseHeight) * (1.0f / eps);
 	return coarseHeight;
 }
@@ -68,13 +63,11 @@ float2 GrassMapSamplePos(float2 bladeQuadPos2D, float2 bladeWorldPos2D, uint3 ha
 	return bladeQuadPos2D + lerp(jitter, GetGrassMapWarp(bladeWorldPos2D), GrassMapWarpShare) * miscParams.x;
 }
 
-void ComputeGrassType(out uint type, uint packedGrassCell, float2 quadLocalPos, float typeRandom, float2 bladeWorldPos2D, float edgeRandom)
+uint ComputeGrassType(uint packedGrassCell, float2 quadLocalPos, float typeRandom, float2 bladeWorldPos2D, float edgeRandom)
 {
 	uint firstType = packedGrassCell & 0xFFu;
-	if (packedGrassCell == firstType * 0x01010101u) {
-		type = firstType;
-		return;
-	}
+	if (packedGrassCell == firstType * 0x01010101u)
+		return firstType;
 
 	float2 grassSample = clamp(quadLocalPos / QUADRANT_GRASS_SPACING, 0.0f, QUADRANT_GRASS_PITCH - 1.001f);
 	float2 sampleFraction = frac(grassSample);
@@ -88,10 +81,8 @@ void ComputeGrassType(out uint type, uint packedGrassCell, float2 quadLocalPos, 
 	float presence = dot(grassWeights, 1.0f);
 	[branch] if (any(ids == 0u))
 	{
-		if (edgeRandom >= GetGrassMapEdgeCoverage(bladeWorldPos2D, presence)) {
-			type = 0u;
-			return;
-		}
+		if (edgeRandom >= GetGrassMapEdgeCoverage(bladeWorldPos2D, presence))
+			return 0u;
 	}
 
 	// Pick among the grass corners by their bilinear weight.
@@ -101,13 +92,12 @@ void ComputeGrassType(out uint type, uint packedGrassCell, float2 quadLocalPos, 
 	float thirdThreshold = secondThreshold + grassWeights.z;
 
 	if (pick < firstThreshold && ids.x != 0u)
-		type = ids.x;
-	else if (pick < secondThreshold && ids.y != 0u)
-		type = ids.y;
-	else if (pick < thirdThreshold && ids.z != 0u)
-		type = ids.z;
-	else
-		type = ids.w != 0u ? ids.w : (ids.z != 0u ? ids.z : (ids.y != 0u ? ids.y : ids.x));
+		return ids.x;
+	if (pick < secondThreshold && ids.y != 0u)
+		return ids.y;
+	if (pick < thirdThreshold && ids.z != 0u)
+		return ids.z;
+	return ids.w != 0u ? ids.w : (ids.z != 0u ? ids.z : (ids.y != 0u ? ids.y : ids.x));
 }
 
 #if defined(FAR_LOD)

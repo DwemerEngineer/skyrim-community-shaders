@@ -28,11 +28,10 @@ void ProceduralGrass::CreateIndexBuffers()
 		return makeIndexBuffer(batchedIndices, name);
 	};
 
-	auto vertexIndicesHigh = CreateVertexIndicesArray(15);
-	vertexIndicesHighBuffer = makeIndexBuffer(vertexIndicesHigh, "PGrass::HighIndices");
+	vertexIndicesHighBuffer = makeIndexBuffer(CreateVertexIndicesArray(15), "PGrass::HighIndices");
 	// Outer High is drawn twice, in depth and colour, and both passes are vertex-bound.
-	auto vertexIndicesHighOuter = CreateVertexIndicesArray(5);
-	vertexIndicesHighOuterBuffer = makeIndexBuffer(vertexIndicesHighOuter, "PGrass::HighOuterIndices");
+	const auto fiveVertexBladeIndices = CreateVertexIndicesArray(5);
+	vertexIndicesHighOuterBuffer = makeIndexBuffer(fiveVertexBladeIndices, "PGrass::HighOuterIndices");
 
 	const std::array<uint16_t, 6> lowBladeIndices = { 0, 1, 2, 2, 1, 3 };
 	vertexIndicesLowBuffer = makeBatchedIndexBuffer(lowBladeIndices, 4u, LowBladeBatchSize, "PGrass::LowIndices");
@@ -40,8 +39,7 @@ void ProceduralGrass::CreateIndexBuffers()
 	vertexIndicesLowOuterBuffer = makeBatchedIndexBuffer(outerBladeIndices, 3u, LowBladeBatchSize, "PGrass::LowOuterIndices");
 
 	// Mid keeps one curve midpoint; Low uses a distant two-triangle ribbon.
-	const auto midBladeIndices = CreateVertexIndicesArray(5);
-	vertexIndicesMidBuffer = makeBatchedIndexBuffer(midBladeIndices, 5u, MidBladeBatchSize, "PGrass::MidIndices");
+	vertexIndicesMidBuffer = makeBatchedIndexBuffer(fiveVertexBladeIndices, 5u, MidBladeBatchSize, "PGrass::MidIndices");
 
 	// Fully straightened Mid blades need only one triangle in both depth and colour passes.
 	vertexIndicesMidOuterBuffer = makeBatchedIndexBuffer(outerBladeIndices, 3u, MidBladeBatchSize, "PGrass::MidOuterIndices");
@@ -64,12 +62,14 @@ void ProceduralGrass::CreatePipelineStates()
 	samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
 	samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
 	samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-	device->CreateSamplerState(&samplerDesc, &linearClampSampler);
+	if (SUCCEEDED(device->CreateSamplerState(&samplerDesc, &linearClampSampler)))
+		Util::SetResourceName(linearClampSampler, "PGrass::LinearClampSampler");
 
 	D3D11_SAMPLER_DESC detailSamplerDesc = samplerDesc;
 	detailSamplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
 	detailSamplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
-	device->CreateSamplerState(&detailSamplerDesc, &grassDetailSampler);
+	if (SUCCEEDED(device->CreateSamplerState(&detailSamplerDesc, &grassDetailSampler)))
+		Util::SetResourceName(grassDetailSampler, "PGrass::DetailSampler");
 
 	D3D11_SAMPLER_DESC shadowSamplerDesc = {};
 	shadowSamplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -81,83 +81,62 @@ void ProceduralGrass::CreatePipelineStates()
 	shadowSamplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
 	shadowSamplerDesc.MinLOD = -FLT_MAX;
 	shadowSamplerDesc.MaxLOD = 0;
-	device->CreateSamplerState(&shadowSamplerDesc, &shadowSampler);
+	if (SUCCEEDED(device->CreateSamplerState(&shadowSamplerDesc, &shadowSampler)))
+		Util::SetResourceName(shadowSampler, "PGrass::ShadowSampler");
 
-	if (!noCullRS) {
-		D3D11_RASTERIZER_DESC rd{};
-		rd.FillMode = D3D11_FILL_SOLID;
-		rd.CullMode = D3D11_CULL_NONE;
-		rd.FrontCounterClockwise = FALSE;
-		rd.DepthClipEnable = TRUE;
-		rd.DepthBiasClamp = -100.0f;
-		device->CreateRasterizerState(&rd, &noCullRS);
-		rd.ScissorEnable = TRUE;
-		device->CreateRasterizerState(&rd, &noCullScissorRS);
-	}
+	D3D11_RASTERIZER_DESC rd{};
+	rd.FillMode = D3D11_FILL_SOLID;
+	rd.CullMode = D3D11_CULL_NONE;
+	rd.DepthClipEnable = TRUE;
+	rd.DepthBiasClamp = -100.0f;
+	if (SUCCEEDED(device->CreateRasterizerState(&rd, &noCullRS)))
+		Util::SetResourceName(noCullRS, "PGrass::NoCullRS");
+	rd.ScissorEnable = TRUE;
+	if (SUCCEEDED(device->CreateRasterizerState(&rd, &noCullScissorRS)))
+		Util::SetResourceName(noCullScissorRS, "PGrass::NoCullScissorRS");
 
-	if (!depthWriteDS) {
-		D3D11_DEPTH_STENCIL_DESC dd{};
-		dd.DepthEnable = TRUE;
-		dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-		dd.DepthFunc = D3D11_COMPARISON_LESS;
-		dd.StencilEnable = FALSE;
-		device->CreateDepthStencilState(&dd, &depthWriteDS);
-	}
+	D3D11_DEPTH_STENCIL_DESC dd{};
+	dd.DepthEnable = TRUE;
+	dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+	dd.DepthFunc = D3D11_COMPARISON_LESS;
+	if (SUCCEEDED(device->CreateDepthStencilState(&dd, &depthWriteDS)))
+		Util::SetResourceName(depthWriteDS, "PGrass::DepthWriteDS");
+	dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+	dd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+	if (SUCCEEDED(device->CreateDepthStencilState(&dd, &depthEqualDS)))
+		Util::SetResourceName(depthEqualDS, "PGrass::DepthTestDS");
+	dd.DepthEnable = FALSE;
+	if (SUCCEEDED(device->CreateDepthStencilState(&dd, &noDepthDSS)))
+		Util::SetResourceName(noDepthDSS, "PGrass::NoDepthDSS");
 
-	if (!depthEqualDS) {
-		D3D11_DEPTH_STENCIL_DESC dd{};
-		dd.DepthEnable = TRUE;
-		dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-		dd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
-		dd.StencilEnable = FALSE;
-		device->CreateDepthStencilState(&dd, &depthEqualDS);
-	}
+	D3D11_BLEND_DESC bd{};
+	if (SUCCEEDED(device->CreateBlendState(&bd, &depthOnlyBlend)))
+		Util::SetResourceName(depthOnlyBlend, "PGrass::DepthOnlyBlend");
 
-	if (!depthOnlyBlend) {
-		D3D11_BLEND_DESC bd = {};
-		bd.RenderTarget[0].BlendEnable = FALSE;
-		bd.RenderTarget[0].RenderTargetWriteMask = 0;
-		device->CreateBlendState(&bd, &depthOnlyBlend);
-	}
+	// Grass clears terrain classification while inheriting the ground's vertex AO.
+	bd.IndependentBlendEnable = TRUE;
+	for (auto& target : bd.RenderTarget)
+		target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+	bd.RenderTarget[7].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_GREEN;
+	if (SUCCEEDED(device->CreateBlendState(&bd, &defaultBlend)))
+		Util::SetResourceName(defaultBlend, "PGrass::DefaultBlend");
 
-	if (!defaultBlend) {
-		D3D11_BLEND_DESC bd = {};
-		bd.IndependentBlendEnable = TRUE;
-		for (auto& target : bd.RenderTarget)
-			target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-		// Grass clears terrain classification while inheriting the ground's vertex AO.
-		bd.RenderTarget[7].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_GREEN;
-		device->CreateBlendState(&bd, &defaultBlend);
+	for (auto& target : bd.RenderTarget) {
+		target.BlendEnable = TRUE;
+		target.SrcBlend = D3D11_BLEND_SRC_ALPHA;
+		target.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+		target.BlendOp = D3D11_BLEND_OP_ADD;
+		target.SrcBlendAlpha = D3D11_BLEND_ONE;
+		target.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+		target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
 	}
-
-	if (!terrainFadeBlend) {
-		D3D11_BLEND_DESC bd = {};
-		bd.IndependentBlendEnable = TRUE;
-		for (uint32_t i = 0; i < 8; i++) {
-			auto& target = bd.RenderTarget[i];
-			target.BlendEnable = TRUE;
-			target.SrcBlend = D3D11_BLEND_SRC_ALPHA;
-			target.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-			target.BlendOp = D3D11_BLEND_OP_ADD;
-			target.SrcBlendAlpha = D3D11_BLEND_ONE;
-			target.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-			target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
-			target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-		}
-		bd.RenderTarget[7].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_GREEN;
-		device->CreateBlendState(&bd, &terrainFadeBlend);
-	}
-
-	if (!noDepthDSS) {
-		D3D11_DEPTH_STENCIL_DESC dd = {};
-		dd.DepthEnable = FALSE;
-		dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-		device->CreateDepthStencilState(&dd, &noDepthDSS);
-	}
+	if (SUCCEEDED(device->CreateBlendState(&bd, &terrainFadeBlend)))
+		Util::SetResourceName(terrainFadeBlend, "PGrass::TerrainFadeBlend");
 }
 
 void ProceduralGrass::CreateGrassTextures()
 {
+	// SetupResources runs once, so every texture is created exactly once here.
 	D3D11_TEXTURE2D_DESC detailDesc{};
 	detailDesc.Width = GrassMaterialDetailDim;
 	detailDesc.Height = GrassMaterialDetailDim;
@@ -168,6 +147,8 @@ void ProceduralGrass::CreateGrassTextures()
 	detailDesc.Usage = D3D11_USAGE_DEFAULT;
 	detailDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 	grassMaterialDetailTexture = new Texture2D(detailDesc, "PGrass::MaterialDetail");
+	grassMaterialDetailValid.fill(false);
+	grassTypesDirty = true;
 	D3D11_SHADER_RESOURCE_VIEW_DESC detailSRVDesc{};
 	detailSRVDesc.Format = detailDesc.Format;
 	detailSRVDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -177,22 +158,16 @@ void ProceduralGrass::CreateGrassTextures()
 	detailSRVDesc.Texture2DArray.ArraySize = detailDesc.ArraySize;
 	grassMaterialDetailTexture->CreateSRV(detailSRVDesc);
 
-	if (!grassDensityTexture)
-		grassDensityTexture = Util::CreateSquareTexture(grassDensityDim, DXGI_FORMAT_R32_UINT, true, "PGrass::GrassDensity");
-	if (!distantAmbientLUT)
-		distantAmbientLUT = Util::CreateSquareTexture(distantAmbientLUTDim, DXGI_FORMAT_R16G16B16A16_FLOAT, true, "PGrass::DistantAmbientLUT");
-	if (!terrainLiftTexture) {
-		// R32_FLOAT is the float format D3D11 guarantees for typed UAV reads.
-		terrainLiftMeasuredTexture = Util::CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLiftMeasured");
-		terrainLiftTexture = Util::CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLift");
-		terrainLiftSurfaceTexture = Util::CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLiftSurface");
-		terrainLiftOriginValid = false;
-	}
-	if (!grassPresenceTexture) {
-		// Rewritten via UpdateSubresource as the window scrolls with the player.
-		grassPresenceTexture = Util::CreateSquareTexture(grassPresenceDim, DXGI_FORMAT_R8_UINT, false, "PGrass::GrassPresence");
-		grassPresenceStaging.assign(static_cast<size_t>(grassPresenceDim) * grassPresenceDim, 0);
-	}
+	grassDensityTexture = Util::CreateSquareTexture(grassDensityDim, DXGI_FORMAT_R32_UINT, true, "PGrass::GrassDensity");
+	distantAmbientLUT = Util::CreateSquareTexture(distantAmbientLUTDim, DXGI_FORMAT_R16G16B16A16_FLOAT, true, "PGrass::DistantAmbientLUT");
+	// R32_FLOAT is the float format D3D11 guarantees for typed UAV reads.
+	terrainLiftMeasuredTexture = Util::CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLiftMeasured");
+	terrainLiftTexture = Util::CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLift");
+	terrainLiftSurfaceTexture = Util::CreateSquareTexture(PGrassCommon::TerrainLiftDim, DXGI_FORMAT_R32_FLOAT, true, "PGrass::TerrainLiftSurface");
+	terrainLiftOriginValid = false;
+	// Rewritten via UpdateSubresource as the window scrolls with the player.
+	grassPresenceTexture = Util::CreateSquareTexture(grassPresenceDim, DXGI_FORMAT_R8_UINT, false, "PGrass::GrassPresence");
+	grassPresenceStaging.assign(static_cast<size_t>(grassPresenceDim) * grassPresenceDim, 0);
 }
 
 void ProceduralGrass::SetupResources()
@@ -215,16 +190,19 @@ void ProceduralGrass::SetupResources()
 
 	CreateIndexBuffers();
 
-	constexpr uint32_t threadGroupSize = 64;
-	// Add steepness-gated slope-fill candidates per patch. Low needs the most to fill sparse steep ground.
+	// Each tier adds one steepness-gated slope-fill candidate per patch.
+	using PGrassCommon::Tier;
 	const bool cacheCollision = globals::features::grassCollision.loaded;
 	const uint32_t highBladeStride = cacheCollision ? sizeof(PGrassCommon::BladeSkylitCollision) : sizeof(PGrassCommon::BladeSkylit);
 	const uint32_t midBladeStride = cacheCollision ? sizeof(PGrassCommon::BladeMidCollision) : sizeof(PGrassCommon::BladeMid);
-	grassRendererHighLOD = new PGrassRenderer<PGrassCommon::HighTierQuadrantCap, 4>(QualityDensities[settings.Quality], threadGroupSize, vertexIndicesHighBuffer,
-		"HIGH_LOD", "HIGH_VERTEX", nullptr, 1, highBladeStride, vertexIndicesHighOuterBuffer);
-	grassRendererMidLOD = new PGrassRenderer<PGrassCommon::MidTierQuadrantCap, PGrassCommon::MidPatchBladeCount>(static_cast<uint32_t>(settings.midGrassDensity), threadGroupSize, vertexIndicesMidBuffer, "MID_LOD", "MID_VERTEX", nullptr, 1, midBladeStride, vertexIndicesMidOuterBuffer);
-	grassRendererLowLOD = new PGrassRenderer<PGrassCommon::LowTierQuadrantCap, 1>(static_cast<uint32_t>(settings.lowGrassDensity), threadGroupSize, vertexIndicesLowBuffer, "LOW_LOD", "LOW_VERTEX", nullptr, 1, sizeof(PGrassCommon::Blade), vertexIndicesLowOuterBuffer);
-	grassRendererFarLOD = new PGrassRenderer<PGrassCommon::FarQuadrantCount, 1>(FarPatchDensity(), threadGroupSize, vertexIndicesFarBuffer, "LOW_LOD", "FAR_VERTEX", "FAR_LOD", 1, sizeof(PGrassCommon::BladeFar), vertexIndicesFarDoubleBuffer);
+	grassRendererHighLOD = std::make_unique<PGrassRenderer<PGrassCommon::HighTierQuadrantCap, 4>>(Tier::High, QualityDensities[settings.Quality],
+		vertexIndicesHighBuffer, vertexIndicesHighOuterBuffer, highBladeStride);
+	grassRendererMidLOD = std::make_unique<PGrassRenderer<PGrassCommon::MidTierQuadrantCap, PGrassCommon::MidPatchBladeCount>>(Tier::Mid,
+		static_cast<uint32_t>(settings.midGrassDensity), vertexIndicesMidBuffer, vertexIndicesMidOuterBuffer, midBladeStride);
+	grassRendererLowLOD = std::make_unique<PGrassRenderer<PGrassCommon::LowTierQuadrantCap, 1>>(Tier::Low,
+		static_cast<uint32_t>(settings.lowGrassDensity), vertexIndicesLowBuffer, vertexIndicesLowOuterBuffer, static_cast<uint32_t>(sizeof(PGrassCommon::Blade)));
+	grassRendererFarLOD = std::make_unique<PGrassRenderer<PGrassCommon::FarQuadrantCount, 1>>(Tier::Far, FarPatchDensity(),
+		vertexIndicesFarBuffer, vertexIndicesFarDoubleBuffer, static_cast<uint32_t>(sizeof(PGrassCommon::BladeFar)), 1u, static_cast<uint32_t>(settings.lowGrassDensity));
 
 	CreatePipelineStates();
 	CreateGrassTextures();

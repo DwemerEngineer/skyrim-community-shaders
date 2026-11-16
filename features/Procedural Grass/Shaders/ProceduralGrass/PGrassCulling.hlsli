@@ -36,6 +36,15 @@ float LoadHiZMax3x3(int2 sampleMin, int2 sampleMax, int mip)
 	return tileMax;
 }
 
+// Clamps a UV rectangle to the texels it covers in one Hi-Z mip.
+void GetHiZSampleRect(float2 uvMin, float2 uvMax, int mip, out int2 sampleMin, out int2 sampleMax)
+{
+	const float2 mipTexels = grassHiZParams.xy / exp2((float)mip);
+	const int2 mipSize = max(int2(ceil(mipTexels)), int2(1, 1));
+	sampleMin = clamp(int2(floor(uvMin * mipTexels)), int2(0, 0), mipSize - 1);
+	sampleMax = clamp(int2(floor(uvMax * mipTexels)), int2(0, 0), mipSize - 1);
+}
+
 bool IsVolumeOccluded(float3 centre, float radius, float minDistance, bool cullsDisabled)
 {
 	if (cullsDisabled || grassHiZParams.w < 1.0f)
@@ -77,12 +86,8 @@ bool IsVolumeOccluded(float3 centre, float radius, float minDistance, bool culls
 		return false;
 
 	const int mip = min((int)wantedMip, (int)grassHiZParams.w - 1);
-	const float mipScale = exp2((float)mip);
-	const int2 minTexel = int2(floor(uvMin * hiZSize / mipScale));
-	const int2 maxTexel = int2(floor(uvMax * hiZSize / mipScale));
-	const int2 mipSize = max(int2(ceil(hiZSize / mipScale)), int2(1, 1));
-	const int2 sampleMin = clamp(minTexel, int2(0, 0), mipSize - 1);
-	const int2 sampleMax = clamp(maxTexel, int2(0, 0), mipSize - 1);
+	int2 sampleMin, sampleMax;
+	GetHiZSampleRect(uvMin, uvMax, mip, sampleMin, sampleMax);
 
 	float tileMax = 0.0f;
 	if (wantedMip <= grassHiZParams.w - 1.0f) {
@@ -182,10 +187,8 @@ bool IsProjectedBladeOccluded(float2 ndcMin, float2 ndcMax, float minClipW)
 	const int mip = (int)max(ceil(log2(max(max(spanTexels.x, spanTexels.y), 1.0f) * 0.5f)), 0.0f);
 	if (mip > (int)grassHiZParams.w - 1)
 		return false;
-	const float mipScale = exp2((float)mip);
-	const int2 mipSize = max(int2(ceil(hiZSize / mipScale)), int2(1, 1));
-	const int2 sampleMin = clamp(int2(floor(uvMin * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
-	const int2 sampleMax = clamp(int2(floor(uvMax * hiZSize / mipScale)), int2(0, 0), mipSize - 1);
+	int2 sampleMin, sampleMax;
+	GetHiZSampleRect(uvMin, uvMax, mip, sampleMin, sampleMax);
 	const float nearestDepth = FrameBuffer::CameraProj._m22 + FrameBuffer::CameraProj._m23 / minClipW;
 	return nearestDepth > LoadHiZMax3x3(sampleMin, sampleMax, mip) + 2.0e-6f;
 }

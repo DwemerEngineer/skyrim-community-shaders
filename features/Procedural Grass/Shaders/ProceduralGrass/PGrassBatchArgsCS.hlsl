@@ -3,7 +3,7 @@ ByteAddressBuffer BladeArgs : register(t13);
 RWByteAddressBuffer BatchArgs : register(u0);
 
 [numthreads(2, 1, 1)] void main(uint segment : SV_GroupIndex) {
-#if !defined(LOW_OUTER_GEOMETRY)
+#if !defined(PGRASS_OUTER_LIST)
 	if (segment != 0u)
 		return;
 #endif

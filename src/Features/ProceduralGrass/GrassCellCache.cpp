@@ -29,7 +29,7 @@ namespace
 		RE::FormID landTexture;
 		uint8_t quadrant;
 		uint8_t unused;
-		int16_t layer;
+		uint16_t layer;
 	};
 	static_assert(sizeof(LandscapeTextureHeader) == 8);
 
@@ -64,7 +64,7 @@ void GrassCellCache::BeginFrame(RE::TESWorldSpace* landWorldSpace)
 		return;
 
 	// Worldspace changed, so bump the generation to drop in-flight worker results on drain, then clear.
-	generation.fetch_add(1, std::memory_order_relaxed);
+	++generation;
 	worldSpace = landWorldSpace;
 
 	auto loadedFiles = std::make_shared<std::vector<RE::TESFile*>>();
@@ -78,33 +78,27 @@ void GrassCellCache::BeginFrame(RE::TESWorldSpace* landWorldSpace)
 	}
 
 	files = std::move(loadedFiles);
-	ready.clear();
-	lastTouched.clear();
-	pending.clear();
-	++readyVersion;
-
-	{
-		std::scoped_lock lock(completedMutex);
-		completed.clear();
-	}
+	ClearCells();
 }
 
-void GrassCellCache::SetGrassMapPolicy(std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy> newTextureOverrides, bool newIgnoreGrassMap)
+void GrassCellCache::ClearCells()
+{
+	ready.clear();
+	pending.clear();
+	++readyVersion;
+	std::scoped_lock lock(completedMutex);
+	completed.clear();
+}
+
+void GrassCellCache::SetGrassMapPolicy(GrassTexturePolicyMap newTextureOverrides, bool newIgnoreGrassMap)
 {
 	if (ignoreGrassMap == newIgnoreGrassMap && *textureOverrides == newTextureOverrides)
 		return;
 
-	generation.fetch_add(1, std::memory_order_relaxed);
-	textureOverrides = std::make_shared<const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>>(std::move(newTextureOverrides));
+	++generation;
+	textureOverrides = std::make_shared<const GrassTexturePolicyMap>(std::move(newTextureOverrides));
 	ignoreGrassMap = newIgnoreGrassMap;
-	ready.clear();
-	lastTouched.clear();
-	pending.clear();
-	++readyVersion;
-	{
-		std::scoped_lock lock(completedMutex);
-		completed.clear();
-	}
+	ClearCells();
 }
 
 void GrassCellCache::DrainCompleted(const size_t maxCount)
@@ -120,16 +114,14 @@ void GrassCellCache::DrainCompleted(const size_t maxCount)
 		}
 	}
 
-	const uint64_t gen = generation.load(std::memory_order_relaxed);
 	bool changed = false;
 	for (auto& [key, taskGen, data] : drained) {
-		if (taskGen != gen)
+		if (taskGen != generation)
 			continue;  // read belongs to a previous worldspace
 		pending.erase(key);
 		for (auto& cacheVersion : data->quadrantCacheVersions)
 			cacheVersion = nextCacheVersion++;
-		lastTouched[key] = frame;
-		ready[key] = std::move(data);
+		ready.insert_or_assign(key, CachedCell{ std::move(data), frame });
 		changed = true;
 	}
 	if (changed)
@@ -141,8 +133,8 @@ const CellGrass* GrassCellCache::Get(int32_t cellX, int32_t cellY)
 	const uint64_t key = PGrassCommon::GrassCellKey(cellX, cellY);
 
 	if (const auto it = ready.find(key); it != ready.end()) {
-		lastTouched[key] = frame;
-		return it->second.get();
+		it->second.lastTouched = frame;
+		return it->second.data.get();
 	}
 
 	return nullptr;
@@ -155,7 +147,7 @@ bool GrassCellCache::Request(int32_t cellX, int32_t cellY)
 		return false;
 
 	pending.insert(key);
-	const uint64_t gen = generation.load(std::memory_order_relaxed);
+	const uint64_t gen = generation;
 	RE::TESWorldSpace* ws = worldSpace;
 	const auto fileList = files;
 	const auto grassTextureOverrides = textureOverrides;
@@ -170,7 +162,7 @@ bool GrassCellCache::Request(int32_t cellX, int32_t cellY)
 	return true;
 }
 
-void GrassCellCache::EvictUntouched()
+void GrassCellCache::EvictUntouched(const int32_t centerX, const int32_t centerY, const int32_t keepRadius)
 {
 	constexpr size_t kMaxCachedCells = 2048;
 	if (ready.size() <= kMaxCachedCells)
@@ -178,20 +170,22 @@ void GrassCellCache::EvictUntouched()
 
 	std::vector<std::pair<uint64_t, uint64_t>> byAge;  // (last-touched frame, key)
 	byAge.reserve(ready.size());
-	for (const auto& kv : ready) {
-		const auto it = lastTouched.find(kv.first);
-		byAge.emplace_back(it != lastTouched.end() ? it->second : 0, kv.first);
+	for (const auto& [key, cell] : ready) {
+		const int32_t cellX = static_cast<int32_t>(key >> 32);
+		const int32_t cellY = static_cast<int32_t>(key & 0xFFFFFFFFu);
+		if (std::max(std::abs(cellX - centerX), std::abs(cellY - centerY)) <= keepRadius)
+			continue;
+		byAge.emplace_back(cell.lastTouched, key);
 	}
 	std::ranges::sort(byAge);  // oldest first
 
-	const size_t toRemove = ready.size() - kMaxCachedCells;
+	const size_t toRemove = std::min(ready.size() - kMaxCachedCells, byAge.size());
 	bool changed = false;
 	for (size_t i = 0; i < toRemove; ++i) {
 		if (byAge[i].first == frame)
-			break;  // never evict a cell requested this frame - its pointers are live in quadrantsFarLOD
+			break;
 
 		ready.erase(byAge[i].second);
-		lastTouched.erase(byAge[i].second);
 		changed = true;
 	}
 	if (changed)
@@ -204,16 +198,11 @@ void GrassCellCache::Shutdown()
 		pool->wait();
 		pool.reset();
 	}
-
-	ready.clear();
-	lastTouched.clear();
-	pending.clear();
-	std::scoped_lock lock(completedMutex);
-	completed.clear();
+	ClearCells();
 }
 
 std::unique_ptr<CellGrass> GrassCellCache::ReadCell(RE::TESWorldSpace* worldSpace, std::shared_ptr<const std::vector<RE::TESFile*>> files, int32_t cellX, int32_t cellY,
-	std::shared_ptr<const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>> textureOverrides, bool ignoreGrassMap)
+	std::shared_ptr<const GrassTexturePolicyMap> textureOverrides, bool ignoreGrassMap)
 {
 	auto cell = std::make_unique<CellGrass>();
 	for (auto& quad : cell->heights)
@@ -227,7 +216,8 @@ std::unique_ptr<CellGrass> GrassCellCache::ReadCell(RE::TESWorldSpace* worldSpac
 	const int32_t fileCount = static_cast<int32_t>(files->size());
 	auto* const fileData = files->data();
 
-	// Highest load order wins, so search files back to front for the one that overrides this cell's LAND.
+	// Highest load order wins, so search files back to front for the one that overrides this cell's LAND. On a worker
+	// thread Duplicate returns this thread's cached copy of the file, as TESObjectLAND::LoadVerticesIntoArrays uses it.
 	for (int32_t i = fileCount - 1; i >= 0; --i) {
 		RE::TESFile* file = fileData[i]->Duplicate();
 		if (file && file->SeekCell(worldSpace, cellX, cellY) && file->SeekLandscapeForCurrentCell()) {
@@ -240,49 +230,16 @@ std::unique_ptr<CellGrass> GrassCellCache::ReadCell(RE::TESWorldSpace* worldSpac
 }
 
 void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out, int32_t cellX, int32_t cellY,
-	const std::unordered_map<const RE::TESLandTexture*, GrassTexturePolicy>& textureOverrides, bool ignoreGrassMap)
+	const GrassTexturePolicyMap& textureOverrides, bool ignoreGrassMap)
 {
 	const bool bigEndian = file->isBigEndian;
 
-	using OpacityGrid = std::array<float, kQuadrantSamples>;
-	using TextureGrid = std::array<RE::TESLandTexture*, PGrassCommon::LandscapeOverlayCount>;
-	using LayerOpacityGrid = std::array<OpacityGrid, PGrassCommon::LandscapeOverlayCount>;
-
-	std::array<RE::TESLandTexture*, 4> baseTexture{};
-	std::array<TextureGrid, 4> layerTextures{};
-	std::array<LayerOpacityGrid, 4> layerOpacity{};
-	std::array<OpacityGrid, 4> totalOpacity{};
-	std::array<std::array<bool, PGrassCommon::LandscapeOverlayCount>, 4> seenLayer{};
-
-	const auto defaultLandTexture = PGrassCommon::GetDefaultLandTexture();
-	const float texturePctThreshold = PGrassCommon::GetGrassTexturePctThreshold();
-
-	const auto getPolicy = [&](const RE::TESLandTexture* texture) -> const GrassTexturePolicy* {
-		if (!texture)
-			return nullptr;
-		if (const auto it = textureOverrides.find(texture); it != textureOverrides.end())
-			return &it->second;
-		return nullptr;
-	};
-
-	const auto growsGrass = [&](const RE::TESLandTexture* texture) {
-		if (!texture)
-			return false;
-		if (const auto policy = getPolicy(texture))
-			return policy->total > 0.0f && PGrassCommon::HasWeightedGrass(policy->ids, policy->cumulative);
-		return !texture->textureGrassList.empty();
-	};
-
-	const auto selectType = [&](const RE::TESLandTexture* texture, uint32_t quadrant, uint32_t sample) -> uint8_t {
-		if (const auto policy = getPolicy(texture); policy && policy->total > 0.0f)
-			return PGrassCommon::SelectWeightedGrass(policy->ids, policy->cumulative, policy->total,
-				PGrassCommon::QuadrantSampleHash(cellX, cellY, quadrant, sample));
-		return 1u;
-	};
+	// Decoded as TESObjectLAND::LoadVerticesIntoArrays does, so streamed cells match loaded ones sample for sample.
+	std::array<PGrassCommon::QuadrantLandTextures, 4> textures{};
+	std::array<std::array<std::array<uint8_t, PGrassCommon::LandscapeOverlayCount>, kQuadrantSamples>, 4> percents{};
 
 	int32_t activeQuadrant = -1;
 	int32_t activeLayer = -1;
-	RE::TESLandTexture* activeLayerTexture = nullptr;
 
 	while (file->SeekNextSubrecord()) {
 		const uint32_t recordType = file->GetCurrentSubRecordType();
@@ -331,89 +288,60 @@ void GrassCellCache::ParseLandscape(RE::TESFile* file, CellGrass& out, int32_t c
 				}
 			}
 
-		} else if (recordType == kBTXT) {
+		} else if (recordType == kBTXT || recordType == kATXT) {
 			if (recordSize < sizeof(LandscapeTextureHeader))
 				continue;
 
 			LandscapeTextureHeader header{};
 			file->ReadData(&header, sizeof(header));
+			const RE::FormID formID = bigEndian ? Swap32(header.landTexture) : header.landTexture;
 
-			if (header.quadrant < 4)
-				baseTexture[header.quadrant] = ResolveLandTexture(file, bigEndian ? Swap32(header.landTexture) : header.landTexture);
-
-		} else if (recordType == kATXT) {
-			if (recordSize < sizeof(LandscapeTextureHeader))
+			if (recordType == kBTXT) {
+				if (header.quadrant < 4)
+					textures[header.quadrant].base = ResolveLandTexture(file, formID);
 				continue;
-
-			LandscapeTextureHeader header{};
-			file->ReadData(&header, sizeof(header));
-			const int16_t layer = bigEndian ? static_cast<int16_t>(Swap16(static_cast<uint16_t>(header.layer))) : header.layer;
-			const bool validLayer = header.quadrant < 4 && layer >= 0 && layer < static_cast<int16_t>(PGrassCommon::LandscapeOverlayCount);
-			activeQuadrant = validLayer ? header.quadrant : -1;
-			activeLayer = validLayer ? layer : -1;
-			activeLayerTexture = validLayer ? ResolveLandTexture(file, bigEndian ? Swap32(header.landTexture) : header.landTexture) : nullptr;
-			if (validLayer) {
-				if (seenLayer[header.quadrant][layer]) {
-					auto& previous = layerOpacity[header.quadrant][layer];
-					for (uint32_t v = 0; v < kQuadrantSamples; ++v)
-						totalOpacity[header.quadrant][v] -= previous[v];
-					previous.fill(0.0f);
-				}
-				seenLayer[header.quadrant][layer] = true;
-				layerTextures[header.quadrant][layer] = activeLayerTexture;
 			}
+
+			// The engine clamps the layer to its sixth slot, which VTXT never fills, and keeps the layer active even
+			// when its texture fails to resolve.
+			const uint32_t layer = std::min<uint32_t>(bigEndian ? Swap16(header.layer) : header.layer, PGrassCommon::LandscapeOverlayCount);
+			activeQuadrant = header.quadrant;
+			activeLayer = static_cast<int32_t>(layer);
+			if (header.quadrant < 4 && layer < PGrassCommon::LandscapeOverlayCount)
+				textures[header.quadrant].layers[layer] = ResolveLandTexture(file, formID);
 
 		} else if (recordType == kVTXT) {
-			if (activeQuadrant < 0 || activeLayer < 0 || !activeLayerTexture || recordSize < sizeof(VertexTextureAlpha))
-				continue;
+			const bool validTarget = activeQuadrant >= 0 && activeQuadrant < 4 && activeLayer >= 0 && activeLayer < static_cast<int32_t>(PGrassCommon::LandscapeOverlayCount);
+			if (validTarget && recordSize % sizeof(VertexTextureAlpha) == 0) {
+				const uint32_t pointCount = recordSize / sizeof(VertexTextureAlpha);
+				std::vector<VertexTextureAlpha> points(pointCount);
+				file->ReadData(points.data(), pointCount * sizeof(VertexTextureAlpha));
 
-			const uint32_t pointCount = recordSize / sizeof(VertexTextureAlpha);
-			std::vector<VertexTextureAlpha> points(pointCount);
-			file->ReadData(points.data(), pointCount * sizeof(VertexTextureAlpha));
-
-			for (const VertexTextureAlpha& point : points) {
-				const uint16_t position = bigEndian ? Swap16(point.position) : point.position;
-				const float opacity = bigEndian ? SwapF(point.opacity) : point.opacity;
-
-				if (position >= kQuadrantSamples)
-					continue;
-
-				const float clampedOpacity = std::clamp(opacity, 0.0f, 1.0f);
-				totalOpacity[activeQuadrant][position] += clampedOpacity - layerOpacity[activeQuadrant][activeLayer][position];
-				layerOpacity[activeQuadrant][activeLayer][position] = clampedOpacity;
+				for (const VertexTextureAlpha& point : points) {
+					const uint16_t position = bigEndian ? Swap16(point.position) : point.position;
+					const float opacity = bigEndian ? SwapF(point.opacity) : point.opacity;
+					if (position < kQuadrantSamples)
+						percents[activeQuadrant][position][activeLayer] = opacity <= 0.0f ? uint8_t{ 0 } : static_cast<uint8_t>(static_cast<int32_t>(opacity * 255.0f));
+				}
 			}
+			activeQuadrant = -1;
+			activeLayer = -1;
 		}
 	}
 
+	const auto getSelection = [&](const RE::TESLandTexture* texture) -> const PGrassCommon::GrassTextureSelection* {
+		const auto it = textureOverrides.find(texture);
+		return it != textureOverrides.end() ? &it->second : nullptr;
+	};
+
 	for (uint32_t quad = 0; quad < 4; ++quad) {
-		for (uint32_t v = 0; v < kQuadrantSamples; ++v) {
-			if (ignoreGrassMap) {
-				out.ids[quad][v] = 1u;
-				continue;
-			}
-
-			const RE::TESLandTexture* grassTexture = nullptr;
-			float bestGrassOpacity = -1.0f;
-			const auto considerTexture = [&](const RE::TESLandTexture* texture, float opacity) {
-				if (!texture || opacity <= 0.0f || opacity < texturePctThreshold || opacity <= bestGrassOpacity || !growsGrass(texture))
-					return;
-				bestGrassOpacity = opacity;
-				grassTexture = texture;
-			};
-
-			const float baseOpacity = std::max(1.0f - totalOpacity[quad][v], 0.0f);
-			considerTexture(baseTexture[quad] ? baseTexture[quad] : defaultLandTexture, baseOpacity);
-			for (uint32_t layer = 0; layer < PGrassCommon::LandscapeOverlayCount; ++layer)
-				considerTexture(layerTextures[quad][layer], layerOpacity[quad][layer][v]);
-
-			out.ids[quad][v] = grassTexture ? selectType(grassTexture, quad, v) : 0u;
-		}
+		out.ids[quad] = PGrassCommon::BuildQuadrantGrassIds(textures[quad], percents[quad][0].data(), PGrassCommon::LandscapeOverlayCount,
+			cellX, cellY, quad, ignoreGrassMap, getSelection);
 
 		const auto [minIt, maxIt] = std::minmax_element(out.heights[quad].begin(), out.heights[quad].end());
 		if (*maxIt > PGrassCommon::QuadrantNoHeight) {
 			out.minHeights[quad] = *minIt;
 			out.maxHeights[quad] = *maxIt;
 		}
-		out.occupancy[quad] = PGrassCommon::BuildQuadrantOccupancy(out.ids[quad].data());
 	}
 }

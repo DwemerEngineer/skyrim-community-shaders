@@ -242,6 +242,7 @@ namespace
 	struct OverrideEditor
 	{
 		nlohmann::json& ov;
+		bool& edited;
 
 		void Section(const char* label) const { ImGui::SeparatorText(label); }
 
@@ -251,6 +252,7 @@ namespace
 			bool has = ov.contains(key);
 
 			if (ImGui::Checkbox(std::format("##en_{}", key).c_str(), &has)) {
+				edited = true;
 				if (has)
 					ov[key] = base;
 				else
@@ -269,12 +271,54 @@ namespace
 			else
 				changed = fmt ? ImGui::SliderFloat3(label, &val.x, mn, mx, fmt) : ImGui::ColorEdit3(label, &val.x);
 
-			if (changed && has)
+			if (changed && has) {
 				ov[key] = val;
+				edited = true;
+			}
 
 			ImGui::EndDisabled();
 		}
 	};
+
+	uint64_t GrassTypeSettingsHash(const ProceduralGrass::Settings& settings)
+	{
+		uint64_t hash = PGrassCommon::GrassHashOffsetBasis;
+		ForEachTypeOverride(settings, OverrideVisitor{ [&](const char*, const auto& value) {
+			PGrassCommon::GrassHashValue(hash, value);
+		} });
+		// View thickening also changes the culling bounds resolved with the type tables.
+		PGrassCommon::GrassHashValue(hash, settings.grassViewThicken);
+		return hash;
+	}
+
+	/** @brief Keeps slider previews separate from applied LOD settings until the edit ends. */
+	bool DensitySlider(const char* label, int& value, int mn, int mx, const char* const* names = nullptr)
+	{
+		ImGui::PushID(label);
+		const auto previewID = ImGui::GetID("Preview");
+		const auto editingID = ImGui::GetID("Editing");
+		const auto frameID = ImGui::GetID("Frame");
+		ImGui::PopID();
+
+		auto* storage = ImGui::GetStateStorage();
+		const int frame = ImGui::GetFrameCount();
+		const bool editing = storage->GetBool(editingID) && storage->GetInt(frameID, -1) == frame - 1;
+		int preview = editing ? storage->GetInt(previewID, value) : value;
+		preview = std::clamp(preview, mn, mx);
+		const auto flags = ImGuiSliderFlags_AlwaysClamp | (names ? ImGuiSliderFlags_NoInput : 0);
+		const bool changed = ImGui::SliderInt(label, &preview, mn, mx, names ? names[preview] : "%d", flags);
+		const bool active = ImGui::IsItemActive();
+		const bool committed = ImGui::IsItemDeactivatedAfterEdit() || (changed && !active);
+
+		storage->SetInt(previewID, preview);
+		storage->SetBool(editingID, active);
+		storage->SetInt(frameID, frame);
+		if (!committed || preview == value)
+			return false;
+
+		value = preview;
+		return true;
+	}
 
 	/** @brief Drops override entries whose key is unknown or whose value has the wrong shape. */
 	void RemoveInvalidGrassTypeOverrides(nlohmann::json& overrides)
@@ -319,6 +363,20 @@ namespace
 		DrawSettingDescription(description);
 		return changed;
 	}
+}
+
+PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& typeOverride) const
+{
+	// Present keys override the base setting; missing keys inherit it. The editor and the loader share this key list.
+	GrassTypeFields fields = settings;
+	if (typeOverride.is_object()) {
+		ForEachTypeOverride(fields, OverrideVisitor{ [&](const char* key, auto& value) {
+			using ValueT = std::remove_cvref_t<decltype(value)>;
+			if (const auto it = typeOverride.find(key); it != typeOverride.end() && IsValidOverrideValue<ValueT>(*it))
+				value = it->template get<ValueT>();
+		} });
+	}
+	return BuildGrassType(fields);
 }
 
 void ProceduralGrass::LoadTextureTypes()
@@ -408,8 +466,7 @@ void ProceduralGrass::SaveTextureTypes() const
 
 void ProceduralGrass::DrawSettings()
 {
-	//  Repack the type tables while the feature panel is active so edits remain live, otherwise use cached tables.
-	grassTypesDirty = true;
+	const auto baseTypeHash = GrassTypeSettingsHash(settings);
 
 	SettingCheckbox(T("feature.procedural_grass.enabled", "Enabled"), settings.Enabled, T("feature.procedural_grass.enabled_tooltip", "Enables procedural grass rendering."));
 
@@ -417,7 +474,7 @@ void ProceduralGrass::DrawSettings()
 			T("feature.procedural_grass.object_grass_tooltip", "Enables grass on supported static objects, such as dirt cliffs.")))
 		globals::topDownOcclusion->Invalidate();
 
-	if (ImGui::Button(T("feature.procedural_grass.toggle_vanilla_grass", "Toggle Vanilla Grass Rendering")))
+	if (Util::Button(T("feature.procedural_grass.toggle_vanilla_grass", "Toggle Vanilla Grass Rendering")))
 		ConsoleFunc_ToggleGrass();
 
 	ImGui::Separator();
@@ -533,26 +590,20 @@ void ProceduralGrass::DrawSettings()
 		ImGui::Separator();
 
 		ImGui::SeparatorText(T("feature.procedural_grass.lod_density_section", "LOD Density"));
-		if (ImGui::SliderInt(T("feature.procedural_grass.high_density", "Density Preset"), &settings.Quality, 0, static_cast<uint8_t>(Quality::Count) - 1, QualityNames[settings.Quality], ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput))
+		if (DensitySlider(T("feature.procedural_grass.high_density", "Density Preset"), settings.Quality, 0, static_cast<uint8_t>(Quality::Count) - 1, QualityNames))
 			ApplyDensityPreset(settings.Quality);
 		DrawSettingDescription(T("feature.procedural_grass.high_density_tooltip", "Sets blade density in the closest tier and matching densities for the middle, low and far tiers."));
-		if (ImGui::SliderInt(T("feature.procedural_grass.mid_density", "Density (Mid LOD)"), &settings.midGrassDensity, 8, 320, "%d", ImGuiSliderFlags_AlwaysClamp))
-			grassRendererMidLOD->SetDensity(static_cast<uint32_t>(settings.midGrassDensity));
+		if (DensitySlider(T("feature.procedural_grass.mid_density", "Density (Mid LOD)"), settings.midGrassDensity, 8, 320))
+			ApplyTierDensities();
 		DrawSettingDescription(T("feature.procedural_grass.mid_density_tooltip", "Sets blade density in the middle-distance grass tier."));
-		if (ImGui::SliderInt(T("feature.procedural_grass.low_density", "Density (Low LOD)"), &settings.lowGrassDensity, 8, 640, "%d", ImGuiSliderFlags_AlwaysClamp)) {
-			grassRendererLowLOD->SetDensity(static_cast<uint32_t>(settings.lowGrassDensity));
-			grassRendererFarLOD->SetDensity(FarPatchDensity());
-		}
+		if (DensitySlider(T("feature.procedural_grass.low_density", "Density (Low LOD)"), settings.lowGrassDensity, 8, 640))
+			ApplyTierDensities();
 		DrawSettingDescription(T("feature.procedural_grass.low_density_tooltip", "Sets blade density in the low-detail grass tier and scales far-tier density."));
 
-		const auto farGridCells = globals::game::tes ? globals::game::tes->gridCells : nullptr;
-		const int32_t loadedGridLength = farGridCells ? farGridCells->length : 5;
-		const int32_t maxFarExtraRadius = std::max(0, PGrassCommon::FarCellRadiusCap - PGrassCommon::FarStreamGuardCells - loadedGridLength / 2);
-		if (ImGui::SliderInt(T("feature.procedural_grass.far_radius", "Far Grass Radius (cells)"), &settings.grassCellRadius, 0, maxFarExtraRadius, "%d", ImGuiSliderFlags_AlwaysClamp))
-			grassRendererFarLOD->ResetBladeCapacity();
+		DensitySlider(T("feature.procedural_grass.far_radius", "Far Grass Radius (cells)"), settings.grassCellRadius, 0, MaxFarExtraCells(GetFarRange().loadedCellRadius));
 		DrawSettingDescription(T("feature.procedural_grass.far_radius_tooltip", "Sets how many exterior cells beyond loaded grass receive the far grass tier."));
-		if (ImGui::SliderInt(T("feature.procedural_grass.far_density", "Far Grass Density"), &settings.farGrassDensity, 8, 160, "%d", ImGuiSliderFlags_AlwaysClamp))
-			grassRendererFarLOD->SetDensity(FarPatchDensity());
+		if (DensitySlider(T("feature.procedural_grass.far_density", "Far Grass Density"), settings.farGrassDensity, 8, 160))
+			ApplyTierDensities();
 		DrawSettingDescription(T("feature.procedural_grass.far_density_tooltip", "Sets blade density in the far grass tier."));
 		SettingSlider(T("feature.procedural_grass.far_edge_density", "Far Edge Density"), settings.farDensityFalloff, 0.0f, 1.0f, T("feature.procedural_grass.far_edge_density_tooltip", "Sets the remaining grass density at the outer edge of the far tier."));
 	}
@@ -560,6 +611,8 @@ void ProceduralGrass::DrawSettings()
 	ImGui::Separator();
 
 	DrawGrassTypeEditor();
+
+	grassTypesDirty |= baseTypeHash != GrassTypeSettingsHash(settings);
 }
 
 void ProceduralGrass::DrawDebugSection()
@@ -615,10 +668,6 @@ void ProceduralGrass::DrawDebugSection()
 			ImGui::TextUnformatted(T("feature.procedural_grass.debug_land_z_missing", "LAND Z at player: <no cached quadrant>"));
 	}
 
-	ImGui::Text(T("feature.procedural_grass.debug_land_raw", "LAND raw[0]: %.1f   raw min: %.1f"), landHeightDebug.rawFirst, landHeightDebug.rawMin);
-	ImGui::Text(T("feature.procedural_grass.debug_land_extents", "LAND heightExtents: %.1f .. %.1f"), landHeightDebug.extents.x, landHeightDebug.extents.y);
-	ImGui::Text(T("feature.procedural_grass.debug_land_anchor", "LAND anchor applied: %.1f   mesh world Z: %.1f"), landHeightDebug.anchor, landHeightDebug.meshWorldZ);
-
 	ImGui::Separator();
 
 	ImGui::Text(T("feature.procedural_grass.debug_blade_counts", "Blades generated  high: %u  mid: %u  low: %u  far: %u"),
@@ -638,12 +687,16 @@ void ProceduralGrass::DrawDebugSection()
 	ImGui::Text(T("feature.procedural_grass.debug_grass_samples", "Samples growing grass: %zu / %zu (%.1f%%)"), grassSet, grassTotal, grassTotal ? 100.0 * grassSet / grassTotal : 0.0);
 }
 
-void ProceduralGrass::DrawTypeOverrides(nlohmann::json& ov) const
+bool ProceduralGrass::DrawTypeOverrides(nlohmann::json& ov) const
 {
-	ForEachTypeOverride(settings, OverrideEditor{ ov });
+	bool edited = false;
+	ForEachTypeOverride(settings, OverrideEditor{ ov, edited });
 	ImGui::Spacing();
-	if (ImGui::Button(T("feature.procedural_grass.clear_overrides", "Clear all overrides")))
+	if (Util::Button(T("feature.procedural_grass.clear_overrides", "Clear all overrides")) && !ov.empty()) {
 		ov = nlohmann::json::object();
+		edited = true;
+	}
+	return edited;
 }
 
 void ProceduralGrass::DrawGrassTypeEditor()
@@ -747,7 +800,7 @@ void ProceduralGrass::DrawGrassTypeEditor()
 					T("feature.procedural_grass.overrides_count", "Overrides ({} set)"),
 					std::make_format_args(overrideCount));
 				if (ImGui::TreeNode("Overrides", "%s", overridesLabel.c_str())) {  // i18n-ignore: stable tree ID; display label is translated
-					DrawTypeOverrides(def.overrides);
+					grassTypesDirty |= DrawTypeOverrides(def.overrides);
 					ImGui::TreePop();
 				}
 				ImGui::EndDisabled();
@@ -800,6 +853,8 @@ void ProceduralGrass::LoadSettings(json& o_json)
 
 	LoadTextureTypes();
 	RebuildTypeAllocation();
+	// Cached LAND ids carry the previous texture types; drop them as RestoreDefaultSettings does.
+	ClearGrassMapCache();
 
 	settings.midGrassDensity = std::clamp(settings.midGrassDensity, 8, 320);
 	settings.lowGrassDensity = std::clamp(settings.lowGrassDensity, 8, 640);
@@ -834,7 +889,7 @@ void ProceduralGrass::ApplyTierDensities()
 	if (grassRendererLowLOD)
 		grassRendererLowLOD->SetDensity(static_cast<uint32_t>(settings.lowGrassDensity));
 	if (grassRendererFarLOD)
-		grassRendererFarLOD->SetDensity(FarPatchDensity());
+		grassRendererFarLOD->SetDensity(FarPatchDensity(), static_cast<uint32_t>(settings.lowGrassDensity));
 }
 
 void ProceduralGrass::SaveSettings(json& o_json)

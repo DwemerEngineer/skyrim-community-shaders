@@ -1,7 +1,6 @@
 #include "Features/ProceduralGrass.h"
 
 #include "Features/LinearLighting.h"
-#include "Utils/Math.h"
 
 #include <algorithm>
 #include <cmath>
@@ -11,6 +10,26 @@ using namespace PGrassCommon;
 
 namespace
 {
+	/** @brief Deterministic 32-bit hash of two unsigned coordinates. */
+	uint32_t Hash2D(uint32_t x, uint32_t y)
+	{
+		x ^= y * 0x9E3779B9u;
+		x ^= x >> 16;
+		x *= 0x7FEB352Du;
+		x ^= x >> 15;
+		x *= 0x846CA68Bu;
+		return x ^ (x >> 16);
+	}
+
+	/** @brief Cubic smoothstep; equal edges produce a step at edge0. */
+	float Smoothstep(float edge0, float edge1, float value)
+	{
+		if (edge0 == edge1)
+			return value < edge0 ? 0.0f : 1.0f;
+		const float t = std::clamp((value - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+		return t * t * (3.0f - 2.0f * t);
+	}
+
 	/** @brief Roughness-dependent coefficients of PBR::FuzzDirectionalAlbedo's MaterialX fit. */
 	float4 GetFuzzDirectionalAlbedoParameters(float roughness)
 	{
@@ -50,8 +69,8 @@ namespace
 		const uint32_t wrappedX = static_cast<uint32_t>(x) & (GrassMaterialDetailDim - 1u);
 		const uint32_t wrappedY = static_cast<uint32_t>(y) & (GrassMaterialDetailDim - 1u);
 		const uint32_t hash = grain ?
-		                          Util::Hash2D(wrappedX, wrappedY) :
-		                          Util::Hash2D(wrappedX / 8u, wrappedY / 8u);
+		                          Hash2D(wrappedX, wrappedY) :
+		                          Hash2D(wrappedX / 8u, wrappedY / 8u);
 		return static_cast<float>(hash >> 24) * (1.0f / 255.0f);
 	}
 
@@ -114,7 +133,7 @@ void ProceduralGrass::RebuildTypeAllocation()
 				sel.ids.push_back(0u);
 			} else {
 				if (typeAllocation.size() + 2 >= PGrassCommon::MaxGrassTypes)
-					break;  // Remaining variants use the base type.
+					break;  // The type pool is full; this texture keeps only the variants allocated so far.
 				sel.ids.push_back(static_cast<uint8_t>(typeAllocation.size() + 2));
 				typeAllocation.emplace_back(key, i);
 			}
@@ -128,89 +147,61 @@ void ProceduralGrass::RebuildTypeAllocation()
 	}
 }
 
-PGrassCommon::GrassType ProceduralGrass::ResolveGrassType(const nlohmann::json& typeOverride) const
+PGrassCommon::GrassType ProceduralGrass::BuildGrassType(const GrassTypeFields& s)
 {
-	// Present keys override the base setting. Missing keys inherit it.
-	static const nlohmann::json emptyObject = nlohmann::json::object();
-	const nlohmann::json& ov = typeOverride.is_object() ? typeOverride : emptyObject;
-	const auto& s = settings;
-
 	const auto packColor = [](const float3& c) { return float4(c.x, c.y, c.z, 0.0f); };
+	constexpr float degreesToRadians = std::numbers::pi_v<float> / 180.0f;
 
 	PGrassCommon::GrassType t{};
-	t.height = ov.value("Height", s.grassHeight);
-	t.width = ov.value("Width", s.grassWidth);
-	t.minSlope = std::cos(ov.value("MinSlope", s.grassMinSlope) * (std::numbers::pi_v<float> / 180.0f));
-	t.maxSlope = std::cos(ov.value("MaxSlope", s.grassMaxSlope) * (std::numbers::pi_v<float> / 180.0f));
-	t.stiffness = ov.value("Stiffness", s.stiffness);
-	t.rotationalStiffness = ov.value("RotationalStiffness", s.rotationalStiffness);
-	t.tipWeight = ov.value("TipWeight", s.tipWeight);
-	t.mid = ov.value("Mid", s.mid);
+	t.height = s.grassHeight;
+	t.width = s.grassWidth;
+	t.minSlope = std::cos(s.grassMinSlope * degreesToRadians);
+	t.maxSlope = std::cos(s.grassMaxSlope * degreesToRadians);
+	t.stiffness = s.stiffness;
+	t.rotationalStiffness = s.rotationalStiffness;
+	t.tipWeight = s.tipWeight;
+	t.mid = s.mid;
 
-	// Keep the generator's reciprocal grid size finite.
-	t.clumpGridSize = std::clamp(ov.value("ClumpGridSize", s.clumpGridSize), MinClumpGridSize, MaxClumpGridSize);
-	t.clumpDistanceFactor = ov.value("ClumpDistanceFactor", s.clumpDistanceFactor);
-	t.clumpFacingFactor = ov.value("ClumpFacingFactor", s.clumpFacingFactor);
-	t.clumpLeanFactor = ov.value("ClumpLeanFactor", s.clumpLeanFactor);
+	// Keep the generator's reciprocal grid size finite and interpolated clump heights within the type bounds.
+	t.clumpGridSize = std::clamp(s.clumpGridSize, MinClumpGridSize, MaxClumpGridSize);
+	t.clumpDistanceFactor = s.clumpDistanceFactor;
+	t.clumpFacingFactor = s.clumpFacingFactor;
+	t.clumpLeanFactor = s.clumpLeanFactor;
+	t.clumpHeightFactor = std::clamp(s.clumpHeightFactor, 0.0f, 1.0f);
+	t.clumpAOStrength = s.clumpAOStrength;
+	t.clumpColorStrength = s.grassClumpColorStrength;
 
-	// Keep interpolated clump heights within the type bounds.
-	t.clumpHeightFactor = std::clamp(ov.value("ClumpHeightFactor", s.clumpHeightFactor), 0.0f, 1.0f);
-	t.clumpAOStrength = ov.value("ClumpAOStrength", s.clumpAOStrength);
-	t.clumpColorStrength = ov.value("ClumpColorStrength", s.grassClumpColorStrength);
+	t.minAO = s.ao;
+	t.specular = s.specular;
+	t.specularAnisotropy = std::clamp(s.specularAnisotropy, 0.0f, 1.0f);
+	t.minMaxSubsurfaceOpacity = s.subsurfaceOpacity;
+	t.grassSubsurfaceColor = packColor(s.grassSubsurfaceTint);
+	t.grassSubsurfaceColor.w = std::clamp(s.sheenTint, 0.0f, 1.0f);
+	t.grassSurfParams = float4(s.sheenStrength, std::clamp(s.grassTransmissionStrength, 0.0f, 2.0f), std::clamp(s.grassSlopeFacing, 0.0f, 1.0f), s.sheenRoughness);
 
-	t.minAO = ov.value("MinAO", s.ao);
-	t.specular = ov.value("Specular", s.specular);
-	t.specularAnisotropy = std::clamp(ov.value("SpecularAnisotropy", s.specularAnisotropy), 0.0f, 1.0f);
-	t.minMaxSubsurfaceOpacity = ov.value("SubsurfaceOpacity", s.subsurfaceOpacity);
-	t.grassSubsurfaceColor = packColor(ov.value("SubsurfaceTint", s.grassSubsurfaceTint));
-	t.grassSubsurfaceColor.w = std::clamp(ov.value("SheenTint", s.sheenTint), 0.0f, 1.0f);
-	t.grassSurfParams = float4(
-		ov.value("SheenStrength", s.sheenStrength),
-		std::clamp(ov.value("TransmissionStrength", s.grassTransmissionStrength), 0.0f, 2.0f),
-		std::clamp(ov.value("SlopeFacing", s.grassSlopeFacing), 0.0f, 1.0f),
-		ov.value("SheenRoughness", s.sheenRoughness));
-
-	const float3 rough = ov.value("BaseMinTipRoughness", s.baseMinTipRoughness);
-	const float roughnessStart = ov.value("TipRoughnessStart", s.tipRoughnessStart);
+	const float3 rough = s.baseMinTipRoughness;
+	const float roughnessStart = s.tipRoughnessStart;
 	t.baseMinTipRoughnessStart = float4(rough.x, rough.y, rough.z, roughnessStart);
 
 	// Fit Mid roughness at its three vertex positions to avoid evaluating both smoothstep curves in the vertex shader.
-	const float roughnessAtMidFirst = std::lerp(rough.x, rough.y, Util::Smoothstep(0.0f, roughnessStart, 0.5f));
-	const float roughnessAtMid = std::lerp(roughnessAtMidFirst, rough.z, Util::Smoothstep(rough.x, 1.0f, 0.5f));
+	const float roughnessAtMidFirst = std::lerp(rough.x, rough.y, Smoothstep(0.0f, roughnessStart, 0.5f));
+	const float roughnessAtMid = std::lerp(roughnessAtMidFirst, rough.z, Smoothstep(rough.x, 1.0f, 0.5f));
 	const float baseToMid = roughnessAtMid - rough.x;
 	const float baseToTip = rough.z - rough.x;
 	t.midRoughnessPolynomial = float4(2.0f * baseToTip - 8.0f * baseToMid, 8.0f * baseToMid - baseToTip, rough.x, 0.0f);
 
-	t.grassTypeLightParams = float4(
-		ov.value("BounceStrength", s.grassBounceStrength),
-		0.0f,
-		0.0f,
-		ov.value("AmbientDesat", s.grassAmbientDesat));
+	t.grassTypeLightParams = float4(s.grassBounceStrength, 0.0f, 0.0f, s.grassAmbientDesat);
 
-	t.baseColor = packColor(ov.value("BaseColor", s.baseColor));
-	t.tipColor = packColor(ov.value("TipColor", s.tipColor));
-	t.grassColorTipDry = packColor(ov.value("ColorTipDry", s.grassColorTipDry));
-	t.grassColorVar = float4(
-		ov.value("HueVariation", s.grassColorHueVariation),
-		ov.value("ValueVariation", s.grassColorValueVariation),
-		ov.value("TipDryStrength", s.grassColorTipDryStrength),
-		ov.value("MottleStrength", s.grassColorMottleStrength));
-	t.grassColorCool = packColor(ov.value("ColorCool", s.grassColorCool));
-	t.grassColorWarm = packColor(ov.value("ColorWarm", s.grassColorWarm));
-	t.grassBounceColor = packColor(ov.value("BounceColor", s.grassBounceColor));
-	t.grassTextureParams = float4(
-		ov.value("BlotchStrength", s.grassBlotchStrength),
-		ov.value("BlotchScale", s.grassBlotchScale),
-		ov.value("SpeckleStrength", s.grassSpeckleStrength),
-		ov.value("SpeckleScale", s.grassSpeckleScale));
-
-	const float3 veinTint = ov.value("VeinTint", s.grassVeinTint);
-	t.grassVeinParams = float4(veinTint.x, veinTint.y, veinTint.z, ov.value("VeinAlbedoStrength", s.grassVeinAlbedoStrength));
-	t.grassVeinParams2 = float4(
-		ov.value("VeinNormalStrength", s.grassVeinNormalStrength),
-		ov.value("VeinRippleDepth", s.grassVeinRippleDepth),
-		ov.value("VeinWiggleAmount", s.grassVeinWiggleAmount),
-		ov.value("CurvedNormalStrength", s.curvedNormalStrength));
+	t.baseColor = packColor(s.baseColor);
+	t.tipColor = packColor(s.tipColor);
+	t.grassColorTipDry = packColor(s.grassColorTipDry);
+	t.grassColorVar = float4(s.grassColorHueVariation, s.grassColorValueVariation, s.grassColorTipDryStrength, s.grassColorMottleStrength);
+	t.grassColorCool = packColor(s.grassColorCool);
+	t.grassColorWarm = packColor(s.grassColorWarm);
+	t.grassBounceColor = packColor(s.grassBounceColor);
+	t.grassTextureParams = float4(s.grassBlotchStrength, s.grassBlotchScale, s.grassSpeckleStrength, s.grassSpeckleScale);
+	t.grassVeinParams = float4(s.grassVeinTint.x, s.grassVeinTint.y, s.grassVeinTint.z, s.grassVeinAlbedoStrength);
+	t.grassVeinParams2 = float4(s.grassVeinNormalStrength, s.grassVeinRippleDepth, s.grassVeinWiggleAmount, s.curvedNormalStrength);
 
 	return t;
 }
@@ -224,11 +215,10 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 		return static_cast<uint8_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
 	};
 
-	std::vector<uint8_t> detailData(GrassMaterialDetailDim * GrassMaterialDetailDim * 4u);
-	const uint32_t activeTypeCount = std::min<uint32_t>(static_cast<uint32_t>(typeAllocation.size()) + 2u, MaxGrassTypes);
+	std::vector<uint8_t> detailData;
 
 	// Slot 0 is bare; only generated grass needs material detail.
-	for (uint32_t typeIndex = 1; typeIndex < activeTypeCount; ++typeIndex) {
+	for (uint32_t typeIndex = 1; typeIndex < ActiveGrassTypeCount(); ++typeIndex) {
 		const auto& type = resolvedGrassTypes.grassType[typeIndex];
 		const float blotchScale = std::max(type.grassTextureParams.y, 0.0f);
 		const float speckleScale = std::max(type.grassTextureParams.w, 0.0f);
@@ -236,11 +226,21 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 		const float veinRippleDepth = type.grassVeinParams2.y;
 		const float veinWiggleAmount = type.grassVeinParams2.z;
 
+		uint64_t detailHash = GrassHashOffsetBasis;
+		GrassHashValue(detailHash, blotchScale);
+		GrassHashValue(detailHash, speckleScale);
+		GrassHashValue(detailHash, veinStrength);
+		GrassHashValue(detailHash, veinRippleDepth);
+		GrassHashValue(detailHash, veinWiggleAmount);
+		if (grassMaterialDetailValid[typeIndex] && grassMaterialDetailHashes[typeIndex] == detailHash)
+			continue;
+
+		detailData.resize(GrassMaterialDetailDim * GrassMaterialDetailDim * 4u);
 		for (uint32_t variant = 0; variant < GrassMaterialDetailVariants; ++variant) {
-			const uint32_t offsetHash = Util::Hash2D(typeIndex * GrassMaterialDetailVariants + variant, variant);
+			const uint32_t offsetHash = Hash2D(typeIndex * GrassMaterialDetailVariants + variant, variant);
 			const float noiseOffsetX = static_cast<float>(offsetHash & 0xFFFFu) * (1.0f / 65536.0f);
 			const float noiseOffsetY = static_cast<float>(offsetHash >> 16) * (1.0f / 65536.0f);
-			const float phase = static_cast<float>(Util::Hash2D(variant, typeIndex) >> 8) * (std::numbers::pi_v<float> * 2.0f / 16777216.0f);
+			const float phase = static_cast<float>(Hash2D(variant, typeIndex) >> 8) * (std::numbers::pi_v<float> * 2.0f / 16777216.0f);
 
 			for (uint32_t y = 0; y < GrassMaterialDetailDim; ++y) {
 				const float along = (static_cast<float>(y) + 0.5f) * (1.0f / GrassMaterialDetailDim);
@@ -253,11 +253,11 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 					const float grain = SampleGrassMaterialDetail(across * 6.0f * speckleScale + noiseOffsetX * 1.7f,
 						along * 26.0f * speckleScale + noiseOffsetY * 1.7f, true);
 
-					const float centreVein = 1.0f - Util::Smoothstep(0.0f, 0.050f, std::abs(across - 0.5f));
-					const float sideVeinL = 1.0f - Util::Smoothstep(0.0f, 0.032f, std::abs(across - 0.27f));
-					const float sideVeinR = 1.0f - Util::Smoothstep(0.0f, 0.032f, std::abs(across - 0.73f));
+					const float centreVein = 1.0f - Smoothstep(0.0f, 0.050f, std::abs(across - 0.5f));
+					const float sideVeinL = 1.0f - Smoothstep(0.0f, 0.032f, std::abs(across - 0.27f));
+					const float sideVeinR = 1.0f - Smoothstep(0.0f, 0.032f, std::abs(across - 0.73f));
 					float vein = std::clamp(centreVein + 0.5f * (sideVeinL + sideVeinR), 0.0f, 1.0f);
-					vein *= Util::Smoothstep(0.0f, 0.16f, along) * Util::Smoothstep(0.0f, 0.20f, 1.0f - along);
+					vein *= Smoothstep(0.0f, 0.16f, along) * Smoothstep(0.0f, 0.20f, 1.0f - along);
 					vein *= (1.0f - veinRippleDepth) + veinRippleDepth * std::sin(along * 26.0f + phase);
 
 					const float normalOffset = (across - 0.5f) * 2.0f * vein * veinStrength +
@@ -275,6 +275,8 @@ void ProceduralGrass::UpdateGrassMaterialDetailTexture()
 			globals::d3d::context->UpdateSubresource(grassMaterialDetailTexture->resource.get(), D3D11CalcSubresource(0, slice, 1), nullptr,
 				detailData.data(), GrassMaterialDetailDim * 4u, 0);
 		}
+		grassMaterialDetailHashes[typeIndex] = detailHash;
+		grassMaterialDetailValid[typeIndex] = true;
 	}
 }
 
@@ -294,8 +296,7 @@ void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors)
 		globals::features::linearLighting.SRGBToWorking(&tint.x);
 	};
 
-	const uint32_t activeTypeCount = std::min<uint32_t>(static_cast<uint32_t>(typeAllocation.size()) + 2u, MaxGrassTypes);
-	for (uint32_t i = 1; i < activeTypeCount; ++i) {
+	for (uint32_t i = 1; i < ActiveGrassTypeCount(); ++i) {
 		auto& type = resolvedGrassTypes.grassType[i];
 		type.fuzzDirectionalAlbedoParams = GetFuzzDirectionalAlbedoParameters(type.grassSurfParams.w);
 		const auto canopyGeometry = GetDistantCanopyGeometry(type);
@@ -349,8 +350,7 @@ void ProceduralGrass::ResolveGrassTypes(const bool prelinearizeTypeColors)
 	// Far grows its blades up to this multiple as it thins with distance.
 	terrainCanopyMaxHeight = maxHeight * PGrassCommon::FarMaxHeightScale;
 
-	// Both terrain-darkening maps apply the types' slope limits. The settings panel re-resolves the types every frame,
-	// and a cleared canopy map refills over many frames, so rebuild the maps only when a limit changes.
+	// Rebuild terrain-darkening maps only when slope limits change; a cleared canopy map refills over many frames.
 	uint64_t slopeLimitsHash = GrassHashOffsetBasis;
 	for (const auto& type : resolvedGeneratorTypes.grassType) {
 		GrassHashValue(slopeLimitsHash, type.minSlope);
