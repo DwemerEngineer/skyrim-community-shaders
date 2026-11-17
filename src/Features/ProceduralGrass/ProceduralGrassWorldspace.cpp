@@ -90,7 +90,12 @@ const ProceduralGrass::LoadedCellGrass& ProceduralGrass::GetCellCache(RE::TESObj
 	cell.land = land;
 	cell.loadedData = landData;
 
-	// LoadedLandData heights are world Z: LoadVerticesIntoArrays scales VHGT by 8 and derives heightExtents from the same values.
+	// Loaded heights can be record-relative; one anchor for all four quadrants moves the lowest sample to heightExtents.x without seams.
+	float rawMin = (std::numeric_limits<float>::max)();
+	for (uint32_t quadIndex = 0; quadIndex < 4; ++quadIndex)
+		rawMin = std::min(rawMin, *std::min_element(landData->heights[quadIndex], landData->heights[quadIndex] + PGrassCommon::QuadrantGrassSamples));
+	const float anchor = landData->heightExtents.x - rawMin;
+
 	const auto getSelection = [this](const RE::TESLandTexture* texture) -> const PGrassCommon::GrassTextureSelection* {
 		if (const auto cached = textureSelectionByTexture.find(texture); cached != textureSelectionByTexture.end())
 			return cached->second;
@@ -103,7 +108,8 @@ const ProceduralGrass::LoadedCellGrass& ProceduralGrass::GetCellCache(RE::TESObj
 	for (uint32_t quadIndex = 0; quadIndex < 4; ++quadIndex) {
 		auto& quadrant = cell.quadrants[quadIndex];
 		quadrant.cacheVersion = nextGrassCacheVersion++;
-		std::copy_n(landData->heights[quadIndex], PGrassCommon::QuadrantGrassSamples, quadrant.heights.begin());
+		std::transform(landData->heights[quadIndex], landData->heights[quadIndex] + PGrassCommon::QuadrantGrassSamples, quadrant.heights.begin(),
+			[anchor](const float height) { return height + anchor; });
 		const auto [minIt, maxIt] = std::minmax_element(quadrant.heights.begin(), quadrant.heights.end());
 		quadrant.minHeight = *minIt;
 		quadrant.maxHeight = *maxIt;
