@@ -16,6 +16,92 @@ static void DiscardMislinkedTextureSet(RE::NiPointer<RE::BSTextureSet>& textureS
 	}
 }
 
+/**
+ * @brief Path of the interior window map for a mesh and its window texture, or empty when the material has no room.
+ *
+ * Window textures are often atlases, and meshes build one window from several pieces that can reuse or mirror the
+ * same texels, so the map is per mesh: textures\\interiormaps\\<mesh path>\\<diffuse name>.dds. Each texel holds the
+ * whole window's UV rectangle in the frame of the piece covering it. Mesh patchers can set texture slots but cannot
+ * add per-window data, hence the side file.
+ */
+static std::string GetInteriorWindowMapPath(RE::BSTextureSet* textureSet, std::string_view meshPath)
+{
+	const char* roomPath = textureSet->GetTexturePath(BSLightingShaderMaterialPBR::InteriorTexture);
+	const char* diffusePath = textureSet->GetTexturePath(RE::BSTextureSet::Texture::kDiffuse);
+	if (!roomPath || !roomPath[0] || !diffusePath || !diffusePath[0] || meshPath.empty()) {
+		return {};
+	}
+
+	const auto normalize = [](std::string_view path) {
+		std::string result(path);
+		std::ranges::transform(result, result.begin(), [](char c) { return c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+		return result;
+	};
+	const std::string mesh = normalize(meshPath);
+	const auto meshesFolder = mesh.rfind("meshes\\");
+	const auto meshStart = meshesFolder == std::string::npos ? 0 : meshesFolder + 7;
+	const auto meshEnd = mesh.rfind('.');
+	if (meshEnd == std::string::npos || meshEnd <= meshStart) {
+		return {};
+	}
+
+	const std::string diffuse = normalize(diffusePath);
+	const auto nameStart = diffuse.find_last_of('\\') + 1;
+	const auto nameEnd = diffuse.rfind('.');
+	if (nameEnd == std::string::npos || nameEnd <= nameStart) {
+		return {};
+	}
+
+	return std::format("textures\\interiormaps\\{}\\{}.dds", mesh.substr(meshStart, meshEnd - meshStart), diffuse.substr(nameStart, nameEnd - nameStart));
+}
+
+/** @brief Loads the interior window map for a mesh, when one was generated for it. */
+static RE::NiPointer<RE::NiSourceTexture> LoadInteriorWindowMap(RE::BSTextureSet* textureSet, std::string_view meshPath)
+{
+	const std::string path = GetInteriorWindowMapPath(textureSet, meshPath);
+	if (path.empty() || !RE::BSResourceNiBinaryStream(path).good()) {
+		return nullptr;
+	}
+
+	RE::NiPointer<RE::NiTexture> texture;
+	RE::BSShaderManager::GetTexture(path.c_str(), true, texture, false);
+	if (!texture || texture->GetRTTI() != globals::rtti::NiSourceTextureRTTI.get()) {
+		return nullptr;
+	}
+	return RE::NiPointer(static_cast<RE::NiSourceTexture*>(texture.get()));
+}
+
+/** @brief Whether a texture path is a room under textures\\interiors, where the interior room export writes. */
+static bool IsInteriorRoomPath(const char* path)
+{
+	if (!path) {
+		return false;
+	}
+	std::string lowered(path);
+	std::ranges::transform(lowered, lowered.begin(), [](char c) { return c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+	return lowered.starts_with("textures\\interiors\\") || lowered.starts_with("interiors\\") || lowered.find("\\textures\\interiors\\") != std::string::npos;
+}
+
+/** @brief Clamps interior mapping parameters to the ranges the shader supports, replacing non-finite values with defaults. */
+static InteriorMappingParameters SanitizeInteriorMappingParameters(const InteriorMappingParameters& parameters)
+{
+	const InteriorMappingParameters defaults;
+	const auto clampFinite = [](float value, float low, float high, float fallback) {
+		return std::isfinite(value) ? std::clamp(value, low, high) : fallback;
+	};
+
+	InteriorMappingParameters result;
+	result.enabled = parameters.enabled;
+	result.atlasColumns = std::clamp(parameters.atlasColumns, 1, 16);
+	result.atlasRows = std::clamp(parameters.atlasRows, 1, 16);
+	result.backWallScale = clampFinite(parameters.backWallScale, 0.05f, 0.95f, defaults.backWallScale);
+	result.depthScale = clampFinite(parameters.depthScale, 0.1f, 4.f, defaults.depthScale);
+	result.daylightScale = clampFinite(parameters.daylightScale, 0.f, 1.f, defaults.daylightScale);
+	result.roomSize = clampFinite(parameters.roomSize, 16.f, 4096.f, defaults.roomSize);
+	result.cubemap = parameters.cubemap;
+	return result;
+}
+
 BSLightingShaderMaterialPBR::~BSLightingShaderMaterialPBR()
 {
 	All.erase(this);
@@ -47,6 +133,8 @@ void BSLightingShaderMaterialPBR::CopyMembers(RE::BSShaderMaterial* that)
 	auto* pbrThat = static_cast<BSLightingShaderMaterialPBR*>(that);
 
 	loadedWithFeature = pbrThat->loadedWithFeature;
+	// Needed to find the mesh's interior window map
+	inputFilePath = pbrThat->inputFilePath;
 	pbrFlags = pbrThat->pbrFlags;
 	nifThinSurfaceFlags = pbrThat->nifThinSurfaceFlags;
 	subsurfaceBalance = pbrThat->subsurfaceBalance;
@@ -56,6 +144,7 @@ void BSLightingShaderMaterialPBR::CopyMembers(RE::BSShaderMaterial* that)
 	fuzzColor = pbrThat->fuzzColor;
 	fuzzWeight = pbrThat->fuzzWeight;
 	glintParameters = pbrThat->glintParameters;
+	interiorMappingParameters = pbrThat->interiorMappingParameters;
 	projectedMaterialBaseColorScale = pbrThat->projectedMaterialBaseColorScale;
 	projectedMaterialRoughness = pbrThat->projectedMaterialRoughness;
 	projectedMaterialSpecularLevel = pbrThat->projectedMaterialSpecularLevel;
@@ -66,6 +155,9 @@ void BSLightingShaderMaterialPBR::CopyMembers(RE::BSShaderMaterial* that)
 	displacementTexture = pbrThat->displacementTexture;
 	featuresTexture0 = pbrThat->featuresTexture0;
 	featuresTexture1 = pbrThat->featuresTexture1;
+	interiorTexture = pbrThat->interiorTexture;
+	interiorWindowMapTexture = pbrThat->interiorWindowMapTexture;
+	interiorRoomTexture = pbrThat->interiorRoomTexture;
 
 	All[this] = All[pbrThat];
 }
@@ -77,6 +169,7 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 		uint32_t pbrFlags = 0;
 		uint32_t nifThinSurfaceFlags = 0;
 		uint32_t hasNifThinSurfaceParameters = 0;
+		uint32_t hasNifInteriorMappingParameters = 0;
 		float subsurfaceBalance = 0.75f;
 		std::array<float, 3> thinSurfaceParameters = { 0.5f, 0.5f, 1.f };
 		float coatRoughness = 0.f;
@@ -87,6 +180,14 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 		float logMicrofacetDensity = 0.f;
 		float microfacetRoughness = 0.f;
 		float densityRandomization = 0.f;
+		uint32_t interiorMappingEnabled = 0;
+		int32_t interiorMappingAtlasColumns = 0;
+		int32_t interiorMappingAtlasRows = 0;
+		float interiorMappingBackWallScale = 0.f;
+		float interiorMappingDepthScale = 0.f;
+		float interiorMappingDaylightScale = 0.f;
+		uint32_t interiorMappingCubemap = 0;
+		float interiorMappingRoomSize = 0.f;
 		std::array<float, 3> projectedMaterialBaseColorScale = { 0.f, 0.f, 0.f };
 		float projectedMaterialRoughness = 0.f;
 		float projectedMaterialSpecularLevel = 0.f;
@@ -99,6 +200,8 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 		uint32_t displacementHash = 0;
 		uint32_t features0Hash = 0;
 		uint32_t features1Hash = 0;
+		uint32_t interiorHash = 0;
+		uint32_t interiorWindowMapHash = 0;
 		uint32_t baseHash = 0;
 	} hashes;
 
@@ -106,6 +209,7 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 	hashes.nifThinSurfaceFlags = nifThinSurfaceFlags.underlying();
 	if (const auto it = All.find(this); it != All.end()) {
 		hashes.hasNifThinSurfaceParameters = it->second.nifThinSurfaceParameters.has_value();
+		hashes.hasNifInteriorMappingParameters = it->second.nifInteriorMappingParameters.has_value();
 	}
 	hashes.subsurfaceBalance = subsurfaceBalance;
 	hashes.thinSurfaceParameters = thinSurfaceParameters;
@@ -119,6 +223,14 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 	hashes.logMicrofacetDensity = glintParameters.logMicrofacetDensity * 100.f;
 	hashes.microfacetRoughness = glintParameters.microfacetRoughness * 100.f;
 	hashes.densityRandomization = glintParameters.densityRandomization * 100.f;
+	hashes.interiorMappingEnabled = interiorMappingParameters.enabled;
+	hashes.interiorMappingAtlasColumns = interiorMappingParameters.atlasColumns;
+	hashes.interiorMappingAtlasRows = interiorMappingParameters.atlasRows;
+	hashes.interiorMappingBackWallScale = interiorMappingParameters.backWallScale * 100.f;
+	hashes.interiorMappingDepthScale = interiorMappingParameters.depthScale * 100.f;
+	hashes.interiorMappingDaylightScale = interiorMappingParameters.daylightScale * 100.f;
+	hashes.interiorMappingCubemap = interiorMappingParameters.cubemap;
+	hashes.interiorMappingRoomSize = interiorMappingParameters.roomSize;
 	hashes.projectedMaterialBaseColorScale[0] = projectedMaterialBaseColorScale[0] * 100.f;
 	hashes.projectedMaterialBaseColorScale[1] = projectedMaterialBaseColorScale[1] * 100.f;
 	hashes.projectedMaterialBaseColorScale[2] = projectedMaterialBaseColorScale[2] * 100.f;
@@ -135,6 +247,11 @@ std::uint32_t BSLightingShaderMaterialPBR::ComputeCRC32(uint32_t srcHash)
 		hashes.displacementHash = RE::BSCRC32<const char*>()(textureSet->GetTexturePath(DisplacementTexture));
 		hashes.features0Hash = RE::BSCRC32<const char*>()(textureSet->GetTexturePath(FeaturesTexture0));
 		hashes.features1Hash = RE::BSCRC32<const char*>()(textureSet->GetTexturePath(FeaturesTexture1));
+		hashes.interiorHash = RE::BSCRC32<const char*>()(textureSet->GetTexturePath(InteriorTexture));
+		// Window maps are per mesh, so interior mapped materials from different meshes must not be shared
+		if (const auto windowMapPath = GetInteriorWindowMapPath(textureSet.get(), inputFilePath); !windowMapPath.empty()) {
+			hashes.interiorWindowMapHash = RE::BSCRC32<const char*>()(windowMapPath.c_str());
+		}
 	}
 
 	hashes.baseHash = BSLightingShaderMaterialBase::ComputeCRC32(srcHash);
@@ -185,9 +302,43 @@ void BSLightingShaderMaterialPBR::ApplyTextureSetData(const TruePBR::PBRTextureS
 
 	glintParameters = textureSetData.glintParameters;
 
-	if (const auto it = All.find(this); it != All.end() && it->second.nifThinSurfaceParameters) {
-		ApplyNifThinSurfaceParameters(*it->second.nifThinSurfaceParameters);
+	interiorMappingParameters = SanitizeInteriorMappingParameters(textureSetData.interiorMappingParameters);
+
+	if (const auto it = All.find(this); it != All.end()) {
+		if (it->second.nifThinSurfaceParameters) {
+			ApplyNifThinSurfaceParameters(*it->second.nifThinSurfaceParameters);
+		}
+		if (it->second.nifInteriorMappingParameters) {
+			ApplyNifInteriorMappingParameters(*it->second.nifInteriorMappingParameters);
+		}
 	}
+}
+
+bool BSLightingShaderMaterialPBR::ApplyNifInteriorMappingParameters(std::span<const float> parameters)
+{
+	if (parameters.size() < 5 || parameters.size() > 7 || std::ranges::any_of(parameters, [](float value) { return !std::isfinite(value); })) {
+		return false;
+	}
+
+	InteriorMappingParameters nifParameters;
+	nifParameters.enabled = interiorMappingParameters.enabled;
+	nifParameters.atlasColumns = static_cast<int>(std::round(std::clamp(parameters[0], 1.f, 16.f)));
+	nifParameters.atlasRows = static_cast<int>(std::round(std::clamp(parameters[1], 1.f, 16.f)));
+	nifParameters.backWallScale = parameters[2];
+	nifParameters.depthScale = parameters[3];
+	nifParameters.daylightScale = parameters[4];
+	// The optional sixth value opts into cubemap rooms; without it the texture set decides
+	nifParameters.cubemap = parameters.size() >= 6 ? parameters[5] != 0.f : interiorMappingParameters.cubemap;
+	nifParameters.roomSize = parameters.size() >= 7 ? parameters[6] : interiorMappingParameters.roomSize;
+	interiorMappingParameters = SanitizeInteriorMappingParameters(nifParameters);
+
+	All[this].nifInteriorMappingParameters = std::vector<float>(parameters.begin(), parameters.end());
+	return true;
+}
+
+bool BSLightingShaderMaterialPBR::HasInteriorMapping() const
+{
+	return interiorMappingParameters.enabled || pbrFlags.any(PBRFlags::InteriorMapping);
 }
 
 bool BSLightingShaderMaterialPBR::ApplyNifThinSurfaceParameters(std::span<const float> parameters)
@@ -243,6 +394,9 @@ void BSLightingShaderMaterialPBR::OnLoadTextureSet(std::uint64_t arg1, RE::BSTex
 			textureSet->SetTexture(DisplacementTexture, displacementTexture);
 			textureSet->SetTexture(FeaturesTexture0, featuresTexture0);
 			textureSet->SetTexture(FeaturesTexture1, featuresTexture1);
+			textureSet->SetTexture(InteriorTexture, interiorTexture);
+			interiorWindowMapTexture = LoadInteriorWindowMap(textureSet.get(), inputFilePath);
+			interiorRoomTexture = IsInteriorRoomPath(textureSet->GetTexturePath(InteriorTexture));
 
 			auto* bgsTextureSet = globals::features::truePBR.currentTextureSet;
 			if (bgsTextureSet == nullptr) {
@@ -255,6 +409,7 @@ void BSLightingShaderMaterialPBR::OnLoadTextureSet(std::uint64_t arg1, RE::BSTex
 				} else if (const auto it = All.find(this); it != All.end()) {
 					it->second.textureSetData = nullptr;
 					it->second.nifThinSurfaceParameters.reset();
+					it->second.nifInteriorMappingParameters.reset();
 				}
 			}
 		}
@@ -274,6 +429,8 @@ void BSLightingShaderMaterialPBR::ClearTextures()
 	displacementTexture.reset();
 	featuresTexture0.reset();
 	featuresTexture1.reset();
+	interiorTexture.reset();
+	interiorWindowMapTexture.reset();
 }
 
 void BSLightingShaderMaterialPBR::ReceiveValuesFromRootMaterial(bool skinned, bool rimLighting, bool softLighting, bool backLighting, bool MSN)
@@ -294,6 +451,9 @@ void BSLightingShaderMaterialPBR::ReceiveValuesFromRootMaterial(bool skinned, bo
 	}
 	if (featuresTexture1 == nullptr) {
 		featuresTexture1 = stateData.defaultTextureWhite;
+	}
+	if (interiorTexture == nullptr) {
+		interiorTexture = stateData.defaultTextureBlack;
 	}
 }
 
@@ -326,6 +486,12 @@ uint32_t BSLightingShaderMaterialPBR::GetTextures(RE::NiSourceTexture** textures
 	}
 	if (featuresTexture1 != nullptr) {
 		textures[textureIndex++] = featuresTexture1.get();
+	}
+	if (interiorTexture != nullptr) {
+		textures[textureIndex++] = interiorTexture.get();
+	}
+	if (interiorWindowMapTexture != nullptr) {
+		textures[textureIndex++] = interiorWindowMapTexture.get();
 	}
 
 	return textureIndex;
@@ -447,4 +613,9 @@ float BSLightingShaderMaterialPBR::GetFuzzWeight() const
 const GlintParameters& BSLightingShaderMaterialPBR::GetGlintParameters() const
 {
 	return glintParameters;
+}
+
+const InteriorMappingParameters& BSLightingShaderMaterialPBR::GetInteriorMappingParameters() const
+{
+	return interiorMappingParameters;
 }

@@ -2,12 +2,15 @@
 
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
+#include <array>
 #include <cassert>
+#include <span>
 
 #include "I18n/I18n.h"
 #include "LinearLighting.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "TruePBR.h"
 #include "Utils/D3D.h"
 
 DynamicCubemaps::Settings DynamicCubemaps::GetCommonBufferData() const
@@ -20,6 +23,31 @@ DynamicCubemaps::Settings DynamicCubemaps::GetCommonBufferData() const
 #define I18N_KEY_PREFIX "feature.dynamic_cubemaps."
 
 constexpr auto MIPLEVELS = 9;
+
+// Set while an interior room is being compressed and written on its worker thread
+static std::atomic<bool> interiorRoomExporting = false;
+// Set by the menu; room captures start, take frames and save during the cubemap update, while each frame's depth and
+// color are valid
+static std::atomic<bool> interiorRoomCaptureRequested = false;
+static std::atomic<bool> interiorRoomSaveRequested = false;
+static std::atomic<bool> interiorRoomCancelRequested = false;
+
+// Room captures save themselves after this many seconds of looking around
+constexpr float kInteriorRoomCaptureSeconds = 18.0f;
+// Frames seen after the player moves this far from where the capture started are skipped, in game units
+constexpr float kInteriorRoomCaptureMaxMove = 16.0f;
+// Room cubemap face size
+constexpr uint32_t kInteriorRoomSize = 1024;
+// The camera's path during a room capture, as yaw and pitch in degrees from the starting heading with pitch down
+// positive: rows from the ceiling down to the floor, wide enough that the screen sweeps the room from wall to wall, with
+// the first and last looking nearly straight up and down to reach the ceiling and floor along the wall behind
+constexpr std::array<std::array<float, 2>, 14> kInteriorRoomSweep = { { { 0.0f, 0.0f }, { -60.0f, -85.0f }, { 60.0f, -85.0f }, { 80.0f, -55.0f }, { -80.0f, -55.0f }, { -80.0f, -18.0f }, { 80.0f, -18.0f }, { 80.0f, 20.0f }, { -80.0f, 20.0f }, { -80.0f, 60.0f }, { 80.0f, 60.0f }, { 60.0f, 85.0f }, { -60.0f, 85.0f }, { 0.0f, 0.0f } } };
+
+// Room cubemap depth is the distance from the capture point in game units, stored as log(distance / min) / log(max / min)
+// scaled to below 1 so rooms without depth (opaque alpha) can be told apart; matches PBR::GetInteriorCubeDistance
+constexpr float kInteriorRoomMinDistance = 16.0f;
+constexpr float kInteriorRoomDistanceRange = 512.0f;
+constexpr float kInteriorRoomDepthAlphaScale = 0.98f;
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DynamicCubemaps::Settings,
@@ -42,6 +70,28 @@ void DynamicCubemaps::DrawSettings()
 		recompileFlag |= ImGui::Checkbox(T(TKEY("enable_ssr"), "Enable Screen Space Reflections"), reinterpret_cast<bool*>(&settings.EnabledSSR));
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("%s", T(TKEY("enable_ssr_tooltip"), "Enable Screen Space Reflections on Water"));
+		}
+		ImGui::TreePop();
+	}
+
+	if (ImGui::TreeNodeEx(T(TKEY("interior_room_export"), "Interior Room Export"))) {
+		ImGui::TextWrapped("%s", T(TKEY("interior_room_export_info"), "Captures a room cubemap with depth for True PBR interior mapping, in Data\\textures\\interiors. Windows look into the room rebuilt around where you stand, so stand in first person where a window would be, against one wall, facing across the room to the wall that should become the back wall. Start the capture and close the menu: the camera looks around the room by itself, from the ceiling down to the floor, and turns back when it saves. Hold still and leave the mouse alone meanwhile. Everything the camera sees is saved at full resolution; the rest comes from the dynamic cubemap."));
+		if (interiorRoomCapture) {
+			const float remaining = std::max(kInteriorRoomCaptureSeconds - (globals::state->timer - interiorRoomCapture->startTime), 0.0f);
+			ImGui::Text(T(TKEY("interior_room_capturing"), "Capturing: the camera is looking around, saving in %.0f s"), remaining);
+			if (ImGui::Button(T(TKEY("save_interior_room"), "Save Now")))
+				interiorRoomSaveRequested = true;
+			ImGui::SameLine();
+			if (ImGui::Button(T(TKEY("cancel_interior_room"), "Cancel")))
+				interiorRoomCancelRequested = true;
+		} else {
+			auto _disabled = Util::DisableGuard(interiorRoomExporting || interiorRoomCaptureRequested || !cubemapValid[0]);
+			if (ImGui::Button(T(TKEY("capture_interior_room"), "Capture Interior Room"))) {
+				interiorRoomCaptureRequested = true;
+			}
+		}
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("%s", T(TKEY("capture_interior_room_tooltip"), "Writes a room cubemap (sRGB BC7, distance in alpha) named after the current cell. Put it in the environment map slot (TX04) of a window's texture set, for example with PGPatcher's slot5: cubemaps from textures\\interiors are used as rooms without further setup."));
 		}
 		ImGui::TreePop();
 	}
@@ -223,6 +273,14 @@ void DynamicCubemaps::ClearShaderCache()
 		bc6hEncodeCS->Release();
 		bc6hEncodeCS = nullptr;
 	}
+	if (exportInteriorRoomCS) {
+		exportInteriorRoomCS->Release();
+		exportInteriorRoomCS = nullptr;
+	}
+	if (accumulateInteriorRoomCS) {
+		accumulateInteriorRoomCS->Release();
+		accumulateInteriorRoomCS = nullptr;
+	}
 }
 
 ID3D11ComputeShader* DynamicCubemaps::GetComputeShaderDetectLighting()
@@ -304,6 +362,552 @@ ID3D11ComputeShader* DynamicCubemaps::GetComputeShaderBC6HEncode()
 		bc6hEncodeCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\DynamicCubemaps\\BC6HEncodeCS.hlsl", {}, "cs_5_0"));
 	}
 	return bc6hEncodeCS;
+}
+
+ID3D11ComputeShader* DynamicCubemaps::GetComputeShaderExportInteriorRoom()
+{
+	if (!exportInteriorRoomCS) {
+		logger::debug("Compiling ExportInteriorRoomCS");
+		exportInteriorRoomCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\DynamicCubemaps\\ExportInteriorRoomCS.hlsl", {}, "cs_5_0"));
+	}
+	return exportInteriorRoomCS;
+}
+
+ID3D11ComputeShader* DynamicCubemaps::GetComputeShaderAccumulateInteriorRoom()
+{
+	if (!accumulateInteriorRoomCS) {
+		logger::debug("Compiling ExportInteriorRoomCS ACCUMULATE");
+		accumulateInteriorRoomCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\DynamicCubemaps\\ExportInteriorRoomCS.hlsl", { { "ACCUMULATE", "" } }, "cs_5_0"));
+	}
+	return accumulateInteriorRoomCS;
+}
+
+/** Shows a notification on the HUD from any thread, so room captures can be followed with the menu closed. */
+static void ShowInteriorRoomMessage(std::string a_message)
+{
+	if (auto* tasks = SKSE::GetTaskInterface())
+		tasks->AddTask([message = std::move(a_message)]() { RE::SendHUDMessage::ShowHUDMessage(message.c_str()); });
+}
+
+/**
+ * Fills the pixels of a square RGBA image whose alpha is zero from their surroundings, colour and alpha alike: each
+ * level of a pyramid averages the filled pixels below it, then holes take the next level's value, bilinearly, from the
+ * coarsest level down, so gaps blend in from their edges.
+ * @return False when no pixel is filled
+ */
+static bool FillInteriorRoomHoles(float* a_pixels, size_t a_size)
+{
+	struct Level
+	{
+		size_t size;
+		std::vector<DirectX::XMFLOAT4> color;
+		std::vector<float> weight;
+	};
+	std::vector<Level> levels;
+	levels.push_back({ a_size, std::vector<DirectX::XMFLOAT4>(a_size * a_size), std::vector<float>(a_size * a_size) });
+	for (size_t i = 0; i < a_size * a_size; ++i) {
+		levels[0].color[i] = { a_pixels[i * 4], a_pixels[i * 4 + 1], a_pixels[i * 4 + 2], a_pixels[i * 4 + 3] };
+		levels[0].weight[i] = a_pixels[i * 4 + 3] > 0.0f ? 1.0f : 0.0f;
+	}
+
+	while (levels.back().size > 1) {
+		const Level& fine = levels.back();
+		Level coarse{ fine.size / 2, std::vector<DirectX::XMFLOAT4>(fine.size * fine.size / 4), std::vector<float>(fine.size * fine.size / 4) };
+		for (size_t y = 0; y < coarse.size; ++y) {
+			for (size_t x = 0; x < coarse.size; ++x) {
+				DirectX::XMFLOAT4 sum{};
+				float weight = 0.0f;
+				for (size_t child = 0; child < 4; ++child) {
+					const size_t index = (y * 2 + child / 2) * fine.size + x * 2 + child % 2;
+					const float w = fine.weight[index];
+					sum = { sum.x + fine.color[index].x * w, sum.y + fine.color[index].y * w, sum.z + fine.color[index].z * w, sum.w + fine.color[index].w * w };
+					weight += w;
+				}
+				const size_t index = y * coarse.size + x;
+				if (weight > 0.0f)
+					coarse.color[index] = { sum.x / weight, sum.y / weight, sum.z / weight, sum.w / weight };
+				coarse.weight[index] = std::min(weight, 1.0f);
+			}
+		}
+		levels.push_back(std::move(coarse));
+	}
+	if (levels.back().weight[0] <= 0.0f)
+		return false;
+
+	for (size_t level = levels.size() - 1; level-- > 0;) {
+		Level& fine = levels[level];
+		const Level& coarse = levels[level + 1];
+		for (size_t y = 0; y < fine.size; ++y) {
+			for (size_t x = 0; x < fine.size; ++x) {
+				const size_t index = y * fine.size + x;
+				const float w = fine.weight[index];
+				if (w >= 1.0f)
+					continue;
+				// Bilinear from the coarser level, whose texel centres sit between every other fine texel
+				const float cx = std::clamp((x + 0.5f) * 0.5f - 0.5f, 0.0f, static_cast<float>(coarse.size - 1));
+				const float cy = std::clamp((y + 0.5f) * 0.5f - 0.5f, 0.0f, static_cast<float>(coarse.size - 1));
+				const size_t x0 = static_cast<size_t>(cx), y0 = static_cast<size_t>(cy);
+				const size_t x1 = std::min(x0 + 1, coarse.size - 1), y1 = std::min(y0 + 1, coarse.size - 1);
+				const float fx = cx - x0, fy = cy - y0;
+				const auto& c00 = coarse.color[y0 * coarse.size + x0];
+				const auto& c10 = coarse.color[y0 * coarse.size + x1];
+				const auto& c01 = coarse.color[y1 * coarse.size + x0];
+				const auto& c11 = coarse.color[y1 * coarse.size + x1];
+				auto lerp2 = [&](float a, float b, float c, float d) { return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy; };
+				const DirectX::XMFLOAT4 filled = { lerp2(c00.x, c10.x, c01.x, c11.x), lerp2(c00.y, c10.y, c01.y, c11.y), lerp2(c00.z, c10.z, c01.z, c11.z), lerp2(c00.w, c10.w, c01.w, c11.w) };
+				auto& color = fine.color[index];
+				color = { color.x * w + filled.x * (1 - w), color.y * w + filled.y * (1 - w), color.z * w + filled.z * (1 - w), color.w * w + filled.w * (1 - w) };
+				fine.weight[index] = 1.0f;
+			}
+		}
+	}
+
+	for (size_t i = 0; i < a_size * a_size; ++i) {
+		if (a_pixels[i * 4 + 3] <= 0.0f) {
+			const auto& color = levels[0].color[i];
+			a_pixels[i * 4] = color.x;
+			a_pixels[i * 4 + 1] = color.y;
+			a_pixels[i * 4 + 2] = color.z;
+			a_pixels[i * 4 + 3] = color.w;
+		}
+	}
+	return true;
+}
+
+/** Room direction of a cube texel's centre (x right, y up, z towards the back wall), as D3D lays out cube faces. */
+static DirectX::XMFLOAT3 GetInteriorRoomDirection(size_t a_face, size_t a_x, size_t a_y, size_t a_size)
+{
+	const float u = (a_x + 0.5f) / a_size * 2.0f - 1.0f;
+	const float v = (a_y + 0.5f) / a_size * 2.0f - 1.0f;
+	constexpr std::array<std::array<float, 9>, 6> axes = { {
+		{ 0, 0, 1, 0, -1, 0, -1, 0, 0 },   // +X: (1, -v, -u)
+		{ 0, 0, -1, 0, -1, 0, 1, 0, 0 },   // -X: (-1, -v, u)
+		{ 1, 0, 0, 0, 0, 1, 0, 1, 0 },     // +Y: (u, 1, v)
+		{ 1, 0, 0, 0, 0, -1, 0, -1, 0 },   // -Y: (u, -1, -v)
+		{ 1, 0, 0, 0, -1, 0, 0, 0, 1 },    // +Z: (u, -v, 1)
+		{ -1, 0, 0, 0, -1, 0, 0, 0, -1 },  // -Z: (-u, -v, -1)
+	} };
+	const auto& a = axes[a_face];
+	const DirectX::XMFLOAT3 direction = { a[0] * u + a[3] * v + a[6], a[1] * u + a[4] * v + a[7], a[2] * u + a[5] * v + a[8] };
+	const float length = std::sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z);
+	return { direction.x / length, direction.y / length, direction.z / length };
+}
+
+/**
+ * Distances from the capture point to the room's walls, floor and ceiling in cube face order, from each texel's
+ * distance in alpha: for each face, how far along its axis the farthest surfaces near its middle lie, as walls lie
+ * beyond the furniture before them and, down a long room, beyond the floor and ceiling that fill most of the view.
+ */
+static std::array<float, 6> MeasureInteriorRoom(const float* a_pixels, size_t a_size)
+{
+	// Texels within about 30 degrees of the face's axis
+	constexpr float kCentre = 0.577f;
+	// Past this, texels see out through windows rather than a wall
+	constexpr float kOutside = 0.9f * kInteriorRoomMinDistance * kInteriorRoomDistanceRange;
+	std::array<float, 6> extent{};
+	std::vector<float> distances;
+	for (size_t face = 0; face < 6; ++face) {
+		distances.clear();
+		for (size_t y = 0; y < a_size; ++y) {
+			for (size_t x = 0; x < a_size; ++x) {
+				const float u = (x + 0.5f) / a_size * 2.0f - 1.0f;
+				const float v = (y + 0.5f) / a_size * 2.0f - 1.0f;
+				if (std::abs(u) > kCentre || std::abs(v) > kCentre)
+					continue;
+				const float distance = a_pixels[((face * a_size + y) * a_size + x) * 4 + 3];
+				if (distance >= kOutside)
+					continue;
+				const auto direction = GetInteriorRoomDirection(face, x, y, a_size);
+				const float axis = std::abs(face < 2 ? direction.x : face < 4 ? direction.y :
+																				direction.z);
+				distances.push_back(distance * axis);
+			}
+		}
+		if (distances.empty()) {
+			extent[face] = kOutside;
+			continue;
+		}
+		const auto percentile = distances.begin() + distances.size() * 9 / 10;
+		std::nth_element(distances.begin(), percentile, distances.end());
+		extent[face] = std::max(*percentile, 1.0f);
+	}
+	return extent;
+}
+
+// Wall distances in a capture's sidecar, in cube face order
+constexpr std::array<const char*, 6> kInteriorRoomExtentNames = { "right", "left", "up", "down", "back", "front" };
+
+/** Scales a room cube's color, encodes its distances into alpha and builds its mip chain in 8-bit sRGB for the encoder. */
+static DirectX::ScratchImage EncodeInteriorRoomCube(DirectX::ScratchImage& a_cube, float a_colorScale)
+{
+	auto* pixels = reinterpret_cast<float*>(a_cube.GetPixels());
+	const size_t count = a_cube.GetPixelsSize() / (4 * sizeof(float));
+	for (size_t i = 0; i < count; ++i) {
+		for (size_t channel = 0; channel < 3; ++channel)
+			pixels[i * 4 + channel] = std::min(pixels[i * 4 + channel] * a_colorScale, 1.0f);
+		// Distance at the room's real scale, so interior mapping can rebuild the room around the capture point
+		const float ratio = std::clamp(pixels[i * 4 + 3] / kInteriorRoomMinDistance, 1.0f, kInteriorRoomDistanceRange);
+		pixels[i * 4 + 3] = kInteriorRoomDepthAlphaScale * std::log(ratio) / std::log(kInteriorRoomDistanceRange);
+	}
+	DirectX::ScratchImage mips;
+	DX::ThrowIfFailed(DirectX::GenerateMipMaps(a_cube.GetImages(), a_cube.GetImageCount(), a_cube.GetMetadata(), DirectX::TEX_FILTER_DEFAULT, 0, mips));
+	DirectX::ScratchImage encoded;
+	DX::ThrowIfFailed(DirectX::Convert(mips.GetImages(), mips.GetImageCount(), mips.GetMetadata(), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DirectX::TEX_FILTER_DEFAULT, DirectX::TEX_THRESHOLD_DEFAULT, encoded));
+	return encoded;
+}
+
+/**
+ * Where a room captured in an interior lies in the exterior world, found through a door of the cell that leads
+ * outside: the interior is turned and moved so that door meets the exterior door it links to.
+ * @return The worldspace, capture point and heading outside, or null when no door of the cell leads outside
+ */
+static json GetInteriorRoomPlacement(RE::TESObjectCELL* a_cell, const float3& a_position, float a_heading)
+{
+	json placement;
+	a_cell->ForEachReference([&](RE::TESObjectREFR* a_door) {
+		const auto* teleport = a_door->extraList.GetByType<RE::ExtraTeleport>();
+		const auto outsideDoor = teleport && teleport->teleportData ? teleport->teleportData->linkedDoor.get() : nullptr;
+		const auto* worldspace = outsideDoor ? outsideDoor->GetWorldspace() : nullptr;
+		const auto* back = outsideDoor ? outsideDoor->extraList.GetByType<RE::ExtraTeleport>() : nullptr;
+		const auto* file = worldspace ? worldspace->GetFile(0) : nullptr;
+		if (!file || !back || !back->teleportData)
+			return RE::BSContainer::ForEachResult::kContinue;
+
+		// Leaving, the player faces away from the building at the exterior marker; entering, along the interior marker
+		const float turn = teleport->teleportData->rotation.z + RE::NI_PI - back->teleportData->rotation.z;
+		const auto inside = a_door->GetPosition();
+		const auto outside = outsideDoor->GetPosition();
+		const float dx = a_position.x - inside.x;
+		const float dy = a_position.y - inside.y;
+		// Headings turn clockwise from +Y
+		const float c = std::cos(turn);
+		const float s = std::sin(turn);
+		placement["worldspace"] = { { "plugin", std::string(file->GetFilename()) }, { "formID", worldspace->GetLocalFormID() } };
+		placement["position"] = { outside.x + dx * c + dy * s, outside.y - dx * s + dy * c, outside.z + a_position.z - inside.z };
+		placement["heading"] = a_heading + turn;
+		return RE::BSContainer::ForEachResult::kStop;
+	});
+	return placement;
+}
+
+/** Turns the player's first-person view on the game thread, as heading and pitch in radians with pitch down positive. */
+static void SetInteriorRoomView(float a_heading, float a_pitch)
+{
+	if (auto* tasks = SKSE::GetTaskInterface()) {
+		tasks->AddTask([a_heading, a_pitch]() {
+			if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+				player->SetHeading(a_heading);
+				player->SetLooking(a_pitch);
+			}
+		});
+	}
+}
+
+/** Yaw and pitch in radians along the room capture's camera path, at a share of the way through it, at even speed. */
+static std::array<float, 2> GetInteriorRoomSweepAngles(float a_progress)
+{
+	std::array<float, kInteriorRoomSweep.size() - 1> lengths{};
+	float total = 0.0f;
+	for (size_t i = 0; i < lengths.size(); ++i) {
+		lengths[i] = std::hypot(kInteriorRoomSweep[i + 1][0] - kInteriorRoomSweep[i][0], kInteriorRoomSweep[i + 1][1] - kInteriorRoomSweep[i][1]);
+		total += lengths[i];
+	}
+	float along = std::clamp(a_progress, 0.0f, 1.0f) * total;
+	for (size_t i = 0; i < lengths.size(); ++i) {
+		if (along <= lengths[i] || i + 1 == lengths.size()) {
+			const float t = lengths[i] > 0.0f ? std::min(along / lengths[i], 1.0f) : 1.0f;
+			const auto& from = kInteriorRoomSweep[i];
+			const auto& to = kInteriorRoomSweep[i + 1];
+			return { RE::deg_to_rad(from[0] + (to[0] - from[0]) * t), RE::deg_to_rad(from[1] + (to[1] - from[1]) * t) };
+		}
+		along -= lengths[i];
+	}
+	return {};
+}
+
+/** Room capture constants for a capture started facing a heading, with the given offset between cameras. */
+static DynamicCubemaps::ExportInteriorRoomCB GetInteriorRoomConstants(float a_heading, const float3& a_offset)
+{
+	// The heading becomes the back wall; Skyrim's heading is clockwise from +Y with +Z up
+	DynamicCubemaps::ExportInteriorRoomCB data{};
+	data.RoomForward = { std::sin(a_heading), std::cos(a_heading), 0.0f, 0.0f };
+	data.RoomRight = { std::cos(a_heading), -std::sin(a_heading), 0.0f, 0.0f };
+	data.RoomUp = { 0.0f, 0.0f, 1.0f, 0.0f };
+	data.CaptureOffset = { a_offset.x, a_offset.y, a_offset.z, 0.0f };
+	return data;
+}
+
+/** Runs one pass of ExportInteriorRoomCS over the room cubemap's faces, then unbinds everything it bound. */
+static void DispatchInteriorRoomPass(ID3D11ComputeShader* a_shader, std::span<ID3D11ShaderResourceView* const> a_srvs, std::span<ID3D11UnorderedAccessView* const> a_uavs, ID3D11Buffer* a_buffer, ID3D11SamplerState* a_sampler)
+{
+	auto context = globals::d3d::context;
+	context->CSSetShaderResources(0, static_cast<UINT>(a_srvs.size()), a_srvs.data());
+	context->CSSetUnorderedAccessViews(0, static_cast<UINT>(a_uavs.size()), a_uavs.data(), nullptr);
+	context->CSSetConstantBuffers(0, 1, &a_buffer);
+	context->CSSetSamplers(0, 1, &a_sampler);
+	context->CSSetShader(a_shader, nullptr, 0);
+	context->Dispatch((kInteriorRoomSize + 7) / 8, (kInteriorRoomSize + 7) / 8, 6);
+
+	std::array<ID3D11ShaderResourceView*, 8> nullSrvs{};
+	std::array<ID3D11UnorderedAccessView*, 8> nullUavs{};
+	ID3D11Buffer* nullBuffer = nullptr;
+	ID3D11SamplerState* nullSampler = nullptr;
+	context->CSSetShaderResources(0, static_cast<UINT>(a_srvs.size()), nullSrvs.data());
+	context->CSSetUnorderedAccessViews(0, static_cast<UINT>(a_uavs.size()), nullUavs.data(), nullptr);
+	context->CSSetConstantBuffers(0, 1, &nullBuffer);
+	context->CSSetSamplers(0, 1, &nullSampler);
+	context->CSSetShader(nullptr, nullptr, 0);
+}
+
+void DynamicCubemaps::StartInteriorRoomCapture()
+{
+	auto player = RE::PlayerCharacter::GetSingleton();
+	if (!player || !player->GetParentCell() || !cubemapValid[0]) {
+		logger::warn("[DynamicCubemaps] No settled capture to start an interior room from");
+		return;
+	}
+	// The capture turns the player's own view, which only the first-person camera follows directly
+	if (auto* camera = RE::PlayerCamera::GetSingleton(); !camera || !camera->IsInFirstPerson()) {
+		ShowInteriorRoomMessage(T(TKEY("interior_room_capture_first_person"), "Room capture needs first person"));
+		return;
+	}
+	// Recompiled for every capture so an updated shader applies without a restart; the disk cache keeps unchanged ones cheap
+	for (auto* shader : { &exportInteriorRoomCS, &accumulateInteriorRoomCS }) {
+		if (*shader) {
+			(*shader)->Release();
+			*shader = nullptr;
+		}
+	}
+	if (!GetComputeShaderExportInteriorRoom() || !GetComputeShaderAccumulateInteriorRoom()) {
+		logger::error("[DynamicCubemaps] ExportInteriorRoomCS failed to compile; interior room capture disabled");
+		return;
+	}
+
+	auto capture = std::make_unique<InteriorRoomCapture>();
+	try {
+		D3D11_TEXTURE2D_DESC texDesc{};
+		texDesc.Width = kInteriorRoomSize;
+		texDesc.Height = kInteriorRoomSize;
+		texDesc.MipLevels = 1;
+		texDesc.ArraySize = 6;
+		texDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+		texDesc.SampleDesc.Count = 1;
+		texDesc.Usage = D3D11_USAGE_DEFAULT;
+		texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+		srvDesc.Texture2DArray.MipLevels = 1;
+		srvDesc.Texture2DArray.ArraySize = 6;
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+		uavDesc.Texture2DArray.ArraySize = 6;
+
+		srvDesc.Format = uavDesc.Format = texDesc.Format;
+		capture->color = std::make_unique<Texture2D>(texDesc, "DynamicCubemaps::InteriorRoomCaptureColor");
+		capture->color->CreateSRV(srvDesc);
+		capture->color->CreateUAV(uavDesc);
+
+		// Read back while accumulating, which typed UAVs only allow for single 32-bit channels
+		texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		capture->weight = std::make_unique<Texture2D>(texDesc, "DynamicCubemaps::InteriorRoomCaptureWeight");
+		capture->weight->CreateSRV(srvDesc);
+		capture->weight->CreateUAV(uavDesc);
+
+		capture->cb = std::make_unique<ConstantBuffer>(ConstantBufferDesc<ExportInteriorRoomCB>(), "DynamicCubemaps::InteriorRoomCaptureCB");
+	} catch (const std::exception& e) {
+		logger::error("[DynamicCubemaps] Failed to start interior room capture: {}", e.what());
+		return;
+	}
+	constexpr float zero[4] = {};
+	globals::d3d::context->ClearUnorderedAccessViewFloat(capture->color->uav.get(), zero);
+	globals::d3d::context->ClearUnorderedAccessViewFloat(capture->weight->uav.get(), zero);
+
+	capture->heading = player->GetAngleZ();
+	capture->pitch = player->GetAngleX();
+	const auto eyePosition = Util::GetEyePosition();
+	capture->eyePosition = { eyePosition.x, eyePosition.y, eyePosition.z };
+	capture->startTime = globals::state->timer;
+	interiorRoomCapture = std::move(capture);
+	interiorRoomSaveRequested = false;
+	interiorRoomCancelRequested = false;
+
+	ShowInteriorRoomMessage(T(TKEY("interior_room_capture_started"), "Room capture: hold still while the camera looks around"));
+}
+
+void DynamicCubemaps::AccumulateInteriorRoom()
+{
+	auto& capture = *interiorRoomCapture;
+	const auto eyePosition = Util::GetEyePosition();
+	const float3 offset = { eyePosition.x - capture.eyePosition.x, eyePosition.y - capture.eyePosition.y, eyePosition.z - capture.eyePosition.z };
+	if (offset.Length() > kInteriorRoomCaptureMaxMove)
+		return;
+
+	capture.cb->Update(GetInteriorRoomConstants(capture.heading, offset));
+
+	auto renderer = globals::game::renderer;
+	auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+	auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+	const std::array<ID3D11ShaderResourceView*, 2> srvs = { depth.depthSRV, main.SRV };
+	const std::array<ID3D11UnorderedAccessView*, 2> uavs = { capture.color->uav.get(), capture.weight->uav.get() };
+	DispatchInteriorRoomPass(accumulateInteriorRoomCS, srvs, uavs, capture.cb->CB(), computeSampler);
+}
+
+void DynamicCubemaps::ExportInteriorRoom()
+{
+	auto capture = std::move(interiorRoomCapture);
+	auto player = RE::PlayerCharacter::GetSingleton();
+	auto cell = player ? player->GetParentCell() : nullptr;
+	if (!capture || !cell) {
+		logger::warn("[DynamicCubemaps] No interior room capture to save");
+		return;
+	}
+
+	auto device = globals::d3d::device;
+	auto context = globals::d3d::context;
+
+	// A cube texture, so the capture reads back and saves as a cubemap
+	D3D11_TEXTURE2D_DESC texDesc{};
+	texDesc.Width = kInteriorRoomSize;
+	texDesc.Height = kInteriorRoomSize;
+	texDesc.MipLevels = 1;
+	texDesc.ArraySize = 6;
+	texDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+	texDesc.SampleDesc.Count = 1;
+	texDesc.Usage = D3D11_USAGE_DEFAULT;
+	texDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+	texDesc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+	uavDesc.Format = texDesc.Format;
+	uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+	uavDesc.Texture2DArray.ArraySize = 6;
+
+	winrt::com_ptr<ID3D11Texture2D> roomTexture;
+	winrt::com_ptr<ID3D11UnorderedAccessView> roomUAV;
+	DirectX::ScratchImage image;
+
+	try {
+		DX::ThrowIfFailed(device->CreateTexture2D(&texDesc, nullptr, roomTexture.put()));
+		Util::SetResourceName(roomTexture.get(), "DynamicCubemaps::InteriorRoomExport");
+		DX::ThrowIfFailed(device->CreateUnorderedAccessView(roomTexture.get(), &uavDesc, roomUAV.put()));
+		Util::SetResourceName(roomUAV.get(), "DynamicCubemaps::InteriorRoomExport UAV");
+
+		// Captured positions are relative to the camera at the last cubemap capture, and the room to where it started
+		capture->cb->Update(GetInteriorRoomConstants(capture->heading, capture->eyePosition - cameraPreviousPosAdjust[0]));
+
+		const std::array<ID3D11ShaderResourceView*, 5> srvs = { envTexture->srv.get(), envCapturePositionTexture->srv.get(), envCaptureRawTexture->srv.get(), capture->color->srv.get(), capture->weight->srv.get() };
+		const std::array<ID3D11UnorderedAccessView*, 1> uavs = { roomUAV.get() };
+		DispatchInteriorRoomPass(exportInteriorRoomCS, srvs, uavs, capture->cb->CB(), computeSampler);
+
+		DX::ThrowIfFailed(CaptureTexture(device, context, roomTexture.get(), image));
+	} catch (const std::exception& e) {
+		logger::error("[DynamicCubemaps] Failed to capture interior room: {}", e.what());
+		return;
+	}
+
+	std::filesystem::path savePath = interiorRoomSavePath;
+	const auto* editorID = cell->GetFormEditorID();
+	const std::string cellName = editorID && editorID[0] ? editorID : std::format("{:08X}", cell->GetFormID());
+	for (uint32_t index = 0;; ++index) {
+		auto candidate = savePath / std::format("{}_{}.dds", cellName, index);
+		if (!std::filesystem::exists(candidate)) {
+			savePath = std::move(candidate);
+			break;
+		}
+	}
+
+	// Where the room lies outside, read while the cell's doors are loaded
+	json record = GetInteriorRoomPlacement(cell, capture->eyePosition, capture->heading);
+	if (record.empty())
+		logger::info("[DynamicCubemaps] No door of {} leads outside, so its room is only shown by materials that use it", cellName);
+	record["cell"] = cellName;
+	record["interior"] = { { "position", { capture->eyePosition.x, capture->eyePosition.y, capture->eyePosition.z } }, { "heading", capture->heading } };
+
+	// Filling, measuring and mips run on the CPU off the render thread; FinishInteriorRoomExport then compresses on the GPU
+	interiorRoomExporting = true;
+	ShowInteriorRoomMessage(T(TKEY("interior_room_capture_saving"), "Room capture: saving"));
+	const std::string fileName = savePath.filename().string();
+	interiorRoomSavedMessage = std::vformat(T(TKEY("interior_room_capture_saved"), "Room capture saved as {}"), std::make_format_args(fileName));
+	interiorRoomFailedMessage = T(TKEY("interior_room_capture_failed"), "Room capture failed; see CommunityShaders.log");
+	interiorRoomExport = std::async(std::launch::async, [image = std::move(image), savePath, record = std::move(record)]() mutable {
+		// Captured as 32-bit float already, which the processing below reads directly
+		DirectX::ScratchImage linear = std::move(image);
+		auto* pixels = reinterpret_cast<float*>(linear.GetPixels());
+		const size_t pixelCount = linear.GetPixelsSize() / (4 * sizeof(float));
+
+		// Texels nothing saw, such as straight down at the player's feet, have no distance and only a guessed color;
+		// they are filled per face, and faces nothing saw at all take the room's average
+		const size_t faceSize = linear.GetMetadata().width;
+		const size_t facePixels = faceSize * faceSize;
+		std::vector<size_t> emptyFaces;
+		for (size_t face = 0; face < pixelCount / facePixels; ++face) {
+			if (!FillInteriorRoomHoles(pixels + face * facePixels * 4, faceSize))
+				emptyFaces.push_back(face);
+		}
+		if (emptyFaces.size() * facePixels == pixelCount)
+			throw std::runtime_error("no depth was captured");
+		if (!emptyFaces.empty()) {
+			std::array<double, 4> average{};
+			for (size_t i = 0; i < pixelCount; ++i) {
+				if (pixels[i * 4 + 3] > 0.0f) {
+					for (size_t channel = 0; channel < 4; ++channel)
+						average[channel] += pixels[i * 4 + channel];
+				}
+			}
+			const double filled = static_cast<double>(pixelCount - emptyFaces.size() * facePixels);
+			for (size_t face : emptyFaces) {
+				for (size_t i = face * facePixels; i < (face + 1) * facePixels; ++i) {
+					for (size_t channel = 0; channel < 4; ++channel)
+						pixels[i * 4 + channel] = static_cast<float>(average[channel] / filled);
+				}
+			}
+		}
+
+		// Scale the HDR capture to an albedo-like average: room images are lit by the window's emittance and by
+		// daylight rather than by their own brightness, and emission is normalized by the room's average anyway
+		double luminance = 0.0;
+		for (size_t i = 0; i < pixelCount; ++i) {
+			luminance += 0.2126 * pixels[i * 4] + 0.7152 * pixels[i * 4 + 1] + 0.0722 * pixels[i * 4 + 2];
+		}
+		const float scale = 0.3f / static_cast<float>(std::max(luminance / static_cast<double>(pixelCount), 1e-4));
+
+		// Where the room's walls are, for the sidecar
+		const auto extent = MeasureInteriorRoom(pixels, faceSize);
+		for (size_t face = 0; face < extent.size(); ++face)
+			record["extent"][kInteriorRoomExtentNames[face]] = extent[face];
+
+		InteriorRoomExport result;
+		result.path = savePath;
+		result.room = EncodeInteriorRoomCube(linear, scale);
+		result.record = std::move(record);
+		return result;
+	});
+}
+
+void DynamicCubemaps::FinishInteriorRoomExport()
+{
+	try {
+		auto result = interiorRoomExport.get();
+		std::filesystem::create_directories(result.path.parent_path());
+		// The GPU encoder takes about a second a cube, where the CPU's full mode search takes minutes
+		DirectX::ScratchImage compressed;
+		DX::ThrowIfFailed(DirectX::Compress(globals::d3d::device, result.room.GetImages(), result.room.GetImageCount(), result.room.GetMetadata(), DXGI_FORMAT_BC7_UNORM_SRGB, DirectX::TEX_COMPRESS_DEFAULT, DirectX::TEX_ALPHA_WEIGHT_DEFAULT, compressed));
+		DX::ThrowIfFailed(DirectX::SaveToDDSFile(compressed.GetImages(), compressed.GetImageCount(), compressed.GetMetadata(), DirectX::DDS_FLAGS_NONE, result.path.c_str()));
+
+		// The sidecar places the room outside for windows near it
+		auto recordPath = result.path;
+		recordPath.replace_extension(".json");
+		std::ofstream(recordPath) << result.record.dump(1, '\t');
+		globals::features::truePBR.interiorCaptures.RequestRescan();
+
+		logger::info("[DynamicCubemaps] Interior room written to {}", result.path.string());
+		ShowInteriorRoomMessage(std::move(interiorRoomSavedMessage));
+	} catch (const std::exception& e) {
+		logger::error("[DynamicCubemaps] Failed to save interior room: {}", e.what());
+		ShowInteriorRoomMessage(std::move(interiorRoomFailedMessage));
+	}
+	interiorRoomExporting = false;
 }
 
 void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
@@ -610,6 +1214,29 @@ void DynamicCubemaps::UpdateCubemap()
 									 (GetComputeShaderUpdateFakeReflections() && GetComputeShaderInferrenceFakeReflections()) :
 									 (GetComputeShaderUpdateReflections() && GetComputeShaderInferrenceReflections())))
 		return;
+
+	// A room export processed on its worker thread is compressed and saved here, where the GPU can be used
+	if (interiorRoomExport.valid() && interiorRoomExport.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+		FinishInteriorRoomExport();
+	if (interiorRoomCaptureRequested.exchange(false) && !interiorRoomCapture)
+		StartInteriorRoomCapture();
+	if (interiorRoomCapture && interiorRoomCancelRequested.exchange(false)) {
+		SetInteriorRoomView(interiorRoomCapture->heading, interiorRoomCapture->pitch);
+		interiorRoomCapture.reset();
+		ShowInteriorRoomMessage(T(TKEY("interior_room_capture_cancelled"), "Room capture cancelled"));
+	}
+	if (interiorRoomCapture) {
+		AccumulateInteriorRoom();
+		const float progress = (globals::state->timer - interiorRoomCapture->startTime) / kInteriorRoomCaptureSeconds;
+		if (interiorRoomSaveRequested.exchange(false) || progress >= 1.0f) {
+			SetInteriorRoomView(interiorRoomCapture->heading, interiorRoomCapture->pitch);
+			ExportInteriorRoom();
+		} else {
+			// The view turns for the next frame, which this frame's accumulation then sees
+			const auto [yaw, pitch] = GetInteriorRoomSweepAngles(progress);
+			SetInteriorRoomView(interiorRoomCapture->heading + yaw, pitch);
+		}
+	}
 
 	static constexpr uint32_t kIrradianceSplit = 2;
 	static constexpr uint32_t kIrradianceSplitB = MIPLEVELS - 1;

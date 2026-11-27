@@ -13,6 +13,7 @@ enum class PBRFlags : uint32_t
 	HairMarschner = 1 << 6,
 	Foliage = 1 << 7,
 	ThinSurface = 1 << 8,
+	InteriorMapping = 1 << 9,
 };
 
 enum class PBRShaderFlags : uint32_t
@@ -32,6 +33,9 @@ enum class PBRShaderFlags : uint32_t
 	ProjectedGlint = 1 << 12,
 	Foliage = 1 << 13,
 	ThinSurface = 1 << 14,
+	InteriorMapping = 1 << 15,
+	InteriorCubemap = 1 << 16,
+	InteriorWindowMap = 1 << 17,
 };
 
 /**
@@ -50,6 +54,7 @@ public:
 		TruePBR::PBRTextureSetData* textureSetData = nullptr;
 		TruePBR::PBRMaterialObjectData* materialObjectData = nullptr;
 		std::optional<std::array<float, 4>> nifThinSurfaceParameters;
+		std::optional<std::vector<float>> nifInteriorMappingParameters;
 		/**
 		 * FormID of the TESObjectREFR whose Clone3D call last wrote MATO data to this
 		 * material.  Used by the fork-before-write check to detect when a pooled material
@@ -65,6 +70,7 @@ public:
 	inline static constexpr auto DisplacementTexture = static_cast<RE::BSTextureSet::Texture>(3);
 	inline static constexpr auto FeaturesTexture0 = static_cast<RE::BSTextureSet::Texture>(7);
 	inline static constexpr auto FeaturesTexture1 = static_cast<RE::BSTextureSet::Texture>(6);
+	inline static constexpr auto InteriorTexture = static_cast<RE::BSTextureSet::Texture>(4);
 
 	/** @brief Destructor that removes this material from the global tracking map. */
 	~BSLightingShaderMaterialPBR();
@@ -146,6 +152,10 @@ public:
 	void ApplyTextureSetData(const TruePBR::PBRTextureSetData& textureSetData);
 	/** @brief Applies the four finite values in the NIF PBRThinSurface extra-data block. */
 	bool ApplyNifThinSurfaceParameters(std::span<const float> parameters);
+	/** @brief Applies the five to seven finite values in the NIF PBRInteriorMapping extra-data block (columns, rows, back wall scale, depth scale, daylight scale, optional cubemap opt-in, optional room size). */
+	bool ApplyNifInteriorMappingParameters(std::span<const float> parameters);
+	/** @brief True when interior mapping is enabled by the NIF flag or the texture set. */
+	bool HasInteriorMapping() const;
 	/**
 	 * @brief Applies projected material object parameters (base color scale, roughness, specular, glint) to this material.
 	 * @param materialObjectData The material object configuration to apply.
@@ -202,6 +212,9 @@ public:
 	/** @brief Returns the glint rendering parameters for this material's base surface. */
 	const GlintParameters& GetGlintParameters() const;
 
+	/** @brief Returns the interior mapping parameters, sanitized when applied from the texture set. */
+	const InteriorMappingParameters& GetInteriorMappingParameters() const;
+
 	inline static std::unordered_map<BSLightingShaderMaterialPBR*, MaterialExtensions> All;
 
 	// members
@@ -220,6 +233,7 @@ public:
 	float fuzzWeight = 0.f;
 
 	GlintParameters glintParameters;
+	InteriorMappingParameters interiorMappingParameters;
 
 	// Roughness in r, metallic in g, AO in b, nonmetal reflectance in a
 	RE::NiPointer<RE::NiSourceTexture> rmaosTexture;
@@ -235,6 +249,15 @@ public:
 
 	// Fuzz map (fuzz color in rgb, fuzz weight in a) / Coat normal map (coat normal in rgb, coat roughness in a)
 	RE::NiPointer<RE::NiSourceTexture> featuresTexture1;
+
+	// Interior mapping room atlas or room cubemap in rgb, from the environment map slot
+	RE::NiPointer<RE::NiSourceTexture> interiorTexture;
+
+	// Interior mapping window map (whole window's UV rectangle per texel), the optional per-mesh textures\interiormaps file
+	RE::NiPointer<RE::NiSourceTexture> interiorWindowMapTexture;
+
+	// Whether the environment map slot holds a room from textures\interiors, so a cubemap there is a room, not a reflection
+	bool interiorRoomTexture = false;
 
 	std::array<float, 3> projectedMaterialBaseColorScale = { 1.f, 1.f, 1.f };
 	float projectedMaterialRoughness = 1.f;

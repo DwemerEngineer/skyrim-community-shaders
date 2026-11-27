@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Feature.h"
+#include "TruePBR/InteriorCaptures.h"
 
 class BSLightingShaderMaterialPBR;
 
@@ -11,6 +12,20 @@ struct GlintParameters
 	float logMicrofacetDensity = 40.f;
 	float microfacetRoughness = .015f;
 	float densityRandomization = 2.f;
+};
+
+struct InteriorMappingParameters
+{
+	bool enabled = false;
+	int atlasColumns = 1;
+	int atlasRows = 1;
+	float backWallScale = 0.5f;
+	float depthScale = 1.f;
+	float daylightScale = 0.3f;
+	// Width and height of the room's front wall in game units; windows are openings in its middle
+	float roomSize = 256.f;
+	// Rooms come from a cubemap instead of an atlas; opt-in so vanilla reflection cubemaps left in the slot are ignored
+	bool cubemap = false;
 };
 
 /**
@@ -58,7 +73,7 @@ public:
 	virtual void DrawSettings() override;
 	/** @brief Loads PBR texture set and material object configurations from disk. */
 	virtual void SetupResources() override;
-	/** @brief Per-frame prepass that initializes the glint noise texture and binds it to the pipeline. */
+	/** @brief Per-frame prepass that binds the glint noise texture and the captured interior rooms near the camera. */
 	virtual void Prepass() override;
 	/** @brief Installs all Detours hooks for PBR material, shader, and decal interception. */
 	virtual void PostPostLoad() override;
@@ -83,12 +98,16 @@ public:
 		float VertexAOStrength = 1.0f;
 		uint EnableMicroShadows = 1;
 		float MicroShadowStrength = 1.0f;
-		uint pad;
+		// How far behind the glass interior room images with depth reach, in multiples of the room's width
+		float InteriorDepthRange = 1.0f;
 	};
 	STATIC_ASSERT_ALIGNAS_16(Settings);
 	static_assert(sizeof(Settings) == 16);
 
 	Settings settings;
+
+	/** @brief Rooms captured inside interiors, shown through the windows near where they lie outside. */
+	InteriorCaptures interiorCaptures;
 
 	/** @brief When true, logs each PBR JSON file path during load. Off by default. */
 	bool enableVerboseJsonLogging = false;
@@ -188,6 +207,7 @@ public:
 		float fuzzWeight = 0.f;
 
 		GlintParameters glintParameters;
+		InteriorMappingParameters interiorMappingParameters;
 	};
 
 	/** @brief Loads all PBR texture set configurations from JSON files in Data/PBRTextureSets. */

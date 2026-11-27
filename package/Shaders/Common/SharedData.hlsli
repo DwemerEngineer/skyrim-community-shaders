@@ -453,7 +453,7 @@ namespace SharedData
 		float VertexAOStrength;
 		uint EnableMicroShadows;
 		float MicroShadowStrength;
-		uint pad;
+		float InteriorDepthRange;
 	};
 
 	struct SkinData

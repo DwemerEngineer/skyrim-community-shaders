@@ -36,6 +36,9 @@ namespace PBR
 		static const uint ProjectedGlint = (1 << 12);
 		static const uint Foliage = (1 << 13);
 		static const uint ThinSurface = (1 << 14);
+		static const uint InteriorMapping = (1 << 15);
+		static const uint InteriorCubemap = (1 << 16);
+		static const uint InteriorWindowMap = (1 << 17);
 	}
 
 	bool IsFoliageMaterial(uint flags)

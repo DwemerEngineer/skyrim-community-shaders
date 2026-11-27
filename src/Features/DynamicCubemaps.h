@@ -2,6 +2,9 @@
 
 #include "Buffer.h"
 
+#include <DirectXTex.h>
+#include <future>
+
 /**
  * Handles menu open and close events.
  */
@@ -146,6 +149,46 @@ public:
 
 	ID3D11UnorderedAccessView* bc6hScratchUAVs[9] = {};
 
+	// Interior room export
+
+	struct alignas(16) ExportInteriorRoomCB
+	{
+		float4 RoomRight;
+		float4 RoomUp;
+		float4 RoomForward;
+		float4 CaptureOffset;
+	};
+	STATIC_ASSERT_ALIGNAS_16(ExportInteriorRoomCB);
+
+	ID3D11ComputeShader* exportInteriorRoomCS = nullptr;
+	ID3D11ComputeShader* accumulateInteriorRoomCS = nullptr;
+
+	/** A room capture in progress: the frames seen so far, from where it started, facing the room's back wall. */
+	struct InteriorRoomCapture
+	{
+		std::unique_ptr<Texture2D> color;   // Frame color, and forward distance in alpha
+		std::unique_ptr<Texture2D> weight;  // How far inside the screen each pixel was seen, 0 for never
+		std::unique_ptr<ConstantBuffer> cb;
+		float heading = 0.0f;  // Of the player when the capture started, towards the room's back wall
+		float pitch = 0.0f;    // Of the player's view when the capture started, restored when it ends
+		float3 eyePosition;
+		float startTime = 0.0f;
+	};
+	std::unique_ptr<InteriorRoomCapture> interiorRoomCapture;
+
+	const std::string interiorRoomSavePath = "Data\\textures\\interiors";
+
+	/** A saved room's cube processed off the render thread, as an 8-bit sRGB mip chain waiting to be compressed. */
+	struct InteriorRoomExport
+	{
+		std::filesystem::path path;
+		DirectX::ScratchImage room;
+		json record;  // Where the room lies outside, saved beside it
+	};
+	std::future<InteriorRoomExport> interiorRoomExport;
+	std::string interiorRoomSavedMessage;
+	std::string interiorRoomFailedMessage;
+
 	// Editor window
 
 	struct Settings
@@ -218,6 +261,38 @@ public:
 	void CompressToBC6H(bool a_reflections);
 
 	ID3D11ComputeShader* GetComputeShaderBC6HEncode();
+
+	ID3D11ComputeShader* GetComputeShaderExportInteriorRoom();
+
+	ID3D11ComputeShader* GetComputeShaderAccumulateInteriorRoom();
+
+	/**
+	 * @brief Starts a room capture from the player's eye, with the player's heading as the room's back wall.
+	 *
+	 * The capture then builds a room cubemap from the full-resolution frames seen while the camera sweeps the room,
+	 * and saves it when the sweep ends.
+	 */
+	void StartInteriorRoomCapture();
+
+	/**
+	 * @brief Adds the current frame to the room capture where it is on screen. Must run while the frame's depth and
+	 * color are valid; frames seen after the player moves away from where the capture started are skipped.
+	 */
+	void AccumulateInteriorRoom();
+
+	/**
+	 * @brief Saves the room capture as an interior mapping room cubemap with each texel's distance in alpha.
+	 *
+	 * Texels never seen on screen take the dynamic cubemap capture, and those nothing saw are filled from around them. A worker thread then normalizes brightness, encodes
+	 * distances, builds mips and compresses to sRGB BC7. The file is named after the current cell.
+	 */
+	void ExportInteriorRoom();
+
+	/**
+	 * @brief Compresses a processed room export to BC7 on the GPU and saves it with its sidecar. Runs on the render
+	 * thread once the export's processing is done; the game pauses while it compresses.
+	 */
+	void FinishInteriorRoomExport();
 
 	virtual bool IsCore() const override { return true; };
 };

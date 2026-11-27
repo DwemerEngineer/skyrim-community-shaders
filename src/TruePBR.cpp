@@ -22,6 +22,17 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	densityRandomization);
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	InteriorMappingParameters,
+	enabled,
+	atlasColumns,
+	atlasRows,
+	backWallScale,
+	depthScale,
+	daylightScale,
+	roomSize,
+	cubemap);
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TruePBR::PBRTextureSetData,
 	roughnessScale,
 	displacementScale,
@@ -41,7 +52,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	innerLayerDisplacementOffset,
 	fuzzColor,
 	fuzzWeight,
-	glintParameters);
+	glintParameters,
+	interiorMappingParameters);
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TruePBR::PBRMaterialObjectData,
@@ -54,7 +66,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TruePBR::Settings,
 	VertexAOStrength,
 	EnableMicroShadows,
-	MicroShadowStrength);
+	MicroShadowStrength,
+	InteriorDepthRange);
 
 #define CHECK_PBR_TEXTURE(textureName)                                                                         \
 	if (!(pbrMaterial->textureName)) {                                                                         \
@@ -128,6 +141,10 @@ void TruePBR::DrawSettings()
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("%s", T(TKEY("micro_shadow_strength_tooltip"), "How strongly ambient occlusion darkens direct light."));
 		}
+
+		ImGui::SliderFloat(T(TKEY("interior_depth_range"), "Interior Room Depth"), &settings.InteriorDepthRange, 0.25f, 4.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("%s", T(TKEY("interior_depth_range_tooltip"), "How far back interior mapped rooms reach behind windows, for room images with depth, in multiples of the room's width. 1 makes rooms as deep as they are wide, as classic interior mapping does. Far parts of the room are pressed smoothly into that depth: lower keeps the room close so it shifts less as you walk past, higher keeps more of a deep hall's depth, so its far end moves along with you."));
 
 		ImGui::TreePop();
 	}
@@ -218,6 +235,34 @@ void TruePBR::DrawSettings()
 					if (ImGui::SliderFloat(T(TKEY("density_randomization"), "Density Randomization"), &selectedPbrTextureSet->glintParameters.densityRandomization, 0.f, 5.f, "%.3f")) {
 						wasEdited = true;
 					}
+				}
+				ImGui::TreePop();
+			}
+			if (ImGui::TreeNodeEx(T(TKEY("interior_mapping"), "Interior Mapping"))) {
+				auto& interior = selectedPbrTextureSet->interiorMappingParameters;
+				wasEdited |= ImGui::Checkbox(T(TKEY("interior_mapping_enabled"), "Enabled"), &interior.enabled);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("%s", T(TKEY("interior_mapping_enabled_tooltip"), "Shows a fake room behind each 0-1 UV tile, read from the environment map texture slot as an atlas of one-point perspective room images, or as a room cubemap when Room Cubemap is enabled. The emissive texture, when present, masks the window. Rooms are lit by the window's emittance, normalized so the window keeps the emittance's brightness and follows emittance changes such as time-of-day fades, plus daylight through the window. The room fades where the surface reflects, so reflections such as Dynamic Cubemaps take over at grazing angles. Rooms stay upright, and windows built from several pieces of an atlas texture share one room using an optional per-mesh window map in textures\\interiormaps. Combines with coat, subsurface and the other features. A 2D atlas in the environment map slot turns this on by itself, so meshes patched by PGPatcher with slot5 need nothing else; room cubemaps also need this, or the NIF Environment Mapping flag. A PBRInteriorMapping extra-data block of five floats (columns, rows, back wall scale, room depth, daylight scale) overrides these values per mesh; an optional sixth float of 1 enables Room Cubemap and an optional seventh sets Room Size."));
+				if (interior.enabled) {
+					wasEdited |= ImGui::Checkbox(T(TKEY("interior_mapping_cubemap"), "Room Cubemap"), &interior.cubemap);
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("%s", T(TKEY("interior_mapping_cubemap_tooltip"), "Reads the room from a cubemap rendered from the room's centre (+X right, +Y up, +Z to the back wall). Room images, including Dynamic Cubemaps' Export Interior Room, are 2D and need no opt-in. Without this, a cubemap in the environment map slot is treated as a leftover reflection cubemap and ignored."));
+					if (!interior.cubemap) {
+						wasEdited |= ImGui::SliderInt(T(TKEY("interior_mapping_atlas_columns"), "Atlas Columns"), &interior.atlasColumns, 1, 16, "%d", ImGuiSliderFlags_AlwaysClamp);
+						wasEdited |= ImGui::SliderInt(T(TKEY("interior_mapping_atlas_rows"), "Atlas Rows"), &interior.atlasRows, 1, 16, "%d", ImGuiSliderFlags_AlwaysClamp);
+						wasEdited |= ImGui::SliderFloat(T(TKEY("interior_mapping_back_wall_scale"), "Back Wall Scale"), &interior.backWallScale, 0.05f, 0.95f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+						if (auto _tt = Util::HoverTooltipWrapper())
+							ImGui::Text("%s", T(TKEY("interior_mapping_back_wall_scale_tooltip"), "Width of the back wall in each atlas room image as a fraction of the image width, matching how the rooms were rendered (90 degree field of view from the window). Smaller values make deeper rooms."));
+					}
+					wasEdited |= ImGui::SliderFloat(T(TKEY("interior_mapping_room_size"), "Room Size"), &interior.roomSize, 16.f, 1024.f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("%s", T(TKEY("interior_mapping_room_size_tooltip"), "Width and height of the room's front wall in game units (about 1.4 cm each). Each window is an opening in the middle of that wall, so small windows show part of a full-size room; rooms never shrink below their window."));
+					wasEdited |= ImGui::SliderFloat(T(TKEY("interior_mapping_depth_scale"), "Room Depth"), &interior.depthScale, 0.1f, 4.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("%s", T(TKEY("interior_mapping_depth_scale_tooltip"), "Scales how deep the rooms appear relative to the depth the room images were rendered with, without changing the images. 1 matches the images; for room cubemaps, 1 is a cube room."));
+					wasEdited |= ImGui::SliderFloat(T(TKEY("interior_mapping_daylight_scale"), "Daylight Scale"), &interior.daylightScale, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("%s", T(TKEY("interior_mapping_daylight_scale_tooltip"), "Share of the outdoor ambient light that lights the room, keeping it visible by day when the window's emittance is faded out. 0 lights the room only by its emittance."));
 				}
 				ImGui::TreePop();
 			}
@@ -392,6 +437,8 @@ void TruePBR::Prepass()
 		SetupGlintsTexture();
 	ID3D11ShaderResourceView* srv = glintsNoiseTexture->srv.get();
 	context->PSSetShaderResources(20, 1, &srv);
+
+	interiorCaptures.Update(context);
 }
 
 void TruePBR::SetupGlintsTexture()
@@ -789,6 +836,11 @@ struct BSLightingShaderProperty_LoadBinary
 				}
 			}
 
+			// Interior mapping has its own texture slot, so it combines with coat, hair and subsurface.
+			if (property->flags.any(kEnvMap)) {
+				pbrMaterial->pbrFlags.set(PBRFlags::InteriorMapping);
+			}
+
 			// It was a bad idea originally to use kMenuScreen flag to enable PBR since it's actually used for world map
 			// meshes. But it was too late to move to use different flag so internally we use kVertexLighting instead
 			// as it's not used for Lighting shader.
@@ -817,18 +869,12 @@ struct BSLightingShaderProperty_PostLinkObject
 			return;
 		}
 
-		const auto* extra = property->GetExtraData("PBRThinSurface");
-		if (!extra) {
-			return;
-		}
-		const auto* parameters = netimmerse_cast<const RE::NiFloatsExtraData*>(extra);
-		if (!parameters || parameters->size != 4 || !parameters->value) {
-			logger::warn("[TruePBR] {} has invalid PBRThinSurface extra data, expected four floats", stream.inputFilePath);
-			return;
-		}
-
 		auto* material = static_cast<BSLightingShaderMaterialPBR*>(property->material);
-		if (material->pbrFlags.any(PBRFlags::TwoLayer, PBRFlags::HairMarschner)) {
+		const bool supportsThinSurface = !material->pbrFlags.any(PBRFlags::TwoLayer, PBRFlags::HairMarschner);
+
+		const auto* thinSurfaceParameters = supportsThinSurface ? GetFloatsExtraData(property, "PBRThinSurface", 4, 4, stream.inputFilePath) : nullptr;
+		const auto* interiorMappingParameters = GetFloatsExtraData(property, "PBRInteriorMapping", 5, 7, stream.inputFilePath);
+		if (!thinSurfaceParameters && !interiorMappingParameters) {
 			return;
 		}
 
@@ -838,11 +884,44 @@ struct BSLightingShaderProperty_PostLinkObject
 		if (const auto* textureSetData = BSLightingShaderMaterialPBR::All[&source].textureSetData) {
 			source.ApplyTextureSetData(*textureSetData);
 		}
-		if (!source.ApplyNifThinSurfaceParameters({ parameters->value, parameters->size })) {
-			logger::warn("[TruePBR] {} has non-finite PBRThinSurface parameters", stream.inputFilePath);
-			return;
+
+		bool applied = false;
+		if (thinSurfaceParameters) {
+			if (source.ApplyNifThinSurfaceParameters({ thinSurfaceParameters->value, thinSurfaceParameters->size })) {
+				applied = true;
+			} else {
+				logger::warn("[TruePBR] {} has non-finite PBRThinSurface parameters", stream.inputFilePath);
+			}
 		}
-		property->SetMaterial(&source, true);
+		if (interiorMappingParameters) {
+			if (source.ApplyNifInteriorMappingParameters({ interiorMappingParameters->value, interiorMappingParameters->size })) {
+				applied = true;
+			} else {
+				logger::warn("[TruePBR] {} has non-finite PBRInteriorMapping parameters", stream.inputFilePath);
+			}
+		}
+		if (applied) {
+			property->SetMaterial(&source, true);
+		}
+	}
+
+	/** @brief Returns the named NiFloatsExtraData when it holds between minSize and maxSize floats, warning when it is malformed. */
+	static const RE::NiFloatsExtraData* GetFloatsExtraData(RE::BSLightingShaderProperty* property, const char* name, std::uint32_t minSize, std::uint32_t maxSize, std::string_view inputFilePath)
+	{
+		const auto* extra = property->GetExtraData(name);
+		if (!extra) {
+			return nullptr;
+		}
+		const auto* parameters = netimmerse_cast<const RE::NiFloatsExtraData*>(extra);
+		if (!parameters || parameters->size < minSize || parameters->size > maxSize || !parameters->value) {
+			if (minSize == maxSize) {
+				logger::warn("[TruePBR] {} has invalid {} extra data, expected {} floats", inputFilePath, name, minSize);
+			} else {
+				logger::warn("[TruePBR] {} has invalid {} extra data, expected {} to {} floats", inputFilePath, name, minSize, maxSize);
+			}
+			return nullptr;
+		}
+		return parameters;
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
@@ -922,6 +1001,18 @@ struct BSLightingShaderProperty_GetRenderPasses_LocalMap
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
+
+/** @brief Returns the loaded texture's view dimension, or unknown while it is still streaming in. */
+static D3D11_SRV_DIMENSION GetTextureDimension(const RE::NiSourceTexture* texture)
+{
+	const auto* rendererTexture = texture ? texture->rendererTexture : nullptr;
+	if (!rendererTexture || !rendererTexture->resourceView) {
+		return D3D11_SRV_DIMENSION_UNKNOWN;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC desc;
+	rendererTexture->resourceView->GetDesc(&desc);
+	return desc.ViewDimension;
+}
 
 bool TruePBR::BSLightingShader_SetupMaterial(RE::BSLightingShader* shader, RE::BSLightingShaderMaterialBase const* material)
 {
@@ -1161,6 +1252,47 @@ bool TruePBR::BSLightingShader_SetupMaterial(RE::BSLightingShader* shader, RE::B
 				shadowState->SetPSTextureFilterMode(12, RE::BSGraphics::TextureFilterMode::kAnisotropic);
 
 				shaderFlags.set(PBRShaderFlags::HasFeaturesTexture0);
+			}
+
+			// Own texture slots and constant, so interior mapping combines with every other PBR feature.
+			// A 2D room atlas in the environment slot enables it by itself, since mesh patchers such as PGPatcher
+			// can set texture slots but not shader flags. So does a room cubemap from textures\interiors, where the room
+			// export writes; any other cubemap needs the explicit opt-in, as it is otherwise a vanilla reflection cubemap
+			// left by mesh conversion and is ignored.
+			// Without a room texture the slot holds the default black texture, and the window keeps its plain emission.
+			const bool hasInteriorTexture = pbrMaterial->interiorTexture != nullptr && pbrMaterial->interiorTexture != graphicsState->GetRuntimeData().defaultTextureBlack;
+			const auto interiorDimension = hasInteriorTexture ? GetTextureDimension(pbrMaterial->interiorTexture.get()) : D3D11_SRV_DIMENSION_UNKNOWN;
+			const bool isCubemap = interiorDimension == D3D11_SRV_DIMENSION_TEXTURECUBE;
+			const bool optedIn = pbrMaterial->GetInteriorMappingParameters().cubemap && pbrMaterial->HasInteriorMapping();
+			const bool interiorEnabled = isCubemap ? optedIn || pbrMaterial->interiorRoomTexture : interiorDimension == D3D11_SRV_DIMENSION_TEXTURE2D;
+			if (interiorEnabled) {
+				const uint32_t interiorSlot = isCubemap ? 13 : 7;
+				shadowState->SetPSTexture(interiorSlot, pbrMaterial->interiorTexture->rendererTexture);
+				shadowState->SetPSTextureAddressMode(interiorSlot, isCubemap ? RE::BSGraphics::TextureAddressMode::kClampSClampT : static_cast<RE::BSGraphics::TextureAddressMode>(pbrMaterial->textureClampMode));
+				shadowState->SetPSTextureFilterMode(interiorSlot, RE::BSGraphics::TextureFilterMode::kAnisotropic);
+
+				shaderFlags.set(PBRShaderFlags::InteriorMapping);
+				if (isCubemap) {
+					shaderFlags.set(PBRShaderFlags::InteriorCubemap);
+				}
+
+				// Fits each room to its window opening on window textures that are atlases
+				if (GetTextureDimension(pbrMaterial->interiorWindowMapTexture.get()) == D3D11_SRV_DIMENSION_TEXTURE2D) {
+					shadowState->SetPSTexture(15, pbrMaterial->interiorWindowMapTexture->rendererTexture);
+					shaderFlags.set(PBRShaderFlags::InteriorWindowMap);
+				}
+
+				// Atlas grid packed as (rows - 1) * 16 + (columns - 1), exact in a float for up to 16x16
+				const auto& interior = pbrMaterial->GetInteriorMappingParameters();
+				std::array<float, 4> interiorMappingParams;
+				interiorMappingParams[0] = static_cast<float>((interior.atlasRows - 1) * 16 + (interior.atlasColumns - 1));
+				interiorMappingParams[1] = interior.backWallScale;
+				interiorMappingParams[2] = interior.depthScale;
+				interiorMappingParams[3] = interior.daylightScale;
+				shadowState->SetPSConstant(interiorMappingParams, RE::BSGraphics::ConstantGroupLevel::PerMaterial, lightingPSConstants.InteriorMappingParams);
+
+				std::array<float, 4> interiorMappingParams2{ interior.roomSize, 0.f, 0.f, 0.f };
+				shadowState->SetPSConstant(interiorMappingParams2, RE::BSGraphics::ConstantGroupLevel::PerMaterial, lightingPSConstants.InteriorMappingParams2);
 			}
 
 			const bool hasFeaturesTexture1 = pbrMaterial->featuresTexture1 != nullptr && pbrMaterial->featuresTexture1 != graphicsState->GetRuntimeData().defaultTextureWhite;

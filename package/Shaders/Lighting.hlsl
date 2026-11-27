@@ -320,6 +320,10 @@ static const bool PBRTextures = true;
 static const bool PBRTextures = false;
 #	endif
 
+#	if defined(TRUE_PBR) && !defined(LANDSCAPE) && !defined(LODLANDSCAPE) && !defined(LODLANDNOISE) && !defined(LOD_LAND_BLEND)
+#		define INTERIOR_MAPPING
+#	endif
+
 SamplerState SampTerrainParallaxSampler : register(s1);
 
 #	if defined(LANDSCAPE)
@@ -390,6 +394,11 @@ SamplerState SampProjDetailSampler : register(s10);
 
 SamplerState SampCharacterLightProjNoiseSampler : register(s11);
 SamplerState SampRimSoftLightWorldMapOverlaySampler : register(s12);
+
+#		if defined(INTERIOR_MAPPING)
+SamplerState SampInteriorSampler : register(s7);
+SamplerState SampInteriorCubeSampler : register(s13);
+#		endif
 
 #		if defined(WORLD_MAP) && (defined(LODLANDSCAPE) || defined(LODLANDNOISE))
 SamplerState SampWorldMapOverlaySnowSampler : register(s13);
@@ -492,6 +501,14 @@ Texture2D<float4> TexProjDetail : register(t10);
 Texture2D<float4> TexCharacterLightProjNoiseSampler : register(t11);
 Texture2D<float4> TexRimSoftLightWorldMapOverlaySampler : register(t12);
 
+#		if defined(INTERIOR_MAPPING)
+// Room atlas, or a room cubemap rendered from the room's centre
+Texture2D<float4> TexInteriorSampler : register(t7);
+TextureCube<float4> TexInteriorCubeSampler : register(t13);
+// Whole window UV rectangle per texel for each piece of a mesh window; left half for texture v pointing down, right half up
+Texture2D<float4> TexInteriorWindowMap : register(t15);
+#		endif
+
 #		if defined(WORLD_MAP) && (defined(LODLANDSCAPE) || defined(LODLANDNOISE))
 Texture2D<float4> TexWorldMapOverlaySnowSampler : register(t13);
 #		endif
@@ -547,6 +564,11 @@ cbuffer PerMaterial : register(b1)
 	float4 LandscapeTexture1to4IsSpecPower : packoffset(c11);
 	float4 LandscapeTexture5to6IsSpecPower : packoffset(c12);
 	float4 SnowRimLightParameters : packoffset(c13);  // fSnowRimLightIntensity in x, fSnowGeometrySpecPower in y, fSnowNormalSpecPower in z, bEnableSnowRimLighting in w
+#	endif
+
+#	if defined(INTERIOR_MAPPING)
+	float4 InteriorMappingParams : packoffset(c9);    // packed atlas grid, back wall scale, depth scale, daylight scale
+	float4 InteriorMappingParams2 : packoffset(c10);  // room front wall size in game units
 #	endif
 
 #	if defined(TRUE_PBR) && defined(LANDSCAPE)
@@ -835,6 +857,12 @@ float GetSnowParameterY(float texProjTmp, float alpha)
 
 #	if defined(TRUE_PBR)
 #		include "Common/PBR.hlsli"
+#	endif
+
+#	if defined(INTERIOR_MAPPING)
+// Rooms captured inside interiors near the camera, one cube each
+TextureCubeArray<float4> TexInteriorCaptureRooms : register(t23);
+StructuredBuffer<PBR::InteriorCapture> InteriorCaptures : register(t24);
 #	endif
 
 #	if defined(LANDSCAPE) && defined(LANDSCAPE_SEAMS)
@@ -2721,9 +2749,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(TRUE_PBR)
 	hasEmissive = hasEmissive || ((PBRFlags & PBR::Flags::HasEmissive) != 0);
 #		endif
+#		if defined(INTERIOR_MAPPING)
+	float3 interiorWindowMask = 1.0;
+#		endif
 	[branch] if (hasEmissive)
 	{
-		float3 glowColor = ColorManagement::TextureToWorking(TexGlowSampler.Sample(SampGlowSampler, uv).xyz, PBRTextures) * SharedData::linearLightingSettings.glowmapMult;
+		float3 glowColor = ColorManagement::TextureToWorking(TexGlowSampler.Sample(SampGlowSampler, uv).xyz, PBRTextures);
+#		if defined(INTERIOR_MAPPING)
+		interiorWindowMask = Color::LinearToPBRMaterial(glowColor);
+#		endif
+		glowColor *= SharedData::linearLightingSettings.glowmapMult;
 
 #		if defined(TRUE_PBR)
 		float3 emitVertexColor = ColorManagement::PBRVertexColorToLinear(input.Color.xyz);
@@ -2736,6 +2771,79 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		emitColor *= glowColor;
 #		endif  // TRUE_PBR
 	}
+
+#		if defined(INTERIOR_MAPPING)
+	// Rooms are lit by their own lights through the emittance (which window emittance mods tune and fade by time of day)
+	// and by daylight entering the window, never by direct exterior light. The emissive map masks the window.
+	// Back faces of two-sided or thin-surface windows, and windows seen from inside interior cells, look out of the
+	// room, so they keep plain emission.
+	bool interiorVisible = false;
+	float3 interiorEmission = 0.0;
+	float3 interiorAlbedo = 0.0;
+	[branch] if ((PBRFlags & PBR::Flags::InteriorMapping) != 0 && frontFace && !SharedData::InInterior)
+	{
+		interiorVisible = true;
+
+		float3 dPdu, dPdv;
+		const bool hasUVAxes = PBR::GetSurfaceUVAxes(input.WorldPosition.xyz, uvOriginal, dPdu, dPdv);
+		float3 modelNormal;
+		float modelToWorld;
+		float3x3 worldToModel;
+		const bool hasModelSurface = PBR::GetModelSurface(input.WorldPosition.xyz, input.ModelPosition.xyz, tbnTr[2], modelNormal, modelToWorld, worldToModel);
+
+		// Walls are found by position, since windows repeating the same UVs can only share per-window rectangles
+		float4 windowRect = 0.0;
+		PBR::InteriorWall wall = (PBR::InteriorWall)0;
+		bool onWall = false;
+		[branch] if ((PBRFlags & PBR::Flags::InteriorWindowMap) != 0 && hasUVAxes)
+		{
+			uint2 windowMapSize;
+			TexInteriorWindowMap.GetDimensions(windowMapSize.x, windowMapSize.y);
+			onWall = hasModelSurface && PBR::FindInteriorWall(TexInteriorWindowMap, windowMapSize, input.ModelPosition.xyz, modelNormal, wall);
+
+			// The right half covers pieces whose texture v points up in the world, such as mirrored lower halves
+			const uint halfWidth = windowMapSize.x / 2;
+			const uint2 tileTexel = min(uint2(frac(uvOriginal) * halfWidth), halfWidth - 1);
+			windowRect = TexInteriorWindowMap.Load(int3(tileTexel.x + (dPdv.z > 0.0 ? halfWidth : 0), tileTexel.y, 0));
+		}
+		const float roomSize = InteriorMappingParams2.x;
+		PBR::InteriorWindow window;
+		if (onWall)
+			window = PBR::GetInteriorWallWindow(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust.xyz, input.ModelPosition.xyz, modelToWorld, worldToModel, wall, roomSize, (PBRFlags & PBR::Flags::InteriorCubemap) == 0, viewDirection);
+		else
+			window = PBR::GetInteriorWindow(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust.xyz, uvOriginal, windowRect, hasUVAxes, dPdu, dPdv, tbnTr, viewDirection);
+
+		float3 roomAverage;
+		float3 roomColor;
+		// A captured room near the window replaces the material's own, traced like room images through rooms as wide as
+		// the wall is high
+		PBR::InteriorCapture capture;
+		[branch] if (PBR::FindInteriorCapture(InteriorCaptures, window.centre + FrameBuffer::CameraPosAdjust.xyz, capture))
+		{
+			PBR::InteriorWindow roomWindow = window;
+			if (onWall)
+				roomWindow = PBR::GetInteriorWallWindow(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust.xyz, input.ModelPosition.xyz, modelToWorld, worldToModel, wall, roomSize, true, viewDirection);
+			roomColor = PBR::SampleInteriorCapture(TexInteriorCaptureRooms, SampColorSampler, capture, roomWindow, roomSize, roomAverage);
+		}
+		else if ((PBRFlags & PBR::Flags::InteriorCubemap) != 0)
+		{
+			roomColor = PBR::SampleInteriorCubemap(TexInteriorCubeSampler, SampInteriorCubeSampler, window, InteriorMappingParams, roomSize, roomAverage);
+		}
+		else
+		{
+			roomColor = PBR::SampleInteriorMapping(TexInteriorSampler, SampInteriorSampler, window, InteriorMappingParams, roomSize, roomAverage);
+		}
+		roomColor = ColorManagement::TextureToWorking(roomColor, PBRTextures);
+		roomAverage = ColorManagement::TextureToWorking(roomAverage, PBRTextures);
+
+		interiorAlbedo = Color::LinearToPBRMaterial(roomColor) * interiorWindowMask;
+
+		// Normalized to the room's average so the window keeps the brightness of its emittance
+		const float3 roomLight = roomColor / max(Color::RGBToLuminance(roomAverage), 0.02);
+		interiorEmission = emitColor * Color::LinearToPBRMaterial(roomLight * (hasEmissive ? 1.0 : SharedData::linearLightingSettings.glowmapMult));
+		emitColor = 0.0;
+	}
+#		endif
 #	endif
 
 #	if !defined(TRUE_PBR)
@@ -2898,6 +3006,20 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	{
 		color.xyz += emitColor.xyz;
 	}
+
+#		if defined(INTERIOR_MAPPING)
+	[branch] if (interiorVisible)
+	{
+		// Daylight through the window keeps rooms visible while their emittance is faded out
+		float3 interiorDaylight = directionalAmbientColor * InteriorMappingParams.w;
+#			if defined(SKYLIGHTING)
+		interiorDaylight *= skylightingDiffuse;
+#			endif
+		// Seen through the surface, so the room gives way to what the surface and any coat reflect, such as Dynamic Cubemaps
+		const float3 interiorTransmission = 1.0 - saturate(indirectLobeWeights.specular);
+		color.xyz += (interiorEmission + interiorAlbedo * interiorDaylight) * interiorTransmission;
+	}
+#		endif
 #	else
 	color.xyz += diffuseColor * material.BaseColor;
 #	endif
